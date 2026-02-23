@@ -5,7 +5,7 @@ mod iptables;
 mod libnftables;
 
 use thiserror::Error;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use crate::dns::HostnameIpResolver;
 use crate::model::RuntimeSnapshot;
@@ -67,10 +67,7 @@ where
             container_count = snapshot.containers.len(),
             "applying nftables changes"
         );
-        for command in &commands {
-            debug!(command = %command, "nft apply command");
-        }
-        trace!(commands = ?commands, "nft apply commands detail");
+        debug!(commands = ?commands, "nft apply commands");
         self.runner.run_commands(&commands)
     }
 
@@ -87,10 +84,7 @@ where
             container_count = snapshot.containers.len(),
             "applying nftables changes with DNS sets"
         );
-        for command in &commands {
-            debug!(command = %command, "nft apply command");
-        }
-        trace!(commands = ?commands, "nft apply commands detail");
+        debug!(commands = ?commands, "nft apply commands");
         self.runner.run_commands(&commands)
     }
 
@@ -98,10 +92,7 @@ where
         let commands = build_cleanup_commands();
         let command_count = commands.len();
         info!(command_count, "cleaning up nftables table");
-        for command in &commands {
-            debug!(command = %command, "nft cleanup command");
-        }
-        trace!(commands = ?commands, "nft cleanup commands detail");
+        debug!(commands = ?commands, "nft cleanup commands");
         match self.runner.run_commands(&commands) {
             Ok(()) => {
                 info!("nftables cleanup completed");
