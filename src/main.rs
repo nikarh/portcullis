@@ -362,6 +362,9 @@ fn parse_container_event_line(line: &str) -> Result<Option<DockerContainerEvent>
     if trimmed.is_empty() {
         return Ok(None);
     }
+    if is_chunk_size_line(trimmed) {
+        return Ok(None);
+    }
 
     let parsed: DockerEventLine = serde_json::from_str(trimmed)
         .map_err(|error| MainError::ServiceState(format!("invalid docker event json: {error}")))?;
@@ -383,6 +386,11 @@ fn parse_container_event_line(line: &str) -> Result<Option<DockerContainerEvent>
         .and_then(|attributes| attributes.get("name").cloned());
 
     Ok(Some(DockerContainerEvent { id, action, name }))
+}
+
+fn is_chunk_size_line(line: &str) -> bool {
+    let size_part = line.split(';').next().unwrap_or_default().trim();
+    !size_part.is_empty() && size_part.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -478,6 +486,19 @@ mod tests {
     fn parse_container_event_line_ignores_non_container_event() {
         let line = "{\"Type\":\"network\",\"Action\":\"connect\",\"Actor\":{\"ID\":\"net0\"}}";
         let event = parse_container_event_line(line).expect("event parse should succeed");
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_container_event_line_ignores_chunk_size_lines() {
+        let event = parse_container_event_line("173\r\n").expect("event parse should succeed");
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_container_event_line_ignores_chunk_size_with_extensions() {
+        let event =
+            parse_container_event_line("173;foo=bar\r\n").expect("event parse should succeed");
         assert!(event.is_none());
     }
 }
