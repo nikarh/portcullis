@@ -30,7 +30,7 @@ Implemented:
 - Docker reports `iptables` => use iptables backend
 - Long-running daemon mode:
 - Startup cleanup to recover from unclean previous exits.
-- Continuous Docker container event polling and policy re-apply on relevant events.
+- Continuous Docker container event subscription over Docker Unix socket and policy re-apply on relevant events.
 - Graceful cleanup on shutdown (SIGINT/SIGTERM via signal handler).
 - Structured logging with `info` / `debug` / `trace` levels.
 
