@@ -61,7 +61,13 @@ where
         resolver: &mut dyn HostnameIpResolver,
     ) -> Result<(), FirewallError> {
         self.cleanup()?;
-        let commands = build_apply_commands_with_dns(snapshot, resolver)?;
+        let use_ipset = detect_ipset_available();
+        if use_ipset {
+            info!("ipset detected; using ipset-backed hostname rules");
+        } else {
+            info!("ipset not detected; using direct iptables hostname rules");
+        }
+        let commands = build_apply_commands_with_dns(snapshot, resolver, use_ipset)?;
 
         for command in &commands {
             self.runner.run(command.program, &command.args)?;
@@ -121,6 +127,7 @@ impl IptablesFirewall<CommandIptablesRunner> {
 fn build_apply_commands_with_dns(
     snapshot: &RuntimeSnapshot,
     resolver: &mut dyn HostnameIpResolver,
+    use_ipset: bool,
 ) -> Result<Vec<CommandSpec>, FirewallError> {
     let mut commands = vec![
         CommandSpec {
@@ -189,6 +196,7 @@ fn build_apply_commands_with_dns(
                             source_ipv4,
                             host,
                             &rule.ports,
+                            use_ipset,
                         )?;
                     }
                 }
@@ -256,6 +264,7 @@ fn append_hostname_target_commands(
     source_ipv4: std::net::Ipv4Addr,
     host: &str,
     ports: &[crate::model::PortSpec],
+    use_ipset: bool,
 ) -> Result<(), FirewallError> {
     let addresses = resolver
         .resolve(host)
@@ -271,8 +280,35 @@ fn append_hostname_target_commands(
         })
         .collect();
 
-    for port in ports {
+    if use_ipset {
+        let set_name = set_name_for_host(host);
+        commands.push(CommandSpec {
+            program: "ipset",
+            args: vec![
+                "create".to_string(),
+                set_name.clone(),
+                "hash:ip".to_string(),
+                "-exist".to_string(),
+            ],
+        });
+        commands.push(CommandSpec {
+            program: "ipset",
+            args: vec!["flush".to_string(), set_name.clone()],
+        });
+
         for destination in &destination_ipv4 {
+            commands.push(CommandSpec {
+                program: "ipset",
+                args: vec![
+                    "add".to_string(),
+                    set_name.clone(),
+                    destination.to_string(),
+                    "-exist".to_string(),
+                ],
+            });
+        }
+
+        for port in ports {
             commands.push(CommandSpec {
                 program: "iptables",
                 args: vec![
@@ -280,8 +316,11 @@ fn append_hostname_target_commands(
                     CHAIN_NAME.to_string(),
                     "-s".to_string(),
                     format!("{source_ipv4}/32"),
-                    "-d".to_string(),
-                    format!("{destination}/32"),
+                    "-m".to_string(),
+                    "set".to_string(),
+                    "--match-set".to_string(),
+                    set_name.clone(),
+                    "dst".to_string(),
                     "-p".to_string(),
                     protocol_name(port.protocol).to_string(),
                     "--dport".to_string(),
@@ -291,9 +330,52 @@ fn append_hostname_target_commands(
                 ],
             });
         }
+    } else {
+        for port in ports {
+            for destination in &destination_ipv4 {
+                commands.push(CommandSpec {
+                    program: "iptables",
+                    args: vec![
+                        "-A".to_string(),
+                        CHAIN_NAME.to_string(),
+                        "-s".to_string(),
+                        format!("{source_ipv4}/32"),
+                        "-d".to_string(),
+                        format!("{destination}/32"),
+                        "-p".to_string(),
+                        protocol_name(port.protocol).to_string(),
+                        "--dport".to_string(),
+                        port.port.to_string(),
+                        "-j".to_string(),
+                        "ACCEPT".to_string(),
+                    ],
+                });
+            }
+        }
     }
 
     Ok(())
+}
+
+fn set_name_for_host(host: &str) -> String {
+    let hash = fnv1a_64(host.as_bytes());
+    format!("pc_h4_{hash:016x}")
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+fn detect_ipset_available() -> bool {
+    match Command::new("ipset").arg("--version").output() {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
 }
 
 fn append_default_drop_command(commands: &mut Vec<CommandSpec>, source_ipv4: std::net::Ipv4Addr) {
@@ -478,9 +560,9 @@ mod tests {
     }
 
     #[test]
-    fn build_commands_includes_iptables_for_hostname() {
+    fn build_commands_includes_iptables_for_hostname_without_ipset() {
         let mut resolver = MockResolver;
-        let commands = build_apply_commands_with_dns(&sample_snapshot(), &mut resolver);
+        let commands = build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false);
         assert!(commands.is_ok());
         let value = match commands {
             Ok(items) => items,
@@ -532,7 +614,7 @@ mod tests {
         }
 
         let mut resolver = MockResolver;
-        let commands = build_apply_commands_with_dns(&snapshot, &mut resolver)
+        let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false)
             .expect("expected command build to succeed");
         assert!(commands.iter().any(|command| {
             command.program == "iptables"
@@ -546,8 +628,8 @@ mod tests {
     #[test]
     fn build_commands_hook_into_docker_user_chain() {
         let mut resolver = MockResolver;
-        let commands =
-            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver).expect("commands");
+        let commands = build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false)
+            .expect("commands");
         assert!(commands.iter().any(|command| {
             command.program == "iptables"
                 && command.args
@@ -596,5 +678,25 @@ mod tests {
         let firewall = IptablesFirewall::new(runner);
         let result = firewall.cleanup();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn build_commands_includes_ipset_for_hostname_with_ipset() {
+        let mut resolver = MockResolver;
+        let commands = build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, true)
+            .expect("expected command build to succeed");
+        assert!(commands.iter().any(|command| {
+            command.program == "ipset"
+                && command.args.first() == Some(&"create".to_string())
+                && command
+                    .args
+                    .get(1)
+                    .is_some_and(|name| name.starts_with("pc_h4_"))
+        }));
+        assert!(commands.iter().any(|command| {
+            command.program == "iptables"
+                && command.args.iter().any(|arg| arg == "--match-set")
+                && command.args.iter().any(|arg| arg.starts_with("pc_h4_"))
+        }));
     }
 }
