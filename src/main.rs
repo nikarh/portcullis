@@ -5,6 +5,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pico_args::Arguments;
@@ -219,8 +220,7 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let mut tracker = RuntimeChangeTracker::new();
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
-    let mut event_stream = DockerSocketEventStream::connect(&config.docker_socket)?;
-
+    let mut event_stream = connect_event_stream(&config.docker_socket)?;
     apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
 
     info!("subscribed to docker container events");
@@ -244,7 +244,11 @@ fn run(config: &Config) -> Result<(), MainError> {
                     container_name = ?event.name,
                     "docker event requires firewall refresh"
                 );
-                apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
+                if let Err(error) =
+                    apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)
+                {
+                    error!(%error, "firewall refresh failed; continuing");
+                }
             }
             Ok(None) => {}
             Err(error) => {
@@ -252,8 +256,13 @@ fn run(config: &Config) -> Result<(), MainError> {
                 if terminate.load(Ordering::Relaxed) {
                     break;
                 }
-                event_stream = DockerSocketEventStream::connect(&config.docker_socket)?;
-                info!("docker event stream reconnected");
+                match connect_event_stream(&config.docker_socket) {
+                    Ok(stream) => event_stream = stream,
+                    Err(reconnect_error) => {
+                        error!(%reconnect_error, "docker event stream reconnect failed; retrying");
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                }
             }
         }
     }
@@ -265,6 +274,12 @@ fn run(config: &Config) -> Result<(), MainError> {
     }
     info!("shutdown cleanup completed");
     Ok(())
+}
+
+fn connect_event_stream(socket: &str) -> Result<DockerSocketEventStream, MainError> {
+    let stream = DockerSocketEventStream::connect(socket)?;
+    info!("docker event stream connected");
+    Ok(stream)
 }
 
 fn apply_snapshot<A>(
