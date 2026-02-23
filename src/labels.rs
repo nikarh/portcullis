@@ -62,7 +62,10 @@ pub fn parse_policy(
             return Err(LabelParseError::InvalidEgressIndex(key.clone()));
         }
 
-        if !index_part.chars().all(|character| character.is_ascii_digit()) {
+        if !index_part
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        {
             return Err(LabelParseError::InvalidEgressIndex(key.clone()));
         }
 
@@ -114,15 +117,15 @@ fn parse_egress_value(key: &str, value: &str) -> Result<EgressRule, LabelParseEr
         .filter(|part| !part.is_empty())
         .collect();
 
-    if parts.is_empty() {
+    let Some((target_part, port_parts)) = parts.split_first() else {
         return Err(LabelParseError::InvalidEgress(
             key.to_string(),
             value.to_string(),
         ));
-    }
+    };
 
-    let target = parse_target(key, parts[0])?;
-    let ports = parse_ports(key, &parts[1..])?;
+    let target = parse_target(key, target_part)?;
+    let ports = parse_ports(key, port_parts)?;
 
     Ok(EgressRule { target, ports })
 }
@@ -172,9 +175,8 @@ fn parse_ports(key: &str, parts: &[&str]) -> Result<Vec<PortSpec>, LabelParseErr
             }
         };
 
-        let port = u16::from_str(port_value).map_err(|_| {
-            LabelParseError::InvalidPortSpec(key.to_string(), (*part).to_string())
-        })?;
+        let port = u16::from_str(port_value)
+            .map_err(|_| LabelParseError::InvalidPortSpec(key.to_string(), (*part).to_string()))?;
 
         if port == 0 {
             return Err(LabelParseError::InvalidPortSpec(
@@ -322,7 +324,10 @@ mod tests {
 
         assert_eq!(
             error,
-            LabelParseError::InvalidPortSpec("portcullis.egress.0".to_string(), "sctp:443".to_string())
+            LabelParseError::InvalidPortSpec(
+                "portcullis.egress.0".to_string(),
+                "sctp:443".to_string()
+            )
         );
     }
 
@@ -336,7 +341,10 @@ mod tests {
 
         assert_eq!(
             error,
-            LabelParseError::InvalidPortSpec("portcullis.egress.0".to_string(), "tcp:0".to_string())
+            LabelParseError::InvalidPortSpec(
+                "portcullis.egress.0".to_string(),
+                "tcp:0".to_string()
+            )
         );
     }
 

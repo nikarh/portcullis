@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
@@ -38,7 +39,6 @@ impl NftRunner for SystemNftRunner {
             .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
 
         let mut stdin = child.stdin.take().ok_or(FirewallError::MissingStdin)?;
-        use std::io::Write as _;
         stdin
             .write_all(script.as_bytes())
             .map_err(|error| FirewallError::StdinWrite(error.to_string()))?;
@@ -91,6 +91,7 @@ where
     }
 }
 
+#[must_use]
 pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
     let mut lines = vec![
         format!("add table {TABLE_FAMILY} {TABLE_NAME}"),
@@ -111,10 +112,10 @@ pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
         }
 
         for attachment in &container.attachments {
-            if policy.icc_mode == IccMode::Deny {
-                if let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources) {
-                    lines.push(rule);
-                }
+            if policy.icc_mode == IccMode::Deny
+                && let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
+            {
+                lines.push(rule);
             }
 
             for rule in &policy.egress {
@@ -137,6 +138,7 @@ pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
     lines.join("\n")
 }
 
+#[must_use]
 pub fn build_cleanup_script() -> String {
     format!("delete table {TABLE_FAMILY} {TABLE_NAME}\n")
 }
@@ -199,7 +201,11 @@ fn build_icc_deny_rule(source: IpAddr, sources: &ManagedSources) -> Option<Strin
     }
 }
 
-fn build_allow_rule(source: IpAddr, cidr: &ipnet::IpNet, port: crate::model::PortSpec) -> Option<String> {
+fn build_allow_rule(
+    source: IpAddr,
+    cidr: &ipnet::IpNet,
+    port: crate::model::PortSpec,
+) -> Option<String> {
     let protocol = match port.protocol {
         Protocol::Tcp => "tcp",
         Protocol::Udp => "udp",

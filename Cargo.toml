@@ -2,6 +2,12 @@
 name = "portcullis"
 version = "0.1.0"
 edition = "2024"
+description = "Host-level container egress controller prototype for Docker and nftables."
+license = "MIT"
+repository = "https://example.com/portcullis"
+readme = "PLAN.md"
+keywords = ["docker", "nftables", "egress", "firewall"]
+categories = ["network-programming", "virtualization"]
 
 [dependencies]
 ipnet = "2.11.0"
