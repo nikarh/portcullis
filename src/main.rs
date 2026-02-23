@@ -224,7 +224,12 @@ fn run(config: &Config) -> Result<(), MainError> {
     apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
 
     info!("subscribed to docker container events");
-    while !terminate.load(Ordering::Relaxed) {
+    loop {
+        if terminate.load(Ordering::Relaxed) {
+            info!("termination signal received; cleanup will start now");
+            break;
+        }
+
         match event_stream.next_event() {
             Ok(Some(event)) => {
                 trace!(event = ?event, "docker event received");
