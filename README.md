@@ -28,6 +28,10 @@ Implemented:
 - Runtime backend auto-selection from Docker info:
 - Docker reports `nftables` => use nftables (lib backend)
 - Docker reports `iptables` => use iptables backend
+- Long-running daemon mode:
+- Startup cleanup to recover from unclean previous exits.
+- Continuous Docker container event polling and policy re-apply on relevant events.
+- Graceful cleanup on shutdown (SIGINT/SIGTERM via signal handler).
 - Structured logging with `info` / `debug` / `trace` levels.
 
 ## Architecture
@@ -50,11 +54,14 @@ flowchart LR
 - `firewall`: backend adapters for nftables and iptables.
 
 ## How It Works
-1. Collect container metadata and labels from Docker.
-2. Parse labels into normalized egress rules.
-3. Resolve hostname targets and cache resulting IPs.
-4. Generate backend-specific firewall operations.
-5. Apply default-deny egress plus explicit allow rules.
+1. On startup, detect firewall backend and run cleanup of managed rules/chains/tables.
+2. Collect container metadata and labels from Docker.
+3. Parse labels into normalized egress rules.
+4. Resolve hostname targets and cache resulting IPs.
+5. Generate backend-specific firewall operations.
+6. Apply default-deny egress plus explicit allow rules.
+7. Enter event loop and refresh policy when relevant Docker container events arrive.
+8. On shutdown, attempt cleanup of managed rules/chains/tables.
 
 ## Quick Start
 
@@ -173,9 +180,9 @@ services:
 ```
 
 ## Logging
-- `info`: operational activity (snapshot/apply/backend selection)
-- `debug`: command-level details and change details
-- `trace`: full snapshots, DNS cache internals, resolved IPs, generated command/script payloads
+- `info`: operational lifecycle activity (startup cleanup, snapshot/apply, backend selection, event-triggered refresh)
+- `debug`: runtime change details
+- `trace`: exact firewall command arrays executed and full event/snapshot payloads
 
 ## DNS Cache Notes
 - Cache stores hostname -> `Arc<[IpAddr]>`.
