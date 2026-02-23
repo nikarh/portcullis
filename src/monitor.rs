@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::process::Command;
+use std::os::unix::net::UnixStream;
 use std::str::FromStr;
 
 use ipnet::IpNet;
@@ -13,16 +14,12 @@ use crate::model::{ContainerSnapshot, NetworkAttachment, RuntimeSnapshot};
 
 #[derive(Debug, Error)]
 pub enum MonitorError {
-    #[error("failed to run command `{program}`: {message}")]
-    CommandExecution { program: String, message: String },
-    #[error("command `{program}` failed with code {code}: {stderr}")]
-    CommandFailure {
-        program: String,
-        code: i32,
-        stderr: String,
-    },
-    #[error("invalid UTF-8 from command `{program}`")]
-    InvalidUtf8 { program: String },
+    #[error("docker socket I/O failed: {0}")]
+    SocketIo(String),
+    #[error("docker api request failed with status {status}: {body}")]
+    ApiHttpStatus { status: u16, body: String },
+    #[error("invalid HTTP response from docker api: {0}")]
+    InvalidHttpResponse(String),
     #[error("invalid JSON from docker output: {0}")]
     InvalidJson(String),
     #[error("unsupported docker firewall backend: {0}")]
@@ -137,81 +134,61 @@ where
     }
 }
 
-pub trait CommandRunner {
-    fn run_capture(&self, program: &str, args: &[&str]) -> Result<String, MonitorError>;
+pub struct SocketDockerApi {
+    socket_path: String,
 }
 
-pub struct SystemCommandRunner;
-
-impl CommandRunner for SystemCommandRunner {
-    fn run_capture(&self, program: &str, args: &[&str]) -> Result<String, MonitorError> {
-        debug!(%program, ?args, "running command");
-        let output = Command::new(program).args(args).output().map_err(|error| {
-            MonitorError::CommandExecution {
-                program: program.to_string(),
-                message: error.to_string(),
-            }
-        })?;
-
-        if !output.status.success() {
-            debug!(
-                %program,
-                code = output.status.code().unwrap_or(-1),
-                stderr = %String::from_utf8_lossy(&output.stderr),
-                "command failed"
-            );
-            return Err(MonitorError::CommandFailure {
-                program: program.to_string(),
-                code: output.status.code().unwrap_or(-1),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
-
-        let stdout = String::from_utf8(output.stdout).map_err(|_| MonitorError::InvalidUtf8 {
-            program: program.to_string(),
-        })?;
-        trace!(%program, stdout = %stdout, "command output");
-        Ok(stdout)
-    }
-}
-
-pub struct CommandDockerApi<R> {
-    runner: R,
-}
-
-impl<R> CommandDockerApi<R>
-where
-    R: CommandRunner,
-{
-    pub const fn new(runner: R) -> Self {
-        Self { runner }
+impl SocketDockerApi {
+    #[must_use]
+    pub fn new(socket: String) -> Self {
+        let socket_path = if let Some(path) = socket.strip_prefix("unix://") {
+            path.to_string()
+        } else {
+            socket
+        };
+        Self { socket_path }
     }
 
-    fn run_json<T>(&self, args: &[&str]) -> Result<Vec<T>, MonitorError>
+    fn request_json<T>(&self, path: &str) -> Result<T, MonitorError>
     where
         T: for<'de> Deserialize<'de>,
     {
-        debug!(?args, "running docker json command");
-        let stdout = self.runner.run_capture("docker", args)?;
-        trace!(?args, raw_json = %stdout, "docker json output");
-        serde_json::from_str::<Vec<T>>(&stdout)
+        let body = self.request_raw(path)?;
+        trace!(path, raw_json = %body, "docker api json response");
+        serde_json::from_str::<T>(&body)
             .map_err(|error| MonitorError::InvalidJson(error.to_string()))
+    }
+
+    fn request_raw(&self, path: &str) -> Result<String, MonitorError> {
+        debug!(socket = %self.socket_path, path, "docker api request");
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .map_err(|error| MonitorError::SocketIo(error.to_string()))?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| MonitorError::SocketIo(error.to_string()))?;
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .map_err(|error| MonitorError::SocketIo(error.to_string()))?;
+        let response_text = String::from_utf8(response)
+            .map_err(|error| MonitorError::InvalidHttpResponse(error.to_string()))?;
+        parse_http_response(&response_text)
     }
 }
 
-impl<R> DockerApi for CommandDockerApi<R>
-where
-    R: CommandRunner,
-{
+impl DockerApi for SocketDockerApi {
     fn list_container_ids(&self) -> Result<Vec<String>, MonitorError> {
-        debug!("listing running docker containers");
-        let stdout = self.runner.run_capture("docker", &["ps", "-q"])?;
-        let ids = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
+        #[derive(Debug, Deserialize)]
+        struct ContainerSummary {
+            #[serde(rename = "Id")]
+            id: String,
+        }
+
+        let summaries: Vec<ContainerSummary> = self.request_json("/containers/json")?;
+        let ids = summaries.into_iter().map(|summary| summary.id).collect();
         trace!(?ids, "parsed docker container ids");
         Ok(ids)
     }
@@ -220,29 +197,16 @@ where
         &self,
         container_id: &str,
     ) -> Result<DockerContainerInspect, MonitorError> {
-        let objects = self.run_json::<DockerContainerInspect>(&["inspect", container_id])?;
-        objects
-            .into_iter()
-            .next()
-            .ok_or_else(|| MonitorError::MissingInspectObject(container_id.to_string()))
+        self.request_json(&format!("/containers/{container_id}/json"))
     }
 
     fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError> {
-        let objects = self.run_json::<DockerNetworkInspect>(&["network", "inspect", network_id])?;
-        objects
-            .into_iter()
-            .next()
-            .ok_or_else(|| MonitorError::MissingInspectObject(network_id.to_string()))
+        self.request_json(&format!("/networks/{network_id}"))
     }
 
     fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
         debug!("detecting docker firewall backend");
-        let stdout = self
-            .runner
-            .run_capture("docker", &["info", "--format", "{{json .}}"])?;
-        trace!(raw_json = %stdout, "docker info output");
-        let info: DockerInfo = serde_json::from_str(&stdout)
-            .map_err(|error| MonitorError::InvalidJson(error.to_string()))?;
+        let info: DockerInfo = self.request_json("/info")?;
         let backend = info
             .firewall_backend
             .and_then(DockerFirewallInfo::into_backend)
@@ -254,6 +218,39 @@ where
             _ => Err(MonitorError::UnsupportedFirewallBackend(backend)),
         }
     }
+}
+
+fn parse_http_response(response: &str) -> Result<String, MonitorError> {
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return Err(MonitorError::InvalidHttpResponse(
+            "missing HTTP header separator".to_string(),
+        ));
+    };
+    let mut lines = head.lines();
+    let Some(status_line) = lines.next() else {
+        return Err(MonitorError::InvalidHttpResponse(
+            "missing HTTP status line".to_string(),
+        ));
+    };
+    let mut parts = status_line.split_whitespace();
+    let _http_version = parts.next();
+    let Some(status_code) = parts.next() else {
+        return Err(MonitorError::InvalidHttpResponse(
+            "missing HTTP status code".to_string(),
+        ));
+    };
+    let status = status_code.parse::<u16>().map_err(|error| {
+        MonitorError::InvalidHttpResponse(format!("invalid HTTP status code: {error}"))
+    })?;
+
+    if !(200..=299).contains(&status) {
+        return Err(MonitorError::ApiHttpStatus {
+            status,
+            body: body.trim().to_string(),
+        });
+    }
+
+    Ok(body.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -642,8 +639,6 @@ impl DockerFirewallInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-
     use super::*;
 
     #[derive(Default)]
@@ -677,36 +672,6 @@ mod tests {
 
         fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
             Ok(DockerFirewallBackend::Nftables)
-        }
-    }
-
-    struct QueueCommandRunner {
-        outputs: std::sync::Mutex<VecDeque<Result<String, MonitorError>>>,
-    }
-
-    impl QueueCommandRunner {
-        fn new(outputs: Vec<Result<String, MonitorError>>) -> Self {
-            Self {
-                outputs: std::sync::Mutex::new(VecDeque::from(outputs)),
-            }
-        }
-    }
-
-    impl CommandRunner for QueueCommandRunner {
-        fn run_capture(&self, _program: &str, _args: &[&str]) -> Result<String, MonitorError> {
-            let mut guard = self
-                .outputs
-                .lock()
-                .map_err(|_| MonitorError::CommandExecution {
-                    program: "docker".to_string(),
-                    message: "failed to lock mock queue".to_string(),
-                })?;
-            guard
-                .pop_front()
-                .ok_or_else(|| MonitorError::CommandExecution {
-                    program: "docker".to_string(),
-                    message: "mock queue exhausted".to_string(),
-                })?
         }
     }
 
@@ -872,100 +837,39 @@ mod tests {
     }
 
     #[test]
-    fn command_docker_api_lists_ids_from_ps_output() {
-        let api =
-            CommandDockerApi::new(QueueCommandRunner::new(vec![
-                Ok("abc\ndef\n\n".to_string()),
-            ]));
-
-        let ids = match api.list_container_ids() {
-            Ok(value) => value,
-            Err(error) => panic!("list_container_ids should succeed: {error}"),
-        };
-
-        assert_eq!(ids, vec!["abc".to_string(), "def".to_string()]);
+    fn parse_http_response_returns_body_on_success() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
+        let body = parse_http_response(response).expect("response should parse");
+        assert_eq!(body, "{\"ok\":true}");
     }
 
     #[test]
-    fn command_docker_api_parses_inspect_json() {
-        let container_json = r#"[
-            {
-              "Id": "abc",
-              "Name": "/web",
-              "Config": {
-                "Labels": {
-                    "portcullis.enable": "true",
-                    "portcullis.egress.0": "ip:1.1.1.1/32,tcp:443"
-                }
-              },
-              "NetworkSettings": {
-                "Networks": {
-                  "bridge": {
-                    "NetworkID": "net0",
-                    "IPAddress": "172.18.0.2"
-                  }
-                }
-              }
-            }
-        ]"#;
-
-        let api =
-            CommandDockerApi::new(QueueCommandRunner::new(vec![
-                Ok(container_json.to_string()),
-            ]));
-
-        let inspect = match api.inspect_container("abc") {
-            Ok(value) => value,
-            Err(error) => panic!("inspect_container should succeed: {error}"),
-        };
-
-        assert_eq!(inspect.id, "abc");
-        assert_eq!(inspect.name, "/web");
-    }
-
-    #[test]
-    fn command_docker_api_errors_for_invalid_json() {
-        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok("nope".to_string())]));
-
-        let result = api.inspect_container("abc");
-        assert!(matches!(result, Err(MonitorError::InvalidJson(_))));
-    }
-
-    #[test]
-    fn command_docker_api_detects_nftables_backend() {
-        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
-            r#"{"FirewallBackend":"nftables"}"#.to_string(),
-        )]));
-        let result = api.firewall_backend();
-        assert_eq!(result.ok(), Some(DockerFirewallBackend::Nftables));
-    }
-
-    #[test]
-    fn command_docker_api_defaults_backend_to_iptables() {
-        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok("{}".to_string())]));
-        let result = api.firewall_backend();
-        assert_eq!(result.ok(), Some(DockerFirewallBackend::Iptables));
-    }
-
-    #[test]
-    fn command_docker_api_detects_object_backend_shape() {
-        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
-            r#"{"FirewallBackend":{"Driver":"nftables"}}"#.to_string(),
-        )]));
-        let result = api.firewall_backend();
-        assert_eq!(result.ok(), Some(DockerFirewallBackend::Nftables));
-    }
-
-    #[test]
-    fn command_docker_api_rejects_unknown_backend() {
-        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
-            r#"{"FirewallBackend":"unknown"}"#.to_string(),
-        )]));
-        let result = api.firewall_backend();
+    fn parse_http_response_rejects_non_success_status() {
+        let response = "HTTP/1.1 404 Not Found\r\n\r\nnot found";
+        let result = parse_http_response(response);
         assert!(matches!(
             result,
-            Err(MonitorError::UnsupportedFirewallBackend(value)) if value == "unknown"
+            Err(MonitorError::ApiHttpStatus { status: 404, .. })
         ));
+    }
+
+    #[test]
+    fn firewall_backend_info_parsing_supports_string_and_object_shapes() {
+        let info_value: DockerInfo = serde_json::from_str(r#"{"FirewallBackend":"nftables"}"#)
+            .expect("docker info value shape should parse");
+        let info_object: DockerInfo =
+            serde_json::from_str(r#"{"FirewallBackend":{"Driver":"iptables"}}"#)
+                .expect("docker info object shape should parse");
+
+        let value_backend = info_value
+            .firewall_backend
+            .and_then(DockerFirewallInfo::into_backend);
+        let object_backend = info_object
+            .firewall_backend
+            .and_then(DockerFirewallInfo::into_backend);
+
+        assert_eq!(value_backend.as_deref(), Some("nftables"));
+        assert_eq!(object_backend.as_deref(), Some("iptables"));
     }
 
     #[test]

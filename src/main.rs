@@ -1,6 +1,5 @@
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::{
     Arc,
@@ -18,8 +17,8 @@ use portcullis::firewall::{
 };
 use portcullis::logging::{self, LogLevel, LoggingError};
 use portcullis::monitor::{
-    CommandDockerApi, CommandRunner, DockerContainerEvent, DockerFirewallBackend, DockerMonitor,
-    MonitorError, RuntimeChangeTracker,
+    DockerContainerEvent, DockerFirewallBackend, DockerMonitor, MonitorError, RuntimeChangeTracker,
+    SocketDockerApi,
 };
 use serde::Deserialize;
 
@@ -180,8 +179,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         "portcullis prototype started"
     );
 
-    let runner = DockerSocketCommandRunner::new(config.docker_socket.clone());
-    let api = CommandDockerApi::new(runner);
+    let api = SocketDockerApi::new(config.docker_socket.clone());
     let monitor = DockerMonitor::new(api);
     let detected_backend = monitor.firewall_backend()?;
 
@@ -264,14 +262,14 @@ fn run(config: &Config) -> Result<(), MainError> {
     Ok(())
 }
 
-fn apply_snapshot<R>(
-    monitor: &DockerMonitor<CommandDockerApi<R>>,
+fn apply_snapshot<A>(
+    monitor: &DockerMonitor<A>,
     firewall: &ActiveFirewall,
     tracker: &mut RuntimeChangeTracker,
     dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
 ) -> Result<(), MainError>
 where
-    R: CommandRunner,
+    A: portcullis::monitor::DockerApi,
 {
     let snapshot = monitor.snapshot()?;
     let changes = tracker.detect_and_log(&snapshot);
@@ -411,48 +409,6 @@ struct DockerEventActor {
     attributes: Option<std::collections::BTreeMap<String, String>>,
 }
 
-#[derive(Debug, Clone)]
-struct DockerSocketCommandRunner {
-    docker_host: String,
-}
-
-impl DockerSocketCommandRunner {
-    fn new(socket: String) -> Self {
-        let docker_host = if socket.starts_with("unix://") {
-            socket
-        } else {
-            format!("unix://{socket}")
-        };
-        Self { docker_host }
-    }
-}
-
-impl CommandRunner for DockerSocketCommandRunner {
-    fn run_capture(&self, program: &str, args: &[&str]) -> Result<String, MonitorError> {
-        debug!(%program, ?args, docker_host = %self.docker_host, "running command with configured docker host");
-        let output = Command::new(program)
-            .args(args)
-            .env("DOCKER_HOST", &self.docker_host)
-            .output()
-            .map_err(|error| MonitorError::CommandExecution {
-                program: program.to_string(),
-                message: error.to_string(),
-            })?;
-
-        if !output.status.success() {
-            return Err(MonitorError::CommandFailure {
-                program: program.to_string(),
-                code: output.status.code().unwrap_or(-1),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
-
-        String::from_utf8(output.stdout).map_err(|_| MonitorError::InvalidUtf8 {
-            program: program.to_string(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,9 +456,8 @@ mod tests {
     }
 
     #[test]
-    fn runner_normalizes_docker_socket() {
-        let runner = DockerSocketCommandRunner::new("/var/run/docker.sock".to_string());
-        assert_eq!(runner.docker_host, "unix:///var/run/docker.sock");
+    fn socket_api_construction_accepts_unix_prefixed_path() {
+        let _api = SocketDockerApi::new("unix:///var/run/docker.sock".to_string());
     }
 
     #[test]
