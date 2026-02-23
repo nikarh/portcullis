@@ -9,13 +9,14 @@ use tracing::trace;
 pub const TABLE_FAMILY: &str = "inet";
 pub const TABLE_NAME: &str = "portcullis";
 pub const CHAIN_NAME: &str = "egress";
+const FORWARD_HOOK_PRIORITY: i32 = -1;
 
 #[must_use]
 pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
     let mut lines = vec![
         format!("add table {TABLE_FAMILY} {TABLE_NAME}"),
         format!(
-            "add chain {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy accept; }}"
+            "add chain {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority {FORWARD_HOOK_PRIORITY}; policy accept; }}"
         ),
     ];
 
@@ -86,7 +87,7 @@ pub fn build_apply_commands_with_dns(
     let mut lines = vec![
         format!("add table {TABLE_FAMILY} {TABLE_NAME}"),
         format!(
-            "add chain {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy accept; }}"
+            "add chain {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority {FORWARD_HOOK_PRIORITY}; policy accept; }}"
         ),
     ];
 
@@ -525,5 +526,11 @@ mod tests {
 
         let script = build_apply_script(&snapshot);
         assert!(script.contains("ip daddr 172.18.0.10 tcp dport 5432 accept"));
+    }
+
+    #[test]
+    fn build_apply_script_uses_pre_docker_forward_priority() {
+        let script = build_apply_script(&snapshot_with_hostname_rule());
+        assert!(script.contains("hook forward priority -1"));
     }
 }

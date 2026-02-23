@@ -10,6 +10,7 @@ use crate::model::{EgressTarget, IccMode, Protocol, RuntimeSnapshot};
 use super::FirewallError;
 
 const CHAIN_NAME: &str = "PORTCULLIS_EGRESS";
+const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandSpec {
@@ -75,7 +76,7 @@ where
                 program: "iptables",
                 args: vec![
                     "-D".to_string(),
-                    "FORWARD".to_string(),
+                    DOCKER_USER_CHAIN.to_string(),
                     "-j".to_string(),
                     CHAIN_NAME.to_string(),
                 ],
@@ -130,7 +131,7 @@ fn build_apply_commands_with_dns(
             program: "iptables",
             args: vec![
                 "-I".to_string(),
-                "FORWARD".to_string(),
+                DOCKER_USER_CHAIN.to_string(),
                 "1".to_string(),
                 "-j".to_string(),
                 CHAIN_NAME.to_string(),
@@ -583,6 +584,24 @@ mod tests {
                 && command.args.iter().any(|arg| arg == "172.18.0.10/32")
                 && command.args.iter().any(|arg| arg == "--dport")
                 && command.args.iter().any(|arg| arg == "5432")
+        }));
+    }
+
+    #[test]
+    fn build_commands_hook_into_docker_user_chain() {
+        let mut resolver = MockResolver;
+        let commands =
+            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver).expect("commands");
+        assert!(commands.iter().any(|command| {
+            command.program == "iptables"
+                && command.args
+                    == vec![
+                        "-I".to_string(),
+                        DOCKER_USER_CHAIN.to_string(),
+                        "1".to_string(),
+                        "-j".to_string(),
+                        CHAIN_NAME.to_string(),
+                    ]
         }));
     }
 
