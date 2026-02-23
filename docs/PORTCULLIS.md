@@ -67,11 +67,11 @@ Portcullis exists to provide:
 ## 5. How It Works (Technical Flow)
 
 ### 5.1 Runtime Discovery
-- `monitor` module runs Docker CLI queries:
-- `docker ps -q`
-- `docker inspect <container>`
-- `docker network inspect <network>`
-- `docker info --format '{{json .}}'` (for firewall backend detection)
+- `monitor` module talks directly to Docker Engine HTTP API over the configured Unix socket:
+- `GET /containers/json`
+- `GET /containers/{id}/json`
+- `GET /networks/{id}`
+- `GET /info` (for firewall backend detection)
 
 Collected data includes:
 - container IDs and names,
@@ -126,9 +126,9 @@ ICC allowlist resolution details:
 - Docker network aliases from endpoint metadata.
 
 ### 5.5 Logging Model
-- `info`: major activity and selections (snapshot/apply/backend selection).
-- `debug`: command-level operations and change details.
-- `trace`: full snapshots, DNS cache internals, resolved address lists, full rule payloads.
+- `info`: major lifecycle activity and selections (startup cleanup, backend selection, snapshot/apply, refresh triggers).
+- `debug`: runtime change details.
+- `trace`: full snapshots, DNS cache internals, resolved address lists, full rule payloads, and executed firewall command arrays.
 
 ---
 

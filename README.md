@@ -48,7 +48,7 @@ flowchart LR
 ```
 
 ### Runtime components
-- `monitor`: Docker discovery (`ps`, `inspect`, `network inspect`, `info`).
+- `monitor`: Docker discovery via Docker Engine HTTP API over Unix socket (`/containers/json`, `/containers/{id}/json`, `/networks/{id}`, `/info`).
 - `labels`: policy parsing from `portcullis.*` labels.
 - `dns`: bounded hostname->IP cache (TTL + max-size eviction).
 - `firewall`: backend adapters for nftables and iptables.
