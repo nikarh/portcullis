@@ -52,6 +52,8 @@ flowchart LR
 - `labels`: policy parsing from `portcullis.*` labels.
 - `dns`: bounded hostname->IP cache (TTL + max-size eviction).
 - `firewall`: backend adapters for nftables and iptables.
+- iptables hook point: `DOCKER-USER` chain (Docker-compatible user policy chain).
+- nftables hook point: dedicated base chain on `forward` hook with priority `-1` (before Docker's default forward filter priority).
 
 ## How It Works
 1. On startup, detect firewall backend and run cleanup of managed rules/chains/tables.

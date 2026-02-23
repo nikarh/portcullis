@@ -79,6 +79,8 @@ Collected data includes:
 - attached network addresses,
 - network subnets,
 - Docker firewall backend (`nftables` or `iptables`).
+- iptables backend anchors policy in `DOCKER-USER` (not direct `FORWARD` jump).
+- nftables backend uses a dedicated forward-hook base chain at priority `-1` so rules evaluate before Docker's forward filter priority.
 
 ### 5.2 Policy Parsing
 - `labels` module parses labels under `portcullis.*`.
