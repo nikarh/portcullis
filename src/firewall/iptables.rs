@@ -263,58 +263,34 @@ fn append_hostname_target_commands(
             host: host.to_string(),
             message: error.to_string(),
         })?;
-
-    let set_name = set_name_for_host(host);
-    commands.push(CommandSpec {
-        program: "ipset",
-        args: vec![
-            "create".to_string(),
-            set_name.clone(),
-            "hash:ip".to_string(),
-            "-exist".to_string(),
-        ],
-    });
-    commands.push(CommandSpec {
-        program: "ipset",
-        args: vec!["flush".to_string(), set_name.clone()],
-    });
-
-    for address in addresses.iter().copied() {
-        let IpAddr::V4(value) = address else {
-            continue;
-        };
-        commands.push(CommandSpec {
-            program: "ipset",
-            args: vec![
-                "add".to_string(),
-                set_name.clone(),
-                value.to_string(),
-                "-exist".to_string(),
-            ],
-        });
-    }
+    let destination_ipv4: Vec<std::net::Ipv4Addr> = addresses
+        .iter()
+        .filter_map(|address| match address {
+            IpAddr::V4(value) => Some(*value),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
 
     for port in ports {
-        commands.push(CommandSpec {
-            program: "iptables",
-            args: vec![
-                "-A".to_string(),
-                CHAIN_NAME.to_string(),
-                "-s".to_string(),
-                format!("{source_ipv4}/32"),
-                "-m".to_string(),
-                "set".to_string(),
-                "--match-set".to_string(),
-                set_name.clone(),
-                "dst".to_string(),
-                "-p".to_string(),
-                protocol_name(port.protocol).to_string(),
-                "--dport".to_string(),
-                port.port.to_string(),
-                "-j".to_string(),
-                "ACCEPT".to_string(),
-            ],
-        });
+        for destination in &destination_ipv4 {
+            commands.push(CommandSpec {
+                program: "iptables",
+                args: vec![
+                    "-A".to_string(),
+                    CHAIN_NAME.to_string(),
+                    "-s".to_string(),
+                    format!("{source_ipv4}/32"),
+                    "-d".to_string(),
+                    format!("{destination}/32"),
+                    "-p".to_string(),
+                    protocol_name(port.protocol).to_string(),
+                    "--dport".to_string(),
+                    port.port.to_string(),
+                    "-j".to_string(),
+                    "ACCEPT".to_string(),
+                ],
+            });
+        }
     }
 
     Ok(())
@@ -393,20 +369,6 @@ fn append_icc_allow_list_commands(
             }
         }
     }
-}
-
-fn set_name_for_host(host: &str) -> String {
-    let hash = fnv1a_64(host.as_bytes());
-    format!("pc_h4_{hash:016x}")
-}
-
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
-    }
-    hash
 }
 
 fn collect_container_targets(
@@ -516,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn build_commands_includes_ipset_and_iptables_for_hostname() {
+    fn build_commands_includes_iptables_for_hostname() {
         let mut resolver = MockResolver;
         let commands = build_apply_commands_with_dns(&sample_snapshot(), &mut resolver);
         assert!(commands.is_ok());
@@ -526,17 +488,11 @@ mod tests {
         };
 
         assert!(value.iter().any(|command| {
-            command.program == "ipset"
-                && command.args.first() == Some(&"create".to_string())
-                && command
-                    .args
-                    .get(1)
-                    .is_some_and(|name| name.starts_with("pc_h4_"))
-        }));
-        assert!(value.iter().any(|command| {
             command.program == "iptables"
-                && command.args.iter().any(|arg| arg == "--match-set")
-                && command.args.iter().any(|arg| arg.starts_with("pc_h4_"))
+                && command.args.iter().any(|arg| arg == "-d")
+                && command.args.iter().any(|arg| arg == "1.1.1.1/32")
+                && command.args.iter().any(|arg| arg == "--dport")
+                && command.args.iter().any(|arg| arg == "443")
         }));
     }
 
