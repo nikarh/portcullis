@@ -94,8 +94,7 @@ where
             match self.runner.run(command.program, &command.args) {
                 Ok(()) => {}
                 Err(FirewallError::CommandFailure { stderr, .. })
-                    if stderr.contains("No chain/target/match by that name")
-                        || stderr.contains("Bad rule") => {}
+                    if is_ignorable_cleanup_stderr(&stderr) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -103,6 +102,12 @@ where
         info!("iptables cleanup completed");
         Ok(())
     }
+}
+
+fn is_ignorable_cleanup_stderr(stderr: &str) -> bool {
+    stderr.contains("No chain/target/match by that name")
+        || stderr.contains("Bad rule")
+        || (stderr.contains("Couldn't load target") && stderr.contains("No such file or directory"))
 }
 
 impl IptablesFirewall<CommandIptablesRunner> {
@@ -438,7 +443,9 @@ fn collect_container_targets(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use ipnet::IpNet;
 
@@ -577,5 +584,42 @@ mod tests {
                 && command.args.iter().any(|arg| arg == "--dport")
                 && command.args.iter().any(|arg| arg == "5432")
         }));
+    }
+
+    struct MockIptablesRunner {
+        results: Mutex<VecDeque<Result<(), FirewallError>>>,
+    }
+
+    impl MockIptablesRunner {
+        fn new(results: Vec<Result<(), FirewallError>>) -> Self {
+            Self {
+                results: Mutex::new(VecDeque::from(results)),
+            }
+        }
+    }
+
+    impl IptablesRunner for MockIptablesRunner {
+        fn run(&self, _program: &str, _args: &[String]) -> Result<(), FirewallError> {
+            let mut guard = self
+                .results
+                .lock()
+                .expect("failed to lock mock iptables runner");
+            guard.pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    #[test]
+    fn cleanup_ignores_missing_jump_target_error() {
+        let runner = MockIptablesRunner::new(vec![
+            Err(FirewallError::CommandFailure {
+                code: 2,
+                stderr: "iptables v1.8.11 (legacy): Couldn't load target `PORTCULLIS_EGRESS':No such file or directory".to_string(),
+            }),
+            Ok(()),
+            Ok(()),
+        ]);
+        let firewall = IptablesFirewall::new(runner);
+        let result = firewall.cleanup();
+        assert!(result.is_ok());
     }
 }
