@@ -120,6 +120,14 @@ portcullis.icc.mode=allow|deny|allow-listed
 portcullis.icc.allow.0=container:db,tcp:5432
 ```
 
+- Network-level default deny (set on Docker network):
+```text
+portcullis.network.enforce=true
+```
+
+When enabled on a Docker network, Portcullis adds a baseline deny for that network subnet.
+Labeled container allow rules are still added and evaluated first.
+
 ICC target lookup notes:
 - `container:<value>` is resolved from Docker runtime metadata, not DNS.
 - `<value>` can be container ID, container name, or network alias.

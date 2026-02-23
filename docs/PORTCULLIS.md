@@ -90,6 +90,7 @@ Collected data includes:
 - `portcullis.egress.<n>=host:<fqdn>,<proto:port>[,<proto:port>...]`
 - `portcullis.icc.mode=allow|deny|allow-listed`
 - `portcullis.icc.allow.<n>=container:<id|name|alias>,<proto:port>[,<proto:port>...]`
+- `portcullis.network.enforce=true` (Docker network label; baseline subnet deny)
 
 Policy compile output is normalized into strongly typed rules.
 
