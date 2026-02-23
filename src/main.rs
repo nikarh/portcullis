@@ -1,11 +1,11 @@
-use std::io::Write as _;
+use std::io::{BufRead, BufReader, Write as _};
+use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pico_args::Arguments;
@@ -21,6 +21,7 @@ use portcullis::monitor::{
     CommandDockerApi, CommandRunner, DockerContainerEvent, DockerFirewallBackend, DockerMonitor,
     MonitorError, RuntimeChangeTracker,
 };
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirewallBackend {
@@ -220,29 +221,38 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let mut tracker = RuntimeChangeTracker::new();
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
-    let mut last_poll_epoch = current_unix_epoch_seconds()?;
+    let mut event_stream = DockerSocketEventStream::connect(&config.docker_socket)?;
 
     apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
 
-    info!("entering docker event loop");
+    info!("subscribed to docker container events");
     while !terminate.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(1));
+        match event_stream.next_event() {
+            Ok(Some(event)) => {
+                trace!(event = ?event, "docker event received");
+                if !event.is_relevant_for_policy_refresh() {
+                    trace!(action = %event.action, "docker event ignored");
+                    continue;
+                }
 
-        let now_epoch = current_unix_epoch_seconds()?;
-        let events = monitor.container_events_between(last_poll_epoch, now_epoch)?;
-        last_poll_epoch = now_epoch;
-
-        if !has_relevant_events(&events) {
-            trace!(event_count = events.len(), "no relevant docker events");
-            continue;
+                info!(
+                    action = %event.action,
+                    container_id = %event.id,
+                    container_name = ?event.name,
+                    "docker event requires firewall refresh"
+                );
+                apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                error!(%error, "docker event stream failed");
+                if terminate.load(Ordering::Relaxed) {
+                    break;
+                }
+                event_stream = DockerSocketEventStream::connect(&config.docker_socket)?;
+                info!("docker event stream reconnected");
+            }
         }
-
-        info!(
-            event_count = events.len(),
-            "relevant docker event detected; refreshing firewall rules"
-        );
-        trace!(events = ?events, "docker events payload");
-        apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
     }
 
     info!("shutdown requested; cleaning up firewall rules");
@@ -272,17 +282,133 @@ where
     Ok(())
 }
 
-fn has_relevant_events(events: &[DockerContainerEvent]) -> bool {
-    events
-        .iter()
-        .any(DockerContainerEvent::is_relevant_for_policy_refresh)
-}
-
 fn current_unix_epoch_seconds() -> Result<i64, MainError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| MainError::ServiceState(error.to_string()))?;
     i64::try_from(duration.as_secs()).map_err(|error| MainError::ServiceState(error.to_string()))
+}
+
+struct DockerSocketEventStream {
+    reader: BufReader<UnixStream>,
+}
+
+impl DockerSocketEventStream {
+    fn connect(socket: &str) -> Result<Self, MainError> {
+        let socket_path = if let Some(path) = socket.strip_prefix("unix://") {
+            path
+        } else {
+            socket
+        };
+
+        let mut stream = UnixStream::connect(socket_path)
+            .map_err(|error| MainError::ServiceState(error.to_string()))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(|error| MainError::ServiceState(error.to_string()))?;
+
+        let since = current_unix_epoch_seconds()?;
+        let request = format!(
+            "GET /events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D&since={since} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| MainError::ServiceState(error.to_string()))?;
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader
+            .read_line(&mut status_line)
+            .map_err(|error| MainError::ServiceState(error.to_string()))?;
+        if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+            return Err(MainError::ServiceState(format!(
+                "docker events subscribe failed: {status_line}"
+            )));
+        }
+
+        loop {
+            let mut header_line = String::new();
+            reader
+                .read_line(&mut header_line)
+                .map_err(|error| MainError::ServiceState(error.to_string()))?;
+            if header_line == "\r\n" {
+                break;
+            }
+        }
+
+        Ok(Self { reader })
+    }
+
+    fn next_event(&mut self) -> Result<Option<DockerContainerEvent>, MainError> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Err(MainError::ServiceState(
+                "docker event stream closed".to_string(),
+            )),
+            Ok(_) => parse_container_event_line(&line),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(MainError::ServiceState(error.to_string())),
+        }
+    }
+}
+
+fn parse_container_event_line(line: &str) -> Result<Option<DockerContainerEvent>, MainError> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed: DockerEventLine = serde_json::from_str(trimmed)
+        .map_err(|error| MainError::ServiceState(format!("invalid docker event json: {error}")))?;
+    let action = parsed.action.or(parsed.status).unwrap_or_default();
+    let kind = parsed.kind.or(parsed.event_type).unwrap_or_default();
+    if !kind.is_empty() && kind != "container" {
+        return Ok(None);
+    }
+    let actor_id = parsed.actor.as_ref().and_then(|actor| actor.id.clone());
+    let id = parsed.id.or(actor_id).unwrap_or_default();
+    if id.is_empty() || action.is_empty() {
+        return Ok(None);
+    }
+
+    let name = parsed
+        .actor
+        .as_ref()
+        .and_then(|actor| actor.attributes.as_ref())
+        .and_then(|attributes| attributes.get("name").cloned());
+
+    Ok(Some(DockerContainerEvent { id, action, name }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DockerEventLine {
+    #[serde(rename = "Type")]
+    event_type: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(rename = "Action")]
+    action: Option<String>,
+    #[serde(rename = "status")]
+    status: Option<String>,
+    #[serde(rename = "id")]
+    id: Option<String>,
+    #[serde(rename = "Actor")]
+    actor: Option<DockerEventActor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DockerEventActor {
+    #[serde(rename = "ID")]
+    id: Option<String>,
+    #[serde(rename = "Attributes")]
+    attributes: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,22 +506,23 @@ mod tests {
     }
 
     #[test]
-    fn relevant_event_detection_returns_true_when_action_matches() {
-        let events = vec![DockerContainerEvent {
-            id: "abc".to_string(),
-            action: "start".to_string(),
-            name: Some("web".to_string()),
-        }];
-        assert!(has_relevant_events(&events));
+    fn parse_container_event_line_parses_container_event() {
+        let line = "{\"Type\":\"container\",\"Action\":\"start\",\"Actor\":{\"ID\":\"abc\",\"Attributes\":{\"name\":\"web\"}}}";
+        let event = parse_container_event_line(line).expect("event parse should succeed");
+        assert_eq!(
+            event,
+            Some(DockerContainerEvent {
+                id: "abc".to_string(),
+                action: "start".to_string(),
+                name: Some("web".to_string()),
+            })
+        );
     }
 
     #[test]
-    fn relevant_event_detection_returns_false_for_noise() {
-        let events = vec![DockerContainerEvent {
-            id: "abc".to_string(),
-            action: "health_status: healthy".to_string(),
-            name: Some("web".to_string()),
-        }];
-        assert!(!has_relevant_events(&events));
+    fn parse_container_event_line_ignores_non_container_event() {
+        let line = "{\"Type\":\"network\",\"Action\":\"connect\",\"Actor\":{\"ID\":\"net0\"}}";
+        let event = parse_container_event_line(line).expect("event parse should succeed");
+        assert!(event.is_none());
     }
 }

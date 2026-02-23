@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::process::Command;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -49,11 +48,6 @@ pub trait DockerApi {
     -> Result<DockerContainerInspect, MonitorError>;
     fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError>;
     fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError>;
-    fn list_container_events(
-        &self,
-        since_epoch_seconds: i64,
-        until_epoch_seconds: i64,
-    ) -> Result<Vec<DockerContainerEvent>, MonitorError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,24 +134,6 @@ where
 
     pub fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
         self.api.firewall_backend()
-    }
-
-    pub fn container_events_since_now(
-        &self,
-        lookback_seconds: i64,
-    ) -> Result<Vec<DockerContainerEvent>, MonitorError> {
-        let now_epoch = current_unix_epoch_seconds()?;
-        let since = now_epoch - lookback_seconds;
-        self.container_events_between(since, now_epoch)
-    }
-
-    pub fn container_events_between(
-        &self,
-        since_epoch_seconds: i64,
-        until_epoch_seconds: i64,
-    ) -> Result<Vec<DockerContainerEvent>, MonitorError> {
-        self.api
-            .list_container_events(since_epoch_seconds, until_epoch_seconds)
     }
 }
 
@@ -278,75 +254,6 @@ where
             _ => Err(MonitorError::UnsupportedFirewallBackend(backend)),
         }
     }
-
-    fn list_container_events(
-        &self,
-        since_epoch_seconds: i64,
-        until_epoch_seconds: i64,
-    ) -> Result<Vec<DockerContainerEvent>, MonitorError> {
-        let since = since_epoch_seconds.to_string();
-        let until = until_epoch_seconds.to_string();
-        let stdout = self.runner.run_capture(
-            "docker",
-            &[
-                "events",
-                "--filter",
-                "type=container",
-                "--since",
-                &since,
-                "--until",
-                &until,
-                "--format",
-                "{{json .}}",
-            ],
-        )?;
-
-        parse_container_events_output(&stdout)
-    }
-}
-
-fn parse_container_events_output(raw: &str) -> Result<Vec<DockerContainerEvent>, MonitorError> {
-    let mut events = Vec::new();
-
-    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let parsed: DockerEventLine = serde_json::from_str(line)
-            .map_err(|error| MonitorError::InvalidJson(error.to_string()))?;
-
-        let action = parsed.action.or(parsed.status).unwrap_or_default();
-        let container_type = parsed.kind.or(parsed.event_type).unwrap_or_default();
-        if !container_type.is_empty() && container_type != "container" {
-            continue;
-        }
-
-        let actor_id = parsed.actor.as_ref().and_then(|actor| actor.id.clone());
-        let id = parsed.id.or(actor_id).unwrap_or_default();
-        if id.is_empty() || action.is_empty() {
-            continue;
-        }
-
-        let name = parsed
-            .actor
-            .as_ref()
-            .and_then(|actor| actor.attributes.as_ref())
-            .and_then(|attributes| attributes.get("name").cloned());
-
-        events.push(DockerContainerEvent { id, action, name });
-    }
-
-    Ok(events)
-}
-
-fn current_unix_epoch_seconds() -> Result<i64, MonitorError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| MonitorError::CommandExecution {
-            program: "time".to_string(),
-            message: error.to_string(),
-        })?;
-    i64::try_from(duration.as_secs()).map_err(|error| MonitorError::CommandExecution {
-        program: "time".to_string(),
-        message: error.to_string(),
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,30 +283,6 @@ impl DockerContainerEvent {
                 | "unpause"
         )
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DockerEventLine {
-    #[serde(rename = "Type")]
-    event_type: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    #[serde(rename = "Action")]
-    action: Option<String>,
-    #[serde(rename = "status")]
-    status: Option<String>,
-    #[serde(rename = "id")]
-    id: Option<String>,
-    #[serde(rename = "Actor")]
-    actor: Option<DockerEventActor>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DockerEventActor {
-    #[serde(rename = "ID")]
-    id: Option<String>,
-    #[serde(rename = "Attributes")]
-    attributes: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -795,14 +678,6 @@ mod tests {
         fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
             Ok(DockerFirewallBackend::Nftables)
         }
-
-        fn list_container_events(
-            &self,
-            _since_epoch_seconds: i64,
-            _until_epoch_seconds: i64,
-        ) -> Result<Vec<DockerContainerEvent>, MonitorError> {
-            Ok(Vec::new())
-        }
     }
 
     struct QueueCommandRunner {
@@ -1091,40 +966,6 @@ mod tests {
             result,
             Err(MonitorError::UnsupportedFirewallBackend(value)) if value == "unknown"
         ));
-    }
-
-    #[test]
-    fn command_docker_api_parses_events_from_json_lines() {
-        let events_output = concat!(
-            "{\"Type\":\"container\",\"Action\":\"start\",\"Actor\":{\"ID\":\"abc\",\"Attributes\":{\"name\":\"web\"}}}\n",
-            "{\"Type\":\"container\",\"Action\":\"die\",\"Actor\":{\"ID\":\"def\",\"Attributes\":{\"name\":\"worker\"}}}\n"
-        );
-        let api =
-            CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(events_output.to_string())]));
-
-        let events = api
-            .list_container_events(100, 101)
-            .expect("events should parse");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].id, "abc");
-        assert_eq!(events[0].action, "start");
-        assert_eq!(events[0].name.as_deref(), Some("web"));
-        assert_eq!(events[1].id, "def");
-        assert_eq!(events[1].action, "die");
-    }
-
-    #[test]
-    fn command_docker_api_parses_legacy_event_shape() {
-        let events_output = "{\"status\":\"start\",\"id\":\"abc\",\"Type\":\"container\",\"Actor\":{\"Attributes\":{\"name\":\"web\"}}}\n";
-        let api =
-            CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(events_output.to_string())]));
-
-        let events = api
-            .list_container_events(100, 101)
-            .expect("events should parse");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "abc");
-        assert_eq!(events[0].action, "start");
     }
 
     #[test]
