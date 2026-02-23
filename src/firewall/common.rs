@@ -205,14 +205,8 @@ pub fn build_cleanup_script() -> String {
     format!("delete table {TABLE_FAMILY} {TABLE_NAME}\n")
 }
 
-#[must_use]
-pub fn split_nft_commands(script: &str) -> Vec<String> {
-    script
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+pub fn split_nft_commands(script: &str) -> impl Iterator<Item = &str> {
+    script.lines()
 }
 
 #[derive(Debug, Default)]

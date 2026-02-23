@@ -11,7 +11,7 @@ impl NftRunner for CommandNftRunner {
     fn run_script(&self, script: &str) -> Result<(), FirewallError> {
         trace!(script = %script, "executing nft script via cli");
         for command in split_nft_commands(script) {
-            debug!(command = %format!("nft {command}"), "executing firewall command");
+            debug!(program = "nft", command = %command, "executing firewall command");
         }
         let mut child = Command::new("nft")
             .args(["-f", "-"])

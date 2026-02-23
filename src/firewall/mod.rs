@@ -60,13 +60,13 @@ where
     pub fn apply(&self, snapshot: &RuntimeSnapshot) -> Result<(), FirewallError> {
         self.cleanup()?;
         let script = build_apply_script(snapshot);
-        let commands = split_nft_commands(&script);
+        let command_count = split_nft_commands(&script).count();
         info!(
-            command_count = commands.len(),
+            command_count,
             container_count = snapshot.containers.len(),
             "applying nftables changes"
         );
-        for command in &commands {
+        for command in split_nft_commands(&script) {
             debug!(command = %command, "nft apply command");
         }
         trace!(script = %script, "nft apply script detail");
@@ -80,13 +80,13 @@ where
     ) -> Result<(), FirewallError> {
         self.cleanup()?;
         let script = build_apply_script_with_dns(snapshot, resolver)?;
-        let commands = split_nft_commands(&script);
+        let command_count = split_nft_commands(&script).count();
         info!(
-            command_count = commands.len(),
+            command_count,
             container_count = snapshot.containers.len(),
             "applying nftables changes with DNS sets"
         );
-        for command in &commands {
+        for command in split_nft_commands(&script) {
             debug!(command = %command, "nft apply command");
         }
         trace!(script = %script, "nft apply script detail");
@@ -95,9 +95,9 @@ where
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
         let script = build_cleanup_script();
-        let commands = split_nft_commands(&script);
-        info!(command_count = commands.len(), "cleaning up nftables table");
-        for command in &commands {
+        let command_count = split_nft_commands(&script).count();
+        info!(command_count, "cleaning up nftables table");
+        for command in split_nft_commands(&script) {
             debug!(command = %command, "nft cleanup command");
         }
         trace!(script = %script, "nft cleanup script detail");
