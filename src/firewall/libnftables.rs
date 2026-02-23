@@ -4,13 +4,7 @@ use std::sync::Mutex;
 
 use super::{FirewallError, NftRunner};
 
-#[allow(
-    clippy::all,
-    dead_code,
-    non_camel_case_types,
-    non_snake_case,
-    non_upper_case_globals
-)]
+#[allow(warnings)]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/libnftables_bindings.rs"));
 }
