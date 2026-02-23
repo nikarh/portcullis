@@ -19,9 +19,9 @@ pub use libnftables::LibNftablesRunner;
 
 #[derive(Debug, Error)]
 pub enum FirewallError {
-    #[error("failed to run nft command: {0}")]
+    #[error("failed to run firewall command: {0}")]
     CommandExecution(String),
-    #[error("nft command failed with code {code}: {stderr}")]
+    #[error("firewall command failed with code {code}: {stderr}")]
     CommandFailure { code: i32, stderr: String },
     #[error("failed to open nft stdin")]
     MissingStdin,
