@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::process::Command;
 use std::str::FromStr;
@@ -6,6 +6,7 @@ use std::str::FromStr;
 use ipnet::IpNet;
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::{debug, info, trace};
 
 use crate::labels::{LabelParseError, parse_policy};
 use crate::model::{ContainerSnapshot, NetworkAttachment, RuntimeSnapshot};
@@ -59,11 +60,14 @@ where
     }
 
     pub fn snapshot(&self) -> Result<RuntimeSnapshot, MonitorError> {
+        debug!("collecting docker runtime snapshot");
         let container_ids = self.api.list_container_ids()?;
+        trace!(?container_ids, "listed container ids");
         let mut network_subnets = HashMap::new();
         let mut containers = Vec::with_capacity(container_ids.len());
 
         for container_id in container_ids {
+            trace!(%container_id, "inspecting container");
             let inspect = self.api.inspect_container(&container_id)?;
             let labels = inspect.labels();
             let policy = parse_policy(&labels)?;
@@ -85,6 +89,7 @@ where
                 let subnet = if let Some(cached) = network_subnets.get(&network_id) {
                     *cached
                 } else {
+                    trace!(%network_id, "inspecting network for subnet");
                     let network = self.api.inspect_network(&network_id)?;
                     let subnet = network.primary_subnet()?;
                     network_subnets.insert(network_id.clone(), subnet);
@@ -108,7 +113,13 @@ where
             });
         }
 
-        Ok(RuntimeSnapshot { containers })
+        let snapshot = RuntimeSnapshot { containers };
+        info!(
+            container_count = snapshot.containers.len(),
+            "docker runtime snapshot collected"
+        );
+        trace!(?snapshot, "full docker runtime snapshot");
+        Ok(snapshot)
     }
 }
 
@@ -120,6 +131,7 @@ pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run_capture(&self, program: &str, args: &[&str]) -> Result<String, MonitorError> {
+        debug!(%program, ?args, "running command");
         let output = Command::new(program).args(args).output().map_err(|error| {
             MonitorError::CommandExecution {
                 program: program.to_string(),
@@ -128,6 +140,12 @@ impl CommandRunner for SystemCommandRunner {
         })?;
 
         if !output.status.success() {
+            debug!(
+                %program,
+                code = output.status.code().unwrap_or(-1),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "command failed"
+            );
             return Err(MonitorError::CommandFailure {
                 program: program.to_string(),
                 code: output.status.code().unwrap_or(-1),
@@ -135,9 +153,11 @@ impl CommandRunner for SystemCommandRunner {
             });
         }
 
-        String::from_utf8(output.stdout).map_err(|_| MonitorError::InvalidUtf8 {
+        let stdout = String::from_utf8(output.stdout).map_err(|_| MonitorError::InvalidUtf8 {
             program: program.to_string(),
-        })
+        })?;
+        trace!(%program, stdout = %stdout, "command output");
+        Ok(stdout)
     }
 }
 
@@ -157,7 +177,9 @@ where
     where
         T: for<'de> Deserialize<'de>,
     {
+        debug!(?args, "running docker json command");
         let stdout = self.runner.run_capture("docker", args)?;
+        trace!(?args, raw_json = %stdout, "docker json output");
         serde_json::from_str::<Vec<T>>(&stdout)
             .map_err(|error| MonitorError::InvalidJson(error.to_string()))
     }
@@ -168,6 +190,7 @@ where
     R: CommandRunner,
 {
     fn list_container_ids(&self) -> Result<Vec<String>, MonitorError> {
+        debug!("listing running docker containers");
         let stdout = self.runner.run_capture("docker", &["ps", "-q"])?;
         let ids = stdout
             .lines()
@@ -175,6 +198,7 @@ where
             .filter(|line| !line.is_empty())
             .map(ToOwned::to_owned)
             .collect();
+        trace!(?ids, "parsed docker container ids");
         Ok(ids)
     }
 
@@ -196,6 +220,234 @@ where
             .next()
             .ok_or_else(|| MonitorError::MissingInspectObject(network_id.to_string()))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeChange {
+    ContainerAdded {
+        id: String,
+        name: String,
+    },
+    ContainerRemoved {
+        id: String,
+        name: String,
+    },
+    LabelChanged {
+        container_id: String,
+        key: String,
+        previous: Option<String>,
+        current: Option<String>,
+    },
+    AttachmentAdded {
+        container_id: String,
+        network_id: String,
+        ip_address: IpAddr,
+        subnet: IpNet,
+    },
+    AttachmentRemoved {
+        container_id: String,
+        network_id: String,
+        ip_address: IpAddr,
+        subnet: IpNet,
+    },
+    PolicyChanged {
+        container_id: String,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeChangeTracker {
+    previous: Option<RuntimeSnapshot>,
+}
+
+impl RuntimeChangeTracker {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { previous: None }
+    }
+
+    pub fn detect_and_log(&mut self, current: &RuntimeSnapshot) -> Vec<RuntimeChange> {
+        let changes = detect_runtime_changes(self.previous.as_ref(), current);
+
+        if changes.is_empty() {
+            debug!("docker change tracker: no runtime changes detected");
+        } else {
+            info!(
+                change_count = changes.len(),
+                "docker runtime changes detected"
+            );
+        }
+
+        for change in &changes {
+            match change {
+                RuntimeChange::ContainerAdded { id, name } => {
+                    info!(%id, %name, "container added");
+                    debug!(?change, "container state change detail");
+                }
+                RuntimeChange::ContainerRemoved { id, name } => {
+                    info!(%id, %name, "container removed");
+                    debug!(?change, "container state change detail");
+                }
+                RuntimeChange::PolicyChanged { container_id } => {
+                    info!(container_id = %container_id, "container policy changed");
+                    debug!(?change, "container policy change detail");
+                }
+                RuntimeChange::LabelChanged {
+                    container_id, key, ..
+                } => {
+                    debug!(container_id = %container_id, label_key = %key, ?change, "container label changed");
+                }
+                RuntimeChange::AttachmentAdded {
+                    container_id,
+                    network_id,
+                    ip_address,
+                    subnet,
+                } => {
+                    info!(container_id = %container_id, network_id = %network_id, %ip_address, %subnet, "container network attachment added");
+                    debug!(?change, "network attachment change detail");
+                }
+                RuntimeChange::AttachmentRemoved {
+                    container_id,
+                    network_id,
+                    ip_address,
+                    subnet,
+                } => {
+                    info!(container_id = %container_id, network_id = %network_id, %ip_address, %subnet, "container network attachment removed");
+                    debug!(?change, "network attachment change detail");
+                }
+            }
+        }
+
+        trace!(?changes, "full docker runtime change set");
+        self.previous = Some(current.clone());
+        changes
+    }
+}
+
+#[must_use]
+pub fn detect_runtime_changes(
+    previous: Option<&RuntimeSnapshot>,
+    current: &RuntimeSnapshot,
+) -> Vec<RuntimeChange> {
+    let mut changes = Vec::new();
+
+    let Some(previous_snapshot) = previous else {
+        for container in &current.containers {
+            changes.push(RuntimeChange::ContainerAdded {
+                id: container.id.clone(),
+                name: container.name.clone(),
+            });
+        }
+        return changes;
+    };
+
+    let previous_by_id: HashMap<&str, &ContainerSnapshot> = previous_snapshot
+        .containers
+        .iter()
+        .map(|container| (container.id.as_str(), container))
+        .collect();
+    let current_by_id: HashMap<&str, &ContainerSnapshot> = current
+        .containers
+        .iter()
+        .map(|container| (container.id.as_str(), container))
+        .collect();
+
+    for (container_id, container) in &current_by_id {
+        if let Some(previous_container) = previous_by_id.get(container_id) {
+            detect_label_changes(&mut changes, previous_container, container);
+            detect_attachment_changes(&mut changes, previous_container, container);
+            if previous_container.policy != container.policy {
+                changes.push(RuntimeChange::PolicyChanged {
+                    container_id: (*container_id).to_string(),
+                });
+            }
+        } else {
+            changes.push(RuntimeChange::ContainerAdded {
+                id: container.id.clone(),
+                name: container.name.clone(),
+            });
+        }
+    }
+
+    for (container_id, container) in &previous_by_id {
+        if !current_by_id.contains_key(container_id) {
+            changes.push(RuntimeChange::ContainerRemoved {
+                id: container.id.clone(),
+                name: container.name.clone(),
+            });
+        }
+    }
+
+    changes
+}
+
+fn detect_label_changes(
+    changes: &mut Vec<RuntimeChange>,
+    previous: &ContainerSnapshot,
+    current: &ContainerSnapshot,
+) {
+    let mut keys = BTreeSet::new();
+    keys.extend(previous.labels.keys().cloned());
+    keys.extend(current.labels.keys().cloned());
+
+    for key in keys {
+        let previous_value = previous.labels.get(&key).cloned();
+        let current_value = current.labels.get(&key).cloned();
+        if previous_value != current_value {
+            changes.push(RuntimeChange::LabelChanged {
+                container_id: current.id.clone(),
+                key,
+                previous: previous_value,
+                current: current_value,
+            });
+        }
+    }
+}
+
+fn detect_attachment_changes(
+    changes: &mut Vec<RuntimeChange>,
+    previous: &ContainerSnapshot,
+    current: &ContainerSnapshot,
+) {
+    let previous_keys: BTreeMap<String, &NetworkAttachment> = previous
+        .attachments
+        .iter()
+        .map(|attachment| (attachment_key(attachment), attachment))
+        .collect();
+    let current_keys: BTreeMap<String, &NetworkAttachment> = current
+        .attachments
+        .iter()
+        .map(|attachment| (attachment_key(attachment), attachment))
+        .collect();
+
+    for (key, attachment) in &current_keys {
+        if !previous_keys.contains_key(key) {
+            changes.push(RuntimeChange::AttachmentAdded {
+                container_id: current.id.clone(),
+                network_id: attachment.network_id.clone(),
+                ip_address: attachment.ip_address,
+                subnet: attachment.subnet,
+            });
+        }
+    }
+
+    for (key, attachment) in &previous_keys {
+        if !current_keys.contains_key(key) {
+            changes.push(RuntimeChange::AttachmentRemoved {
+                container_id: previous.id.clone(),
+                network_id: attachment.network_id.clone(),
+                ip_address: attachment.ip_address,
+                subnet: attachment.subnet,
+            });
+        }
+    }
+}
+
+fn attachment_key(attachment: &NetworkAttachment) -> String {
+    format!(
+        "{}|{}|{}",
+        attachment.network_id, attachment.ip_address, attachment.subnet
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -584,5 +836,140 @@ mod tests {
         };
 
         assert_eq!(subnet.to_string(), "172.18.0.0/16");
+    }
+
+    fn runtime_snapshot(
+        container_id: &str,
+        name: &str,
+        labels: &[(&str, &str)],
+        network_id: &str,
+        network_name: &str,
+        ip_address: &str,
+        subnet: &str,
+    ) -> RuntimeSnapshot {
+        let mut label_map = BTreeMap::new();
+        for (key, value) in labels {
+            label_map.insert((*key).to_string(), (*value).to_string());
+        }
+
+        let parsed_ip = match ip_address.parse() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse ip fixture: {error}"),
+        };
+        let parsed_subnet = match subnet.parse() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse subnet fixture: {error}"),
+        };
+
+        RuntimeSnapshot {
+            containers: vec![ContainerSnapshot {
+                id: container_id.to_string(),
+                name: name.to_string(),
+                labels: label_map.clone(),
+                attachments: vec![NetworkAttachment {
+                    network_id: network_id.to_string(),
+                    network_name: network_name.to_string(),
+                    ip_address: parsed_ip,
+                    subnet: parsed_subnet,
+                }],
+                policy: match parse_policy(&label_map) {
+                    Ok(value) => value,
+                    Err(error) => panic!("failed to parse policy fixture: {error}"),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn detect_runtime_changes_reports_additions_for_initial_snapshot() {
+        let current = runtime_snapshot(
+            "abc",
+            "web",
+            &[
+                ("portcullis.enable", "true"),
+                ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443"),
+            ],
+            "net0",
+            "bridge",
+            "172.18.0.2",
+            "172.18.0.0/16",
+        );
+
+        let changes = detect_runtime_changes(None, &current);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], RuntimeChange::ContainerAdded { .. }));
+    }
+
+    #[test]
+    fn detect_runtime_changes_reports_label_and_attachment_changes() {
+        let previous = runtime_snapshot(
+            "abc",
+            "web",
+            &[
+                ("portcullis.enable", "true"),
+                ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443"),
+            ],
+            "net0",
+            "bridge",
+            "172.18.0.2",
+            "172.18.0.0/16",
+        );
+        let current = runtime_snapshot(
+            "abc",
+            "web",
+            &[
+                ("portcullis.enable", "true"),
+                ("portcullis.egress.0", "ip:2.2.2.2/32,tcp:443"),
+            ],
+            "net1",
+            "backend",
+            "172.18.0.3",
+            "172.18.0.0/16",
+        );
+
+        let changes = detect_runtime_changes(Some(&previous), &current);
+        assert!(changes.iter().any(|change| matches!(
+            change,
+            RuntimeChange::LabelChanged { key, .. } if key == "portcullis.egress.0"
+        )));
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, RuntimeChange::AttachmentAdded { .. }))
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, RuntimeChange::AttachmentRemoved { .. }))
+        );
+    }
+
+    #[test]
+    fn runtime_change_tracker_stores_previous_snapshot() {
+        let previous = runtime_snapshot(
+            "abc",
+            "web",
+            &[("portcullis.enable", "true")],
+            "net0",
+            "bridge",
+            "172.18.0.2",
+            "172.18.0.0/16",
+        );
+        let current = runtime_snapshot(
+            "abc",
+            "web",
+            &[("portcullis.enable", "false")],
+            "net0",
+            "bridge",
+            "172.18.0.2",
+            "172.18.0.0/16",
+        );
+
+        let mut tracker = RuntimeChangeTracker::new();
+        let first_changes = tracker.detect_and_log(&previous);
+        assert_eq!(first_changes.len(), 1);
+
+        let second_changes = tracker.detect_and_log(&current);
+        assert!(!second_changes.is_empty());
     }
 }

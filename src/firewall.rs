@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 use thiserror::Error;
+use tracing::{debug, info, trace, warn};
 
 use crate::model::{EgressTarget, IccMode, Protocol, RuntimeSnapshot};
 
@@ -30,6 +31,7 @@ pub struct SystemNftRunner;
 
 impl NftRunner for SystemNftRunner {
     fn run_script(&self, script: &str) -> Result<(), FirewallError> {
+        trace!(script = %script, "executing nft script");
         let mut child = Command::new("nft")
             .args(["-f", "-"])
             .stdin(Stdio::piped())
@@ -49,11 +51,13 @@ impl NftRunner for SystemNftRunner {
             .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
 
         if output.status.success() {
+            trace!("nft script executed successfully");
             return Ok(());
         }
 
         let code = output.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        debug!(code, stderr = %stderr, "nft script execution failed");
         Err(FirewallError::CommandFailure { code, stderr })
     }
 }
@@ -73,17 +77,37 @@ where
     pub fn apply(&self, snapshot: &RuntimeSnapshot) -> Result<(), FirewallError> {
         self.cleanup()?;
         let script = build_apply_script(snapshot);
+        let commands = split_nft_commands(&script);
+        info!(
+            command_count = commands.len(),
+            container_count = snapshot.containers.len(),
+            "applying nftables changes"
+        );
+        for command in &commands {
+            debug!(command = %command, "nft apply command");
+        }
+        trace!(script = %script, "nft apply script detail");
         self.runner.run_script(&script)
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
         let script = build_cleanup_script();
+        let commands = split_nft_commands(&script);
+        info!(command_count = commands.len(), "cleaning up nftables table");
+        for command in &commands {
+            debug!(command = %command, "nft cleanup command");
+        }
+        trace!(script = %script, "nft cleanup script detail");
         match self.runner.run_script(&script) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                info!("nftables cleanup completed");
+                Ok(())
+            }
             Err(FirewallError::CommandFailure { stderr, .. })
                 if stderr.contains("No such file")
                     || stderr.contains("No such file or directory") =>
             {
+                warn!("nftables table not found during cleanup; continuing");
                 Ok(())
             }
             Err(error) => Err(error),
@@ -141,6 +165,16 @@ pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
 #[must_use]
 pub fn build_cleanup_script() -> String {
     format!("delete table {TABLE_FAMILY} {TABLE_NAME}\n")
+}
+
+#[must_use]
+pub fn split_nft_commands(script: &str) -> Vec<String> {
+    script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -390,6 +424,15 @@ mod tests {
     fn build_cleanup_script_deletes_table() {
         let script = build_cleanup_script();
         assert_eq!(script, "delete table inet portcullis\n");
+    }
+
+    #[test]
+    fn split_nft_commands_skips_empty_lines() {
+        let commands =
+            split_nft_commands("add table inet portcullis\n\nadd chain inet portcullis egress\n");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], "add table inet portcullis");
+        assert_eq!(commands[1], "add chain inet portcullis egress");
     }
 
     #[test]
