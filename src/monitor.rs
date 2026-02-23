@@ -41,7 +41,8 @@ pub enum MonitorError {
 
 pub trait DockerApi {
     fn list_container_ids(&self) -> Result<Vec<String>, MonitorError>;
-    fn inspect_container(&self, container_id: &str) -> Result<DockerContainerInspect, MonitorError>;
+    fn inspect_container(&self, container_id: &str)
+    -> Result<DockerContainerInspect, MonitorError>;
     fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError>;
 }
 
@@ -73,10 +74,13 @@ where
                     continue;
                 };
 
-                let network_id = endpoint.network_id.ok_or_else(|| MonitorError::MissingNetworkId {
-                    container_id: inspect.id.clone(),
-                    network_name: network_name.to_string(),
-                })?;
+                let network_id =
+                    endpoint
+                        .network_id
+                        .ok_or_else(|| MonitorError::MissingNetworkId {
+                            container_id: inspect.id.clone(),
+                            network_name: network_name.to_string(),
+                        })?;
 
                 let subnet = if let Some(cached) = network_subnets.get(&network_id) {
                     *cached
@@ -116,13 +120,12 @@ pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run_capture(&self, program: &str, args: &[&str]) -> Result<String, MonitorError> {
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|error| MonitorError::CommandExecution {
+        let output = Command::new(program).args(args).output().map_err(|error| {
+            MonitorError::CommandExecution {
                 program: program.to_string(),
                 message: error.to_string(),
-            })?;
+            }
+        })?;
 
         if !output.status.success() {
             return Err(MonitorError::CommandFailure {
@@ -175,7 +178,10 @@ where
         Ok(ids)
     }
 
-    fn inspect_container(&self, container_id: &str) -> Result<DockerContainerInspect, MonitorError> {
+    fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> Result<DockerContainerInspect, MonitorError> {
         let objects = self.run_json::<DockerContainerInspect>(&["inspect", container_id])?;
         objects
             .into_iter()
@@ -341,10 +347,12 @@ mod tests {
                     program: "docker".to_string(),
                     message: "failed to lock mock queue".to_string(),
                 })?;
-            guard.pop_front().ok_or_else(|| MonitorError::CommandExecution {
-                program: "docker".to_string(),
-                message: "mock queue exhausted".to_string(),
-            })?
+            guard
+                .pop_front()
+                .ok_or_else(|| MonitorError::CommandExecution {
+                    program: "docker".to_string(),
+                    message: "mock queue exhausted".to_string(),
+                })?
         }
     }
 
@@ -487,7 +495,10 @@ mod tests {
             container_inspect(
                 "abc",
                 "web",
-                &[("portcullis.enable", "true"), ("portcullis.egress.0", "ip:bad,tcp:443")],
+                &[
+                    ("portcullis.enable", "true"),
+                    ("portcullis.egress.0", "ip:bad,tcp:443"),
+                ],
                 "bridge",
                 "net0",
                 "172.18.0.2",
@@ -506,9 +517,10 @@ mod tests {
 
     #[test]
     fn command_docker_api_lists_ids_from_ps_output() {
-        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
-            "abc\ndef\n\n".to_string(),
-        )]));
+        let api =
+            CommandDockerApi::new(QueueCommandRunner::new(vec![
+                Ok("abc\ndef\n\n".to_string()),
+            ]));
 
         let ids = match api.list_container_ids() {
             Ok(value) => value,
@@ -541,9 +553,10 @@ mod tests {
             }
         ]"#;
 
-        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
-            container_json.to_string(),
-        )]));
+        let api =
+            CommandDockerApi::new(QueueCommandRunner::new(vec![
+                Ok(container_json.to_string()),
+            ]));
 
         let inspect = match api.inspect_container("abc") {
             Ok(value) => value,
