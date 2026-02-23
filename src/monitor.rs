@@ -1,0 +1,575 @@
+use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
+use std::process::Command;
+use std::str::FromStr;
+
+use ipnet::IpNet;
+use serde::Deserialize;
+use thiserror::Error;
+
+use crate::labels::{LabelParseError, parse_policy};
+use crate::model::{ContainerSnapshot, NetworkAttachment, RuntimeSnapshot};
+
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("failed to run command `{program}`: {message}")]
+    CommandExecution { program: String, message: String },
+    #[error("command `{program}` failed with code {code}: {stderr}")]
+    CommandFailure {
+        program: String,
+        code: i32,
+        stderr: String,
+    },
+    #[error("invalid UTF-8 from command `{program}`")]
+    InvalidUtf8 { program: String },
+    #[error("invalid JSON from docker output: {0}")]
+    InvalidJson(String),
+    #[error("docker inspect returned no object for id: {0}")]
+    MissingInspectObject(String),
+    #[error("missing network id in container {container_id} attachment {network_name}")]
+    MissingNetworkId {
+        container_id: String,
+        network_name: String,
+    },
+    #[error("missing subnet for network id: {0}")]
+    MissingNetworkSubnet(String),
+    #[error("invalid subnet in network id {network_id}: {subnet}")]
+    InvalidNetworkSubnet { network_id: String, subnet: String },
+    #[error(transparent)]
+    LabelParse(#[from] LabelParseError),
+}
+
+pub trait DockerApi {
+    fn list_container_ids(&self) -> Result<Vec<String>, MonitorError>;
+    fn inspect_container(&self, container_id: &str) -> Result<DockerContainerInspect, MonitorError>;
+    fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError>;
+}
+
+pub struct DockerMonitor<A> {
+    api: A,
+}
+
+impl<A> DockerMonitor<A>
+where
+    A: DockerApi,
+{
+    pub const fn new(api: A) -> Self {
+        Self { api }
+    }
+
+    pub fn snapshot(&self) -> Result<RuntimeSnapshot, MonitorError> {
+        let container_ids = self.api.list_container_ids()?;
+        let mut network_subnets = HashMap::new();
+        let mut containers = Vec::with_capacity(container_ids.len());
+
+        for container_id in container_ids {
+            let inspect = self.api.inspect_container(&container_id)?;
+            let labels = inspect.labels();
+            let policy = parse_policy(&labels)?;
+
+            let mut attachments = Vec::new();
+            for (network_name, endpoint) in inspect.network_endpoints() {
+                let Some(address) = endpoint.ip_address else {
+                    continue;
+                };
+
+                let network_id = endpoint.network_id.ok_or_else(|| MonitorError::MissingNetworkId {
+                    container_id: inspect.id.clone(),
+                    network_name: network_name.to_string(),
+                })?;
+
+                let subnet = if let Some(cached) = network_subnets.get(&network_id) {
+                    *cached
+                } else {
+                    let network = self.api.inspect_network(&network_id)?;
+                    let subnet = network.primary_subnet()?;
+                    network_subnets.insert(network_id.clone(), subnet);
+                    subnet
+                };
+
+                attachments.push(NetworkAttachment {
+                    network_id,
+                    network_name: network_name.to_string(),
+                    ip_address: address,
+                    subnet,
+                });
+            }
+
+            containers.push(ContainerSnapshot {
+                id: inspect.id,
+                name: inspect.name,
+                labels,
+                attachments,
+                policy,
+            });
+        }
+
+        Ok(RuntimeSnapshot { containers })
+    }
+}
+
+pub trait CommandRunner {
+    fn run_capture(&self, program: &str, args: &[&str]) -> Result<String, MonitorError>;
+}
+
+pub struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run_capture(&self, program: &str, args: &[&str]) -> Result<String, MonitorError> {
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|error| MonitorError::CommandExecution {
+                program: program.to_string(),
+                message: error.to_string(),
+            })?;
+
+        if !output.status.success() {
+            return Err(MonitorError::CommandFailure {
+                program: program.to_string(),
+                code: output.status.code().unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+
+        String::from_utf8(output.stdout).map_err(|_| MonitorError::InvalidUtf8 {
+            program: program.to_string(),
+        })
+    }
+}
+
+pub struct CommandDockerApi<R> {
+    runner: R,
+}
+
+impl<R> CommandDockerApi<R>
+where
+    R: CommandRunner,
+{
+    pub const fn new(runner: R) -> Self {
+        Self { runner }
+    }
+
+    fn run_json<T>(&self, args: &[&str]) -> Result<Vec<T>, MonitorError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let stdout = self.runner.run_capture("docker", args)?;
+        serde_json::from_str::<Vec<T>>(&stdout)
+            .map_err(|error| MonitorError::InvalidJson(error.to_string()))
+    }
+}
+
+impl<R> DockerApi for CommandDockerApi<R>
+where
+    R: CommandRunner,
+{
+    fn list_container_ids(&self) -> Result<Vec<String>, MonitorError> {
+        let stdout = self.runner.run_capture("docker", &["ps", "-q"])?;
+        let ids = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        Ok(ids)
+    }
+
+    fn inspect_container(&self, container_id: &str) -> Result<DockerContainerInspect, MonitorError> {
+        let objects = self.run_json::<DockerContainerInspect>(&["inspect", container_id])?;
+        objects
+            .into_iter()
+            .next()
+            .ok_or_else(|| MonitorError::MissingInspectObject(container_id.to_string()))
+    }
+
+    fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError> {
+        let objects = self.run_json::<DockerNetworkInspect>(&["network", "inspect", network_id])?;
+        objects
+            .into_iter()
+            .next()
+            .ok_or_else(|| MonitorError::MissingInspectObject(network_id.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerContainerInspect {
+    #[serde(rename = "Id")]
+    pub id: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Config")]
+    pub config: Option<DockerContainerConfig>,
+    #[serde(rename = "NetworkSettings")]
+    pub network_settings: Option<DockerNetworkSettings>,
+}
+
+impl DockerContainerInspect {
+    fn labels(&self) -> BTreeMap<String, String> {
+        self.config
+            .as_ref()
+            .and_then(|config| config.labels.clone())
+            .unwrap_or_default()
+    }
+
+    fn network_endpoints(&self) -> Vec<(&str, DockerEndpoint)> {
+        self.network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .map(|networks| {
+                networks
+                    .iter()
+                    .map(|(name, endpoint)| (name.as_str(), endpoint.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerContainerConfig {
+    #[serde(rename = "Labels")]
+    pub labels: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerNetworkSettings {
+    #[serde(rename = "Networks")]
+    pub networks: Option<BTreeMap<String, DockerEndpoint>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerEndpoint {
+    #[serde(rename = "NetworkID")]
+    pub network_id: Option<String>,
+    #[serde(rename = "IPAddress")]
+    pub ip_address: Option<IpAddr>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerNetworkInspect {
+    #[serde(rename = "Id")]
+    pub id: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "IPAM")]
+    pub ipam: Option<DockerIpam>,
+}
+
+impl DockerNetworkInspect {
+    fn primary_subnet(&self) -> Result<IpNet, MonitorError> {
+        let subnet = self
+            .ipam
+            .as_ref()
+            .and_then(|ipam| ipam.config.as_ref())
+            .and_then(|configs| configs.iter().find_map(|config| config.subnet.clone()))
+            .ok_or_else(|| MonitorError::MissingNetworkSubnet(self.id.clone()))?;
+
+        IpNet::from_str(&subnet).map_err(|_| MonitorError::InvalidNetworkSubnet {
+            network_id: self.id.clone(),
+            subnet,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerIpam {
+    #[serde(rename = "Config")]
+    pub config: Option<Vec<DockerIpamConfig>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerIpamConfig {
+    #[serde(rename = "Subnet")]
+    pub subnet: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MockDockerApi {
+        ids: Vec<String>,
+        containers: HashMap<String, DockerContainerInspect>,
+        networks: HashMap<String, DockerNetworkInspect>,
+    }
+
+    impl DockerApi for MockDockerApi {
+        fn list_container_ids(&self) -> Result<Vec<String>, MonitorError> {
+            Ok(self.ids.clone())
+        }
+
+        fn inspect_container(
+            &self,
+            container_id: &str,
+        ) -> Result<DockerContainerInspect, MonitorError> {
+            self.containers
+                .get(container_id)
+                .cloned()
+                .ok_or_else(|| MonitorError::MissingInspectObject(container_id.to_string()))
+        }
+
+        fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError> {
+            self.networks
+                .get(network_id)
+                .cloned()
+                .ok_or_else(|| MonitorError::MissingInspectObject(network_id.to_string()))
+        }
+    }
+
+    struct QueueCommandRunner {
+        outputs: std::sync::Mutex<VecDeque<Result<String, MonitorError>>>,
+    }
+
+    impl QueueCommandRunner {
+        fn new(outputs: Vec<Result<String, MonitorError>>) -> Self {
+            Self {
+                outputs: std::sync::Mutex::new(VecDeque::from(outputs)),
+            }
+        }
+    }
+
+    impl CommandRunner for QueueCommandRunner {
+        fn run_capture(&self, _program: &str, _args: &[&str]) -> Result<String, MonitorError> {
+            let mut guard = self
+                .outputs
+                .lock()
+                .map_err(|_| MonitorError::CommandExecution {
+                    program: "docker".to_string(),
+                    message: "failed to lock mock queue".to_string(),
+                })?;
+            guard.pop_front().ok_or_else(|| MonitorError::CommandExecution {
+                program: "docker".to_string(),
+                message: "mock queue exhausted".to_string(),
+            })?
+        }
+    }
+
+    fn container_inspect(
+        id: &str,
+        name: &str,
+        labels: &[(&str, &str)],
+        network_name: &str,
+        network_id: &str,
+        address: &str,
+    ) -> DockerContainerInspect {
+        let mut label_map = BTreeMap::new();
+        for (key, value) in labels {
+            label_map.insert((*key).to_string(), (*value).to_string());
+        }
+
+        let mut networks = BTreeMap::new();
+        let parsed_address: IpAddr = match address.parse() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse IP address for test fixture: {error}"),
+        };
+        networks.insert(
+            network_name.to_string(),
+            DockerEndpoint {
+                network_id: Some(network_id.to_string()),
+                ip_address: Some(parsed_address),
+            },
+        );
+
+        DockerContainerInspect {
+            id: id.to_string(),
+            name: name.to_string(),
+            config: Some(DockerContainerConfig {
+                labels: Some(label_map),
+            }),
+            network_settings: Some(DockerNetworkSettings {
+                networks: Some(networks),
+            }),
+        }
+    }
+
+    fn network_inspect(id: &str, name: &str, subnet: &str) -> DockerNetworkInspect {
+        DockerNetworkInspect {
+            id: id.to_string(),
+            name: name.to_string(),
+            ipam: Some(DockerIpam {
+                config: Some(vec![DockerIpamConfig {
+                    subnet: Some(subnet.to_string()),
+                }]),
+            }),
+        }
+    }
+
+    #[test]
+    fn docker_monitor_builds_snapshot_with_policy_and_attachments() {
+        let mut api = MockDockerApi {
+            ids: vec!["abc".to_string()],
+            ..MockDockerApi::default()
+        };
+
+        api.containers.insert(
+            "abc".to_string(),
+            container_inspect(
+                "abc",
+                "web",
+                &[
+                    ("portcullis.enable", "true"),
+                    ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443"),
+                ],
+                "bridge",
+                "net0",
+                "172.18.0.2",
+            ),
+        );
+
+        api.networks.insert(
+            "net0".to_string(),
+            network_inspect("net0", "bridge", "172.18.0.0/16"),
+        );
+
+        let monitor = DockerMonitor::new(api);
+        let snapshot = match monitor.snapshot() {
+            Ok(value) => value,
+            Err(error) => panic!("snapshot should succeed: {error}"),
+        };
+
+        assert_eq!(snapshot.containers.len(), 1);
+        let container = &snapshot.containers[0];
+        assert_eq!(container.id, "abc");
+        assert_eq!(container.attachments.len(), 1);
+        assert!(container.policy.is_some());
+    }
+
+    #[test]
+    fn docker_monitor_skips_endpoints_without_ip() {
+        let mut networks = BTreeMap::new();
+        networks.insert(
+            "bridge".to_string(),
+            DockerEndpoint {
+                network_id: Some("net0".to_string()),
+                ip_address: None,
+            },
+        );
+
+        let inspect = DockerContainerInspect {
+            id: "abc".to_string(),
+            name: "web".to_string(),
+            config: Some(DockerContainerConfig {
+                labels: Some(BTreeMap::new()),
+            }),
+            network_settings: Some(DockerNetworkSettings {
+                networks: Some(networks),
+            }),
+        };
+
+        let mut api = MockDockerApi {
+            ids: vec!["abc".to_string()],
+            ..MockDockerApi::default()
+        };
+        api.containers.insert("abc".to_string(), inspect);
+
+        let monitor = DockerMonitor::new(api);
+        let snapshot = match monitor.snapshot() {
+            Ok(value) => value,
+            Err(error) => panic!("snapshot should succeed: {error}"),
+        };
+
+        assert_eq!(snapshot.containers[0].attachments.len(), 0);
+    }
+
+    #[test]
+    fn docker_monitor_fails_for_invalid_labels() {
+        let mut api = MockDockerApi {
+            ids: vec!["abc".to_string()],
+            ..MockDockerApi::default()
+        };
+
+        api.containers.insert(
+            "abc".to_string(),
+            container_inspect(
+                "abc",
+                "web",
+                &[("portcullis.enable", "true"), ("portcullis.egress.0", "ip:bad,tcp:443")],
+                "bridge",
+                "net0",
+                "172.18.0.2",
+            ),
+        );
+
+        api.networks.insert(
+            "net0".to_string(),
+            network_inspect("net0", "bridge", "172.18.0.0/16"),
+        );
+
+        let monitor = DockerMonitor::new(api);
+        let result = monitor.snapshot();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn command_docker_api_lists_ids_from_ps_output() {
+        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
+            "abc\ndef\n\n".to_string(),
+        )]));
+
+        let ids = match api.list_container_ids() {
+            Ok(value) => value,
+            Err(error) => panic!("list_container_ids should succeed: {error}"),
+        };
+
+        assert_eq!(ids, vec!["abc".to_string(), "def".to_string()]);
+    }
+
+    #[test]
+    fn command_docker_api_parses_inspect_json() {
+        let container_json = r#"[
+            {
+              "Id": "abc",
+              "Name": "/web",
+              "Config": {
+                "Labels": {
+                    "portcullis.enable": "true",
+                    "portcullis.egress.0": "ip:1.1.1.1/32,tcp:443"
+                }
+              },
+              "NetworkSettings": {
+                "Networks": {
+                  "bridge": {
+                    "NetworkID": "net0",
+                    "IPAddress": "172.18.0.2"
+                  }
+                }
+              }
+            }
+        ]"#;
+
+        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
+            container_json.to_string(),
+        )]));
+
+        let inspect = match api.inspect_container("abc") {
+            Ok(value) => value,
+            Err(error) => panic!("inspect_container should succeed: {error}"),
+        };
+
+        assert_eq!(inspect.id, "abc");
+        assert_eq!(inspect.name, "/web");
+    }
+
+    #[test]
+    fn command_docker_api_errors_for_invalid_json() {
+        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok("nope".to_string())]));
+
+        let result = api.inspect_container("abc");
+        assert!(matches!(result, Err(MonitorError::InvalidJson(_))));
+    }
+
+    #[test]
+    fn docker_network_primary_subnet_parses_first_subnet() {
+        let network = network_inspect("net0", "bridge", "172.18.0.0/16");
+        let subnet = match network.primary_subnet() {
+            Ok(value) => value,
+            Err(error) => panic!("primary_subnet should succeed: {error}"),
+        };
+
+        assert_eq!(subnet.to_string(), "172.18.0.0/16");
+    }
+}
