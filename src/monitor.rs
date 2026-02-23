@@ -245,7 +245,9 @@ where
             .map_err(|error| MonitorError::InvalidJson(error.to_string()))?;
         let backend = info
             .firewall_backend
-            .unwrap_or_else(|| "iptables".to_string());
+            .and_then(DockerFirewallInfo::into_backend)
+            .unwrap_or_else(|| "iptables".to_string())
+            .to_lowercase();
         match backend.as_str() {
             "nftables" => Ok(DockerFirewallBackend::Nftables),
             "iptables" => Ok(DockerFirewallBackend::Iptables),
@@ -579,7 +581,34 @@ pub struct DockerIpamConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DockerInfo {
     #[serde(rename = "FirewallBackend")]
-    pub firewall_backend: Option<String>,
+    pub firewall_backend: Option<DockerFirewallInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DockerFirewallInfo {
+    Value(String),
+    Object {
+        #[serde(rename = "Driver")]
+        driver: Option<String>,
+        #[serde(rename = "Backend")]
+        backend: Option<String>,
+        #[serde(rename = "Name")]
+        name: Option<String>,
+    },
+}
+
+impl DockerFirewallInfo {
+    fn into_backend(self) -> Option<String> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Object {
+                driver,
+                backend,
+                name,
+            } => driver.or(backend).or(name),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -887,6 +916,15 @@ mod tests {
         let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok("{}".to_string())]));
         let result = api.firewall_backend();
         assert_eq!(result.ok(), Some(DockerFirewallBackend::Iptables));
+    }
+
+    #[test]
+    fn command_docker_api_detects_object_backend_shape() {
+        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
+            r#"{"FirewallBackend":{"Driver":"nftables"}}"#.to_string(),
+        )]));
+        let result = api.firewall_backend();
+        assert_eq!(result.ok(), Some(DockerFirewallBackend::Nftables));
     }
 
     #[test]
