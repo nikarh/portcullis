@@ -150,12 +150,12 @@ impl LibNftablesRunner {
 
 impl NftRunner for LibNftablesRunner {
     fn run_commands(&self, commands: &[String]) -> Result<(), FirewallError> {
+        debug!(
+            program = "nft",
+            commands = ?commands,
+            "executing firewall commands"
+        );
         let script = format!("{}\n", commands.join("\n"));
-        trace!(script = %script, "executing nft script via libnftables");
-        for command in commands {
-            // Log libnftables execution in CLI-equivalent format for operator visibility.
-            debug!(program = "nft", command = %command, "executing firewall command");
-        }
         let mut guard = self
             .context
             .lock()

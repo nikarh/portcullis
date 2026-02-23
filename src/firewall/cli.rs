@@ -9,11 +9,8 @@ pub struct CommandNftRunner;
 
 impl NftRunner for CommandNftRunner {
     fn run_commands(&self, commands: &[String]) -> Result<(), FirewallError> {
+        debug!(program = "nft", commands = ?commands, "executing firewall commands");
         let script = format!("{}\n", commands.join("\n"));
-        trace!(script = %script, "executing nft script via cli");
-        for command in commands {
-            debug!(program = "nft", command = %command, "executing firewall command");
-        }
         let mut child = Command::new("nft")
             .args(["-f", "-"])
             .stdin(Stdio::piped())
