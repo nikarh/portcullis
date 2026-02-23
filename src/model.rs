@@ -53,6 +53,7 @@ pub struct NetworkAttachment {
     pub network_id: String,
     pub network_name: String,
     pub ip_address: IpAddr,
+    pub gateway: Option<IpAddr>,
     pub subnet: IpNet,
     pub aliases: Vec<String>,
 }

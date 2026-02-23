@@ -33,6 +33,8 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
         }
 
         for attachment in &container.attachments {
+            append_implicit_dns_allow_rules(&mut lines, attachment.ip_address, attachment.gateway);
+
             match policy.icc_mode {
                 IccMode::Deny => {
                     if let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
@@ -119,6 +121,8 @@ pub fn build_apply_commands_with_dns(
         }
 
         for attachment in &container.attachments {
+            append_implicit_dns_allow_rules(&mut lines, attachment.ip_address, attachment.gateway);
+
             match policy.icc_mode {
                 IccMode::Deny => {
                     if let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
@@ -378,6 +382,36 @@ fn build_default_drop_rule(source: IpAddr) -> String {
     }
 }
 
+fn append_implicit_dns_allow_rules(
+    lines: &mut Vec<String>,
+    source: IpAddr,
+    gateway: Option<IpAddr>,
+) {
+    let Some(destination) = gateway else {
+        return;
+    };
+
+    match (source, destination) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            lines.push(format!(
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} ip daddr {dst} udp dport 53 accept"
+            ));
+            lines.push(format!(
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} ip daddr {dst} tcp dport 53 accept"
+            ));
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            lines.push(format!(
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} ip6 daddr {dst} udp dport 53 accept"
+            ));
+            lines.push(format!(
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} ip6 daddr {dst} tcp dport 53 accept"
+            ));
+        }
+        _ => {}
+    }
+}
+
 fn append_enforced_network_baseline_drop_rules(lines: &mut Vec<String>, subnets: &[ipnet::IpNet]) {
     for subnet in subnets {
         match subnet {
@@ -490,6 +524,7 @@ mod tests {
                     network_id: "net0".to_string(),
                     network_name: "bridge".to_string(),
                     ip_address: source_ip,
+                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
                     subnet,
                     aliases: vec!["web".to_string()],
                 }],
@@ -557,6 +592,7 @@ mod tests {
                 network_id: "net0".to_string(),
                 network_name: "bridge".to_string(),
                 ip_address: peer_ip,
+                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
                 subnet,
                 aliases: vec!["db".to_string()],
             }],
@@ -594,5 +630,12 @@ mod tests {
         );
         let script = build_apply_script(&snapshot);
         assert!(script.contains("ip saddr 172.18.0.0/16 drop"));
+    }
+
+    #[test]
+    fn build_apply_script_adds_dns_allows_for_network_gateway() {
+        let script = build_apply_script(&snapshot_with_hostname_rule());
+        assert!(script.contains("ip daddr 172.18.0.1 udp dport 53 accept"));
+        assert!(script.contains("ip daddr 172.18.0.1 tcp dport 53 accept"));
     }
 }

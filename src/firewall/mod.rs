@@ -258,6 +258,7 @@ mod tests {
                     network_id: "net0".to_string(),
                     network_name: "bridge".to_string(),
                     ip_address: attachment_ip,
+                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
                     subnet,
                     aliases: vec!["web".to_string()],
                 }],

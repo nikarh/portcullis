@@ -186,6 +186,12 @@ fn build_apply_commands_with_dns(
             let IpAddr::V4(source_ipv4) = attachment.ip_address else {
                 continue;
             };
+            append_implicit_dns_allow_commands(
+                &mut commands,
+                chain_name,
+                source_ipv4,
+                attachment.gateway,
+            );
 
             if policy.icc_mode == IccMode::Deny {
                 append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
@@ -474,6 +480,37 @@ fn append_enforced_network_drop_commands(
     }
 }
 
+fn append_implicit_dns_allow_commands(
+    commands: &mut Vec<CommandSpec>,
+    chain_name: &str,
+    source_ipv4: std::net::Ipv4Addr,
+    gateway: Option<IpAddr>,
+) {
+    let Some(IpAddr::V4(destination_ipv4)) = gateway else {
+        return;
+    };
+
+    for protocol in ["udp", "tcp"] {
+        commands.push(CommandSpec {
+            program: "iptables",
+            args: vec![
+                "-A".to_string(),
+                chain_name.to_string(),
+                "-s".to_string(),
+                format!("{source_ipv4}/32"),
+                "-d".to_string(),
+                format!("{destination_ipv4}/32"),
+                "-p".to_string(),
+                protocol.to_string(),
+                "--dport".to_string(),
+                "53".to_string(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ],
+        });
+    }
+}
+
 fn protocol_name(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Tcp => "tcp",
@@ -603,6 +640,7 @@ mod tests {
                     network_id: "net0".to_string(),
                     network_name: "bridge".to_string(),
                     ip_address: source_ip,
+                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
                     subnet,
                     aliases: vec!["web".to_string(), "app".to_string()],
                 }],
@@ -662,6 +700,7 @@ mod tests {
                 network_id: "net0".to_string(),
                 network_name: "bridge".to_string(),
                 ip_address: peer_ip,
+                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
                 subnet,
                 aliases: vec!["db".to_string()],
             }],
@@ -780,6 +819,50 @@ mod tests {
                         "172.18.0.0/16".to_string(),
                         "-j".to_string(),
                         "DROP".to_string(),
+                    ]
+        }));
+    }
+
+    #[test]
+    fn build_commands_adds_dns_allows_for_gateway_by_default() {
+        let mut resolver = MockResolver;
+        let commands =
+            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, CHAIN_NAME)
+                .expect("expected command build to succeed");
+        assert!(commands.iter().any(|command| {
+            command.program == "iptables"
+                && command.args
+                    == vec![
+                        "-A".to_string(),
+                        CHAIN_NAME.to_string(),
+                        "-s".to_string(),
+                        "172.18.0.2/32".to_string(),
+                        "-d".to_string(),
+                        "172.18.0.1/32".to_string(),
+                        "-p".to_string(),
+                        "udp".to_string(),
+                        "--dport".to_string(),
+                        "53".to_string(),
+                        "-j".to_string(),
+                        "ACCEPT".to_string(),
+                    ]
+        }));
+        assert!(commands.iter().any(|command| {
+            command.program == "iptables"
+                && command.args
+                    == vec![
+                        "-A".to_string(),
+                        CHAIN_NAME.to_string(),
+                        "-s".to_string(),
+                        "172.18.0.2/32".to_string(),
+                        "-d".to_string(),
+                        "172.18.0.1/32".to_string(),
+                        "-p".to_string(),
+                        "tcp".to_string(),
+                        "--dport".to_string(),
+                        "53".to_string(),
+                        "-j".to_string(),
+                        "ACCEPT".to_string(),
                     ]
         }));
     }

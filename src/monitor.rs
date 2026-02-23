@@ -99,16 +99,20 @@ where
                             network_name: network_name.to_string(),
                         })?;
 
-                let (subnet, enforce_network_policy) =
+                let (subnet, gateway, enforce_network_policy) =
                     if let Some(cached) = network_data.get(&network_id) {
                         *cached
                     } else {
                         trace!(%network_id, "inspecting network for subnet");
                         let network = self.api.inspect_network(&network_id)?;
                         let subnet = network.primary_subnet()?;
+                        let gateway = network.primary_gateway()?;
                         let enforce_network_policy = network.is_portcullis_network_enforced()?;
-                        network_data.insert(network_id.clone(), (subnet, enforce_network_policy));
-                        (subnet, enforce_network_policy)
+                        network_data.insert(
+                            network_id.clone(),
+                            (subnet, gateway, enforce_network_policy),
+                        );
+                        (subnet, gateway, enforce_network_policy)
                     };
                 if enforce_network_policy {
                     enforced_network_subnets.insert(subnet);
@@ -118,6 +122,7 @@ where
                     network_id,
                     network_name: network_name.to_string(),
                     ip_address: address,
+                    gateway,
                     subnet,
                     aliases: endpoint.aliases.unwrap_or_default(),
                 });
@@ -704,6 +709,26 @@ impl DockerNetworkInspect {
         })
     }
 
+    fn primary_gateway(&self) -> Result<Option<IpAddr>, MonitorError> {
+        let gateway = self
+            .ipam
+            .as_ref()
+            .and_then(|ipam| ipam.config.as_ref())
+            .and_then(|configs| configs.iter().find_map(|config| config.gateway.clone()));
+
+        let Some(value) = gateway else {
+            return Ok(None);
+        };
+
+        value
+            .parse::<IpAddr>()
+            .map(Some)
+            .map_err(|_| MonitorError::InvalidNetworkSubnet {
+                network_id: self.id.clone(),
+                subnet: value,
+            })
+    }
+
     fn is_portcullis_network_enforced(&self) -> Result<bool, MonitorError> {
         const LABEL_KEY: &str = "portcullis.network.enforce";
         let Some(value) = self
@@ -736,6 +761,8 @@ pub struct DockerIpam {
 pub struct DockerIpamConfig {
     #[serde(rename = "Subnet")]
     pub subnet: Option<String>,
+    #[serde(rename = "Gateway")]
+    pub gateway: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -855,6 +882,7 @@ mod tests {
             ipam: Some(DockerIpam {
                 config: Some(vec![DockerIpamConfig {
                     subnet: Some(subnet.to_string()),
+                    gateway: None,
                 }]),
             }),
             labels: None,
@@ -1132,6 +1160,7 @@ mod tests {
                     network_id: network_id.to_string(),
                     network_name: network_name.to_string(),
                     ip_address: parsed_ip,
+                    gateway: None,
                     subnet: parsed_subnet,
                     aliases: vec![name.to_string()],
                 }],
