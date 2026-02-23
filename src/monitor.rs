@@ -232,6 +232,14 @@ fn parse_http_response(response: &str) -> Result<String, MonitorError> {
             "missing HTTP status line".to_string(),
         ));
     };
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(key.trim().to_lowercase(), value.trim().to_lowercase());
+    }
+
     let mut parts = status_line.split_whitespace();
     let _http_version = parts.next();
     let Some(status_code) = parts.next() else {
@@ -243,14 +251,102 @@ fn parse_http_response(response: &str) -> Result<String, MonitorError> {
         MonitorError::InvalidHttpResponse(format!("invalid HTTP status code: {error}"))
     })?;
 
+    let parsed_body = decode_http_body(body, &headers)?;
+
     if !(200..=299).contains(&status) {
         return Err(MonitorError::ApiHttpStatus {
             status,
-            body: body.trim().to_string(),
+            body: parsed_body.trim().to_string(),
         });
     }
 
-    Ok(body.to_string())
+    Ok(parsed_body)
+}
+
+fn decode_http_body(
+    raw_body: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<String, MonitorError> {
+    let transfer_encoding = headers
+        .get("transfer-encoding")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if transfer_encoding.contains("chunked") {
+        return decode_chunked_body(raw_body);
+    }
+
+    Ok(raw_body.to_string())
+}
+
+fn decode_chunked_body(raw_body: &str) -> Result<String, MonitorError> {
+    let bytes = raw_body.as_bytes();
+    let mut cursor = 0usize;
+    let mut decoded = Vec::new();
+
+    loop {
+        let Some(line_end) = find_crlf(bytes, cursor) else {
+            return Err(MonitorError::InvalidHttpResponse(
+                "chunked response missing chunk size line terminator".to_string(),
+            ));
+        };
+
+        let size_bytes = bytes.get(cursor..line_end).ok_or_else(|| {
+            MonitorError::InvalidHttpResponse(
+                "chunked response missing chunk size bytes".to_string(),
+            )
+        })?;
+        let size_line = std::str::from_utf8(size_bytes).map_err(|error| {
+            MonitorError::InvalidHttpResponse(format!("invalid chunk size line encoding: {error}"))
+        })?;
+        let size_hex = size_line.split(';').next().unwrap_or_default().trim();
+        let chunk_size = usize::from_str_radix(size_hex, 16).map_err(|error| {
+            MonitorError::InvalidHttpResponse(format!("invalid chunk size `{size_hex}`: {error}"))
+        })?;
+        cursor = line_end + 2;
+
+        if chunk_size == 0 {
+            break;
+        }
+
+        let chunk_end = cursor
+            .checked_add(chunk_size)
+            .ok_or_else(|| MonitorError::InvalidHttpResponse("chunk size overflow".to_string()))?;
+        let terminator_end = chunk_end.checked_add(2).ok_or_else(|| {
+            MonitorError::InvalidHttpResponse("chunk terminator overflow".to_string())
+        })?;
+        if terminator_end > bytes.len() {
+            return Err(MonitorError::InvalidHttpResponse(
+                "chunked response truncated before chunk end".to_string(),
+            ));
+        }
+
+        let chunk = bytes.get(cursor..chunk_end).ok_or_else(|| {
+            MonitorError::InvalidHttpResponse("chunked response missing chunk bytes".to_string())
+        })?;
+        decoded.extend_from_slice(chunk);
+
+        let terminator = bytes.get(chunk_end..terminator_end).ok_or_else(|| {
+            MonitorError::InvalidHttpResponse(
+                "chunked response missing chunk terminator".to_string(),
+            )
+        })?;
+        if terminator != b"\r\n" {
+            return Err(MonitorError::InvalidHttpResponse(
+                "chunked response missing chunk terminator".to_string(),
+            ));
+        }
+
+        cursor = terminator_end;
+    }
+
+    String::from_utf8(decoded).map_err(|error| MonitorError::InvalidHttpResponse(error.to_string()))
+}
+
+fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
+    let tail = bytes.get(start..)?;
+    tail.windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|offset| start + offset)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -844,6 +940,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_http_response_decodes_chunked_body() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Content-Type: application/json\r\n",
+            "\r\n",
+            "7\r\n",
+            "{\"a\":1}\r\n",
+            "0\r\n",
+            "\r\n"
+        );
+        let body = parse_http_response(response).expect("chunked response should parse");
+        assert_eq!(body, "{\"a\":1}");
+    }
+
+    #[test]
     fn parse_http_response_rejects_non_success_status() {
         let response = "HTTP/1.1 404 Not Found\r\n\r\nnot found";
         let result = parse_http_response(response);
@@ -870,6 +982,21 @@ mod tests {
 
         assert_eq!(value_backend.as_deref(), Some("nftables"));
         assert_eq!(object_backend.as_deref(), Some("iptables"));
+    }
+
+    #[test]
+    fn parse_http_response_rejects_invalid_chunk_size() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "ZZ\r\n",
+            "{}\r\n",
+            "0\r\n",
+            "\r\n"
+        );
+        let result = parse_http_response(response);
+        assert!(matches!(result, Err(MonitorError::InvalidHttpResponse(_))));
     }
 
     #[test]
