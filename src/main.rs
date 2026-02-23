@@ -1,6 +1,12 @@
 use std::io::Write as _;
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pico_args::Arguments;
 use thiserror::Error;
@@ -12,8 +18,8 @@ use portcullis::firewall::{
 };
 use portcullis::logging::{self, LogLevel, LoggingError};
 use portcullis::monitor::{
-    CommandDockerApi, CommandRunner, DockerFirewallBackend, DockerMonitor, MonitorError,
-    RuntimeChangeTracker,
+    CommandDockerApi, CommandRunner, DockerContainerEvent, DockerFirewallBackend, DockerMonitor,
+    MonitorError, RuntimeChangeTracker,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +73,10 @@ enum MainError {
     Monitor(#[from] MonitorError),
     #[error("firewall apply failed: {0}")]
     Firewall(#[from] FirewallError),
+    #[error("failed to install signal handler: {0}")]
+    SignalHandler(String),
+    #[error("service state error: {0}")]
+    ServiceState(String),
 }
 
 fn main() {
@@ -134,6 +144,31 @@ fn write_stderr_line(message: &str) -> Result<(), std::io::Error> {
     std::io::stderr().write_all(format!("{message}\n").as_bytes())
 }
 
+enum ActiveFirewall {
+    Nftables(NftablesFirewall<portcullis::firewall::LibNftablesRunner>),
+    Iptables(IptablesFirewall<CommandIptablesRunner>),
+}
+
+impl ActiveFirewall {
+    fn apply(
+        &self,
+        snapshot: &portcullis::model::RuntimeSnapshot,
+        dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
+    ) -> Result<(), FirewallError> {
+        match self {
+            Self::Nftables(firewall) => firewall.apply_with_dns(snapshot, dns_cache),
+            Self::Iptables(firewall) => firewall.apply_with_dns(snapshot, dns_cache),
+        }
+    }
+
+    fn cleanup(&self) -> Result<(), FirewallError> {
+        match self {
+            Self::Nftables(firewall) => firewall.cleanup(),
+            Self::Iptables(firewall) => firewall.cleanup(),
+        }
+    }
+}
+
 fn run(config: &Config) -> Result<(), MainError> {
     logging::init_logging_with_level(config.log_level)?;
 
@@ -147,18 +182,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     let runner = DockerSocketCommandRunner::new(config.docker_socket.clone());
     let api = CommandDockerApi::new(runner);
     let monitor = DockerMonitor::new(api);
-    let snapshot = monitor.snapshot()?;
     let detected_backend = monitor.firewall_backend()?;
-
-    let mut tracker = RuntimeChangeTracker::new();
-    let changes = tracker.detect_and_log(&snapshot);
-    debug!(change_count = changes.len(), "runtime changes computed");
-    trace!(?snapshot, "runtime snapshot for firewall apply");
-    let mut dns_cache = DnsProxyCache::new(
-        SystemUpstreamResolver,
-        std::time::Duration::from_secs(300),
-        2048,
-    );
 
     let selected_backend = match config.firewall_backend {
         FirewallBackend::Auto => match detected_backend {
@@ -174,20 +198,91 @@ fn run(config: &Config) -> Result<(), MainError> {
         "selected firewall backend"
     );
 
-    match selected_backend {
+    let firewall = match selected_backend {
         FirewallBackend::Auto => unreachable!("auto backend must be resolved before execution"),
         FirewallBackend::Nftables => {
-            let firewall = NftablesFirewall::with_libnftables()?;
-            firewall.apply_with_dns(&snapshot, &mut dns_cache)?;
+            ActiveFirewall::Nftables(NftablesFirewall::with_libnftables()?)
         }
         FirewallBackend::Iptables => {
-            let firewall = IptablesFirewall::<CommandIptablesRunner>::with_cli();
-            firewall.apply_with_dns(&snapshot, &mut dns_cache)?;
+            ActiveFirewall::Iptables(IptablesFirewall::<CommandIptablesRunner>::with_cli())
         }
+    };
+
+    info!("performing startup firewall cleanup");
+    firewall.cleanup()?;
+
+    let terminate = Arc::new(AtomicBool::new(false));
+    let terminate_flag = Arc::clone(&terminate);
+    ctrlc::set_handler(move || {
+        terminate_flag.store(true, Ordering::Relaxed);
+    })
+    .map_err(|error| MainError::SignalHandler(error.to_string()))?;
+
+    let mut tracker = RuntimeChangeTracker::new();
+    let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
+    let mut last_poll_epoch = current_unix_epoch_seconds()?;
+
+    apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
+
+    info!("entering docker event loop");
+    while !terminate.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+
+        let now_epoch = current_unix_epoch_seconds()?;
+        let events = monitor.container_events_between(last_poll_epoch, now_epoch)?;
+        last_poll_epoch = now_epoch;
+
+        if !has_relevant_events(&events) {
+            trace!(event_count = events.len(), "no relevant docker events");
+            continue;
+        }
+
+        info!(
+            event_count = events.len(),
+            "relevant docker event detected; refreshing firewall rules"
+        );
+        trace!(events = ?events, "docker events payload");
+        apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
     }
 
+    info!("shutdown requested; cleaning up firewall rules");
+    if let Err(error) = firewall.cleanup() {
+        error!(%error, "shutdown cleanup failed");
+        return Err(MainError::Firewall(error));
+    }
+    info!("shutdown cleanup completed");
+    Ok(())
+}
+
+fn apply_snapshot<R>(
+    monitor: &DockerMonitor<CommandDockerApi<R>>,
+    firewall: &ActiveFirewall,
+    tracker: &mut RuntimeChangeTracker,
+    dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
+) -> Result<(), MainError>
+where
+    R: CommandRunner,
+{
+    let snapshot = monitor.snapshot()?;
+    let changes = tracker.detect_and_log(&snapshot);
+    debug!(change_count = changes.len(), "runtime changes computed");
+    trace!(?snapshot, "runtime snapshot for firewall apply");
+    firewall.apply(&snapshot, dns_cache)?;
     info!("firewall rules applied");
     Ok(())
+}
+
+fn has_relevant_events(events: &[DockerContainerEvent]) -> bool {
+    events
+        .iter()
+        .any(DockerContainerEvent::is_relevant_for_policy_refresh)
+}
+
+fn current_unix_epoch_seconds() -> Result<i64, MainError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| MainError::ServiceState(error.to_string()))?;
+    i64::try_from(duration.as_secs()).map_err(|error| MainError::ServiceState(error.to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -282,5 +377,25 @@ mod tests {
     fn runner_normalizes_docker_socket() {
         let runner = DockerSocketCommandRunner::new("/var/run/docker.sock".to_string());
         assert_eq!(runner.docker_host, "unix:///var/run/docker.sock");
+    }
+
+    #[test]
+    fn relevant_event_detection_returns_true_when_action_matches() {
+        let events = vec![DockerContainerEvent {
+            id: "abc".to_string(),
+            action: "start".to_string(),
+            name: Some("web".to_string()),
+        }];
+        assert!(has_relevant_events(&events));
+    }
+
+    #[test]
+    fn relevant_event_detection_returns_false_for_noise() {
+        let events = vec![DockerContainerEvent {
+            id: "abc".to_string(),
+            action: "health_status: healthy".to_string(),
+            name: Some("web".to_string()),
+        }];
+        assert!(!has_relevant_events(&events));
     }
 }

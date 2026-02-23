@@ -148,7 +148,16 @@ where
     ) -> Result<Vec<DockerContainerEvent>, MonitorError> {
         let now_epoch = current_unix_epoch_seconds()?;
         let since = now_epoch - lookback_seconds;
-        self.api.list_container_events(since, now_epoch)
+        self.container_events_between(since, now_epoch)
+    }
+
+    pub fn container_events_between(
+        &self,
+        since_epoch_seconds: i64,
+        until_epoch_seconds: i64,
+    ) -> Result<Vec<DockerContainerEvent>, MonitorError> {
+        self.api
+            .list_container_events(since_epoch_seconds, until_epoch_seconds)
     }
 }
 
