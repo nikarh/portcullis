@@ -2,7 +2,9 @@ use std::ffi::{CStr, CString};
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
-use super::{FirewallError, NftRunner};
+use tracing::debug;
+
+use super::{FirewallError, NftRunner, split_nft_commands};
 
 #[allow(warnings)]
 mod bindings {
@@ -148,6 +150,10 @@ impl LibNftablesRunner {
 
 impl NftRunner for LibNftablesRunner {
     fn run_script(&self, script: &str) -> Result<(), FirewallError> {
+        for command in split_nft_commands(script) {
+            // Log libnftables execution in CLI-equivalent format for operator visibility.
+            debug!(command = %format!("nft {command}"), "executing firewall command");
+        }
         let mut guard = self
             .context
             .lock()
