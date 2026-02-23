@@ -1,3 +1,4 @@
+pub mod dns;
 pub mod firewall;
 pub mod labels;
 pub mod logging;

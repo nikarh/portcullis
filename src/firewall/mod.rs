@@ -6,10 +6,13 @@ mod libnftables;
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
+use crate::dns::HostnameIpResolver;
 use crate::model::RuntimeSnapshot;
 
 pub use cli::CommandNftRunner;
-pub use common::{build_apply_script, build_cleanup_script, split_nft_commands};
+pub use common::{
+    build_apply_script, build_apply_script_with_dns, build_cleanup_script, split_nft_commands,
+};
 pub use libnftables::LibNftablesRunner;
 
 #[derive(Debug, Error)]
@@ -32,6 +35,8 @@ pub enum FirewallError {
     LibCommandFailure { code: i32, stderr: String },
     #[error("libnftables context lock poisoned")]
     LibContextLock,
+    #[error("dns resolve failed for host {host}: {message}")]
+    DnsResolve { host: String, message: String },
 }
 
 pub trait NftRunner {
@@ -58,6 +63,26 @@ where
             command_count = commands.len(),
             container_count = snapshot.containers.len(),
             "applying nftables changes"
+        );
+        for command in &commands {
+            debug!(command = %command, "nft apply command");
+        }
+        trace!(script = %script, "nft apply script detail");
+        self.runner.run_script(&script)
+    }
+
+    pub fn apply_with_dns(
+        &self,
+        snapshot: &RuntimeSnapshot,
+        resolver: &mut dyn HostnameIpResolver,
+    ) -> Result<(), FirewallError> {
+        self.cleanup()?;
+        let script = build_apply_script_with_dns(snapshot, resolver)?;
+        let commands = split_nft_commands(&script);
+        info!(
+            command_count = commands.len(),
+            container_count = snapshot.containers.len(),
+            "applying nftables changes with DNS sets"
         );
         for command in &commands {
             debug!(command = %command, "nft apply command");

@@ -6,6 +6,7 @@ use pico_args::Arguments;
 use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
+use portcullis::dns::{DnsProxyCache, SystemUpstreamResolver};
 use portcullis::firewall::{CommandNftRunner, FirewallError, NftablesFirewall};
 use portcullis::logging::{self, LogLevel, LoggingError};
 use portcullis::monitor::{
@@ -147,15 +148,20 @@ fn run(config: &Config) -> Result<(), MainError> {
     let changes = tracker.detect_and_log(&snapshot);
     debug!(change_count = changes.len(), "runtime changes computed");
     trace!(?snapshot, "runtime snapshot for firewall apply");
+    let mut dns_cache = DnsProxyCache::new(
+        SystemUpstreamResolver,
+        std::time::Duration::from_secs(300),
+        2048,
+    );
 
     match config.firewall_backend {
         FirewallBackend::Cli => {
             let firewall = NftablesFirewall::<CommandNftRunner>::with_cli();
-            firewall.apply(&snapshot)?;
+            firewall.apply_with_dns(&snapshot, &mut dns_cache)?;
         }
         FirewallBackend::LibNftables => {
             let firewall = NftablesFirewall::with_libnftables()?;
-            firewall.apply(&snapshot)?;
+            firewall.apply_with_dns(&snapshot, &mut dns_cache)?;
         }
     }
 
