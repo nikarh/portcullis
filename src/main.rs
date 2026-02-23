@@ -48,6 +48,7 @@ struct Config {
     docker_socket: String,
     firewall_backend: FirewallBackend,
     log_level: LogLevel,
+    fail_closed: bool,
 }
 
 impl Default for Config {
@@ -56,6 +57,7 @@ impl Default for Config {
             docker_socket: "/var/run/docker.sock".to_string(),
             firewall_backend: FirewallBackend::Auto,
             log_level: LogLevel::Info,
+            fail_closed: false,
         }
     }
 }
@@ -116,6 +118,9 @@ fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
     if let Some(level) = args.opt_value_from_str::<_, String>("--log-level")? {
         config.log_level = LogLevel::from_str(&level)?;
     }
+    if args.contains("--fail-closed") {
+        config.fail_closed = true;
+    }
 
     let remaining = args.finish();
     if !remaining.is_empty() {
@@ -130,12 +135,13 @@ fn print_help() -> Result<(), std::io::Error> {
 portcullis prototype
 
 USAGE:
-  portcullis [--docker-socket <path>] [--firewall-backend <auto|nftables|iptables>] [--log-level <error|warn|info|debug|trace>]
+  portcullis [--docker-socket <path>] [--firewall-backend <auto|nftables|iptables>] [--log-level <error|warn|info|debug|trace>] [--fail-closed]
 
 OPTIONS:
   --docker-socket      Path to Docker Unix socket (default: /var/run/docker.sock)
   --firewall-backend   Firewall implementation: auto, nftables, or iptables (default: auto)
   --log-level          Logging level (default: info)
+  --fail-closed        Force default-deny for all discovered containers, even without labels
   -h, --help           Show this help
 ";
     std::io::stdout().write_all(usage.as_bytes())
@@ -170,6 +176,7 @@ impl ActiveFirewall {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(config: &Config) -> Result<(), MainError> {
     logging::init_logging_with_level(config.log_level)?;
 
@@ -177,6 +184,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         docker_socket = %config.docker_socket,
         firewall_backend = ?config.firewall_backend,
         log_level = ?config.log_level,
+        fail_closed = config.fail_closed,
         "portcullis prototype started"
     );
 
@@ -221,7 +229,13 @@ fn run(config: &Config) -> Result<(), MainError> {
     let mut tracker = RuntimeChangeTracker::new();
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut event_stream = connect_event_stream(&config.docker_socket)?;
-    apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)?;
+    apply_snapshot(
+        &monitor,
+        &firewall,
+        &mut tracker,
+        &mut dns_cache,
+        config.fail_closed,
+    )?;
 
     info!("subscribed to docker container events");
     loop {
@@ -244,9 +258,13 @@ fn run(config: &Config) -> Result<(), MainError> {
                     container_name = ?event.name,
                     "docker event requires firewall refresh"
                 );
-                if let Err(error) =
-                    apply_snapshot(&monitor, &firewall, &mut tracker, &mut dns_cache)
-                {
+                if let Err(error) = apply_snapshot(
+                    &monitor,
+                    &firewall,
+                    &mut tracker,
+                    &mut dns_cache,
+                    config.fail_closed,
+                ) {
                     error!(%error, "firewall refresh failed; continuing");
                 }
             }
@@ -287,17 +305,43 @@ fn apply_snapshot<A>(
     firewall: &ActiveFirewall,
     tracker: &mut RuntimeChangeTracker,
     dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
+    fail_closed: bool,
 ) -> Result<(), MainError>
 where
     A: portcullis::monitor::DockerApi,
 {
-    let snapshot = monitor.snapshot()?;
+    let mut snapshot = monitor.snapshot()?;
+    if fail_closed {
+        enforce_fail_closed_defaults(&mut snapshot);
+    }
     let changes = tracker.detect_and_log(&snapshot);
     debug!(change_count = changes.len(), "runtime changes computed");
     trace!(?snapshot, "runtime snapshot for firewall apply");
     firewall.apply(&snapshot, dns_cache)?;
     info!("firewall rules applied");
     Ok(())
+}
+
+fn enforce_fail_closed_defaults(snapshot: &mut portcullis::model::RuntimeSnapshot) {
+    for container in &mut snapshot.containers {
+        match &mut container.policy {
+            Some(policy) => {
+                if !policy.enabled {
+                    policy.enabled = true;
+                    policy.egress.clear();
+                    policy.icc_allow.clear();
+                }
+            }
+            None => {
+                container.policy = Some(portcullis::model::ContainerPolicy {
+                    enabled: true,
+                    icc_mode: portcullis::model::IccMode::Allow,
+                    egress: Vec::new(),
+                    icc_allow: Vec::new(),
+                });
+            }
+        }
+    }
 }
 
 fn current_unix_epoch_seconds() -> Result<i64, MainError> {
@@ -451,6 +495,7 @@ mod tests {
                 docker_socket: "/var/run/docker.sock".to_string(),
                 firewall_backend: FirewallBackend::Auto,
                 log_level: LogLevel::Info,
+                fail_closed: false,
             })
         );
     }
@@ -464,6 +509,7 @@ mod tests {
             "nftables".into(),
             "--log-level".into(),
             "debug".into(),
+            "--fail-closed".into(),
         ]);
         let config = parse_config(args).ok();
         assert_eq!(
@@ -472,6 +518,7 @@ mod tests {
                 docker_socket: "/tmp/docker.sock".to_string(),
                 firewall_backend: FirewallBackend::Nftables,
                 log_level: LogLevel::Debug,
+                fail_closed: true,
             })
         );
     }
