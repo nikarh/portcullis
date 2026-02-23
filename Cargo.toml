@@ -38,3 +38,6 @@ indexing_slicing = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
 undocumented_unsafe_blocks = "deny"
+
+[build-dependencies]
+bindgen = "0.72.1"
