@@ -3,14 +3,15 @@ use std::process::{Command, Stdio};
 
 use tracing::{debug, trace};
 
-use super::{FirewallError, NftRunner, split_nft_commands};
+use super::{FirewallError, NftRunner};
 
 pub struct CommandNftRunner;
 
 impl NftRunner for CommandNftRunner {
-    fn run_script(&self, script: &str) -> Result<(), FirewallError> {
+    fn run_commands(&self, commands: &[String]) -> Result<(), FirewallError> {
+        let script = format!("{}\n", commands.join("\n"));
         trace!(script = %script, "executing nft script via cli");
-        for command in split_nft_commands(script) {
+        for command in commands {
             debug!(program = "nft", command = %command, "executing firewall command");
         }
         let mut child = Command::new("nft")

@@ -11,7 +11,7 @@ pub const TABLE_NAME: &str = "portcullis";
 pub const CHAIN_NAME: &str = "egress";
 
 #[must_use]
-pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
+pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
     let mut lines = vec![
         format!("add table {TABLE_FAMILY} {TABLE_NAME}"),
         format!(
@@ -70,15 +70,19 @@ pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
         }
     }
 
-    lines.push(String::new());
-    lines.join("\n")
+    lines
+}
+
+#[must_use]
+pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
+    build_apply_commands(snapshot).join("\n")
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn build_apply_script_with_dns(
+pub fn build_apply_commands_with_dns(
     snapshot: &RuntimeSnapshot,
     resolver: &mut dyn HostnameIpResolver,
-) -> Result<String, FirewallError> {
+) -> Result<Vec<String>, FirewallError> {
     let mut lines = vec![
         format!("add table {TABLE_FAMILY} {TABLE_NAME}"),
         format!(
@@ -196,17 +200,25 @@ pub fn build_apply_script_with_dns(
         }
     }
 
-    lines.push(String::new());
-    Ok(lines.join("\n"))
+    Ok(lines)
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn build_apply_script_with_dns(
+    snapshot: &RuntimeSnapshot,
+    resolver: &mut dyn HostnameIpResolver,
+) -> Result<String, FirewallError> {
+    Ok(build_apply_commands_with_dns(snapshot, resolver)?.join("\n"))
+}
+
+#[must_use]
+pub fn build_cleanup_commands() -> Vec<String> {
+    vec![format!("delete table {TABLE_FAMILY} {TABLE_NAME}")]
 }
 
 #[must_use]
 pub fn build_cleanup_script() -> String {
-    format!("delete table {TABLE_FAMILY} {TABLE_NAME}\n")
-}
-
-pub fn split_nft_commands(script: &str) -> impl Iterator<Item = &str> {
-    script.lines()
+    format!("{}\n", build_cleanup_commands().join("\n"))
 }
 
 #[derive(Debug, Default)]

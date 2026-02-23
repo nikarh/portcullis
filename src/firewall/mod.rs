@@ -12,7 +12,8 @@ use crate::model::RuntimeSnapshot;
 
 pub use cli::CommandNftRunner;
 pub use common::{
-    build_apply_script, build_apply_script_with_dns, build_cleanup_script, split_nft_commands,
+    build_apply_commands, build_apply_commands_with_dns, build_apply_script,
+    build_apply_script_with_dns, build_cleanup_commands, build_cleanup_script,
 };
 pub use iptables::{CommandIptablesRunner, IptablesFirewall};
 pub use libnftables::LibNftablesRunner;
@@ -42,7 +43,7 @@ pub enum FirewallError {
 }
 
 pub trait NftRunner {
-    fn run_script(&self, script: &str) -> Result<(), FirewallError>;
+    fn run_commands(&self, commands: &[String]) -> Result<(), FirewallError>;
 }
 
 pub struct NftablesFirewall<R> {
@@ -59,18 +60,18 @@ where
 
     pub fn apply(&self, snapshot: &RuntimeSnapshot) -> Result<(), FirewallError> {
         self.cleanup()?;
-        let script = build_apply_script(snapshot);
-        let command_count = split_nft_commands(&script).count();
+        let commands = build_apply_commands(snapshot);
+        let command_count = commands.len();
         info!(
             command_count,
             container_count = snapshot.containers.len(),
             "applying nftables changes"
         );
-        for command in split_nft_commands(&script) {
+        for command in &commands {
             debug!(command = %command, "nft apply command");
         }
-        trace!(script = %script, "nft apply script detail");
-        self.runner.run_script(&script)
+        trace!(commands = ?commands, "nft apply commands detail");
+        self.runner.run_commands(&commands)
     }
 
     pub fn apply_with_dns(
@@ -79,29 +80,29 @@ where
         resolver: &mut dyn HostnameIpResolver,
     ) -> Result<(), FirewallError> {
         self.cleanup()?;
-        let script = build_apply_script_with_dns(snapshot, resolver)?;
-        let command_count = split_nft_commands(&script).count();
+        let commands = build_apply_commands_with_dns(snapshot, resolver)?;
+        let command_count = commands.len();
         info!(
             command_count,
             container_count = snapshot.containers.len(),
             "applying nftables changes with DNS sets"
         );
-        for command in split_nft_commands(&script) {
+        for command in &commands {
             debug!(command = %command, "nft apply command");
         }
-        trace!(script = %script, "nft apply script detail");
-        self.runner.run_script(&script)
+        trace!(commands = ?commands, "nft apply commands detail");
+        self.runner.run_commands(&commands)
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
-        let script = build_cleanup_script();
-        let command_count = split_nft_commands(&script).count();
+        let commands = build_cleanup_commands();
+        let command_count = commands.len();
         info!(command_count, "cleaning up nftables table");
-        for command in split_nft_commands(&script) {
+        for command in &commands {
             debug!(command = %command, "nft cleanup command");
         }
-        trace!(script = %script, "nft cleanup script detail");
-        match self.runner.run_script(&script) {
+        trace!(commands = ?commands, "nft cleanup commands detail");
+        match self.runner.run_commands(&commands) {
             Ok(()) => {
                 info!("nftables cleanup completed");
                 Ok(())
@@ -189,7 +190,7 @@ mod tests {
     }
 
     impl NftRunner for RecordingRunner {
-        fn run_script(&self, script: &str) -> Result<(), FirewallError> {
+        fn run_commands(&self, commands: &[String]) -> Result<(), FirewallError> {
             if let Some(error) = &self.fail_with {
                 return Err(match error {
                     RunnerFailure::CommandFailure { code, stderr } => {
@@ -211,7 +212,7 @@ mod tests {
                 .scripts
                 .lock()
                 .map_err(|_| FirewallError::LibContextLock)?;
-            guard.push(script.to_string());
+            guard.push(commands.join("\n"));
             Ok(())
         }
     }
@@ -275,7 +276,7 @@ mod tests {
 
         let scripts = runner.scripts();
         assert_eq!(scripts.len(), 2);
-        assert_eq!(scripts[0], "delete table inet portcullis\n");
+        assert_eq!(scripts[0], "delete table inet portcullis");
         assert!(scripts[1].contains("add table inet portcullis"));
     }
 
