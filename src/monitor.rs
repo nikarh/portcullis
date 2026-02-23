@@ -35,6 +35,12 @@ pub enum MonitorError {
     MissingNetworkSubnet(String),
     #[error("invalid subnet in network id {network_id}: {subnet}")]
     InvalidNetworkSubnet { network_id: String, subnet: String },
+    #[error("invalid network label {label} on network {network_id}: {value}")]
+    InvalidNetworkLabel {
+        network_id: String,
+        label: String,
+        value: String,
+    },
     #[error(transparent)]
     LabelParse(#[from] LabelParseError),
 }
@@ -69,7 +75,8 @@ where
         debug!("collecting docker runtime snapshot");
         let container_ids = self.api.list_container_ids()?;
         trace!(?container_ids, "listed container ids");
-        let mut network_subnets = HashMap::new();
+        let mut network_data = HashMap::new();
+        let mut enforced_network_subnets = BTreeSet::new();
         let mut containers = Vec::with_capacity(container_ids.len());
 
         for container_id in container_ids {
@@ -92,15 +99,20 @@ where
                             network_name: network_name.to_string(),
                         })?;
 
-                let subnet = if let Some(cached) = network_subnets.get(&network_id) {
-                    *cached
-                } else {
-                    trace!(%network_id, "inspecting network for subnet");
-                    let network = self.api.inspect_network(&network_id)?;
-                    let subnet = network.primary_subnet()?;
-                    network_subnets.insert(network_id.clone(), subnet);
-                    subnet
-                };
+                let (subnet, enforce_network_policy) =
+                    if let Some(cached) = network_data.get(&network_id) {
+                        *cached
+                    } else {
+                        trace!(%network_id, "inspecting network for subnet");
+                        let network = self.api.inspect_network(&network_id)?;
+                        let subnet = network.primary_subnet()?;
+                        let enforce_network_policy = network.is_portcullis_network_enforced()?;
+                        network_data.insert(network_id.clone(), (subnet, enforce_network_policy));
+                        (subnet, enforce_network_policy)
+                    };
+                if enforce_network_policy {
+                    enforced_network_subnets.insert(subnet);
+                }
 
                 attachments.push(NetworkAttachment {
                     network_id,
@@ -120,7 +132,10 @@ where
             });
         }
 
-        let snapshot = RuntimeSnapshot { containers };
+        let snapshot = RuntimeSnapshot {
+            containers,
+            enforced_network_subnets: enforced_network_subnets.into_iter().collect(),
+        };
         info!(
             container_count = snapshot.containers.len(),
             "docker runtime snapshot collected"
@@ -670,6 +685,8 @@ pub struct DockerNetworkInspect {
     pub name: String,
     #[serde(rename = "IPAM")]
     pub ipam: Option<DockerIpam>,
+    #[serde(rename = "Labels")]
+    pub labels: Option<BTreeMap<String, String>>,
 }
 
 impl DockerNetworkInspect {
@@ -685,6 +702,27 @@ impl DockerNetworkInspect {
             network_id: self.id.clone(),
             subnet,
         })
+    }
+
+    fn is_portcullis_network_enforced(&self) -> Result<bool, MonitorError> {
+        const LABEL_KEY: &str = "portcullis.network.enforce";
+        let Some(value) = self
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_KEY))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(MonitorError::InvalidNetworkLabel {
+                network_id: self.id.clone(),
+                label: LABEL_KEY.to_string(),
+                value,
+            }),
+        }
     }
 }
 
@@ -819,6 +857,7 @@ mod tests {
                     subnet: Some(subnet.to_string()),
                 }]),
             }),
+            labels: None,
         }
     }
 
@@ -860,6 +899,7 @@ mod tests {
         assert_eq!(container.id, "abc");
         assert_eq!(container.attachments.len(), 1);
         assert!(container.policy.is_some());
+        assert!(snapshot.enforced_network_subnets.is_empty());
     }
 
     #[test]
@@ -930,6 +970,39 @@ mod tests {
         let monitor = DockerMonitor::new(api);
         let result = monitor.snapshot();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn docker_monitor_collects_enforced_network_subnets_from_network_labels() {
+        let mut api = MockDockerApi {
+            ids: vec!["abc".to_string()],
+            ..MockDockerApi::default()
+        };
+        api.containers.insert(
+            "abc".to_string(),
+            container_inspect(
+                "abc",
+                "web",
+                &[("portcullis.enable", "true")],
+                "bridge",
+                "net0",
+                "172.18.0.2",
+            ),
+        );
+        let mut network = network_inspect("net0", "bridge", "172.18.0.0/16");
+        network.labels = Some(BTreeMap::from([(
+            "portcullis.network.enforce".to_string(),
+            "true".to_string(),
+        )]));
+        api.networks.insert("net0".to_string(), network);
+
+        let monitor = DockerMonitor::new(api);
+        let snapshot = monitor.snapshot().expect("snapshot should succeed");
+        assert_eq!(snapshot.enforced_network_subnets.len(), 1);
+        assert_eq!(
+            snapshot.enforced_network_subnets[0].to_string(),
+            "172.18.0.0/16"
+        );
     }
 
     #[test]
@@ -1067,6 +1140,7 @@ mod tests {
                     Err(error) => panic!("failed to parse policy fixture: {error}"),
                 },
             }],
+            enforced_network_subnets: Vec::new(),
         }
     }
 

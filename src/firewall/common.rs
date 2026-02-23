@@ -71,6 +71,8 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
         }
     }
 
+    append_enforced_network_baseline_drop_rules(&mut lines, &snapshot.enforced_network_subnets);
+
     lines
 }
 
@@ -213,6 +215,8 @@ pub fn build_apply_commands_with_dns(
             lines.push(build_default_drop_rule(attachment.ip_address));
         }
     }
+
+    append_enforced_network_baseline_drop_rules(&mut lines, &snapshot.enforced_network_subnets);
 
     Ok(lines)
 }
@@ -374,6 +378,19 @@ fn build_default_drop_rule(source: IpAddr) -> String {
     }
 }
 
+fn append_enforced_network_baseline_drop_rules(lines: &mut Vec<String>, subnets: &[ipnet::IpNet]) {
+    for subnet in subnets {
+        match subnet {
+            ipnet::IpNet::V4(value) => lines.push(format!(
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {value} drop"
+            )),
+            ipnet::IpNet::V6(value) => lines.push(format!(
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {value} drop"
+            )),
+        }
+    }
+}
+
 fn append_icc_allow_list_rules(
     lines: &mut Vec<String>,
     source: IpAddr,
@@ -489,6 +506,7 @@ mod tests {
                     icc_allow: Vec::new(),
                 }),
             }],
+            enforced_network_subnets: Vec::new(),
         }
     }
 
@@ -564,5 +582,17 @@ mod tests {
     fn build_apply_script_uses_pre_docker_forward_priority() {
         let script = build_apply_script(&snapshot_with_hostname_rule());
         assert!(script.contains("hook forward priority -1"));
+    }
+
+    #[test]
+    fn build_apply_script_adds_baseline_drop_for_enforced_network() {
+        let mut snapshot = snapshot_with_hostname_rule();
+        snapshot.enforced_network_subnets.push(
+            "172.18.0.0/16"
+                .parse()
+                .expect("subnet fixture should parse"),
+        );
+        let script = build_apply_script(&snapshot);
+        assert!(script.contains("ip saddr 172.18.0.0/16 drop"));
     }
 }

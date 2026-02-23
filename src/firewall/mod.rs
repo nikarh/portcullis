@@ -274,6 +274,7 @@ mod tests {
                     icc_allow: Vec::new(),
                 }),
             }],
+            enforced_network_subnets: Vec::new(),
         }
     }
 

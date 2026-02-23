@@ -69,4 +69,5 @@ pub struct ContainerSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
     pub containers: Vec<ContainerSnapshot>,
+    pub enforced_network_subnets: Vec<IpNet>,
 }

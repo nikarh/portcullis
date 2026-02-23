@@ -232,6 +232,11 @@ fn build_apply_commands_with_dns(
             append_default_drop_command(&mut commands, chain_name, source_ipv4);
         }
     }
+    append_enforced_network_drop_commands(
+        &mut commands,
+        chain_name,
+        &snapshot.enforced_network_subnets,
+    );
 
     Ok(commands)
 }
@@ -446,6 +451,29 @@ fn collect_managed_ipv4(snapshot: &RuntimeSnapshot) -> Vec<std::net::Ipv4Addr> {
     values.into_iter().collect()
 }
 
+fn append_enforced_network_drop_commands(
+    commands: &mut Vec<CommandSpec>,
+    chain_name: &str,
+    subnets: &[ipnet::IpNet],
+) {
+    for subnet in subnets {
+        let ipnet::IpNet::V4(value) = subnet else {
+            continue;
+        };
+        commands.push(CommandSpec {
+            program: "iptables",
+            args: vec![
+                "-A".to_string(),
+                chain_name.to_string(),
+                "-s".to_string(),
+                value.to_string(),
+                "-j".to_string(),
+                "DROP".to_string(),
+            ],
+        });
+    }
+}
+
 fn protocol_name(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Tcp => "tcp",
@@ -591,6 +619,7 @@ mod tests {
                     icc_allow: Vec::new(),
                 }),
             }],
+            enforced_network_subnets: Vec::new(),
         }
     }
 
@@ -727,6 +756,31 @@ mod tests {
             command.program == "iptables"
                 && command.args.iter().any(|arg| arg == "--match-set")
                 && command.args.iter().any(|arg| arg.starts_with("pc_h4_"))
+        }));
+    }
+
+    #[test]
+    fn build_commands_adds_baseline_drop_for_enforced_network() {
+        let mut snapshot = sample_snapshot();
+        snapshot.enforced_network_subnets.push(
+            "172.18.0.0/16"
+                .parse()
+                .expect("subnet fixture should parse"),
+        );
+        let mut resolver = MockResolver;
+        let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
+            .expect("expected command build to succeed");
+        assert!(commands.iter().any(|command| {
+            command.program == "iptables"
+                && command.args
+                    == vec![
+                        "-A".to_string(),
+                        CHAIN_NAME.to_string(),
+                        "-s".to_string(),
+                        "172.18.0.0/16".to_string(),
+                        "-j".to_string(),
+                        "DROP".to_string(),
+                    ]
         }));
     }
 }
