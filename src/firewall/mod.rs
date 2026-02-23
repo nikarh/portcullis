@@ -1,5 +1,6 @@
 mod cli;
 mod common;
+mod iptables;
 #[allow(unsafe_code)]
 mod libnftables;
 
@@ -13,6 +14,7 @@ pub use cli::CommandNftRunner;
 pub use common::{
     build_apply_script, build_apply_script_with_dns, build_cleanup_script, split_nft_commands,
 };
+pub use iptables::{CommandIptablesRunner, IptablesFirewall};
 pub use libnftables::LibNftablesRunner;
 
 #[derive(Debug, Error)]
@@ -244,6 +246,7 @@ mod tests {
                     network_name: "bridge".to_string(),
                     ip_address: attachment_ip,
                     subnet,
+                    aliases: vec!["web".to_string()],
                 }],
                 policy: Some(ContainerPolicy {
                     enabled: true,
@@ -255,6 +258,7 @@ mod tests {
                             port: 443,
                         }],
                     }],
+                    icc_allow: Vec::new(),
                 }),
             }],
         }

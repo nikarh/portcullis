@@ -25,6 +25,8 @@ pub enum MonitorError {
     InvalidUtf8 { program: String },
     #[error("invalid JSON from docker output: {0}")]
     InvalidJson(String),
+    #[error("unsupported docker firewall backend: {0}")]
+    UnsupportedFirewallBackend(String),
     #[error("docker inspect returned no object for id: {0}")]
     MissingInspectObject(String),
     #[error("missing network id in container {container_id} attachment {network_name}")]
@@ -45,6 +47,13 @@ pub trait DockerApi {
     fn inspect_container(&self, container_id: &str)
     -> Result<DockerContainerInspect, MonitorError>;
     fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError>;
+    fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerFirewallBackend {
+    Nftables,
+    Iptables,
 }
 
 pub struct DockerMonitor<A> {
@@ -101,6 +110,7 @@ where
                     network_name: network_name.to_string(),
                     ip_address: address,
                     subnet,
+                    aliases: endpoint.aliases.unwrap_or_default(),
                 });
             }
 
@@ -120,6 +130,10 @@ where
         );
         trace!(?snapshot, "full docker runtime snapshot");
         Ok(snapshot)
+    }
+
+    pub fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
+        self.api.firewall_backend()
     }
 }
 
@@ -219,6 +233,24 @@ where
             .into_iter()
             .next()
             .ok_or_else(|| MonitorError::MissingInspectObject(network_id.to_string()))
+    }
+
+    fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
+        debug!("detecting docker firewall backend");
+        let stdout = self
+            .runner
+            .run_capture("docker", &["info", "--format", "{{json .}}"])?;
+        trace!(raw_json = %stdout, "docker info output");
+        let info: DockerInfo = serde_json::from_str(&stdout)
+            .map_err(|error| MonitorError::InvalidJson(error.to_string()))?;
+        let backend = info
+            .firewall_backend
+            .unwrap_or_else(|| "iptables".to_string());
+        match backend.as_str() {
+            "nftables" => Ok(DockerFirewallBackend::Nftables),
+            "iptables" => Ok(DockerFirewallBackend::Iptables),
+            _ => Err(MonitorError::UnsupportedFirewallBackend(backend)),
+        }
     }
 }
 
@@ -502,6 +534,8 @@ pub struct DockerEndpoint {
     pub network_id: Option<String>,
     #[serde(rename = "IPAddress")]
     pub ip_address: Option<IpAddr>,
+    #[serde(rename = "Aliases")]
+    pub aliases: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -542,6 +576,12 @@ pub struct DockerIpamConfig {
     pub subnet: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerInfo {
+    #[serde(rename = "FirewallBackend")]
+    pub firewall_backend: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -575,6 +615,10 @@ mod tests {
                 .get(network_id)
                 .cloned()
                 .ok_or_else(|| MonitorError::MissingInspectObject(network_id.to_string()))
+        }
+
+        fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
+            Ok(DockerFirewallBackend::Nftables)
         }
     }
 
@@ -631,6 +675,7 @@ mod tests {
             DockerEndpoint {
                 network_id: Some(network_id.to_string()),
                 ip_address: Some(parsed_address),
+                aliases: Some(vec![name.to_string()]),
             },
         );
 
@@ -706,6 +751,7 @@ mod tests {
             DockerEndpoint {
                 network_id: Some("net0".to_string()),
                 ip_address: None,
+                aliases: None,
             },
         );
 
@@ -828,6 +874,34 @@ mod tests {
     }
 
     #[test]
+    fn command_docker_api_detects_nftables_backend() {
+        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
+            r#"{"FirewallBackend":"nftables"}"#.to_string(),
+        )]));
+        let result = api.firewall_backend();
+        assert_eq!(result.ok(), Some(DockerFirewallBackend::Nftables));
+    }
+
+    #[test]
+    fn command_docker_api_defaults_backend_to_iptables() {
+        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok("{}".to_string())]));
+        let result = api.firewall_backend();
+        assert_eq!(result.ok(), Some(DockerFirewallBackend::Iptables));
+    }
+
+    #[test]
+    fn command_docker_api_rejects_unknown_backend() {
+        let api = CommandDockerApi::new(QueueCommandRunner::new(vec![Ok(
+            r#"{"FirewallBackend":"unknown"}"#.to_string(),
+        )]));
+        let result = api.firewall_backend();
+        assert!(matches!(
+            result,
+            Err(MonitorError::UnsupportedFirewallBackend(value)) if value == "unknown"
+        ));
+    }
+
+    #[test]
     fn docker_network_primary_subnet_parses_first_subnet() {
         let network = network_inspect("net0", "bridge", "172.18.0.0/16");
         let subnet = match network.primary_subnet() {
@@ -871,6 +945,7 @@ mod tests {
                     network_name: network_name.to_string(),
                     ip_address: parsed_ip,
                     subnet: parsed_subnet,
+                    aliases: vec![name.to_string()],
                 }],
                 policy: match parse_policy(&label_map) {
                     Ok(value) => value,

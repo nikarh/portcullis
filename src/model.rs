@@ -27,6 +27,12 @@ pub struct EgressRule {
     pub ports: Vec<PortSpec>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IccAllowRule {
+    pub target_container: String,
+    pub ports: Vec<PortSpec>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IccMode {
     Allow,
@@ -39,6 +45,7 @@ pub struct ContainerPolicy {
     pub enabled: bool,
     pub icc_mode: IccMode,
     pub egress: Vec<EgressRule>,
+    pub icc_allow: Vec<IccAllowRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +54,7 @@ pub struct NetworkAttachment {
     pub network_name: String,
     pub ip_address: IpAddr,
     pub subnet: IpNet,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

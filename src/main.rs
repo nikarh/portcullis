@@ -7,16 +7,20 @@ use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
 use portcullis::dns::{DnsProxyCache, SystemUpstreamResolver};
-use portcullis::firewall::{CommandNftRunner, FirewallError, NftablesFirewall};
+use portcullis::firewall::{
+    CommandIptablesRunner, FirewallError, IptablesFirewall, NftablesFirewall,
+};
 use portcullis::logging::{self, LogLevel, LoggingError};
 use portcullis::monitor::{
-    CommandDockerApi, CommandRunner, DockerMonitor, MonitorError, RuntimeChangeTracker,
+    CommandDockerApi, CommandRunner, DockerFirewallBackend, DockerMonitor, MonitorError,
+    RuntimeChangeTracker,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirewallBackend {
-    Cli,
-    LibNftables,
+    Auto,
+    Nftables,
+    Iptables,
 }
 
 impl FromStr for FirewallBackend {
@@ -24,8 +28,9 @@ impl FromStr for FirewallBackend {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "cli" => Ok(Self::Cli),
-            "libnftables" => Ok(Self::LibNftables),
+            "auto" => Ok(Self::Auto),
+            "nftables" => Ok(Self::Nftables),
+            "iptables" => Ok(Self::Iptables),
             _ => Err(MainError::InvalidFirewallBackend(value.to_string())),
         }
     }
@@ -42,7 +47,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             docker_socket: "/var/run/docker.sock".to_string(),
-            firewall_backend: FirewallBackend::Cli,
+            firewall_backend: FirewallBackend::Auto,
             log_level: LogLevel::Info,
         }
     }
@@ -114,11 +119,11 @@ fn print_help() -> Result<(), std::io::Error> {
 portcullis prototype
 
 USAGE:
-  portcullis [--docker-socket <path>] [--firewall-backend <cli|libnftables>] [--log-level <error|warn|info|debug|trace>]
+  portcullis [--docker-socket <path>] [--firewall-backend <auto|nftables|iptables>] [--log-level <error|warn|info|debug|trace>]
 
 OPTIONS:
   --docker-socket      Path to Docker Unix socket (default: /var/run/docker.sock)
-  --firewall-backend   Firewall implementation: cli or libnftables (default: cli)
+  --firewall-backend   Firewall implementation: auto, nftables, or iptables (default: auto)
   --log-level          Logging level (default: info)
   -h, --help           Show this help
 ";
@@ -143,6 +148,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     let api = CommandDockerApi::new(runner);
     let monitor = DockerMonitor::new(api);
     let snapshot = monitor.snapshot()?;
+    let detected_backend = monitor.firewall_backend()?;
 
     let mut tracker = RuntimeChangeTracker::new();
     let changes = tracker.detect_and_log(&snapshot);
@@ -154,13 +160,28 @@ fn run(config: &Config) -> Result<(), MainError> {
         2048,
     );
 
-    match config.firewall_backend {
-        FirewallBackend::Cli => {
-            let firewall = NftablesFirewall::<CommandNftRunner>::with_cli();
+    let selected_backend = match config.firewall_backend {
+        FirewallBackend::Auto => match detected_backend {
+            DockerFirewallBackend::Nftables => FirewallBackend::Nftables,
+            DockerFirewallBackend::Iptables => FirewallBackend::Iptables,
+        },
+        backend => backend,
+    };
+    info!(
+        configured_backend = ?config.firewall_backend,
+        detected_backend = ?detected_backend,
+        selected_backend = ?selected_backend,
+        "selected firewall backend"
+    );
+
+    match selected_backend {
+        FirewallBackend::Auto => unreachable!("auto backend must be resolved before execution"),
+        FirewallBackend::Nftables => {
+            let firewall = NftablesFirewall::with_libnftables()?;
             firewall.apply_with_dns(&snapshot, &mut dns_cache)?;
         }
-        FirewallBackend::LibNftables => {
-            let firewall = NftablesFirewall::with_libnftables()?;
+        FirewallBackend::Iptables => {
+            let firewall = IptablesFirewall::<CommandIptablesRunner>::with_cli();
             firewall.apply_with_dns(&snapshot, &mut dns_cache)?;
         }
     }
@@ -223,7 +244,7 @@ mod tests {
             config,
             Some(Config {
                 docker_socket: "/var/run/docker.sock".to_string(),
-                firewall_backend: FirewallBackend::Cli,
+                firewall_backend: FirewallBackend::Auto,
                 log_level: LogLevel::Info,
             })
         );
@@ -235,7 +256,7 @@ mod tests {
             "--docker-socket".into(),
             "/tmp/docker.sock".into(),
             "--firewall-backend".into(),
-            "libnftables".into(),
+            "nftables".into(),
             "--log-level".into(),
             "debug".into(),
         ]);
@@ -244,7 +265,7 @@ mod tests {
             config,
             Some(Config {
                 docker_socket: "/tmp/docker.sock".to_string(),
-                firewall_backend: FirewallBackend::LibNftables,
+                firewall_backend: FirewallBackend::Nftables,
                 log_level: LogLevel::Debug,
             })
         );

@@ -4,11 +4,14 @@ use std::str::FromStr;
 use ipnet::IpNet;
 use thiserror::Error;
 
-use crate::model::{ContainerPolicy, EgressRule, EgressTarget, IccMode, PortSpec, Protocol};
+use crate::model::{
+    ContainerPolicy, EgressRule, EgressTarget, IccAllowRule, IccMode, PortSpec, Protocol,
+};
 
 const ENABLE_LABEL: &str = "portcullis.enable";
 const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
+const ICC_ALLOW_PREFIX: &str = "portcullis.icc.allow.";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LabelParseError {
@@ -22,10 +25,14 @@ pub enum LabelParseError {
     DuplicateEgressIndex(String),
     #[error("invalid egress value for {0}: {1}")]
     InvalidEgress(String, String),
+    #[error("invalid ICC allow value for {0}: {1}")]
+    InvalidIccAllow(String, String),
     #[error("invalid CIDR in {0}: {1}")]
     InvalidCidr(String, String),
     #[error("invalid hostname in {0}: {1}")]
     InvalidHostname(String, String),
+    #[error("invalid container target in {0}: {1}")]
+    InvalidContainerTarget(String, String),
     #[error("invalid port spec in {0}: {1}")]
     InvalidPortSpec(String, String),
     #[error("no ports defined in {0}")]
@@ -49,27 +56,48 @@ pub fn parse_policy(
         Some(mode) => parse_icc_mode(mode)?,
     };
 
-    let mut egress_indices = BTreeSet::new();
+    let keyed_values = collect_indexed_values(labels, EGRESS_PREFIX)?;
+    let icc_allow_values = collect_indexed_values(labels, ICC_ALLOW_PREFIX)?;
+
+    let mut egress = Vec::with_capacity(keyed_values.len());
+    for (_, key, value) in keyed_values {
+        egress.push(parse_egress_value(&key, &value)?);
+    }
+    let mut icc_allow = Vec::with_capacity(icc_allow_values.len());
+    for (_, key, value) in icc_allow_values {
+        icc_allow.push(parse_icc_allow_value(&key, &value)?);
+    }
+
+    Ok(Some(ContainerPolicy {
+        enabled,
+        icc_mode,
+        egress,
+        icc_allow,
+    }))
+}
+
+fn collect_indexed_values(
+    labels: &BTreeMap<String, String>,
+    prefix: &str,
+) -> Result<Vec<(String, String, String)>, LabelParseError> {
+    let mut indices = BTreeSet::new();
     let mut keyed_values = Vec::new();
 
     for (key, value) in labels {
-        if !key.starts_with(EGRESS_PREFIX) {
+        if !key.starts_with(prefix) {
             continue;
         }
 
-        let index_part = key.trim_start_matches(EGRESS_PREFIX);
-        if index_part.is_empty() {
-            return Err(LabelParseError::InvalidEgressIndex(key.clone()));
-        }
-
-        if !index_part
-            .chars()
-            .all(|character| character.is_ascii_digit())
+        let index_part = key.trim_start_matches(prefix);
+        if index_part.is_empty()
+            || !index_part
+                .chars()
+                .all(|character| character.is_ascii_digit())
         {
             return Err(LabelParseError::InvalidEgressIndex(key.clone()));
         }
 
-        if !egress_indices.insert(index_part.to_string()) {
+        if !indices.insert(index_part.to_string()) {
             return Err(LabelParseError::DuplicateEgressIndex(key.clone()));
         }
 
@@ -77,17 +105,7 @@ pub fn parse_policy(
     }
 
     keyed_values.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut egress = Vec::with_capacity(keyed_values.len());
-    for (_, key, value) in keyed_values {
-        egress.push(parse_egress_value(&key, &value)?);
-    }
-
-    Ok(Some(ContainerPolicy {
-        enabled,
-        icc_mode,
-        egress,
-    }))
+    Ok(keyed_values)
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, LabelParseError> {
@@ -191,6 +209,34 @@ fn parse_ports(key: &str, parts: &[&str]) -> Result<Vec<PortSpec>, LabelParseErr
     Ok(ports)
 }
 
+fn parse_icc_allow_value(key: &str, value: &str) -> Result<IccAllowRule, LabelParseError> {
+    let parts: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some((target_part, port_parts)) = parts.split_first() else {
+        return Err(LabelParseError::InvalidIccAllow(
+            key.to_string(),
+            value.to_string(),
+        ));
+    };
+
+    let (kind, target) = split_once_colon(key, target_part)?;
+    if kind != "container" || target.is_empty() {
+        return Err(LabelParseError::InvalidContainerTarget(
+            key.to_string(),
+            (*target_part).to_string(),
+        ));
+    }
+
+    let ports = parse_ports(key, port_parts)?;
+    Ok(IccAllowRule {
+        target_container: target.to_string(),
+        ports,
+    })
+}
+
 fn split_once_colon<'a>(key: &str, part: &'a str) -> Result<(&'a str, &'a str), LabelParseError> {
     let Some((left, right)) = part.split_once(':') else {
         return Err(LabelParseError::InvalidEgress(
@@ -230,6 +276,7 @@ mod tests {
             ("portcullis.icc.mode", "deny"),
             ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443,udp:53"),
             ("portcullis.egress.1", "host:api.example.com,tcp:443"),
+            ("portcullis.icc.allow.0", "container:db,tcp:5432"),
         ]))
         .expect("parser should not fail")
         .expect("policy should be enabled");
@@ -247,6 +294,9 @@ mod tests {
             parsed.egress[1].target,
             EgressTarget::Hostname("api.example.com".to_string())
         );
+        assert_eq!(parsed.icc_allow.len(), 1);
+        assert_eq!(parsed.icc_allow[0].target_container, "db");
+        assert_eq!(parsed.icc_allow[0].ports[0].port, 5432);
     }
 
     #[test]
@@ -259,6 +309,7 @@ mod tests {
         .expect("policy should be enabled");
 
         assert_eq!(parsed.icc_mode, IccMode::Allow);
+        assert!(parsed.icc_allow.is_empty());
     }
 
     #[test]
@@ -360,5 +411,34 @@ mod tests {
             error,
             LabelParseError::InvalidEgressIndex("portcullis.egress.foo".to_string())
         );
+    }
+
+    #[test]
+    fn parse_policy_parses_icc_allow_rule() {
+        let parsed = parse_policy(&labels(&[
+            ("portcullis.enable", "true"),
+            ("portcullis.icc.mode", "allow-listed"),
+            ("portcullis.icc.allow.0", "container:redis,tcp:6379"),
+        ]))
+        .expect("parser should not fail")
+        .expect("policy should be enabled");
+
+        assert_eq!(parsed.icc_mode, IccMode::AllowListed);
+        assert_eq!(parsed.icc_allow.len(), 1);
+        assert_eq!(parsed.icc_allow[0].target_container, "redis");
+    }
+
+    #[test]
+    fn parse_policy_rejects_invalid_icc_allow_target() {
+        let error = parse_policy(&labels(&[
+            ("portcullis.enable", "true"),
+            ("portcullis.icc.allow.0", "host:redis,tcp:6379"),
+        ]))
+        .expect_err("invalid icc allow target should be rejected");
+
+        assert!(matches!(
+            error,
+            LabelParseError::InvalidContainerTarget(_, _)
+        ));
     }
 }

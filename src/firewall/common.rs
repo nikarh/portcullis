@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 
 use crate::dns::HostnameIpResolver;
@@ -19,6 +20,7 @@ pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
     ];
 
     let managed_sources = collect_managed_sources(snapshot);
+    let container_targets = collect_container_targets(snapshot);
 
     for container in &snapshot.containers {
         let Some(policy) = &container.policy else {
@@ -30,10 +32,26 @@ pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
         }
 
         for attachment in &container.attachments {
-            if policy.icc_mode == IccMode::Deny
-                && let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
-            {
-                lines.push(rule);
+            match policy.icc_mode {
+                IccMode::Deny => {
+                    if let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
+                    {
+                        lines.push(rule);
+                    }
+                }
+                IccMode::AllowListed => {
+                    append_icc_allow_list_rules(
+                        &mut lines,
+                        attachment.ip_address,
+                        &policy.icc_allow,
+                        &container_targets,
+                    );
+                    if let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
+                    {
+                        lines.push(rule);
+                    }
+                }
+                IccMode::Allow => {}
             }
 
             for rule in &policy.egress {
@@ -56,6 +74,7 @@ pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
     lines.join("\n")
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn build_apply_script_with_dns(
     snapshot: &RuntimeSnapshot,
     resolver: &mut dyn HostnameIpResolver,
@@ -68,6 +87,7 @@ pub fn build_apply_script_with_dns(
     ];
 
     let managed_sources = collect_managed_sources(snapshot);
+    let container_targets = collect_container_targets(snapshot);
 
     for container in &snapshot.containers {
         let Some(policy) = &container.policy else {
@@ -79,10 +99,26 @@ pub fn build_apply_script_with_dns(
         }
 
         for attachment in &container.attachments {
-            if policy.icc_mode == IccMode::Deny
-                && let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
-            {
-                lines.push(rule);
+            match policy.icc_mode {
+                IccMode::Deny => {
+                    if let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
+                    {
+                        lines.push(rule);
+                    }
+                }
+                IccMode::AllowListed => {
+                    append_icc_allow_list_rules(
+                        &mut lines,
+                        attachment.ip_address,
+                        &policy.icc_allow,
+                        &container_targets,
+                    );
+                    if let Some(rule) = build_icc_deny_rule(attachment.ip_address, &managed_sources)
+                    {
+                        lines.push(rule);
+                    }
+                }
+                IccMode::Allow => {}
             }
 
             for rule in &policy.egress {
@@ -214,6 +250,34 @@ fn collect_managed_sources(snapshot: &RuntimeSnapshot) -> ManagedSources {
     ManagedSources { ipv4, ipv6 }
 }
 
+fn collect_container_targets(snapshot: &RuntimeSnapshot) -> HashMap<String, Vec<IpAddr>> {
+    let mut by_key: HashMap<String, BTreeSet<IpAddr>> = HashMap::new();
+
+    for container in &snapshot.containers {
+        let mut keys = vec![container.id.clone(), container.name.clone()];
+        if let Some(trimmed) = container.name.strip_prefix('/') {
+            keys.push(trimmed.to_string());
+        }
+        for attachment in &container.attachments {
+            for alias in &attachment.aliases {
+                keys.push(alias.clone());
+            }
+        }
+
+        for key in keys {
+            let entry = by_key.entry(key).or_default();
+            for attachment in &container.attachments {
+                entry.insert(attachment.ip_address);
+            }
+        }
+    }
+
+    by_key
+        .into_iter()
+        .map(|(key, values)| (key, values.into_iter().collect()))
+        .collect()
+}
+
 fn build_icc_deny_rule(source: IpAddr, sources: &ManagedSources) -> Option<String> {
     match source {
         IpAddr::V4(value) => {
@@ -267,6 +331,38 @@ fn build_default_drop_rule(source: IpAddr) -> String {
         }
         IpAddr::V6(value) => {
             format!("add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {value} drop")
+        }
+    }
+}
+
+fn append_icc_allow_list_rules(
+    lines: &mut Vec<String>,
+    source: IpAddr,
+    icc_allow: &[crate::model::IccAllowRule],
+    container_targets: &HashMap<String, Vec<IpAddr>>,
+) {
+    for rule in icc_allow {
+        let Some(destinations) = container_targets.get(&rule.target_container) else {
+            continue;
+        };
+        for destination in destinations {
+            for port in &rule.ports {
+                let protocol = match port.protocol {
+                    Protocol::Tcp => "tcp",
+                    Protocol::Udp => "udp",
+                };
+                match (source, destination) {
+                    (IpAddr::V4(src), IpAddr::V4(dst)) => lines.push(format!(
+                        "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} ip daddr {dst} {protocol} dport {} accept",
+                        port.port
+                    )),
+                    (IpAddr::V6(src), IpAddr::V6(dst)) => lines.push(format!(
+                        "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} ip6 daddr {dst} {protocol} dport {} accept",
+                        port.port
+                    )),
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -339,6 +435,7 @@ mod tests {
                     network_name: "bridge".to_string(),
                     ip_address: source_ip,
                     subnet,
+                    aliases: vec!["web".to_string()],
                 }],
                 policy: Some(ContainerPolicy {
                     enabled: true,
@@ -350,6 +447,7 @@ mod tests {
                             port: 443,
                         }],
                     }],
+                    icc_allow: Vec::new(),
                 }),
             }],
         }
@@ -380,5 +478,46 @@ mod tests {
 
         let script = build_apply_script_with_dns(&snapshot, &mut resolver);
         assert!(matches!(script, Err(FirewallError::DnsResolve { .. })));
+    }
+
+    #[test]
+    fn build_apply_script_with_icc_allowlisted_alias_target() {
+        let mut snapshot = snapshot_with_hostname_rule();
+        let peer_ip: IpAddr = match "172.18.0.10".parse() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse peer ip: {error}"),
+        };
+        let subnet: ipnet::IpNet = match "172.18.0.0/16".parse() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse subnet: {error}"),
+        };
+
+        snapshot.containers.push(ContainerSnapshot {
+            id: "peer".to_string(),
+            name: "/peer".to_string(),
+            labels: BTreeMap::new(),
+            attachments: vec![NetworkAttachment {
+                network_id: "net0".to_string(),
+                network_name: "bridge".to_string(),
+                ip_address: peer_ip,
+                subnet,
+                aliases: vec!["db".to_string()],
+            }],
+            policy: None,
+        });
+
+        if let Some(policy) = &mut snapshot.containers[0].policy {
+            policy.icc_mode = crate::model::IccMode::AllowListed;
+            policy.icc_allow = vec![crate::model::IccAllowRule {
+                target_container: "db".to_string(),
+                ports: vec![PortSpec {
+                    protocol: Protocol::Tcp,
+                    port: 5432,
+                }],
+            }];
+        }
+
+        let script = build_apply_script(&snapshot);
+        assert!(script.contains("ip daddr 172.18.0.10 tcp dport 5432 accept"));
     }
 }
