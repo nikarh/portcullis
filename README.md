@@ -128,6 +128,9 @@ portcullis.network.enforce=true
 When enabled on a Docker network, Portcullis adds a baseline deny for that network subnet.
 Labeled container allow rules are still added and evaluated first.
 
+Implicit behavior:
+- When policy is enabled for a container, Portcullis automatically allows DNS to that container's Docker network gateway on `udp/53` and `tcp/53`.
+
 ICC target lookup notes:
 - `container:<value>` is resolved from Docker runtime metadata, not DNS.
 - `<value>` can be container ID, container name, or network alias.

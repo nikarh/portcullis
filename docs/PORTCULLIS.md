@@ -128,6 +128,9 @@ ICC allowlist resolution details:
 - container name (`/name` and `name`),
 - Docker network aliases from endpoint metadata.
 
+Implicit DNS behavior:
+- For policy-enabled containers, Portcullis automatically adds DNS allow rules to the network gateway (`udp/53`, `tcp/53`) so container DNS resolution keeps working by default.
+
 ### 5.5 Logging Model
 - `info`: major lifecycle activity and selections (startup cleanup, backend selection, snapshot/apply, refresh triggers).
 - `debug`: runtime change details.
