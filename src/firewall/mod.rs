@@ -14,6 +14,8 @@ pub use cli::CommandNftRunner;
 pub use common::{
     build_apply_commands, build_apply_commands_with_dns, build_apply_script,
     build_apply_script_with_dns, build_cleanup_commands, build_cleanup_script,
+    build_refresh_commands, build_refresh_commands_with_dns, build_refresh_script,
+    build_refresh_script_with_dns,
 };
 pub use iptables::{CommandIptablesRunner, IptablesFirewall};
 pub use libnftables::LibNftablesRunner;
@@ -59,15 +61,21 @@ where
     }
 
     pub fn apply(&self, snapshot: &RuntimeSnapshot) -> Result<(), FirewallError> {
-        self.cleanup()?;
-        let commands = build_apply_commands(snapshot);
+        let commands = build_refresh_commands(snapshot);
         let command_count = commands.len();
         info!(
             command_count,
             container_count = snapshot.containers.len(),
             "applying nftables changes"
         );
-        self.runner.run_commands(&commands)
+        match self.runner.run_commands(&commands) {
+            Ok(()) => Ok(()),
+            Err(error) if is_missing_table_error(&error) => {
+                let init_commands = build_apply_commands(snapshot);
+                self.runner.run_commands(&init_commands)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn apply_with_dns(
@@ -75,15 +83,21 @@ where
         snapshot: &RuntimeSnapshot,
         resolver: &mut dyn HostnameIpResolver,
     ) -> Result<(), FirewallError> {
-        self.cleanup()?;
-        let commands = build_apply_commands_with_dns(snapshot, resolver)?;
+        let commands = build_refresh_commands_with_dns(snapshot, resolver)?;
         let command_count = commands.len();
         info!(
             command_count,
             container_count = snapshot.containers.len(),
             "applying nftables changes with DNS sets"
         );
-        self.runner.run_commands(&commands)
+        match self.runner.run_commands(&commands) {
+            Ok(()) => Ok(()),
+            Err(error) if is_missing_table_error(&error) => {
+                let init_commands = build_apply_commands_with_dns(snapshot, resolver)?;
+                self.runner.run_commands(&init_commands)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
@@ -111,6 +125,16 @@ where
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+fn is_missing_table_error(error: &FirewallError) -> bool {
+    match error {
+        FirewallError::CommandFailure { stderr, .. }
+        | FirewallError::LibCommandFailure { stderr, .. } => {
+            stderr.contains("No such file") || stderr.contains("No such file or directory")
+        }
+        _ => false,
     }
 }
 
@@ -254,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_runs_cleanup_then_apply() {
+    fn apply_uses_refresh_commands() {
         let runner = RecordingRunner::new();
         let firewall = NftablesFirewall::new(runner.clone());
         let snapshot = sample_snapshot();
@@ -263,9 +287,9 @@ mod tests {
         assert!(result.is_ok());
 
         let scripts = runner.scripts();
-        assert_eq!(scripts.len(), 2);
-        assert_eq!(scripts[0], "delete table inet portcullis");
-        assert!(scripts[1].contains("add table inet portcullis"));
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("flush table inet portcullis"));
+        assert!(scripts[0].contains("add chain inet portcullis egress"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::model::{EgressTarget, IccMode, Protocol, RuntimeSnapshot};
 use super::FirewallError;
 
 const CHAIN_NAME: &str = "PORTCULLIS_EGRESS";
+const STAGING_CHAIN_NAME: &str = "PORTCULLIS_EGRESS_NEXT";
 const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,53 +61,90 @@ where
         snapshot: &RuntimeSnapshot,
         resolver: &mut dyn HostnameIpResolver,
     ) -> Result<(), FirewallError> {
-        self.cleanup()?;
         let use_ipset = detect_ipset_available();
         if use_ipset {
             info!("ipset detected; using ipset-backed hostname rules");
         } else {
             info!("ipset not detected; using direct iptables hostname rules");
         }
-        let commands = build_apply_commands_with_dns(snapshot, resolver, use_ipset)?;
+        self.cleanup_chain(STAGING_CHAIN_NAME)?;
+        self.runner.run(
+            "iptables",
+            &["-N".to_string(), STAGING_CHAIN_NAME.to_string()],
+        )?;
 
+        let commands =
+            build_apply_commands_with_dns(snapshot, resolver, use_ipset, STAGING_CHAIN_NAME)?;
         for command in &commands {
             self.runner.run(command.program, &command.args)?;
         }
+
+        self.runner.run(
+            "iptables",
+            &[
+                "-I".to_string(),
+                DOCKER_USER_CHAIN.to_string(),
+                "1".to_string(),
+                "-j".to_string(),
+                STAGING_CHAIN_NAME.to_string(),
+            ],
+        )?;
+        self.delete_jump_to_chain(CHAIN_NAME)?;
+        self.cleanup_chain(CHAIN_NAME)?;
+        self.runner.run(
+            "iptables",
+            &[
+                "-E".to_string(),
+                STAGING_CHAIN_NAME.to_string(),
+                CHAIN_NAME.to_string(),
+            ],
+        )?;
 
         Ok(())
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
-        let commands = vec![
-            CommandSpec {
-                program: "iptables",
-                args: vec![
-                    "-D".to_string(),
-                    DOCKER_USER_CHAIN.to_string(),
-                    "-j".to_string(),
-                    CHAIN_NAME.to_string(),
-                ],
-            },
-            CommandSpec {
-                program: "iptables",
-                args: vec!["-F".to_string(), CHAIN_NAME.to_string()],
-            },
-            CommandSpec {
-                program: "iptables",
-                args: vec!["-X".to_string(), CHAIN_NAME.to_string()],
-            },
-        ];
+        self.delete_jump_to_chain(CHAIN_NAME)?;
+        self.delete_jump_to_chain(STAGING_CHAIN_NAME)?;
+        self.cleanup_chain(CHAIN_NAME)?;
+        self.cleanup_chain(STAGING_CHAIN_NAME)?;
 
-        for command in &commands {
-            match self.runner.run(command.program, &command.args) {
+        info!("iptables cleanup completed");
+        Ok(())
+    }
+
+    fn delete_jump_to_chain(&self, chain: &str) -> Result<(), FirewallError> {
+        match self.runner.run(
+            "iptables",
+            &[
+                "-D".to_string(),
+                DOCKER_USER_CHAIN.to_string(),
+                "-j".to_string(),
+                chain.to_string(),
+            ],
+        ) {
+            Ok(()) => Ok(()),
+            Err(FirewallError::CommandFailure { stderr, .. })
+                if is_ignorable_cleanup_stderr(&stderr) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn cleanup_chain(&self, chain: &str) -> Result<(), FirewallError> {
+        for args in [
+            vec!["-F".to_string(), chain.to_string()],
+            vec!["-X".to_string(), chain.to_string()],
+        ] {
+            match self.runner.run("iptables", &args) {
                 Ok(()) => {}
                 Err(FirewallError::CommandFailure { stderr, .. })
                     if is_ignorable_cleanup_stderr(&stderr) => {}
                 Err(error) => return Err(error),
             }
         }
-
-        info!("iptables cleanup completed");
         Ok(())
     }
 }
@@ -128,23 +166,9 @@ fn build_apply_commands_with_dns(
     snapshot: &RuntimeSnapshot,
     resolver: &mut dyn HostnameIpResolver,
     use_ipset: bool,
+    chain_name: &str,
 ) -> Result<Vec<CommandSpec>, FirewallError> {
-    let mut commands = vec![
-        CommandSpec {
-            program: "iptables",
-            args: vec!["-N".to_string(), CHAIN_NAME.to_string()],
-        },
-        CommandSpec {
-            program: "iptables",
-            args: vec![
-                "-I".to_string(),
-                DOCKER_USER_CHAIN.to_string(),
-                "1".to_string(),
-                "-j".to_string(),
-                CHAIN_NAME.to_string(),
-            ],
-        },
-    ];
+    let mut commands = Vec::new();
 
     let managed_ipv4 = collect_managed_ipv4(snapshot);
     let container_targets = collect_container_targets(snapshot);
@@ -164,15 +188,16 @@ fn build_apply_commands_with_dns(
             };
 
             if policy.icc_mode == IccMode::Deny {
-                append_icc_drop_commands(&mut commands, source_ipv4, &managed_ipv4);
+                append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
             } else if policy.icc_mode == IccMode::AllowListed {
                 append_icc_allow_list_commands(
                     &mut commands,
+                    chain_name,
                     source_ipv4,
                     &policy.icc_allow,
                     &container_targets,
                 );
-                append_icc_drop_commands(&mut commands, source_ipv4, &managed_ipv4);
+                append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
             }
 
             for rule in &policy.egress {
@@ -184,6 +209,7 @@ fn build_apply_commands_with_dns(
 
                         append_ip_target_commands(
                             &mut commands,
+                            chain_name,
                             source_ipv4,
                             &cidr.to_string(),
                             &rule.ports,
@@ -192,6 +218,7 @@ fn build_apply_commands_with_dns(
                     EgressTarget::Hostname(host) => {
                         append_hostname_target_commands(
                             &mut commands,
+                            chain_name,
                             resolver,
                             source_ipv4,
                             host,
@@ -202,7 +229,7 @@ fn build_apply_commands_with_dns(
                 }
             }
 
-            append_default_drop_command(&mut commands, source_ipv4);
+            append_default_drop_command(&mut commands, chain_name, source_ipv4);
         }
     }
 
@@ -211,6 +238,7 @@ fn build_apply_commands_with_dns(
 
 fn append_icc_drop_commands(
     commands: &mut Vec<CommandSpec>,
+    chain_name: &str,
     source_ipv4: std::net::Ipv4Addr,
     managed_ipv4: &[std::net::Ipv4Addr],
 ) {
@@ -219,7 +247,7 @@ fn append_icc_drop_commands(
             program: "iptables",
             args: vec![
                 "-A".to_string(),
-                CHAIN_NAME.to_string(),
+                chain_name.to_string(),
                 "-s".to_string(),
                 format!("{source_ipv4}/32"),
                 "-d".to_string(),
@@ -233,6 +261,7 @@ fn append_icc_drop_commands(
 
 fn append_ip_target_commands(
     commands: &mut Vec<CommandSpec>,
+    chain_name: &str,
     source_ipv4: std::net::Ipv4Addr,
     destination: &str,
     ports: &[crate::model::PortSpec],
@@ -242,7 +271,7 @@ fn append_ip_target_commands(
             program: "iptables",
             args: vec![
                 "-A".to_string(),
-                CHAIN_NAME.to_string(),
+                chain_name.to_string(),
                 "-s".to_string(),
                 format!("{source_ipv4}/32"),
                 "-d".to_string(),
@@ -260,6 +289,7 @@ fn append_ip_target_commands(
 
 fn append_hostname_target_commands(
     commands: &mut Vec<CommandSpec>,
+    chain_name: &str,
     resolver: &mut dyn HostnameIpResolver,
     source_ipv4: std::net::Ipv4Addr,
     host: &str,
@@ -313,7 +343,7 @@ fn append_hostname_target_commands(
                 program: "iptables",
                 args: vec![
                     "-A".to_string(),
-                    CHAIN_NAME.to_string(),
+                    chain_name.to_string(),
                     "-s".to_string(),
                     format!("{source_ipv4}/32"),
                     "-m".to_string(),
@@ -337,7 +367,7 @@ fn append_hostname_target_commands(
                     program: "iptables",
                     args: vec![
                         "-A".to_string(),
-                        CHAIN_NAME.to_string(),
+                        chain_name.to_string(),
                         "-s".to_string(),
                         format!("{source_ipv4}/32"),
                         "-d".to_string(),
@@ -378,12 +408,16 @@ fn detect_ipset_available() -> bool {
     }
 }
 
-fn append_default_drop_command(commands: &mut Vec<CommandSpec>, source_ipv4: std::net::Ipv4Addr) {
+fn append_default_drop_command(
+    commands: &mut Vec<CommandSpec>,
+    chain_name: &str,
+    source_ipv4: std::net::Ipv4Addr,
+) {
     commands.push(CommandSpec {
         program: "iptables",
         args: vec![
             "-A".to_string(),
-            CHAIN_NAME.to_string(),
+            chain_name.to_string(),
             "-s".to_string(),
             format!("{source_ipv4}/32"),
             "-j".to_string(),
@@ -421,6 +455,7 @@ fn protocol_name(protocol: Protocol) -> &'static str {
 
 fn append_icc_allow_list_commands(
     commands: &mut Vec<CommandSpec>,
+    chain_name: &str,
     source_ipv4: std::net::Ipv4Addr,
     rules: &[crate::model::IccAllowRule],
     container_targets: &HashMap<String, Vec<std::net::Ipv4Addr>>,
@@ -435,7 +470,7 @@ fn append_icc_allow_list_commands(
                     program: "iptables",
                     args: vec![
                         "-A".to_string(),
-                        CHAIN_NAME.to_string(),
+                        chain_name.to_string(),
                         "-s".to_string(),
                         format!("{source_ipv4}/32"),
                         "-d".to_string(),
@@ -562,7 +597,8 @@ mod tests {
     #[test]
     fn build_commands_includes_iptables_for_hostname_without_ipset() {
         let mut resolver = MockResolver;
-        let commands = build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false);
+        let commands =
+            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, CHAIN_NAME);
         assert!(commands.is_ok());
         let value = match commands {
             Ok(items) => items,
@@ -614,7 +650,7 @@ mod tests {
         }
 
         let mut resolver = MockResolver;
-        let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false)
+        let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
             .expect("expected command build to succeed");
         assert!(commands.iter().any(|command| {
             command.program == "iptables"
@@ -626,20 +662,13 @@ mod tests {
     }
 
     #[test]
-    fn build_commands_hook_into_docker_user_chain() {
+    fn build_commands_target_supplied_chain_name() {
         let mut resolver = MockResolver;
-        let commands = build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false)
-            .expect("commands");
+        let commands =
+            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, "MYCHAIN")
+                .expect("commands");
         assert!(commands.iter().any(|command| {
-            command.program == "iptables"
-                && command.args
-                    == vec![
-                        "-I".to_string(),
-                        DOCKER_USER_CHAIN.to_string(),
-                        "1".to_string(),
-                        "-j".to_string(),
-                        CHAIN_NAME.to_string(),
-                    ]
+            command.program == "iptables" && command.args.iter().any(|arg| arg == "MYCHAIN")
         }));
     }
 
@@ -683,8 +712,9 @@ mod tests {
     #[test]
     fn build_commands_includes_ipset_for_hostname_with_ipset() {
         let mut resolver = MockResolver;
-        let commands = build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, true)
-            .expect("expected command build to succeed");
+        let commands =
+            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, true, CHAIN_NAME)
+                .expect("expected command build to succeed");
         assert!(commands.iter().any(|command| {
             command.program == "ipset"
                 && command.args.first() == Some(&"create".to_string())
