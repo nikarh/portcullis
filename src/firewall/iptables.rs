@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::process::Command;
 
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace};
 
 use crate::dns::HostnameIpResolver;
 use crate::model::{EgressTarget, IccMode, Protocol, RuntimeSnapshot};
@@ -25,17 +25,13 @@ pub struct CommandIptablesRunner;
 
 impl IptablesRunner for CommandIptablesRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<(), FirewallError> {
-        debug!(
-            command = %format_shell_command(program, args),
-            "executing firewall command"
-        );
+        trace!(program, args = ?args, "executing firewall command");
         let output = Command::new(program)
             .args(args)
             .output()
             .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
 
         if output.status.success() {
-            trace!(command = %format_shell_command(program, args), "firewall command completed");
             return Ok(());
         }
 
@@ -66,12 +62,6 @@ where
         self.cleanup()?;
         let commands = build_apply_commands_with_dns(snapshot, resolver)?;
 
-        info!(command_count = commands.len(), "applying iptables changes");
-        for command in &commands {
-            debug!(program = command.program, args = ?command.args, "iptables command");
-        }
-        trace!(?commands, "iptables apply command list");
-
         for command in &commands {
             self.runner.run(command.program, &command.args)?;
         }
@@ -101,7 +91,6 @@ where
         ];
 
         for command in &commands {
-            debug!(program = command.program, args = ?command.args, "iptables cleanup command");
             match self.runner.run(command.program, &command.args) {
                 Ok(()) => {}
                 Err(FirewallError::CommandFailure { stderr, .. })
@@ -111,7 +100,7 @@ where
             }
         }
 
-        warn!("iptables cleanup completed (missing chain errors ignored)");
+        info!("iptables cleanup completed");
         Ok(())
     }
 }
@@ -412,15 +401,6 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x1000_0000_01b3);
     }
     hash
-}
-
-fn format_shell_command(program: &str, args: &[String]) -> String {
-    let mut command = String::from(program);
-    for arg in args {
-        command.push(' ');
-        command.push_str(arg);
-    }
-    command
 }
 
 fn collect_container_targets(

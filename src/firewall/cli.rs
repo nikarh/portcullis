@@ -1,7 +1,7 @@
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
-use tracing::{debug, trace};
+use tracing::trace;
 
 use super::{FirewallError, NftRunner};
 
@@ -9,7 +9,8 @@ pub struct CommandNftRunner;
 
 impl NftRunner for CommandNftRunner {
     fn run_commands(&self, commands: &[String]) -> Result<(), FirewallError> {
-        debug!(program = "nft", commands = ?commands, "executing firewall commands");
+        trace!(program = "nft", commands = ?commands, "executing firewall commands");
+
         let script = format!("{}\n", commands.join("\n"));
         let mut child = Command::new("nft")
             .args(["-f", "-"])
@@ -30,13 +31,11 @@ impl NftRunner for CommandNftRunner {
             .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
 
         if output.status.success() {
-            trace!("nft cli script executed successfully");
             return Ok(());
         }
 
         let code = output.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        debug!(code, stderr = %stderr, "nft cli script execution failed");
         Err(FirewallError::CommandFailure { code, stderr })
     }
 }

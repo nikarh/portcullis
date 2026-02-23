@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
-use tracing::{debug, trace};
+use tracing::trace;
 
 use super::{FirewallError, NftRunner};
 
@@ -150,27 +150,18 @@ impl LibNftablesRunner {
 
 impl NftRunner for LibNftablesRunner {
     fn run_commands(&self, commands: &[String]) -> Result<(), FirewallError> {
-        debug!(
+        trace!(
             program = "nft",
             commands = ?commands,
             "executing firewall commands"
         );
+
         let script = format!("{}\n", commands.join("\n"));
         let mut guard = self
             .context
             .lock()
             .map_err(|_| FirewallError::LibContextLock)?;
-        let result = guard.run_script(&script);
-        if result.is_ok() {
-            trace!("nft libnftables script executed successfully");
-            return Ok(());
-        }
-
-        if let Err(FirewallError::LibCommandFailure { code, stderr }) = &result {
-            debug!(code = *code, stderr = %stderr, "nft libnftables script execution failed");
-        }
-
-        result
+        guard.run_script(&script)
     }
 }
 

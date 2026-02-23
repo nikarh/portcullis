@@ -88,7 +88,7 @@ fn main() {
     };
 
     if let Err(error) = run(&config) {
-        error!(%error, "prototype execution failed");
+        error!(%error, "portcullis run failed");
         std::process::exit(1);
     }
 }

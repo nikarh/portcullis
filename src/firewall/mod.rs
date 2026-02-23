@@ -5,7 +5,7 @@ mod iptables;
 mod libnftables;
 
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::dns::HostnameIpResolver;
 use crate::model::RuntimeSnapshot;
@@ -67,7 +67,6 @@ where
             container_count = snapshot.containers.len(),
             "applying nftables changes"
         );
-        debug!(commands = ?commands, "nft apply commands");
         self.runner.run_commands(&commands)
     }
 
@@ -84,7 +83,6 @@ where
             container_count = snapshot.containers.len(),
             "applying nftables changes with DNS sets"
         );
-        debug!(commands = ?commands, "nft apply commands");
         self.runner.run_commands(&commands)
     }
 
@@ -92,7 +90,6 @@ where
         let commands = build_cleanup_commands();
         let command_count = commands.len();
         info!(command_count, "cleaning up nftables table");
-        debug!(commands = ?commands, "nft cleanup commands");
         match self.runner.run_commands(&commands) {
             Ok(()) => {
                 info!("nftables cleanup completed");
@@ -102,14 +99,14 @@ where
                 if stderr.contains("No such file")
                     || stderr.contains("No such file or directory") =>
             {
-                warn!("nftables table not found during cleanup; continuing");
+                warn!("nftables cleanup ignored: table does not exist");
                 Ok(())
             }
             Err(FirewallError::LibCommandFailure { stderr, .. })
                 if stderr.contains("No such file")
                     || stderr.contains("No such file or directory") =>
             {
-                warn!("nftables table not found during cleanup; continuing");
+                warn!("nftables cleanup ignored: table does not exist");
                 Ok(())
             }
             Err(error) => Err(error),
