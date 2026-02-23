@@ -82,13 +82,14 @@ cargo build --release
 
 ## CLI
 ```text
-portcullis [--docker-socket <path>] [--firewall-backend <auto|nftables|iptables>] [--log-level <error|warn|info|debug|trace>]
+portcullis [--docker-socket <path>] [--firewall-backend <auto|nftables|iptables>] [--log-level <error|warn|info|debug|trace>] [--fail-closed]
 ```
 
 Options:
 - `--docker-socket`: Docker Unix socket path. Default: `/var/run/docker.sock`
 - `--firewall-backend`: `auto`, `nftables`, or `iptables`. Default: `auto`
 - `--log-level`: `error|warn|info|debug|trace`. Default: `info`
+- `--fail-closed`: force default-deny for all discovered containers, even without labels.
 
 ## Labels
 
