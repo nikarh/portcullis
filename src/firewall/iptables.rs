@@ -24,6 +24,7 @@ struct CommandSpec {
 pub trait IptablesRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<(), FirewallError>;
     fn run_iptables_restore(&self, lines: &[String]) -> Result<(), FirewallError>;
+    fn run_ipset_restore(&self, lines: &[String]) -> Result<(), FirewallError>;
     fn read_iptables_save_filter(&self) -> Result<String, FirewallError>;
 }
 
@@ -92,6 +93,50 @@ impl IptablesRunner for CommandIptablesRunner {
         })
     }
 
+    fn run_ipset_restore(&self, lines: &[String]) -> Result<(), FirewallError> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        trace!(
+            program = "ipset",
+            args = ?["restore"],
+            line_count = lines.len(),
+            lines = ?lines,
+            "executing firewall batch command"
+        );
+        let mut child = Command::new("ipset")
+            .arg("restore")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+        let mut script = String::new();
+        for line in lines {
+            script.push_str(line);
+            script.push('\n');
+        }
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(script.as_bytes())
+                .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+        } else {
+            return Err(FirewallError::CommandExecution(
+                "ipset restore stdin unavailable".to_string(),
+            ));
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(FirewallError::CommandFailure {
+            code: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
     fn read_iptables_save_filter(&self) -> Result<String, FirewallError> {
         trace!(program = "iptables-save", args = ?["-t", "filter"], "reading firewall filter table");
         let output = Command::new("iptables-save")
@@ -129,14 +174,18 @@ where
         let commands =
             build_apply_commands_with_dns(snapshot, resolver, self.use_ipset, CHAIN_NAME)?;
         let mut restore_lines = Vec::new();
+        let mut ipset_restore_lines = Vec::new();
         restore_lines.push(format!("-F {CHAIN_NAME}"));
         for command in commands {
             if command.program == "iptables" {
                 restore_lines.push(iptables_restore_line(&command.args));
+            } else if command.program == "ipset" {
+                ipset_restore_lines.push(command_line(&command.args));
             } else {
                 self.runner.run(command.program, &command.args)?;
             }
         }
+        self.runner.run_ipset_restore(&ipset_restore_lines)?;
         self.runner.run_iptables_restore(&restore_lines)?;
 
         Ok(())
@@ -679,6 +728,10 @@ fn collect_container_targets(
 }
 
 fn iptables_restore_line(args: &[String]) -> String {
+    command_line(args)
+}
+
+fn command_line(args: &[String]) -> String {
     args.join(" ")
 }
 
@@ -931,6 +984,17 @@ mod tests {
         }
 
         fn run_iptables_restore(&self, _lines: &[String]) -> Result<(), FirewallError> {
+            let mut guard = self
+                .results
+                .lock()
+                .expect("failed to lock mock iptables runner");
+            guard.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn run_ipset_restore(&self, lines: &[String]) -> Result<(), FirewallError> {
+            if lines.is_empty() {
+                return Ok(());
+            }
             let mut guard = self
                 .results
                 .lock()
