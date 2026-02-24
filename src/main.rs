@@ -1,3 +1,10 @@
+mod dns;
+mod firewall;
+mod labels;
+mod logging;
+mod model;
+mod monitor;
+
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
@@ -13,12 +20,10 @@ use pico_args::Arguments;
 use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
-use portcullis::dns::{DnsProxyCache, SystemUpstreamResolver};
-use portcullis::firewall::{
-    CommandIptablesRunner, FirewallError, IptablesFirewall, NftablesFirewall,
-};
-use portcullis::logging::{self, LogLevel, LoggingError};
-use portcullis::monitor::{
+use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
+use crate::firewall::{CommandIptablesRunner, FirewallError, IptablesFirewall, NftablesFirewall};
+use crate::logging::{LogLevel, LoggingError};
+use crate::monitor::{
     DockerEvent, DockerEventKind, DockerFirewallBackend, DockerMonitor, MonitorError,
     RuntimeChangeTracker, RuntimeState, SocketDockerApi,
 };
@@ -153,14 +158,14 @@ fn write_stderr_line(message: &str) -> Result<(), std::io::Error> {
 }
 
 enum ActiveFirewall {
-    Nftables(NftablesFirewall<portcullis::firewall::LibNftablesRunner>),
+    Nftables(NftablesFirewall<crate::firewall::LibNftablesRunner>),
     Iptables(IptablesFirewall<CommandIptablesRunner>),
 }
 
 impl ActiveFirewall {
     fn apply(
         &self,
-        snapshot: &portcullis::model::RuntimeSnapshot,
+        snapshot: &crate::model::RuntimeSnapshot,
         dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
     ) -> Result<(), FirewallError> {
         match self {
@@ -212,9 +217,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         FirewallBackend::Nftables => {
             ActiveFirewall::Nftables(NftablesFirewall::with_libnftables()?)
         }
-        FirewallBackend::Iptables => {
-            ActiveFirewall::Iptables(IptablesFirewall::<CommandIptablesRunner>::with_cli())
-        }
+        FirewallBackend::Iptables => ActiveFirewall::Iptables(IptablesFirewall::with_cli()),
     };
 
     info!("performing startup firewall cleanup");
@@ -231,6 +234,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.collect_state()?;
     let mut event_stream = connect_event_stream(&config.docker_socket)?;
+
     apply_runtime_state(
         &runtime_state,
         &firewall,
@@ -346,13 +350,13 @@ fn apply_event_update<A>(
     event: &DockerEvent,
 ) -> Result<bool, MainError>
 where
-    A: portcullis::monitor::DockerApi,
+    A: crate::monitor::DockerApi,
 {
     let mut changed = false;
     match event.kind {
         DockerEventKind::Container => match event.action.as_str() {
             "destroy" => {
-                changed |= monitor.remove_container(runtime_state, &event.id);
+                changed |= DockerMonitor::<A>::remove_container(runtime_state, &event.id);
             }
             "create" | "start" | "rename" | "update" | "connect" | "disconnect" => {
                 let container_changed = monitor.refresh_container(runtime_state, &event.id)?;
@@ -373,7 +377,7 @@ where
         },
         DockerEventKind::Network => match event.action.as_str() {
             "destroy" => {
-                changed |= monitor.remove_network(runtime_state, &event.id);
+                changed |= DockerMonitor::<A>::remove_network(runtime_state, &event.id);
             }
             "create" | "update" | "connect" | "disconnect" => {
                 let (network_result, container_ids) =
@@ -398,7 +402,7 @@ fn should_delay_apply_for_create(action: &str, changed: bool, has_attachments: b
     action == "create" && changed && !has_attachments
 }
 
-fn enforce_fail_closed_defaults(snapshot: &mut portcullis::model::RuntimeSnapshot) {
+fn enforce_fail_closed_defaults(snapshot: &mut crate::model::RuntimeSnapshot) {
     for container in &mut snapshot.containers {
         match &mut container.policy {
             Some(policy) => {
@@ -409,12 +413,12 @@ fn enforce_fail_closed_defaults(snapshot: &mut portcullis::model::RuntimeSnapsho
                 }
             }
             None => {
-                container.policy = Some(portcullis::model::ContainerPolicy {
+                container.policy = Some(crate::model::ContainerPolicy {
                     enabled: true,
-                    icc_mode: portcullis::model::IccMode::Allow,
+                    icc_mode: crate::model::IccMode::Allow,
                     egress: Vec::new(),
                     icc_allow: Vec::new(),
-                    dns_targets: vec![portcullis::model::DnsTarget::Docker],
+                    dns_targets: vec![crate::model::DnsTarget::Docker],
                 });
             }
         }
