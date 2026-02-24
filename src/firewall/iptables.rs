@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::net::IpAddr;
 use std::process::Command;
@@ -564,8 +564,8 @@ fn append_implicit_dns_allow_commands(
     source_ipv4: std::net::Ipv4Addr,
     gateway: Option<IpAddr>,
     dns_targets: &[DnsTarget],
-    runtime_dns_servers: &[IpAddr],
-    host_dns_servers: &[IpAddr],
+    runtime_dns_servers: &HashSet<IpAddr>,
+    host_dns_servers: &HashSet<IpAddr>,
 ) {
     let mut allow_any = false;
     let mut destinations = BTreeSet::new();
@@ -790,8 +790,8 @@ fn build_cleanup_restore_lines(filter_rules: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::collections::VecDeque;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -822,8 +822,8 @@ mod tests {
     }
 
     fn sample_snapshot() -> RuntimeSnapshot {
-        let mut labels = BTreeMap::new();
-        labels.insert("portcullis.enable".to_string(), "true".to_string());
+        let labels: HashMap<String, String> =
+            [("portcullis.enable".to_string(), "true".to_string())].into();
 
         let source_ip: IpAddr = match "172.18.0.2".parse() {
             Ok(value) => value,
@@ -847,8 +847,8 @@ mod tests {
                     subnet,
                     aliases: vec!["web".to_string(), "app".to_string()],
                 }],
-                runtime_dns_servers: Vec::new(),
-                host_dns_servers: Vec::new(),
+                runtime_dns_servers: HashSet::new(),
+                host_dns_servers: HashSet::new(),
                 policy: Some(ContainerPolicy {
                     enabled: true,
                     icc_mode: IccMode::Allow,
@@ -901,7 +901,7 @@ mod tests {
         snapshot.containers.push(ContainerSnapshot {
             id: "peer".to_string(),
             name: "/peer".to_string(),
-            labels: BTreeMap::new(),
+            labels: HashMap::new(),
             attachments: vec![NetworkAttachment {
                 network_id: "net0".to_string(),
                 network_name: "bridge".to_string(),
@@ -910,8 +910,8 @@ mod tests {
                 subnet,
                 aliases: vec!["db".to_string()],
             }],
-            runtime_dns_servers: Vec::new(),
-            host_dns_servers: Vec::new(),
+            runtime_dns_servers: HashSet::new(),
+            host_dns_servers: HashSet::new(),
             policy: None,
         });
         if let Some(policy) = &mut snapshot.containers[0].policy {

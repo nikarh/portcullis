@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -72,10 +72,10 @@ pub struct NetworkAttachment {
 pub struct ContainerSnapshot {
     pub id: String,
     pub name: String,
-    pub labels: BTreeMap<String, String>,
+    pub labels: HashMap<String, String>,
     pub attachments: Vec<NetworkAttachment>,
-    pub runtime_dns_servers: Vec<IpAddr>,
-    pub host_dns_servers: Vec<IpAddr>,
+    pub runtime_dns_servers: HashSet<IpAddr>,
+    pub host_dns_servers: HashSet<IpAddr>,
     pub policy: Option<ContainerPolicy>,
 }
 

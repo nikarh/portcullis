@@ -5,7 +5,7 @@ mod logging;
 mod model;
 mod monitor;
 
-use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
@@ -197,10 +197,9 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let api = SocketDockerApi::new(config.docker_socket.clone());
     let monitor = DockerMonitor::new(api);
-    let detected_backend = monitor.firewall_backend()?;
 
     let selected_backend = match config.firewall_backend {
-        FirewallBackend::Auto => match detected_backend {
+        FirewallBackend::Auto => match monitor.firewall_backend()? {
             DockerFirewallBackend::Nftables => FirewallBackend::Nftables,
             DockerFirewallBackend::Iptables => FirewallBackend::Iptables,
         },
@@ -208,7 +207,6 @@ fn run(config: &Config) -> Result<(), MainError> {
     };
     info!(
         configured_backend = ?config.firewall_backend,
-        detected_backend = ?detected_backend,
         selected_backend = ?selected_backend,
         "selected firewall backend"
     );
@@ -265,9 +263,14 @@ fn run(config: &Config) -> Result<(), MainError> {
                     object_id = %event.id,
                     object_name = ?event.name,
                     kind = ?event.kind,
-                    "docker event requires firewall refresh"
+                    "docker event may require firewall refresh"
                 );
-                let update_result = apply_event_update(&monitor, &mut runtime_state, &event);
+
+                let update_result = monitor
+                    .resolve_event_actions(&event)
+                    .map(|actions| runtime_state.apply_actions(actions))
+                    .map_err(MainError::from);
+
                 match update_result {
                     Ok(false) => {
                         trace!(event = ?event, "docker event produced no policy state changes");
@@ -343,76 +346,6 @@ fn apply_runtime_state(
     firewall.apply(&snapshot, dns_cache)?;
     info!("firewall rules applied");
     Ok(())
-}
-
-fn apply_event_update<A>(
-    monitor: &DockerMonitor<A>,
-    runtime_state: &mut RuntimeState,
-    event: &DockerEvent,
-) -> Result<bool, MainError>
-where
-    A: crate::monitor::DockerApi,
-{
-    let mut changed = false;
-    match event.kind {
-        DockerEventKind::Container => match event.action {
-            DockerEventAction::Destroy => {
-                changed |= runtime_state.remove_container(&event.id);
-            }
-            DockerEventAction::Create
-            | DockerEventAction::Start
-            | DockerEventAction::Rename
-            | DockerEventAction::Update
-            | DockerEventAction::Connect
-            | DockerEventAction::Disconnect => {
-                let container_changed = monitor.refresh_container(runtime_state, &event.id)?;
-                changed |= container_changed;
-                if should_delay_apply_for_create(
-                    &event.action,
-                    container_changed,
-                    runtime_state.container_has_attachments(&event.id),
-                ) {
-                    debug!(
-                        container_id = %event.id,
-                        "container created without network attachments; delaying firewall apply"
-                    );
-                    changed = false;
-                }
-            }
-            _ => {}
-        },
-        DockerEventKind::Network => match event.action {
-            DockerEventAction::Destroy => {
-                changed |= runtime_state.remove_network(&event.id);
-            }
-            DockerEventAction::Create
-            | DockerEventAction::Update
-            | DockerEventAction::Connect
-            | DockerEventAction::Disconnect => {
-                let (network_result, container_ids) =
-                    monitor.refresh_network(runtime_state, &event.id)?;
-                changed |= network_result.changed;
-                let mut impacted = BTreeSet::new();
-                impacted.extend(container_ids);
-                if let Some(container_id) = event.attributes.get("container") {
-                    impacted.insert(container_id.clone());
-                }
-                for container_id in impacted {
-                    changed |= monitor.refresh_container(runtime_state, &container_id)?;
-                }
-            }
-            _ => {}
-        },
-    }
-    Ok(changed)
-}
-
-fn should_delay_apply_for_create(
-    action: &DockerEventAction,
-    changed: bool,
-    has_attachments: bool,
-) -> bool {
-    matches!(action, DockerEventAction::Create) && changed && !has_attachments
 }
 
 fn enforce_fail_closed_defaults(snapshot: &mut crate::model::RuntimeSnapshot) {
@@ -544,6 +477,7 @@ fn parse_container_event_line(line: &str) -> Result<Option<DockerEvent>, MainErr
         .and_then(|actor| actor.attributes.as_ref())
         .cloned()
         .unwrap_or_default();
+
     let name = attributes.get("name").cloned();
 
     Ok(Some(DockerEvent {
@@ -618,7 +552,7 @@ struct DockerEventActor {
     #[serde(rename = "ID")]
     id: Option<String>,
     #[serde(rename = "Attributes")]
-    attributes: Option<std::collections::BTreeMap<String, String>>,
+    attributes: Option<HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -686,7 +620,7 @@ mod tests {
                 action: DockerEventAction::Start,
                 name: Some("web".to_string()),
                 kind: DockerEventKind::Container,
-                attributes: std::collections::BTreeMap::from([(
+                attributes: std::collections::HashMap::from([(
                     "name".to_string(),
                     "web".to_string(),
                 )]),
@@ -705,7 +639,7 @@ mod tests {
                 action: DockerEventAction::Create,
                 name: Some("pc-managed".to_string()),
                 kind: DockerEventKind::Network,
-                attributes: std::collections::BTreeMap::from([(
+                attributes: std::collections::HashMap::from([(
                     "name".to_string(),
                     "pc-managed".to_string(),
                 )]),
@@ -742,29 +676,5 @@ mod tests {
         assert!(path.contains("%22event%22"));
         assert!(path.contains("connect"));
         assert!(path.contains("disconnect"));
-    }
-
-    #[test]
-    fn should_delay_apply_for_create_when_changed_without_attachments() {
-        assert!(should_delay_apply_for_create(
-            &DockerEventAction::Create,
-            true,
-            false
-        ));
-        assert!(!should_delay_apply_for_create(
-            &DockerEventAction::Create,
-            true,
-            true
-        ));
-        assert!(!should_delay_apply_for_create(
-            &DockerEventAction::Start,
-            true,
-            false
-        ));
-        assert!(!should_delay_apply_for_create(
-            &DockerEventAction::Create,
-            false,
-            false
-        ));
     }
 }

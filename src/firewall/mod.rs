@@ -139,7 +139,7 @@ impl NftablesFirewall<LibNftablesRunner> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     use ipnet::IpNet;
@@ -215,11 +215,8 @@ mod tests {
     }
 
     fn sample_snapshot() -> RuntimeSnapshot {
-        let labels = {
-            let mut map = BTreeMap::new();
-            map.insert("portcullis.enable".to_string(), "true".to_string());
-            map
-        };
+        let labels: HashMap<String, String> =
+            [("portcullis.enable".to_string(), "true".to_string())].into();
 
         let attachment_ip: std::net::IpAddr = match "172.18.0.2".parse() {
             Ok(value) => value,
@@ -247,8 +244,8 @@ mod tests {
                     subnet,
                     aliases: vec!["web".to_string()],
                 }],
-                runtime_dns_servers: Vec::new(),
-                host_dns_servers: Vec::new(),
+                runtime_dns_servers: HashSet::new(),
+                host_dns_servers: HashSet::new(),
                 policy: Some(ContainerPolicy {
                     enabled: true,
                     icc_mode: IccMode::Deny,

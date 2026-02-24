@@ -18,6 +18,7 @@ Prototype implementation in Rust.
 
 Implemented:
 - Docker container/network discovery from labels and runtime metadata.
+- Docker network support is currently limited to `bridge` driver networks.
 - Label-based egress policy parsing (`ip/cidr + ports`, `host + ports`).
 - ICC allowlist parsing (`container|name|alias + ports`) in `allow-listed` mode.
 - DNS resolution cache with TTL + max size + eviction.
@@ -147,6 +148,7 @@ portcullis.network.enforce=true
 ```
 
 When enabled on a Docker network, Portcullis adds a baseline deny for that network subnet.
+Only `bridge` driver networks are currently supported for network-level enforcement.
 Labeled container allow rules are still added and evaluated first.
 
 Implicit behavior:
@@ -226,6 +228,7 @@ services:
 
 ## Limitations
 - Prototype quality, not fully production hardened.
+- Docker network handling currently supports only `bridge` driver networks; other drivers are ignored.
 - DNS path currently resolver-driven (not a full packet-level DNS proxy listener yet).
 - Backend behavior differences can exist between `nftables` and `iptables` edge cases.
 

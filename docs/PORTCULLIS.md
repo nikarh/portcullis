@@ -62,6 +62,10 @@ Portcullis exists to provide:
 5. **Operational safeguards**
 - Additional hardening is still needed for HA operation, rollback guarantees, and advanced telemetry.
 
+6. **Docker network scope**
+- Network discovery/enforcement currently supports only Docker `bridge` driver networks.
+- Non-bridge networks (`host`, `none`, `overlay`, `ipvlan`, `macvlan`, plugin drivers) are ignored by runtime state collection.
+
 ---
 
 ## 5. How It Works (Technical Flow)
@@ -85,7 +89,7 @@ Collected data includes:
 - container IDs and names,
 - labels,
 - attached network addresses,
-- network subnets,
+- network subnets (from Docker `bridge` driver networks only),
 - Docker firewall backend (`nftables` or `iptables`).
 - iptables backend anchors policy in `DOCKER-USER` (not direct `FORWARD` jump).
 - nftables backend uses a dedicated forward-hook base chain at priority `-1` so rules evaluate before Docker's forward filter priority.
@@ -98,7 +102,7 @@ Collected data includes:
 - `portcullis.egress.<n>=host:<fqdn>,<proto:port>[,<proto:port>...]`
 - `portcullis.icc.mode=allow|deny|allow-listed`
 - `portcullis.icc.allow.<n>=container:<id|name|alias>,<proto:port>[,<proto:port>...]`
-- `portcullis.network.enforce=true` (Docker network label; baseline subnet deny)
+- `portcullis.network.enforce=true` (Docker network label; baseline subnet deny on `bridge` networks only)
 - `portcullis.dns.<n>=docker|host|runtime|ip:<addr>|*`
 - `portcullis.dns.host.<n>=<ip>` (required when using `host` DNS target)
 

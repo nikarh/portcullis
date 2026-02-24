@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use indexmap::IndexMap;
 use ipnet::IpNet;
 use thiserror::Error;
 
@@ -51,7 +52,7 @@ pub enum LabelParseError {
 }
 
 pub fn parse_policy(
-    labels: &BTreeMap<String, String>,
+    labels: &IndexMap<String, String>,
 ) -> Result<Option<ContainerPolicy>, LabelParseError> {
     let enabled = match labels.get(ENABLE_LABEL) {
         None => false,
@@ -87,19 +88,19 @@ pub fn parse_policy(
     )?;
 
     let mut egress = Vec::with_capacity(keyed_values.len());
-    for (_, key, value) in keyed_values {
-        egress.push(parse_egress_value(&key, &value)?);
+    for (key, value) in keyed_values {
+        egress.push(parse_egress_value(key, value)?);
     }
     let mut icc_allow = Vec::with_capacity(icc_allow_values.len());
-    for (_, key, value) in icc_allow_values {
-        icc_allow.push(parse_icc_allow_value(&key, &value)?);
+    for (key, value) in icc_allow_values {
+        icc_allow.push(parse_icc_allow_value(key, value)?);
     }
     let dns_targets = if dns_values.is_empty() {
         vec![DnsTarget::Docker]
     } else {
         let mut parsed = Vec::with_capacity(dns_values.len());
-        for (_, key, value) in dns_values {
-            parsed.push(parse_dns_target(&key, &value)?);
+        for (key, value) in dns_values {
+            parsed.push(parse_dns_target(key, value)?);
         }
         parsed
     };
@@ -114,34 +115,35 @@ pub fn parse_policy(
 }
 
 pub fn parse_host_dns_servers(
-    labels: &BTreeMap<String, String>,
-) -> Result<Vec<IpAddr>, LabelParseError> {
+    labels: &IndexMap<String, String>,
+) -> Result<HashSet<IpAddr>, LabelParseError> {
     let values = collect_indexed_values(
         labels,
         DNS_HOST_PREFIX,
         LabelParseError::InvalidDnsIndex,
         LabelParseError::DuplicateDnsIndex,
     )?;
-    let mut parsed = Vec::with_capacity(values.len());
-    for (_, key, value) in values {
-        let ip = value
-            .parse::<IpAddr>()
-            .map_err(|_| LabelParseError::InvalidHostDnsResolver(key.clone(), value.clone()))?;
-        parsed.push(ip);
+
+    let mut parsed = HashSet::with_capacity(values.len());
+    for (key, value) in values {
+        let ip = value.parse::<IpAddr>().map_err(|_| {
+            LabelParseError::InvalidHostDnsResolver(key.to_string(), value.to_string())
+        })?;
+
+        parsed.insert(ip);
     }
-    parsed.sort_unstable();
-    parsed.dedup();
+
     Ok(parsed)
 }
 
-fn collect_indexed_values(
-    labels: &BTreeMap<String, String>,
+fn collect_indexed_values<'a>(
+    labels: &'a IndexMap<String, String>,
     prefix: &str,
     invalid_index: fn(String) -> LabelParseError,
     duplicate_index: fn(String) -> LabelParseError,
-) -> Result<Vec<(String, String, String)>, LabelParseError> {
-    let mut indices = BTreeSet::new();
-    let mut keyed_values = Vec::new();
+) -> Result<IndexMap<&'a str, &'a str>, LabelParseError> {
+    let mut indices = HashSet::new();
+    let mut keyed_values = IndexMap::new();
 
     for (key, value) in labels {
         if !key.starts_with(prefix) {
@@ -157,14 +159,12 @@ fn collect_indexed_values(
             return Err(invalid_index(key.clone()));
         }
 
-        if !indices.insert(index_part.to_string()) {
+        if !indices.insert(index_part) {
             return Err(duplicate_index(key.clone()));
         }
-
-        keyed_values.push((index_part.to_string(), key.clone(), value.clone()));
+        keyed_values.insert(key.as_str(), value.as_str());
     }
 
-    keyed_values.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(keyed_values)
 }
 
@@ -268,7 +268,7 @@ fn parse_ports(key: &str, parts: &[&str]) -> Result<Vec<PortSpec>, LabelParseErr
             _ => {
                 return Err(LabelParseError::InvalidPortSpec(
                     key.to_string(),
-                    (*part).to_string(),
+                    part.to_string(),
                 ));
             }
         };
@@ -279,7 +279,7 @@ fn parse_ports(key: &str, parts: &[&str]) -> Result<Vec<PortSpec>, LabelParseErr
         if port == 0 {
             return Err(LabelParseError::InvalidPortSpec(
                 key.to_string(),
-                (*part).to_string(),
+                part.to_string(),
             ));
         }
 
@@ -333,13 +333,13 @@ mod tests {
     use super::*;
 
     use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol};
+    use indexmap::IndexMap;
 
-    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        let mut map = BTreeMap::new();
-        for (key, value) in pairs {
-            map.insert((*key).to_string(), (*value).to_string());
-        }
-        map
+    fn labels(pairs: &[(&str, &str)]) -> IndexMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -566,8 +566,8 @@ mod tests {
         ]))
         .expect("host dns resolvers should parse");
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].to_string(), "1.1.1.1");
-        assert_eq!(parsed[1].to_string(), "8.8.8.8");
+        assert!(parsed.contains(&"1.1.1.1".parse().expect("ip should parse")));
+        assert!(parsed.contains(&"8.8.8.8".parse().expect("ip should parse")));
     }
 
     #[test]

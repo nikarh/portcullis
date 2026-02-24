@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 
 use crate::dns::HostnameIpResolver;
@@ -387,8 +387,8 @@ fn append_dns_policy_rules(
     source: IpAddr,
     gateway: Option<IpAddr>,
     dns_targets: &[DnsTarget],
-    runtime_dns_servers: &[IpAddr],
-    host_dns_servers: &[IpAddr],
+    runtime_dns_servers: &HashSet<IpAddr>,
+    host_dns_servers: &HashSet<IpAddr>,
 ) {
     let mut allow_any = false;
     let mut destinations = BTreeSet::new();
@@ -539,7 +539,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use crate::dns::{DnsError, HostnameIpResolver};
@@ -569,8 +569,8 @@ mod tests {
     }
 
     fn snapshot_with_hostname_rule() -> RuntimeSnapshot {
-        let mut labels = BTreeMap::new();
-        labels.insert("portcullis.enable".to_string(), "true".to_string());
+        let labels: HashMap<String, String> =
+            [("portcullis.enable".to_string(), "true".to_string())].into();
 
         let source_ip: IpAddr = match "172.18.0.2".parse() {
             Ok(value) => value,
@@ -594,8 +594,8 @@ mod tests {
                     subnet,
                     aliases: vec!["web".to_string()],
                 }],
-                runtime_dns_servers: Vec::new(),
-                host_dns_servers: Vec::new(),
+                runtime_dns_servers: HashSet::new(),
+                host_dns_servers: HashSet::new(),
                 policy: Some(ContainerPolicy {
                     enabled: true,
                     icc_mode: crate::model::IccMode::Allow,
@@ -656,7 +656,7 @@ mod tests {
         snapshot.containers.push(ContainerSnapshot {
             id: "peer".to_string(),
             name: "/peer".to_string(),
-            labels: BTreeMap::new(),
+            labels: HashMap::new(),
             attachments: vec![NetworkAttachment {
                 network_id: "net0".to_string(),
                 network_name: "bridge".to_string(),
@@ -665,8 +665,8 @@ mod tests {
                 subnet,
                 aliases: vec!["db".to_string()],
             }],
-            runtime_dns_servers: Vec::new(),
-            host_dns_servers: Vec::new(),
+            runtime_dns_servers: HashSet::new(),
+            host_dns_servers: HashSet::new(),
             policy: None,
         });
 
