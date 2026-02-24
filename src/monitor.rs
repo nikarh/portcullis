@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::str::FromStr;
 
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
@@ -802,9 +802,28 @@ pub struct DockerEndpoint {
     #[serde(rename = "NetworkID")]
     pub network_id: Option<String>,
     #[serde(rename = "IPAddress")]
+    #[serde(deserialize_with = "deserialize_optional_ipaddr")]
     pub ip_address: Option<IpAddr>,
     #[serde(rename = "Aliases")]
     pub aliases: Option<Vec<String>>,
+}
+
+fn deserialize_optional_ipaddr<'de, D>(deserializer: D) -> Result<Option<IpAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<IpAddr>()
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1115,6 +1134,34 @@ mod tests {
         };
 
         assert_eq!(snapshot.containers[0].attachments.len(), 0);
+    }
+
+    #[test]
+    fn docker_endpoint_deserialization_treats_empty_ip_as_none() {
+        let inspect_json = r#"{
+          "Id": "abc",
+          "Name": "/web",
+          "Config": {"Labels": {}},
+          "NetworkSettings": {
+            "Networks": {
+              "bridge": {
+                "NetworkID": "net0",
+                "IPAddress": "",
+                "Aliases": ["web"]
+              }
+            }
+          }
+        }"#;
+
+        let inspect: DockerContainerInspect =
+            serde_json::from_str(inspect_json).expect("container inspect should deserialize");
+        let endpoint = inspect
+            .network_endpoints()
+            .into_iter()
+            .next()
+            .expect("expected one endpoint")
+            .1;
+        assert!(endpoint.ip_address.is_none());
     }
 
     #[test]
