@@ -587,16 +587,38 @@ fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum DockerEventKind {
     Container,
     Network,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DockerEventAction {
+    Create,
+    Start,
+    Rename,
+    Update,
+    Destroy,
+    Connect,
+    Disconnect,
+    Attach,
+    Detach,
+    Restart,
+    Stop,
+    Die,
+    Kill,
+    Pause,
+    Unpause,
+    Resize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DockerEvent {
     pub id: String,
-    pub action: String,
+    pub action: DockerEventAction,
     pub name: Option<String>,
     pub kind: DockerEventKind,
     pub attributes: BTreeMap<String, String>,
@@ -607,15 +629,23 @@ impl DockerEvent {
     pub fn is_relevant_for_policy_refresh(&self) -> bool {
         match self.kind {
             DockerEventKind::Container => matches!(
-                self.action.as_str(),
-                "create" | "start" | "destroy" | "rename" | "update" | "connect" | "disconnect"
+                self.action,
+                DockerEventAction::Create
+                    | DockerEventAction::Start
+                    | DockerEventAction::Destroy
+                    | DockerEventAction::Rename
+                    | DockerEventAction::Update
+                    | DockerEventAction::Connect
+                    | DockerEventAction::Disconnect
             ),
-            DockerEventKind::Network => {
-                matches!(
-                    self.action.as_str(),
-                    "create" | "destroy" | "update" | "connect" | "disconnect"
-                )
-            }
+            DockerEventKind::Network => matches!(
+                self.action,
+                DockerEventAction::Create
+                    | DockerEventAction::Destroy
+                    | DockerEventAction::Update
+                    | DockerEventAction::Connect
+                    | DockerEventAction::Disconnect
+            ),
         }
     }
 }
@@ -1570,21 +1600,21 @@ mod tests {
     fn docker_container_event_relevance_filters_noise() {
         let relevant = DockerEvent {
             id: "abc".to_string(),
-            action: "start".to_string(),
+            action: DockerEventAction::Start,
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
             attributes: BTreeMap::new(),
         };
         let not_relevant = DockerEvent {
             id: "abc".to_string(),
-            action: "health_status: healthy".to_string(),
+            action: DockerEventAction::Resize,
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
             attributes: BTreeMap::new(),
         };
         let relevant_network = DockerEvent {
             id: "net0".to_string(),
-            action: "disconnect".to_string(),
+            action: DockerEventAction::Disconnect,
             name: Some("pc-managed".to_string()),
             kind: DockerEventKind::Network,
             attributes: BTreeMap::new(),

@@ -25,8 +25,8 @@ use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
 use crate::firewall::{CommandIptablesRunner, FirewallError, IptablesFirewall, NftablesFirewall};
 use crate::logging::{LogLevel, LoggingError};
 use crate::monitor::{
-    DockerEvent, DockerEventKind, DockerFirewallBackend, DockerMonitor, MonitorError,
-    RuntimeChangeTracker, RuntimeState, SocketDockerApi,
+    DockerEvent, DockerEventAction, DockerEventKind, DockerFirewallBackend, DockerMonitor,
+    MonitorError, RuntimeChangeTracker, RuntimeState, SocketDockerApi,
 };
 use serde::Deserialize;
 
@@ -256,12 +256,12 @@ fn run(config: &Config) -> Result<(), MainError> {
             Ok(Some(event)) => {
                 trace!(event = ?event, "docker event received");
                 if !event.is_relevant_for_policy_refresh() {
-                    trace!(action = %event.action, "docker event ignored");
+                    trace!(action = ?event.action, "docker event ignored");
                     continue;
                 }
 
                 info!(
-                    action = %event.action,
+                    action = ?event.action,
                     object_id = %event.id,
                     object_name = ?event.name,
                     kind = ?event.kind,
@@ -355,11 +355,16 @@ where
 {
     let mut changed = false;
     match event.kind {
-        DockerEventKind::Container => match event.action.as_str() {
-            "destroy" => {
+        DockerEventKind::Container => match event.action {
+            DockerEventAction::Destroy => {
                 changed |= runtime_state.remove_container(&event.id);
             }
-            "create" | "start" | "rename" | "update" | "connect" | "disconnect" => {
+            DockerEventAction::Create
+            | DockerEventAction::Start
+            | DockerEventAction::Rename
+            | DockerEventAction::Update
+            | DockerEventAction::Connect
+            | DockerEventAction::Disconnect => {
                 let container_changed = monitor.refresh_container(runtime_state, &event.id)?;
                 changed |= container_changed;
                 if should_delay_apply_for_create(
@@ -376,11 +381,14 @@ where
             }
             _ => {}
         },
-        DockerEventKind::Network => match event.action.as_str() {
-            "destroy" => {
+        DockerEventKind::Network => match event.action {
+            DockerEventAction::Destroy => {
                 changed |= runtime_state.remove_network(&event.id);
             }
-            "create" | "update" | "connect" | "disconnect" => {
+            DockerEventAction::Create
+            | DockerEventAction::Update
+            | DockerEventAction::Connect
+            | DockerEventAction::Disconnect => {
                 let (network_result, container_ids) =
                     monitor.refresh_network(runtime_state, &event.id)?;
                 changed |= network_result.changed;
@@ -399,8 +407,12 @@ where
     Ok(changed)
 }
 
-fn should_delay_apply_for_create(action: &str, changed: bool, has_attachments: bool) -> bool {
-    action == "create" && changed && !has_attachments
+fn should_delay_apply_for_create(
+    action: &DockerEventAction,
+    changed: bool,
+    has_attachments: bool,
+) -> bool {
+    matches!(action, DockerEventAction::Create) && changed && !has_attachments
 }
 
 fn enforce_fail_closed_defaults(snapshot: &mut crate::model::RuntimeSnapshot) {
@@ -514,26 +526,15 @@ fn parse_container_event_line(line: &str) -> Result<Option<DockerEvent>, MainErr
 
     let parsed: DockerEventLine = serde_json::from_str(trimmed)
         .map_err(|error| MainError::ServiceState(format!("invalid docker event json: {error}")))?;
-    let action = parsed
-        .action
-        .or(parsed.status)
-        .map(DockerEventActionValue::into_string)
-        .unwrap_or_default();
-    let kind = parsed
-        .kind
-        .or(parsed.event_type)
-        .map(DockerEventTypeValue::into_string)
-        .unwrap_or_default();
-    if !kind.is_empty() && kind != "container" && kind != "network" {
+    let action = parsed.action.or(parsed.status);
+    let kind = parsed.kind.or(parsed.event_type);
+    let Some(action) = action else {
         return Ok(None);
-    }
-    let kind = match kind.as_str() {
-        "network" => DockerEventKind::Network,
-        _ => DockerEventKind::Container,
     };
+    let kind = kind.unwrap_or(DockerEventKind::Container);
     let actor_id = parsed.actor.as_ref().and_then(|actor| actor.id.clone());
     let id = parsed.id.or(actor_id).unwrap_or_default();
-    if id.is_empty() || action.is_empty() {
+    if id.is_empty() {
         return Ok(None);
     }
 
@@ -597,107 +598,15 @@ fn percent_encode_query_value(value: &str) -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum DockerEventTypeValue {
-    Known(DockerEventTypeKnown),
-    Other(String),
-}
-
-impl DockerEventTypeValue {
-    fn into_string(self) -> String {
-        match self {
-            Self::Known(value) => value.as_str().to_string(),
-            Self::Other(value) => value.to_lowercase(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum DockerEventTypeKnown {
-    Container,
-    Network,
-}
-
-impl DockerEventTypeKnown {
-    const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Container => "container",
-            Self::Network => "network",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum DockerEventActionValue {
-    Known(DockerEventActionKnown),
-    Other(String),
-}
-
-impl DockerEventActionValue {
-    fn into_string(self) -> String {
-        match self {
-            Self::Known(value) => value.as_str().to_string(),
-            Self::Other(value) => value,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum DockerEventActionKnown {
-    Create,
-    Start,
-    Rename,
-    Update,
-    Destroy,
-    Connect,
-    Disconnect,
-    Attach,
-    Detach,
-    Restart,
-    Stop,
-    Die,
-    Kill,
-    Pause,
-    Unpause,
-    Resize,
-}
-
-impl DockerEventActionKnown {
-    const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Create => "create",
-            Self::Start => "start",
-            Self::Rename => "rename",
-            Self::Update => "update",
-            Self::Destroy => "destroy",
-            Self::Connect => "connect",
-            Self::Disconnect => "disconnect",
-            Self::Attach => "attach",
-            Self::Detach => "detach",
-            Self::Restart => "restart",
-            Self::Stop => "stop",
-            Self::Die => "die",
-            Self::Kill => "kill",
-            Self::Pause => "pause",
-            Self::Unpause => "unpause",
-            Self::Resize => "resize",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct DockerEventLine {
     #[serde(rename = "Type")]
-    event_type: Option<DockerEventTypeValue>,
+    event_type: Option<DockerEventKind>,
     #[serde(rename = "type")]
-    kind: Option<DockerEventTypeValue>,
+    kind: Option<DockerEventKind>,
     #[serde(rename = "Action")]
-    action: Option<DockerEventActionValue>,
+    action: Option<DockerEventAction>,
     #[serde(rename = "status")]
-    status: Option<DockerEventActionValue>,
+    status: Option<DockerEventAction>,
     #[serde(rename = "id")]
     id: Option<String>,
     #[serde(rename = "Actor")]
@@ -774,7 +683,7 @@ mod tests {
             event,
             Some(DockerEvent {
                 id: "abc".to_string(),
-                action: "start".to_string(),
+                action: DockerEventAction::Start,
                 name: Some("web".to_string()),
                 kind: DockerEventKind::Container,
                 attributes: std::collections::BTreeMap::from([(
@@ -793,7 +702,7 @@ mod tests {
             event,
             Some(DockerEvent {
                 id: "net0".to_string(),
-                action: "create".to_string(),
+                action: DockerEventAction::Create,
                 name: Some("pc-managed".to_string()),
                 kind: DockerEventKind::Network,
                 attributes: std::collections::BTreeMap::from([(
@@ -807,8 +716,8 @@ mod tests {
     #[test]
     fn parse_container_event_line_ignores_unrelated_event_type() {
         let line = "{\"Type\":\"volume\",\"Action\":\"create\",\"Actor\":{\"ID\":\"vol0\"}}";
-        let event = parse_container_event_line(line).expect("event parse should succeed");
-        assert!(event.is_none());
+        let result = parse_container_event_line(line);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -825,13 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_container_event_line_accepts_unknown_action_value() {
-        let line = "{\"Type\":\"container\",\"Action\":\"new_future_action\",\"Actor\":{\"ID\":\"abc\",\"Attributes\":{\"name\":\"web\"}}}";
-        let event = parse_container_event_line(line).expect("event parse should succeed");
-        assert_eq!(event.expect("event expected").action, "new_future_action");
-    }
-
-    #[test]
     fn build_events_path_includes_type_and_event_filters() {
         let path = build_events_path(123).expect("events path should build");
         assert!(path.starts_with("/events?filters="));
@@ -844,9 +746,25 @@ mod tests {
 
     #[test]
     fn should_delay_apply_for_create_when_changed_without_attachments() {
-        assert!(should_delay_apply_for_create("create", true, false));
-        assert!(!should_delay_apply_for_create("create", true, true));
-        assert!(!should_delay_apply_for_create("start", true, false));
-        assert!(!should_delay_apply_for_create("create", false, false));
+        assert!(should_delay_apply_for_create(
+            &DockerEventAction::Create,
+            true,
+            false
+        ));
+        assert!(!should_delay_apply_for_create(
+            &DockerEventAction::Create,
+            true,
+            true
+        ));
+        assert!(!should_delay_apply_for_create(
+            &DockerEventAction::Start,
+            true,
+            false
+        ));
+        assert!(!should_delay_apply_for_create(
+            &DockerEventAction::Create,
+            false,
+            false
+        ));
     }
 }
