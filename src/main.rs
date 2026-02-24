@@ -5,6 +5,7 @@ mod logging;
 mod model;
 mod monitor;
 
+use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
@@ -20,8 +21,7 @@ use pico_args::Arguments;
 use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
-use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
-use crate::firewall::{CommandIptablesRunner, FirewallError, IptablesFirewall, NftablesFirewall};
+use crate::firewall::{ActiveFirewall, FirewallError};
 use crate::logging::{LogLevel, LoggingError};
 use crate::monitor::{
     DockerEvent, DockerEventAction, DockerEventKind, DockerFirewallBackend, DockerMonitor,
@@ -76,7 +76,7 @@ enum MainError {
     #[error("invalid firewall backend: {0}")]
     InvalidFirewallBackend(String),
     #[error("unexpected positional arguments: {0:?}")]
-    UnexpectedArguments(Vec<std::ffi::OsString>),
+    UnexpectedArguments(Vec<OsString>),
     #[error("failed to initialize logging: {0}")]
     Logging(#[from] LoggingError),
     #[error("monitoring failed: {0}")]
@@ -158,38 +158,6 @@ fn write_stderr_line(message: &str) -> Result<(), std::io::Error> {
     std::io::stderr().write_all(format!("{message}\n").as_bytes())
 }
 
-enum ActiveFirewall {
-    Nftables(NftablesFirewall<crate::firewall::LibNftablesRunner>),
-    Iptables(IptablesFirewall<CommandIptablesRunner>),
-}
-
-impl ActiveFirewall {
-    fn initialize(&self) -> Result<(), FirewallError> {
-        match self {
-            Self::Nftables(_) => Ok(()),
-            Self::Iptables(firewall) => firewall.initialize(),
-        }
-    }
-
-    fn apply(
-        &self,
-        snapshot: &crate::model::RuntimeSnapshot,
-        dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
-    ) -> Result<(), FirewallError> {
-        match self {
-            Self::Nftables(firewall) => firewall.apply_with_dns(snapshot, dns_cache),
-            Self::Iptables(firewall) => firewall.apply_with_dns(snapshot, dns_cache),
-        }
-    }
-
-    fn cleanup(&self) -> Result<(), FirewallError> {
-        match self {
-            Self::Nftables(firewall) => firewall.cleanup(),
-            Self::Iptables(firewall) => firewall.cleanup(),
-        }
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 fn run(config: &Config) -> Result<(), MainError> {
     logging::init_logging_with_level(config.log_level)?;
@@ -220,10 +188,8 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let firewall = match selected_backend {
         FirewallBackend::Auto => unreachable!("auto backend must be resolved before execution"),
-        FirewallBackend::Nftables => {
-            ActiveFirewall::Nftables(NftablesFirewall::with_libnftables()?)
-        }
-        FirewallBackend::Iptables => ActiveFirewall::Iptables(IptablesFirewall::with_cli()),
+        FirewallBackend::Nftables => ActiveFirewall::with_nftables()?,
+        FirewallBackend::Iptables => ActiveFirewall::with_iptables(),
     };
 
     info!("performing startup firewall cleanup");
@@ -238,7 +204,11 @@ fn run(config: &Config) -> Result<(), MainError> {
     .map_err(|error| MainError::SignalHandler(error.to_string()))?;
 
     let mut tracker = RuntimeChangeTracker::new();
-    let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
+    let mut dns_cache = crate::dns::DnsProxyCache::new(
+        crate::dns::SystemUpstreamResolver,
+        Duration::from_secs(300),
+        2048,
+    );
     let mut runtime_state = monitor.collect_state()?;
     let mut event_stream = connect_event_stream(&config.docker_socket)?;
 
@@ -336,7 +306,7 @@ fn apply_runtime_state(
     runtime_state: &RuntimeState,
     firewall: &ActiveFirewall,
     tracker: &mut RuntimeChangeTracker,
-    dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
+    dns_cache: &mut crate::dns::DnsProxyCache<crate::dns::SystemUpstreamResolver>,
     fail_closed: bool,
     force_apply: bool,
 ) -> Result<(), MainError> {
