@@ -120,6 +120,25 @@ portcullis.icc.mode=allow|deny|allow-listed
 portcullis.icc.allow.0=container:db,tcp:5432
 ```
 
+- DNS policy entries (per container):
+```text
+portcullis.dns.0=docker
+portcullis.dns.1=host
+portcullis.dns.2=runtime
+portcullis.dns.3=ip:1.1.1.1
+portcullis.dns.4=*
+```
+
+DNS entry meanings:
+- `docker`: allow Docker internal resolver endpoint for that attachment (gateway-derived).
+- `host`: allow nameservers found in container `resolv.conf` (host-propagated path).
+- `runtime`: allow DNS configured via container runtime (`docker run --dns` / Compose `dns`).
+- `ip:<addr>`: allow a specific resolver IP.
+- `*`: allow DNS to any destination (`udp/53` and `tcp/53`).
+
+Default when no `portcullis.dns.*` labels are set:
+- `docker` only, plus explicit drop of any other DNS destination.
+
 - Network-level default deny (set on Docker network):
 ```text
 portcullis.network.enforce=true

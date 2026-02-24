@@ -91,6 +91,7 @@ Collected data includes:
 - `portcullis.icc.mode=allow|deny|allow-listed`
 - `portcullis.icc.allow.<n>=container:<id|name|alias>,<proto:port>[,<proto:port>...]`
 - `portcullis.network.enforce=true` (Docker network label; baseline subnet deny)
+- `portcullis.dns.<n>=docker|host|runtime|ip:<addr>|*`
 
 Policy compile output is normalized into strongly typed rules.
 
@@ -129,7 +130,9 @@ ICC allowlist resolution details:
 - Docker network aliases from endpoint metadata.
 
 Implicit DNS behavior:
-- For policy-enabled containers, Portcullis automatically adds DNS allow rules to the network gateway (`udp/53`, `tcp/53`) so container DNS resolution keeps working by default.
+- For policy-enabled containers, DNS is policy-controlled per container.
+- Default DNS policy when no `portcullis.dns.*` labels are set is `docker` only.
+- Non-allowed DNS destinations are explicitly dropped (`udp/53`, `tcp/53`).
 
 ### 5.5 Logging Model
 - `info`: major lifecycle activity and selections (startup cleanup, backend selection, snapshot/apply, refresh triggers).
