@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-use std::net::IpAddr;
 use std::str::FromStr;
 
 use indexmap::IndexMap;
@@ -15,7 +13,6 @@ const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
 const ICC_ALLOW_PREFIX: &str = "portcullis.icc.allow.";
 const DNS_PREFIX: &str = "portcullis.dns.";
-const DNS_HOST_PREFIX: &str = "portcullis.dns.host.";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LabelParseError {
@@ -23,14 +20,6 @@ pub enum LabelParseError {
     InvalidBool(String, String),
     #[error("invalid ICC mode value: {0}")]
     InvalidIccMode(String),
-    #[error("invalid egress index in key: {0}")]
-    InvalidEgressIndex(String),
-    #[error("duplicate egress index in key: {0}")]
-    DuplicateEgressIndex(String),
-    #[error("invalid dns index in key: {0}")]
-    InvalidDnsIndex(String),
-    #[error("duplicate dns index in key: {0}")]
-    DuplicateDnsIndex(String),
     #[error("invalid egress value for {0}: {1}")]
     InvalidEgress(String, String),
     #[error("invalid ICC allow value for {0}: {1}")]
@@ -47,8 +36,6 @@ pub enum LabelParseError {
     MissingPorts(String),
     #[error("invalid dns target in {0}: {1}")]
     InvalidDnsTarget(String, String),
-    #[error("invalid host dns resolver in {0}: {1}")]
-    InvalidHostDnsResolver(String, String),
 }
 
 pub fn parse_policy(labels: &IndexMap<String, String>) -> Result<ContainerPolicy, LabelParseError> {
@@ -72,42 +59,23 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> Result<ContainerPolicy
         Some(mode) => parse_icc_mode(mode)?,
     };
 
-    let keyed_values = collect_indexed_values(
-        labels,
-        EGRESS_PREFIX,
-        LabelParseError::InvalidEgressIndex,
-        LabelParseError::DuplicateEgressIndex,
-    )?;
-    let icc_allow_values = collect_indexed_values(
-        labels,
-        ICC_ALLOW_PREFIX,
-        LabelParseError::InvalidEgressIndex,
-        LabelParseError::DuplicateEgressIndex,
-    )?;
-    let dns_values = collect_indexed_values(
-        labels,
-        DNS_PREFIX,
-        LabelParseError::InvalidDnsIndex,
-        LabelParseError::DuplicateDnsIndex,
-    )?;
+    let mut egress = Vec::new();
+    let mut icc_allow = Vec::new();
+    let mut dns_targets = Vec::with_capacity(1);
 
-    let mut egress = Vec::with_capacity(keyed_values.len());
-    for (key, value) in keyed_values {
-        egress.push(parse_egress_value(key, value)?);
-    }
-    let mut icc_allow = Vec::with_capacity(icc_allow_values.len());
-    for (key, value) in icc_allow_values {
-        icc_allow.push(parse_icc_allow_value(key, value)?);
-    }
-    let dns_targets = if dns_values.is_empty() {
-        vec![DnsTarget::Docker]
-    } else {
-        let mut parsed = Vec::with_capacity(dns_values.len());
-        for (key, value) in dns_values {
-            parsed.push(parse_dns_target(key, value)?);
+    for (key, value) in labels {
+        if key.starts_with(EGRESS_PREFIX) {
+            egress.push(parse_egress_value(key, value)?);
+        } else if key.starts_with(ICC_ALLOW_PREFIX) {
+            icc_allow.push(parse_icc_allow_value(key, value)?);
+        } else if key.starts_with(DNS_PREFIX) {
+            dns_targets.push(parse_dns_target(key, value)?);
         }
-        parsed
-    };
+    }
+
+    if dns_targets.is_empty() {
+        dns_targets.push(DnsTarget::Docker);
+    }
 
     Ok(ContainerPolicy {
         enabled,
@@ -116,60 +84,6 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> Result<ContainerPolicy
         icc_allow,
         dns_targets,
     })
-}
-
-pub fn parse_host_dns_servers(
-    labels: &IndexMap<String, String>,
-) -> Result<HashSet<IpAddr>, LabelParseError> {
-    let values = collect_indexed_values(
-        labels,
-        DNS_HOST_PREFIX,
-        LabelParseError::InvalidDnsIndex,
-        LabelParseError::DuplicateDnsIndex,
-    )?;
-
-    let mut parsed = HashSet::with_capacity(values.len());
-    for (key, value) in values {
-        let ip = value.parse::<IpAddr>().map_err(|_| {
-            LabelParseError::InvalidHostDnsResolver(key.to_string(), value.to_string())
-        })?;
-
-        parsed.insert(ip);
-    }
-
-    Ok(parsed)
-}
-
-fn collect_indexed_values<'a>(
-    labels: &'a IndexMap<String, String>,
-    prefix: &str,
-    invalid_index: fn(String) -> LabelParseError,
-    duplicate_index: fn(String) -> LabelParseError,
-) -> Result<IndexMap<&'a str, &'a str>, LabelParseError> {
-    let mut indices = HashSet::new();
-    let mut keyed_values = IndexMap::new();
-
-    for (key, value) in labels {
-        if !key.starts_with(prefix) {
-            continue;
-        }
-
-        let index_part = key.trim_start_matches(prefix);
-        if index_part.is_empty()
-            || !index_part
-                .chars()
-                .all(|character| character.is_ascii_digit())
-        {
-            return Err(invalid_index(key.clone()));
-        }
-
-        if !indices.insert(index_part) {
-            return Err(duplicate_index(key.clone()));
-        }
-        keyed_values.insert(key.as_str(), value.as_str());
-    }
-
-    Ok(keyed_values)
 }
 
 fn parse_dns_target(key: &str, value: &str) -> Result<DnsTarget, LabelParseError> {
@@ -337,7 +251,6 @@ mod tests {
     use super::*;
 
     use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol};
-    use indexmap::IndexMap;
 
     fn labels(pairs: &[(&str, &str)]) -> IndexMap<String, String> {
         pairs
@@ -483,20 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_policy_rejects_non_numeric_index() {
-        let error = parse_policy(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.egress.foo", "ip:1.1.1.1/32,tcp:443"),
-        ]))
-        .expect_err("non numeric index should be rejected");
-
-        assert_eq!(
-            error,
-            LabelParseError::InvalidEgressIndex("portcullis.egress.foo".to_string())
-        );
-    }
-
-    #[test]
     fn parse_policy_parses_icc_allow_rule() {
         let parsed = parse_policy(&labels(&[
             ("portcullis.enable", "true"),
@@ -555,28 +454,6 @@ mod tests {
         assert!(matches!(
             error,
             LabelParseError::InvalidContainerTarget(_, _)
-        ));
-    }
-
-    #[test]
-    fn parse_host_dns_servers_parses_resolvers() {
-        let parsed = parse_host_dns_servers(&labels(&[
-            ("portcullis.dns.host.0", "1.1.1.1"),
-            ("portcullis.dns.host.1", "8.8.8.8"),
-        ]))
-        .expect("host dns resolvers should parse");
-        assert_eq!(parsed.len(), 2);
-        assert!(parsed.contains(&"1.1.1.1".parse().expect("ip should parse")));
-        assert!(parsed.contains(&"8.8.8.8".parse().expect("ip should parse")));
-    }
-
-    #[test]
-    fn parse_host_dns_servers_rejects_invalid_ip() {
-        let error = parse_host_dns_servers(&labels(&[("portcullis.dns.host.0", "not-ip")]))
-            .expect_err("invalid host dns resolver should fail");
-        assert!(matches!(
-            error,
-            LabelParseError::InvalidHostDnsResolver(_, _)
         ));
     }
 }

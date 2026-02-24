@@ -39,7 +39,6 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
                 gateway,
                 &policy.dns_targets,
                 &container.runtime_dns_servers,
-                &container.parsed_labels.host_dns_servers,
             );
 
             match policy.icc_mode {
@@ -130,7 +129,6 @@ pub fn build_apply_commands_with_dns(
                 gateway,
                 &policy.dns_targets,
                 &container.runtime_dns_servers,
-                &container.parsed_labels.host_dns_servers,
             );
 
             match policy.icc_mode {
@@ -384,7 +382,6 @@ fn append_dns_policy_rules(
     gateway: Option<IpAddr>,
     dns_targets: &[DnsTarget],
     runtime_dns_servers: &HashSet<IpAddr>,
-    host_dns_servers: &HashSet<IpAddr>,
 ) {
     let mut allow_any = false;
     let mut destinations = BTreeSet::new();
@@ -396,9 +393,7 @@ fn append_dns_policy_rules(
                 }
             }
             DnsTarget::Host => {
-                for value in host_dns_servers {
-                    destinations.insert(*value);
-                }
+                // Host DNS target is intentionally ignored: host resolvers are no longer label-driven.
             }
             DnsTarget::Runtime => {
                 for value in runtime_dns_servers {
@@ -586,7 +581,6 @@ mod tests {
             containers: vec![ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                parsed_labels: crate::model::ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: source_ip,
@@ -656,7 +650,6 @@ mod tests {
         snapshot.containers.push(ContainerSnapshot {
             id: "peer".into(),
             name: "/peer".to_string(),
-            parsed_labels: crate::model::ParsedContainerLabels::default(),
             attachments: vec![NetworkAttachment {
                 network_id: "net0".into(),
                 ip_address: peer_ip,

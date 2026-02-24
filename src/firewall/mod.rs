@@ -232,7 +232,6 @@ mod tests {
             containers: vec![ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                parsed_labels: crate::model::ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: attachment_ip,

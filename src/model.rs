@@ -160,15 +160,9 @@ pub struct NetworkSnapshot {
 pub struct ContainerSnapshot {
     pub id: ContainerId,
     pub name: String,
-    pub parsed_labels: ParsedContainerLabels,
     pub attachments: Vec<NetworkAttachment>,
     pub runtime_dns_servers: HashSet<IpAddr>,
     pub policy: ContainerPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ParsedContainerLabels {
-    pub host_dns_servers: HashSet<IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -10,10 +10,9 @@ use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
-use crate::labels::{LabelParseError, parse_host_dns_servers, parse_policy};
+use crate::labels::{LabelParseError, parse_policy};
 use crate::model::{
-    ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, NetworkSnapshot,
-    ParsedContainerLabels, RuntimeSnapshot,
+    ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, NetworkSnapshot, RuntimeSnapshot,
 };
 
 #[derive(Debug, Error)]
@@ -103,8 +102,12 @@ pub(crate) struct RuntimeState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeStateAction {
-    UpsertContainer {
+    CreateContainer {
         snapshot: Box<ContainerSnapshot>,
+    },
+    RenameContainer {
+        container_id: ContainerId,
+        name: String,
     },
     RemoveContainer {
         container_id: ContainerId,
@@ -176,12 +179,18 @@ impl RuntimeState {
 
     pub(crate) fn apply_action(&mut self, action: RuntimeStateAction) -> bool {
         match action {
-            RuntimeStateAction::UpsertContainer { snapshot } => {
-                let snapshot = *snapshot;
+            RuntimeStateAction::CreateContainer { snapshot } => {
                 let container_id = snapshot.id.clone();
                 let changed = self.containers.get(&container_id) != Some(&snapshot);
-                self.containers.insert(container_id, snapshot);
+                self.containers.insert(container_id, *snapshot);
                 changed
+            }
+            RuntimeStateAction::RenameContainer { container_id, name } => {
+                if let Some(container) = self.containers.get_mut(&container_id) {
+                    container.name = name;
+                    return true;
+                }
+                false
             }
             RuntimeStateAction::RemoveContainer { container_id } => {
                 self.remove_container(&container_id)
@@ -277,25 +286,32 @@ where
     pub(crate) fn resolve_event_action(
         &self,
         state: &RuntimeState,
-        event: &DockerEvent,
+        event: DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         match event.kind {
-            DockerEventKind::Container => Self::resolve_container_event_action(state, event),
-            DockerEventKind::Network => self.resolve_network_event_action(state, event),
+            DockerEventKind::Container => Self::resolve_container_event_action(event),
+            DockerEventKind::Network => self.resolve_network_event_action(state, &event),
         }
     }
 
     fn resolve_container_event_action(
-        state: &RuntimeState,
-        event: &DockerEvent,
+        event: DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         match event.action {
             DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
                 container_id: event.id.as_str().into(),
             })),
             DockerEventAction::Create => Self::create_container_action(event),
-            DockerEventAction::Rename => Ok(Self::rename_container_action(state, event)),
-            DockerEventAction::Update => Self::update_container_action(state, event),
+            DockerEventAction::Rename => {
+                let Some(name) = event.name else {
+                    return Ok(None);
+                };
+
+                Ok(Some(RuntimeStateAction::RenameContainer {
+                    container_id: event.id.into(),
+                    name,
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -325,9 +341,7 @@ where
         state: &mut RuntimeState,
         inspect: DockerContainerInspect,
     ) -> Result<ContainerSnapshot, MonitorError> {
-        let labels = inspect.labels();
-        let policy = parse_policy(&labels)?;
-        let host_dns_servers = parse_host_dns_servers(&labels)?;
+        let policy = parse_policy(&inspect.config.labels)?;
         let runtime_dns_servers = inspect.runtime_dns_servers();
         let mut attachments = Vec::new();
 
@@ -370,7 +384,6 @@ where
         Ok(ContainerSnapshot {
             id: inspect.id.into(),
             name: inspect.name,
-            parsed_labels: ParsedContainerLabels { host_dns_servers },
             attachments,
             runtime_dns_servers,
             policy,
@@ -382,10 +395,9 @@ where
         state: &RuntimeState,
         inspect: DockerContainerInspect,
     ) -> Result<ContainerSnapshot, MonitorError> {
-        let labels = inspect.labels();
-        let policy = parse_policy(&labels)?;
-        let host_dns_servers = parse_host_dns_servers(&labels)?;
+        let policy = parse_policy(&inspect.config.labels)?;
         let runtime_dns_servers = inspect.runtime_dns_servers();
+
         let mut attachments = Vec::new();
         let mut network_cache: HashMap<NetworkId, Option<NetworkRuntimeData>> = state
             .networks
@@ -433,7 +445,6 @@ where
         Ok(ContainerSnapshot {
             id: inspect.id.into(),
             name: inspect.name,
-            parsed_labels: ParsedContainerLabels { host_dns_servers },
             attachments,
             runtime_dns_servers,
             policy,
@@ -449,7 +460,7 @@ where
         match self.api.inspect_container(container_id) {
             Ok(inspect) => {
                 let snapshot = self.build_container_snapshot_from_inspect(state, inspect)?;
-                Ok(Some(RuntimeStateAction::UpsertContainer {
+                Ok(Some(RuntimeStateAction::CreateContainer {
                     snapshot: Box::new(snapshot),
                 }))
             }
@@ -461,72 +472,22 @@ where
     }
 
     fn create_container_action(
-        event: &DockerEvent,
+        event: DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        let labels = event_attributes_as_labels(&event.attributes);
-        let policy = parse_policy(&labels)?;
-        let host_dns_servers = parse_host_dns_servers(&labels)?;
+        let policy = parse_policy(&event.attributes)?;
 
-        let name = event
-            .name
-            .as_deref()
-            .or_else(|| event.attributes.get("name").map(String::as_str))
-            .unwrap_or(event.id.as_str())
-            .to_string();
-        let snapshot = ContainerSnapshot {
-            id: event.id.as_str().into(),
-            name,
-            parsed_labels: ParsedContainerLabels { host_dns_servers },
-            attachments: Vec::new(),
-            runtime_dns_servers: HashSet::new(),
-            policy,
-        };
-        Ok(Some(RuntimeStateAction::UpsertContainer {
-            snapshot: Box::new(snapshot),
-        }))
-    }
-
-    fn rename_container_action(
-        state: &RuntimeState,
-        event: &DockerEvent,
-    ) -> Option<RuntimeStateAction> {
-        let existing = state.containers.get(event.id.as_str())?;
-        let name = event
-            .name
-            .as_deref()
-            .or_else(|| event.attributes.get("name").map(String::as_str))
-            .unwrap_or(existing.name.as_str())
-            .to_string();
-        if name == existing.name {
-            return None;
-        }
-        let mut snapshot = existing.clone();
-        snapshot.name = name;
-        Some(RuntimeStateAction::UpsertContainer {
-            snapshot: Box::new(snapshot),
-        })
-    }
-
-    fn update_container_action(
-        state: &RuntimeState,
-        event: &DockerEvent,
-    ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        let Some(existing) = state.containers.get(event.id.as_str()) else {
+        let Some(name) = event.name else {
             return Ok(None);
         };
-        let labels = event_attributes_as_labels(&event.attributes);
-        let policy = parse_policy(&labels)?;
-        let host_dns_servers = parse_host_dns_servers(&labels)?;
 
-        if labels.is_empty() {
-            return Ok(None);
-        }
-
-        let mut snapshot = existing.clone();
-        snapshot.policy = policy;
-        snapshot.parsed_labels = ParsedContainerLabels { host_dns_servers };
-        Ok(Some(RuntimeStateAction::UpsertContainer {
-            snapshot: Box::new(snapshot),
+        Ok(Some(RuntimeStateAction::CreateContainer {
+            snapshot: Box::new(ContainerSnapshot {
+                id: event.id.into(),
+                name,
+                attachments: Vec::new(),
+                runtime_dns_servers: HashSet::new(),
+                policy,
+            }),
         }))
     }
 
@@ -611,9 +572,7 @@ where
         state: &RuntimeState,
         summary: &DockerContainerSummary,
     ) -> Result<Option<ContainerSnapshot>, MonitorError> {
-        let labels = summary.labels.clone().unwrap_or_default();
-        let policy = parse_policy(&labels)?;
-        let host_dns_servers = parse_host_dns_servers(&labels)?;
+        let policy = parse_policy(&summary.labels)?;
         let runtime_dns_servers = summary.runtime_dns_servers();
 
         if policy_uses_runtime_dns(&policy) && runtime_dns_servers.is_empty() {
@@ -645,7 +604,6 @@ where
         Ok(Some(ContainerSnapshot {
             id: summary.id.clone().into(),
             name: summary.name(),
-            parsed_labels: ParsedContainerLabels { host_dns_servers },
             attachments,
             runtime_dns_servers,
             policy,
@@ -658,13 +616,6 @@ fn policy_uses_runtime_dns(policy: &crate::model::ContainerPolicy) -> bool {
         .dns_targets
         .iter()
         .any(|target| matches!(target, crate::model::DnsTarget::Runtime))
-}
-
-fn event_attributes_as_labels(attributes: &HashMap<String, String>) -> IndexMap<String, String> {
-    attributes
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
 }
 
 fn is_not_found(error: &MonitorError) -> bool {
@@ -926,7 +877,7 @@ pub(crate) struct DockerEvent {
     pub action: DockerEventAction,
     pub name: Option<String>,
     pub kind: DockerEventKind,
-    pub attributes: HashMap<String, String>,
+    pub attributes: IndexMap<String, String>,
 }
 
 impl DockerEvent {
@@ -935,10 +886,7 @@ impl DockerEvent {
         match self.kind {
             DockerEventKind::Container => matches!(
                 self.action,
-                DockerEventAction::Create
-                    | DockerEventAction::Destroy
-                    | DockerEventAction::Rename
-                    | DockerEventAction::Update
+                DockerEventAction::Create | DockerEventAction::Destroy | DockerEventAction::Rename
             ),
             DockerEventKind::Network => matches!(
                 self.action,
@@ -1142,8 +1090,8 @@ pub struct DockerContainerSummary {
     pub id: String,
     #[serde(rename = "Names")]
     pub names: Option<Vec<String>>,
-    #[serde(rename = "Labels")]
-    pub labels: Option<IndexMap<String, String>>,
+    #[serde(rename = "Labels", default)]
+    pub labels: IndexMap<String, String>,
     #[serde(rename = "HostConfig")]
     pub host_config: Option<DockerHostConfig>,
     #[serde(rename = "NetworkSettings")]
@@ -1206,8 +1154,8 @@ pub struct DockerContainerInspect {
     pub id: String,
     #[serde(rename = "Name")]
     pub name: String,
-    #[serde(rename = "Config")]
-    pub config: Option<DockerContainerConfig>,
+    #[serde(rename = "Config", default)]
+    pub config: DockerContainerConfig,
     #[serde(rename = "HostConfig")]
     pub host_config: Option<DockerHostConfig>,
     #[serde(rename = "NetworkSettings")]
@@ -1215,13 +1163,6 @@ pub struct DockerContainerInspect {
 }
 
 impl DockerContainerInspect {
-    fn labels(&self) -> IndexMap<String, String> {
-        self.config
-            .as_ref()
-            .and_then(|config| config.labels.clone())
-            .unwrap_or_default()
-    }
-
     fn runtime_dns_servers(&self) -> HashSet<IpAddr> {
         self.host_config
             .as_ref()
@@ -1246,10 +1187,10 @@ impl DockerContainerInspect {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct DockerContainerConfig {
-    #[serde(rename = "Labels")]
-    pub labels: Option<IndexMap<String, String>>,
+    #[serde(rename = "Labels", default)]
+    pub labels: IndexMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1519,7 +1460,7 @@ mod tests {
         network_id: &str,
         address: &str,
     ) -> DockerContainerInspect {
-        let label_map: IndexMap<String, String> = labels
+        let label_map = labels
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
@@ -1541,9 +1482,7 @@ mod tests {
         DockerContainerInspect {
             id: id.to_string(),
             name: name.to_string(),
-            config: Some(DockerContainerConfig {
-                labels: Some(label_map),
-            }),
+            config: DockerContainerConfig { labels: label_map },
             host_config: None,
             network_settings: Some(DockerNetworkSettings {
                 networks: Some(networks),
@@ -1559,7 +1498,7 @@ mod tests {
         network_id: &str,
         address: &str,
     ) -> DockerContainerSummary {
-        let label_map: IndexMap<String, String> = labels
+        let label_map = labels
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
@@ -1579,7 +1518,7 @@ mod tests {
         DockerContainerSummary {
             id: id.to_string(),
             names: Some(vec![name.to_string()]),
-            labels: Some(label_map),
+            labels: label_map,
             host_config: None,
             network_settings: Some(DockerContainerSummaryNetworkSettings {
                 networks: Some(networks),
@@ -1676,7 +1615,7 @@ mod tests {
             containers_list: vec![DockerContainerSummary {
                 id: "abc".into(),
                 names: Some(vec!["/web".to_string()]),
-                labels: Some(IndexMap::new()),
+                labels: IndexMap::new(),
                 host_config: None,
                 network_settings: Some(DockerContainerSummaryNetworkSettings {
                     networks: Some(BTreeMap::from([(
@@ -1879,21 +1818,21 @@ mod tests {
             action: DockerEventAction::Create,
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
-            attributes: HashMap::new(),
+            attributes: IndexMap::new(),
         };
         let not_relevant = DockerEvent {
             id: "abc".into(),
             action: DockerEventAction::Resize,
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
-            attributes: HashMap::new(),
+            attributes: IndexMap::new(),
         };
         let relevant_network = DockerEvent {
             id: "net0".to_string(),
             action: DockerEventAction::Disconnect,
             name: Some("pc-managed".to_string()),
             kind: DockerEventKind::Network,
-            attributes: HashMap::new(),
+            attributes: IndexMap::new(),
         };
 
         assert!(relevant.is_relevant_for_policy_refresh());
@@ -1911,7 +1850,7 @@ mod tests {
             action: DockerEventAction::Create,
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
-            attributes: HashMap::from([
+            attributes: IndexMap::from([
                 ("name".to_string(), "web".to_string()),
                 ("image".to_string(), "alpine/curl:latest".to_string()),
                 ("portcullis.enable".to_string(), "true".to_string()),
@@ -1923,11 +1862,11 @@ mod tests {
         };
 
         let action = monitor
-            .resolve_event_action(&state, &event)
+            .resolve_event_action(&state, event)
             .expect("create event should resolve");
         assert!(matches!(
             action,
-            Some(RuntimeStateAction::UpsertContainer { .. })
+            Some(RuntimeStateAction::CreateContainer { .. })
         ));
         assert!(monitor.api.inspect_container_requests.borrow().is_empty());
     }
@@ -1959,17 +1898,15 @@ mod tests {
             gateway: None,
             enforced: true,
         });
-        state.apply_action(RuntimeStateAction::UpsertContainer {
+        state.apply_action(RuntimeStateAction::CreateContainer {
             snapshot: Box::new(ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                parsed_labels: ParsedContainerLabels::default(),
                 attachments: Vec::new(),
                 runtime_dns_servers: HashSet::new(),
-                policy: parse_policy(&IndexMap::from([(
-                    "portcullis.enable".to_string(),
-                    "true".to_string(),
-                )]))
+                policy: parse_policy(
+                    &[("portcullis.enable".to_string(), "true".to_string())].into(),
+                )
                 .expect("policy should parse"),
             }),
         });
@@ -1978,15 +1915,15 @@ mod tests {
             action: DockerEventAction::Connect,
             name: Some("pc-managed".to_string()),
             kind: DockerEventKind::Network,
-            attributes: HashMap::from([("container".to_string(), "abc".to_string())]),
+            attributes: [("container".to_string(), "abc".to_string())].into(),
         };
 
         let action = monitor
-            .resolve_event_action(&state, &event)
+            .resolve_event_action(&state, event)
             .expect("connect event should resolve");
         assert!(matches!(
             action,
-            Some(RuntimeStateAction::UpsertContainer { .. })
+            Some(RuntimeStateAction::CreateContainer { .. })
         ));
         assert_eq!(
             monitor.api.inspect_container_requests.borrow().as_slice(),
@@ -2000,11 +1937,10 @@ mod tests {
         let api = MockDockerApi::default();
         let monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
-        state.apply_action(RuntimeStateAction::UpsertContainer {
+        state.apply_action(RuntimeStateAction::CreateContainer {
             snapshot: Box::new(ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                parsed_labels: ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: "172.20.0.2".parse().expect("valid ip"),
@@ -2019,11 +1955,11 @@ mod tests {
             action: DockerEventAction::Disconnect,
             name: Some("pc-managed".to_string()),
             kind: DockerEventKind::Network,
-            attributes: HashMap::from([("container".to_string(), "abc".to_string())]),
+            attributes: [("container".to_string(), "abc".to_string())].into(),
         };
 
         let action = monitor
-            .resolve_event_action(&state, &event)
+            .resolve_event_action(&state, event)
             .expect("disconnect event should resolve");
         assert!(matches!(
             action,
@@ -2208,7 +2144,7 @@ mod tests {
         ip_address: &str,
         subnet: &str,
     ) -> RuntimeSnapshot {
-        let label_map: IndexMap<String, String> = labels
+        let label_map = labels
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
@@ -2226,17 +2162,13 @@ mod tests {
             containers: vec![ContainerSnapshot {
                 id: container_id.into(),
                 name: name.to_string(),
-                parsed_labels: ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: network_id.into(),
                     ip_address: parsed_ip,
                     aliases: vec![name.to_string()],
                 }],
                 runtime_dns_servers: HashSet::new(),
-                policy: match parse_policy(&label_map) {
-                    Ok(value) => value,
-                    Err(error) => panic!("failed to parse policy fixture: {error}"),
-                },
+                policy: parse_policy(&label_map).unwrap(),
             }],
             networks: HashMap::from([(
                 network_id.into(),

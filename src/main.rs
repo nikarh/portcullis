@@ -5,7 +5,6 @@ mod logging;
 mod model;
 mod monitor;
 
-use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
@@ -29,6 +28,7 @@ use crate::monitor::{
     MonitorError, RuntimeChangeTracker, RuntimeState, SocketDockerApi,
 };
 use serde::Deserialize;
+use indexmap::IndexMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirewallBackend {
@@ -267,13 +267,13 @@ fn run(config: &Config) -> Result<(), MainError> {
                 );
 
                 let update_result = monitor
-                    .resolve_event_action(&runtime_state, &event)
+                    .resolve_event_action(&runtime_state, event)
                     .map(|action| action.is_some_and(|value| runtime_state.apply_action(value)))
                     .map_err(MainError::from);
 
                 match update_result {
                     Ok(false) => {
-                        trace!(event = ?event, "docker event produced no policy state changes");
+                        trace!("docker event produced no policy state changes");
                     }
                     Ok(true) => {
                         if let Err(error) = apply_runtime_state(
@@ -458,13 +458,7 @@ fn parse_container_event_line(line: &str) -> Result<Option<DockerEvent>, MainErr
         return Ok(None);
     }
 
-    let attributes = parsed
-        .actor
-        .as_ref()
-        .and_then(|actor| actor.attributes.as_ref())
-        .cloned()
-        .unwrap_or_default();
-
+    let attributes = parsed.actor.and_then(|a| a.attributes).unwrap_or_default();
     let name = attributes.get("name").cloned();
 
     Ok(Some(DockerEvent {
@@ -538,7 +532,7 @@ struct DockerEventActor {
     #[serde(rename = "ID")]
     id: Option<String>,
     #[serde(rename = "Attributes")]
-    attributes: Option<HashMap<String, String>>,
+    attributes: Option<IndexMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -606,7 +600,7 @@ mod tests {
                 action: DockerEventAction::Start,
                 name: Some("web".to_string()),
                 kind: DockerEventKind::Container,
-                attributes: std::collections::HashMap::from([(
+                attributes: indexmap::IndexMap::from([(
                     "name".to_string(),
                     "web".to_string(),
                 )]),
@@ -625,7 +619,7 @@ mod tests {
                 action: DockerEventAction::Create,
                 name: Some("pc-managed".to_string()),
                 kind: DockerEventKind::Network,
-                attributes: std::collections::HashMap::from([(
+                attributes: indexmap::IndexMap::from([(
                     "name".to_string(),
                     "pc-managed".to_string(),
                 )]),

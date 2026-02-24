@@ -267,7 +267,6 @@ fn build_apply_commands_with_dns(
                 gateway,
                 &policy.dns_targets,
                 &container.runtime_dns_servers,
-                &container.parsed_labels.host_dns_servers,
             );
 
             if policy.icc_mode == IccMode::Deny {
@@ -569,7 +568,6 @@ fn append_implicit_dns_allow_commands(
     gateway: Option<IpAddr>,
     dns_targets: &[DnsTarget],
     runtime_dns_servers: &HashSet<IpAddr>,
-    host_dns_servers: &HashSet<IpAddr>,
 ) {
     let mut allow_any = false;
     let mut destinations = BTreeSet::new();
@@ -580,13 +578,7 @@ fn append_implicit_dns_allow_commands(
                     destinations.insert(value);
                 }
             }
-            DnsTarget::Host => {
-                for value in host_dns_servers {
-                    if let IpAddr::V4(v4) = value {
-                        destinations.insert(*v4);
-                    }
-                }
-            }
+            DnsTarget::Host | DnsTarget::Ip(IpAddr::V6(_)) => {}
             DnsTarget::Runtime => {
                 for value in runtime_dns_servers {
                     if let IpAddr::V4(v4) = value {
@@ -597,7 +589,6 @@ fn append_implicit_dns_allow_commands(
             DnsTarget::Ip(IpAddr::V4(value)) => {
                 destinations.insert(*value);
             }
-            DnsTarget::Ip(IpAddr::V6(_)) => {}
             DnsTarget::Any => allow_any = true,
         }
     }
@@ -840,7 +831,6 @@ mod tests {
             containers: vec![ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                parsed_labels: crate::model::ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: source_ip,
@@ -909,7 +899,6 @@ mod tests {
         snapshot.containers.push(ContainerSnapshot {
             id: "peer".into(),
             name: "/peer".to_string(),
-            parsed_labels: crate::model::ParsedContainerLabels::default(),
             attachments: vec![NetworkAttachment {
                 network_id: "net0".into(),
                 ip_address: peer_ip,
