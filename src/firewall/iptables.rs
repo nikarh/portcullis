@@ -126,20 +126,12 @@ where
         snapshot: &RuntimeSnapshot,
         resolver: &mut dyn HostnameIpResolver,
     ) -> Result<(), FirewallError> {
-        if self.use_ipset {
-            info!("ipset detected; using ipset-backed hostname rules");
-        } else {
-            info!("ipset not detected; using direct iptables hostname rules");
-        }
-        self.cleanup_chain(STAGING_CHAIN_NAME)?;
-        self.runner.run(
-            "iptables",
-            &["-N".to_string(), STAGING_CHAIN_NAME.to_string()],
-        )?;
+        self.ensure_chain_and_jump()?;
 
         let commands =
-            build_apply_commands_with_dns(snapshot, resolver, self.use_ipset, STAGING_CHAIN_NAME)?;
+            build_apply_commands_with_dns(snapshot, resolver, self.use_ipset, CHAIN_NAME)?;
         let mut restore_lines = Vec::new();
+        restore_lines.push(format!("-F {CHAIN_NAME}"));
         for command in commands {
             if command.program == "iptables" {
                 restore_lines.push(iptables_restore_line(&command.args));
@@ -148,27 +140,6 @@ where
             }
         }
         self.runner.run_iptables_restore(&restore_lines)?;
-
-        self.runner.run(
-            "iptables",
-            &[
-                "-I".to_string(),
-                DOCKER_USER_CHAIN.to_string(),
-                "1".to_string(),
-                "-j".to_string(),
-                STAGING_CHAIN_NAME.to_string(),
-            ],
-        )?;
-        self.delete_jump_to_chain(CHAIN_NAME)?;
-        self.cleanup_chain(CHAIN_NAME)?;
-        self.runner.run(
-            "iptables",
-            &[
-                "-E".to_string(),
-                STAGING_CHAIN_NAME.to_string(),
-                CHAIN_NAME.to_string(),
-            ],
-        )?;
 
         Ok(())
     }
@@ -182,38 +153,44 @@ where
         Ok(())
     }
 
-    fn delete_jump_to_chain(&self, chain: &str) -> Result<(), FirewallError> {
+    fn ensure_chain_and_jump(&self) -> Result<(), FirewallError> {
+        match self
+            .runner
+            .run("iptables", &["-N".to_string(), CHAIN_NAME.to_string()])
+        {
+            Ok(()) => {}
+            Err(FirewallError::CommandFailure { stderr, .. })
+                if stderr.contains("Chain already exists") => {}
+            Err(error) => return Err(error),
+        }
+
         match self.runner.run(
             "iptables",
             &[
-                "-D".to_string(),
+                "-C".to_string(),
                 DOCKER_USER_CHAIN.to_string(),
                 "-j".to_string(),
-                chain.to_string(),
+                CHAIN_NAME.to_string(),
             ],
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(FirewallError::CommandFailure { stderr, .. })
                 if is_ignorable_cleanup_stderr(&stderr) =>
             {
-                Ok(())
+                self.runner.run(
+                    "iptables",
+                    &[
+                        "-I".to_string(),
+                        DOCKER_USER_CHAIN.to_string(),
+                        "1".to_string(),
+                        "-j".to_string(),
+                        CHAIN_NAME.to_string(),
+                    ],
+                )?;
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
         }
-    }
 
-    fn cleanup_chain(&self, chain: &str) -> Result<(), FirewallError> {
-        for args in [
-            vec!["-F".to_string(), chain.to_string()],
-            vec!["-X".to_string(), chain.to_string()],
-        ] {
-            match self.runner.run("iptables", &args) {
-                Ok(()) => {}
-                Err(FirewallError::CommandFailure { stderr, .. })
-                    if is_ignorable_cleanup_stderr(&stderr) => {}
-                Err(error) => return Err(error),
-            }
-        }
         Ok(())
     }
 }
