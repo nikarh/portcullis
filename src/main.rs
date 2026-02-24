@@ -6,6 +6,7 @@ mod model;
 mod monitor;
 
 use std::collections::BTreeSet;
+use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::str::FromStr;
@@ -356,7 +357,7 @@ where
     match event.kind {
         DockerEventKind::Container => match event.action.as_str() {
             "destroy" => {
-                changed |= DockerMonitor::<A>::remove_container(runtime_state, &event.id);
+                changed |= runtime_state.remove_container(&event.id);
             }
             "create" | "start" | "rename" | "update" | "connect" | "disconnect" => {
                 let container_changed = monitor.refresh_container(runtime_state, &event.id)?;
@@ -377,7 +378,7 @@ where
         },
         DockerEventKind::Network => match event.action.as_str() {
             "destroy" => {
-                changed |= DockerMonitor::<A>::remove_network(runtime_state, &event.id);
+                changed |= runtime_state.remove_network(&event.id);
             }
             "create" | "update" | "connect" | "disconnect" => {
                 let (network_result, container_ids) =
@@ -451,9 +452,9 @@ impl DockerSocketEventStream {
             .map_err(|error| MainError::ServiceState(error.to_string()))?;
 
         let since = current_unix_epoch_seconds()?;
-        let request = format!(
-            "GET /events?filters=%7B%22type%22%3A%5B%22container%22%2C%22network%22%5D%7D&since={since} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
-        );
+        let path = build_events_path(since)?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
         stream
             .write_all(request.as_bytes())
             .map_err(|error| MainError::ServiceState(error.to_string()))?;
@@ -513,9 +514,16 @@ fn parse_container_event_line(line: &str) -> Result<Option<DockerEvent>, MainErr
 
     let parsed: DockerEventLine = serde_json::from_str(trimmed)
         .map_err(|error| MainError::ServiceState(format!("invalid docker event json: {error}")))?;
-    let action = parsed.action.or(parsed.status).unwrap_or_default();
-    let kind = parsed.kind.or(parsed.event_type).unwrap_or_default();
-    let kind = kind.to_lowercase();
+    let action = parsed
+        .action
+        .or(parsed.status)
+        .map(DockerEventActionValue::into_string)
+        .unwrap_or_default();
+    let kind = parsed
+        .kind
+        .or(parsed.event_type)
+        .map(DockerEventTypeValue::into_string)
+        .unwrap_or_default();
     if !kind.is_empty() && kind != "container" && kind != "network" {
         return Ok(None);
     }
@@ -551,16 +559,145 @@ fn is_chunk_size_line(line: &str) -> bool {
     !size_part.is_empty() && size_part.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
+fn build_events_path(since: i64) -> Result<String, MainError> {
+    let filters = serde_json::json!({
+        "type": ["container", "network"],
+        "event": [
+            "create",
+            "start",
+            "rename",
+            "update",
+            "destroy",
+            "connect",
+            "disconnect"
+        ]
+    });
+    let raw = serde_json::to_string(&filters)
+        .map_err(|error| MainError::ServiceState(error.to_string()))?;
+    Ok(format!(
+        "/events?filters={}&since={since}",
+        percent_encode_query_value(&raw)
+    ))
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                encoded.push('%');
+                let _ = write!(encoded, "{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DockerEventTypeValue {
+    Known(DockerEventTypeKnown),
+    Other(String),
+}
+
+impl DockerEventTypeValue {
+    fn into_string(self) -> String {
+        match self {
+            Self::Known(value) => value.as_str().to_string(),
+            Self::Other(value) => value.to_lowercase(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DockerEventTypeKnown {
+    Container,
+    Network,
+}
+
+impl DockerEventTypeKnown {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Network => "network",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DockerEventActionValue {
+    Known(DockerEventActionKnown),
+    Other(String),
+}
+
+impl DockerEventActionValue {
+    fn into_string(self) -> String {
+        match self {
+            Self::Known(value) => value.as_str().to_string(),
+            Self::Other(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DockerEventActionKnown {
+    Create,
+    Start,
+    Rename,
+    Update,
+    Destroy,
+    Connect,
+    Disconnect,
+    Attach,
+    Detach,
+    Restart,
+    Stop,
+    Die,
+    Kill,
+    Pause,
+    Unpause,
+    Resize,
+}
+
+impl DockerEventActionKnown {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Start => "start",
+            Self::Rename => "rename",
+            Self::Update => "update",
+            Self::Destroy => "destroy",
+            Self::Connect => "connect",
+            Self::Disconnect => "disconnect",
+            Self::Attach => "attach",
+            Self::Detach => "detach",
+            Self::Restart => "restart",
+            Self::Stop => "stop",
+            Self::Die => "die",
+            Self::Kill => "kill",
+            Self::Pause => "pause",
+            Self::Unpause => "unpause",
+            Self::Resize => "resize",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct DockerEventLine {
     #[serde(rename = "Type")]
-    event_type: Option<String>,
+    event_type: Option<DockerEventTypeValue>,
     #[serde(rename = "type")]
-    kind: Option<String>,
+    kind: Option<DockerEventTypeValue>,
     #[serde(rename = "Action")]
-    action: Option<String>,
+    action: Option<DockerEventActionValue>,
     #[serde(rename = "status")]
-    status: Option<String>,
+    status: Option<DockerEventActionValue>,
     #[serde(rename = "id")]
     id: Option<String>,
     #[serde(rename = "Actor")]
@@ -685,6 +822,24 @@ mod tests {
         let event =
             parse_container_event_line("173;foo=bar\r\n").expect("event parse should succeed");
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_container_event_line_accepts_unknown_action_value() {
+        let line = "{\"Type\":\"container\",\"Action\":\"new_future_action\",\"Actor\":{\"ID\":\"abc\",\"Attributes\":{\"name\":\"web\"}}}";
+        let event = parse_container_event_line(line).expect("event parse should succeed");
+        assert_eq!(event.expect("event expected").action, "new_future_action");
+    }
+
+    #[test]
+    fn build_events_path_includes_type_and_event_filters() {
+        let path = build_events_path(123).expect("events path should build");
+        assert!(path.starts_with("/events?filters="));
+        assert!(path.contains("&since=123"));
+        assert!(path.contains("%22type%22"));
+        assert!(path.contains("%22event%22"));
+        assert!(path.contains("connect"));
+        assert!(path.contains("disconnect"));
     }
 
     #[test]

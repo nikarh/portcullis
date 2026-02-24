@@ -97,6 +97,24 @@ impl RuntimeState {
             .get(container_id)
             .is_some_and(|container| !container.attachments.is_empty())
     }
+
+    pub(crate) fn remove_container(&mut self, container_id: &str) -> bool {
+        self.containers.remove(container_id).is_some()
+    }
+
+    pub(crate) fn remove_network(&mut self, network_id: &str) -> bool {
+        let mut changed = self.networks.remove(network_id).is_some();
+        for container in self.containers.values_mut() {
+            let previous_len = container.attachments.len();
+            container
+                .attachments
+                .retain(|attachment| attachment.network_id != network_id);
+            if container.attachments.len() != previous_len {
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 pub(crate) struct DockerMonitor<A> {
@@ -177,10 +195,6 @@ where
         }
     }
 
-    pub(crate) fn remove_container(state: &mut RuntimeState, container_id: &str) -> bool {
-        state.containers.remove(container_id).is_some()
-    }
-
     pub(crate) fn refresh_network(
         &self,
         state: &mut RuntimeState,
@@ -200,35 +214,14 @@ where
                     Ok((NetworkRefreshResult { changed }, attached_container_ids))
                 }
             }
-            Err(error) if is_not_found(&error) => {
-                let mut changed = state.networks.remove(network_id).is_some();
-                for container in state.containers.values_mut() {
-                    let before = container.attachments.len();
-                    container
-                        .attachments
-                        .retain(|attachment| attachment.network_id != network_id);
-                    if before != container.attachments.len() {
-                        changed = true;
-                    }
-                }
-                Ok((NetworkRefreshResult { changed }, Vec::new()))
-            }
+            Err(error) if is_not_found(&error) => Ok((
+                NetworkRefreshResult {
+                    changed: state.remove_network(network_id),
+                },
+                Vec::new(),
+            )),
             Err(error) => Err(error),
         }
-    }
-
-    pub(crate) fn remove_network(state: &mut RuntimeState, network_id: &str) -> bool {
-        let mut changed = state.networks.remove(network_id).is_some();
-        for container in state.containers.values_mut() {
-            let previous_len = container.attachments.len();
-            container
-                .attachments
-                .retain(|attachment| attachment.network_id != network_id);
-            if container.attachments.len() != previous_len {
-                changed = true;
-            }
-        }
-        changed
     }
 
     fn network_runtime_data(
@@ -1711,9 +1704,7 @@ mod tests {
             .expect("collect state should succeed");
         let container_before = state.snapshot().containers[0].attachments.len();
         assert_eq!(container_before, 1);
-        assert!(DockerMonitor::<MockDockerApi>::remove_network(
-            &mut state, "net0"
-        ));
+        assert!(state.remove_network("net0"));
         let container_after = state.snapshot().containers[0].attachments.len();
         assert_eq!(container_after, 0);
     }
