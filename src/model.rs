@@ -131,11 +131,17 @@ pub struct ContainerPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkAttachment {
     pub network_id: NetworkId,
-    pub network_name: String,
     pub ip_address: IpAddr,
-    pub gateway: Option<IpAddr>,
-    pub subnet: IpNet,
     pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkSnapshot {
+    pub id: NetworkId,
+    pub name: String,
+    pub subnet: IpNet,
+    pub gateway: Option<IpAddr>,
+    pub enforced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,5 +158,6 @@ pub struct ContainerSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
     pub containers: Vec<ContainerSnapshot>,
+    pub networks: HashMap<NetworkId, NetworkSnapshot>,
     pub enforced_network_subnets: Vec<IpNet>,
 }

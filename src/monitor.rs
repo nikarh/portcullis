@@ -11,7 +11,9 @@ use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
 use crate::labels::{LabelParseError, parse_host_dns_servers, parse_policy};
-use crate::model::{ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, RuntimeSnapshot};
+use crate::model::{
+    ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, NetworkSnapshot, RuntimeSnapshot,
+};
 
 #[derive(Debug, Error)]
 pub enum MonitorError {
@@ -59,8 +61,9 @@ pub(crate) enum DockerFirewallBackend {
     Iptables,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NetworkRuntimeData {
+    pub name: String,
     pub subnet: IpNet,
     pub gateway: Option<IpAddr>,
     pub enforced: bool,
@@ -83,6 +86,7 @@ impl NetworkRuntimeData {
         let enforce_network_policy = network.is_portcullis_network_enforced()?;
 
         Ok(Some(Self {
+            name: network.name.clone(),
             subnet,
             gateway,
             enforced: enforce_network_policy,
@@ -110,6 +114,7 @@ pub(crate) enum RuntimeStateAction {
     },
     UpsertNetwork {
         network_id: NetworkId,
+        network_name: String,
         subnet: IpNet,
         gateway: Option<IpAddr>,
         enforced: bool,
@@ -130,6 +135,22 @@ impl RuntimeState {
         }
         RuntimeSnapshot {
             containers: self.containers.values().cloned().collect(),
+            networks: self
+                .networks
+                .iter()
+                .map(|(id, data)| {
+                    (
+                        id.clone(),
+                        NetworkSnapshot {
+                            id: id.clone(),
+                            name: data.name.clone(),
+                            subnet: data.subnet,
+                            gateway: data.gateway,
+                            enforced: data.enforced,
+                        },
+                    )
+                })
+                .collect(),
             enforced_network_subnets: enforced_network_subnets.into_iter().collect(),
         }
     }
@@ -179,16 +200,18 @@ impl RuntimeState {
             }
             RuntimeStateAction::UpsertNetwork {
                 network_id,
+                network_name,
                 subnet,
                 gateway,
                 enforced,
             } => {
                 let next = NetworkRuntimeData {
+                    name: network_name,
                     subnet,
                     gateway,
                     enforced,
                 };
-                let changed = self.networks.get(&network_id).copied() != Some(next);
+                let changed = self.networks.get(&network_id).cloned() != Some(next.clone());
                 self.networks.insert(network_id, next);
                 changed
             }
@@ -328,7 +351,7 @@ where
                     state.networks.insert(network_id.clone(), data);
                 }
             }
-            let Some(network_data) = state.networks.get(&network_id).copied() else {
+            let Some(_network_data) = state.networks.get(&network_id) else {
                 warn!(
                     network_id = %network_id,
                     container_id = %inspect.id,
@@ -338,10 +361,7 @@ where
             };
             attachments.push(NetworkAttachment {
                 network_id,
-                network_name: network_name.to_string(),
                 ip_address: address,
-                gateway: network_data.gateway,
-                subnet: network_data.subnet,
                 aliases: endpoint.aliases.unwrap_or_default(),
             });
         }
@@ -370,7 +390,7 @@ where
         let mut network_cache: HashMap<NetworkId, Option<NetworkRuntimeData>> = state
             .networks
             .iter()
-            .map(|(network_id, data)| (network_id.clone(), Some(*data)))
+            .map(|(network_id, data)| (network_id.clone(), Some(data.clone())))
             .collect();
 
         for (network_name, endpoint) in inspect.network_endpoints() {
@@ -385,17 +405,17 @@ where
                 })?
                 .into();
             let network_data = if let Some(value) = network_cache.get(&network_id) {
-                *value
+                value.clone()
             } else {
                 let value = match self.api.inspect_network(network_id.as_str()) {
                     Ok(network) => NetworkRuntimeData::try_new(&network)?,
                     Err(error) if is_not_found(&error) => None,
                     Err(error) => return Err(error),
                 };
-                network_cache.insert(network_id.clone(), value);
+                network_cache.insert(network_id.clone(), value.clone());
                 value
             };
-            let Some(network_data) = network_data else {
+            let Some(_network_data) = network_data else {
                 warn!(
                     network_id = %network_id,
                     container_id = %inspect.id,
@@ -405,10 +425,7 @@ where
             };
             attachments.push(NetworkAttachment {
                 network_id,
-                network_name: network_name.to_string(),
                 ip_address: address,
-                gateway: network_data.gateway,
-                subnet: network_data.subnet,
                 aliases: endpoint.aliases.unwrap_or_default(),
             });
         }
@@ -576,6 +593,7 @@ where
                 if let Some(data) = NetworkRuntimeData::try_new(&network)? {
                     Ok(Some(RuntimeStateAction::UpsertNetwork {
                         network_id: network_id.into(),
+                        network_name: network.name.clone(),
                         subnet: data.subnet,
                         gateway: data.gateway,
                         enforced: data.enforced,
@@ -607,7 +625,7 @@ where
         }
 
         let mut attachments = Vec::new();
-        for (network_name, endpoint) in summary.network_endpoints() {
+        for (_network_name, endpoint) in summary.network_endpoints() {
             let Some(address) = endpoint.ip_address else {
                 continue;
             };
@@ -615,7 +633,7 @@ where
                 return Ok(None);
             };
             let network_id: NetworkId = network_id_raw.into();
-            let Some(network_data) = state.networks.get(&network_id).copied() else {
+            let Some(_network_data) = state.networks.get(&network_id) else {
                 return Ok(None);
             };
             if endpoint.aliases.is_none() {
@@ -623,10 +641,7 @@ where
             }
             attachments.push(NetworkAttachment {
                 network_id,
-                network_name: network_name.to_string(),
                 ip_address: address,
-                gateway: network_data.gateway,
-                subnet: network_data.subnet,
                 aliases: endpoint.aliases.clone().unwrap_or_default(),
             });
         }
@@ -965,13 +980,11 @@ pub(crate) enum RuntimeChange {
         container_id: String,
         network_id: String,
         ip_address: IpAddr,
-        subnet: IpNet,
     },
     AttachmentRemoved {
         container_id: String,
         network_id: String,
         ip_address: IpAddr,
-        subnet: IpNet,
     },
     PolicyChanged {
         container_id: String,
@@ -1024,18 +1037,16 @@ impl RuntimeChangeTracker {
                     container_id,
                     network_id,
                     ip_address,
-                    subnet,
                 } => {
-                    info!(container_id = %container_id, network_id = %network_id, %ip_address, %subnet, "container network attachment added");
+                    info!(container_id = %container_id, network_id = %network_id, %ip_address, "container network attachment added");
                     debug!(?change, "network attachment change detail");
                 }
                 RuntimeChange::AttachmentRemoved {
                     container_id,
                     network_id,
                     ip_address,
-                    subnet,
                 } => {
-                    info!(container_id = %container_id, network_id = %network_id, %ip_address, %subnet, "container network attachment removed");
+                    info!(container_id = %container_id, network_id = %network_id, %ip_address, "container network attachment removed");
                     debug!(?change, "network attachment change detail");
                 }
             }
@@ -1149,7 +1160,6 @@ fn detect_attachment_changes(
                 container_id: current.id.to_string(),
                 network_id: attachment.network_id.to_string(),
                 ip_address: attachment.ip_address,
-                subnet: attachment.subnet,
             });
         }
     }
@@ -1160,17 +1170,13 @@ fn detect_attachment_changes(
                 container_id: previous.id.to_string(),
                 network_id: attachment.network_id.to_string(),
                 ip_address: attachment.ip_address,
-                subnet: attachment.subnet,
             });
         }
     }
 }
 
 fn attachment_key(attachment: &NetworkAttachment) -> String {
-    format!(
-        "{}|{}|{}",
-        attachment.network_id, attachment.ip_address, attachment.subnet
-    )
+    format!("{}|{}", attachment.network_id, attachment.ip_address)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1991,6 +1997,7 @@ mod tests {
         let mut state = RuntimeState::default();
         state.apply_action(RuntimeStateAction::UpsertNetwork {
             network_id: "net0".into(),
+            network_name: "pc-managed".to_string(),
             subnet: "172.20.0.0/16".parse().expect("valid subnet"),
             gateway: None,
             enforced: true,
@@ -2046,10 +2053,7 @@ mod tests {
                 labels: HashMap::new(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
-                    network_name: "pc-managed".to_string(),
                     ip_address: "172.20.0.2".parse().expect("valid ip"),
-                    gateway: None,
-                    subnet: "172.20.0.0/16".parse().expect("valid subnet"),
                     aliases: Vec::new(),
                 }],
                 runtime_dns_servers: HashSet::new(),
@@ -2275,10 +2279,7 @@ mod tests {
                     .collect(),
                 attachments: vec![NetworkAttachment {
                     network_id: network_id.into(),
-                    network_name: network_name.to_string(),
                     ip_address: parsed_ip,
-                    gateway: None,
-                    subnet: parsed_subnet,
                     aliases: vec![name.to_string()],
                 }],
                 runtime_dns_servers: HashSet::new(),
@@ -2288,6 +2289,16 @@ mod tests {
                     Err(error) => panic!("failed to parse policy fixture: {error}"),
                 },
             }],
+            networks: HashMap::from([(
+                network_id.into(),
+                NetworkSnapshot {
+                    id: network_id.into(),
+                    name: network_name.to_string(),
+                    subnet: parsed_subnet,
+                    gateway: None,
+                    enforced: false,
+                },
+            )]),
             enforced_network_subnets: Vec::new(),
         }
     }

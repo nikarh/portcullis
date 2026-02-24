@@ -147,7 +147,7 @@ mod tests {
     use super::*;
     use crate::model::{
         ContainerPolicy, ContainerSnapshot, EgressRule, EgressTarget, IccMode, NetworkAttachment,
-        PortSpec, Protocol,
+        NetworkSnapshot, PortSpec, Protocol,
     };
 
     #[derive(Clone)]
@@ -238,10 +238,7 @@ mod tests {
                 labels,
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
-                    network_name: "bridge".to_string(),
                     ip_address: attachment_ip,
-                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                    subnet,
                     aliases: vec!["web".to_string()],
                 }],
                 runtime_dns_servers: HashSet::new(),
@@ -260,6 +257,16 @@ mod tests {
                     dns_targets: vec![crate::model::DnsTarget::Docker],
                 }),
             }],
+            networks: HashMap::from([(
+                "net0".into(),
+                NetworkSnapshot {
+                    id: "net0".into(),
+                    name: "bridge".to_string(),
+                    subnet,
+                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
+                    enforced: false,
+                },
+            )]),
             enforced_network_subnets: Vec::new(),
         }
     }

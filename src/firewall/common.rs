@@ -3,7 +3,7 @@ use std::net::IpAddr;
 
 use crate::dns::HostnameIpResolver;
 use crate::firewall::FirewallError;
-use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol, RuntimeSnapshot};
+use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeSnapshot};
 use tracing::trace;
 
 pub const TABLE_FAMILY: &str = "inet";
@@ -34,10 +34,11 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
         }
 
         for attachment in &container.attachments {
+            let gateway = network_gateway(snapshot, &attachment.network_id);
             append_dns_policy_rules(
                 &mut lines,
                 attachment.ip_address,
-                attachment.gateway,
+                gateway,
                 &policy.dns_targets,
                 &container.runtime_dns_servers,
                 &container.host_dns_servers,
@@ -126,10 +127,11 @@ pub fn build_apply_commands_with_dns(
         }
 
         for attachment in &container.attachments {
+            let gateway = network_gateway(snapshot, &attachment.network_id);
             append_dns_policy_rules(
                 &mut lines,
                 attachment.ip_address,
-                attachment.gateway,
+                gateway,
                 &policy.dns_targets,
                 &container.runtime_dns_servers,
                 &container.host_dns_servers,
@@ -491,6 +493,13 @@ fn append_enforced_network_baseline_drop_rules(lines: &mut Vec<String>, subnets:
     }
 }
 
+fn network_gateway(snapshot: &RuntimeSnapshot, network_id: &NetworkId) -> Option<IpAddr> {
+    snapshot
+        .networks
+        .get(network_id)
+        .and_then(|network| network.gateway)
+}
+
 fn append_icc_allow_list_rules(
     lines: &mut Vec<String>,
     source: IpAddr,
@@ -544,7 +553,8 @@ mod tests {
 
     use crate::dns::{DnsError, HostnameIpResolver};
     use crate::model::{
-        ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, PortSpec, Protocol,
+        ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, NetworkSnapshot,
+        PortSpec, Protocol,
     };
 
     use super::*;
@@ -588,10 +598,7 @@ mod tests {
                 labels,
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
-                    network_name: "bridge".to_string(),
                     ip_address: source_ip,
-                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                    subnet,
                     aliases: vec!["web".to_string()],
                 }],
                 runtime_dns_servers: HashSet::new(),
@@ -610,6 +617,16 @@ mod tests {
                     dns_targets: vec![crate::model::DnsTarget::Docker],
                 }),
             }],
+            networks: HashMap::from([(
+                "net0".into(),
+                NetworkSnapshot {
+                    id: "net0".into(),
+                    name: "bridge".to_string(),
+                    subnet,
+                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
+                    enforced: false,
+                },
+            )]),
             enforced_network_subnets: Vec::new(),
         }
     }
@@ -648,21 +665,13 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("failed to parse peer ip: {error}"),
         };
-        let subnet: ipnet::IpNet = match "172.18.0.0/16".parse() {
-            Ok(value) => value,
-            Err(error) => panic!("failed to parse subnet: {error}"),
-        };
-
         snapshot.containers.push(ContainerSnapshot {
             id: "peer".into(),
             name: "/peer".to_string(),
             labels: HashMap::new(),
             attachments: vec![NetworkAttachment {
                 network_id: "net0".into(),
-                network_name: "bridge".to_string(),
                 ip_address: peer_ip,
-                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                subnet,
                 aliases: vec!["db".to_string()],
             }],
             runtime_dns_servers: HashSet::new(),

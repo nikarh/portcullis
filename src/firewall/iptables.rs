@@ -7,7 +7,7 @@ use std::process::Stdio;
 use tracing::{info, trace};
 
 use crate::dns::HostnameIpResolver;
-use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol, RuntimeSnapshot};
+use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeSnapshot};
 
 use super::FirewallError;
 
@@ -261,11 +261,12 @@ fn build_apply_commands_with_dns(
             let IpAddr::V4(source_ipv4) = attachment.ip_address else {
                 continue;
             };
+            let gateway = network_gateway(snapshot, &attachment.network_id);
             append_implicit_dns_allow_commands(
                 &mut commands,
                 chain_name,
                 source_ipv4,
-                attachment.gateway,
+                gateway,
                 &policy.dns_targets,
                 &container.runtime_dns_servers,
                 &container.host_dns_servers,
@@ -535,6 +536,13 @@ fn collect_managed_ipv4(snapshot: &RuntimeSnapshot) -> Vec<std::net::Ipv4Addr> {
     values.into_iter().collect()
 }
 
+fn network_gateway(snapshot: &RuntimeSnapshot, network_id: &NetworkId) -> Option<IpAddr> {
+    snapshot
+        .networks
+        .get(network_id)
+        .and_then(|network| network.gateway)
+}
+
 fn append_enforced_network_drop_commands(
     commands: &mut Vec<CommandSpec>,
     chain_name: &str,
@@ -800,7 +808,8 @@ mod tests {
     use super::*;
     use crate::dns::{DnsError, HostnameIpResolver};
     use crate::model::{
-        ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, PortSpec,
+        ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, NetworkSnapshot,
+        PortSpec,
     };
 
     struct MockResolver;
@@ -841,10 +850,7 @@ mod tests {
                 labels,
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
-                    network_name: "bridge".to_string(),
                     ip_address: source_ip,
-                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                    subnet,
                     aliases: vec!["web".to_string(), "app".to_string()],
                 }],
                 runtime_dns_servers: HashSet::new(),
@@ -863,6 +869,16 @@ mod tests {
                     dns_targets: vec![crate::model::DnsTarget::Docker],
                 }),
             }],
+            networks: HashMap::from([(
+                "net0".into(),
+                NetworkSnapshot {
+                    id: "net0".into(),
+                    name: "bridge".to_string(),
+                    subnet,
+                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
+                    enforced: false,
+                },
+            )]),
             enforced_network_subnets: Vec::new(),
         }
     }
@@ -904,16 +920,23 @@ mod tests {
             labels: HashMap::new(),
             attachments: vec![NetworkAttachment {
                 network_id: "net0".into(),
-                network_name: "bridge".to_string(),
                 ip_address: peer_ip,
-                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                subnet,
                 aliases: vec!["db".to_string()],
             }],
             runtime_dns_servers: HashSet::new(),
             host_dns_servers: HashSet::new(),
             policy: None,
         });
+        snapshot.networks.insert(
+            "net0".into(),
+            NetworkSnapshot {
+                id: "net0".into(),
+                name: "bridge".to_string(),
+                subnet,
+                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
+                enforced: false,
+            },
+        );
         if let Some(policy) = &mut snapshot.containers[0].policy {
             policy.icc_mode = IccMode::AllowListed;
             policy.icc_allow = vec![crate::model::IccAllowRule {
