@@ -92,6 +92,13 @@ impl RuntimeState {
             enforced_network_subnets: enforced_network_subnets.into_iter().collect(),
         }
     }
+
+    #[must_use]
+    pub fn container_has_attachments(&self, container_id: &str) -> bool {
+        self.containers
+            .get(container_id)
+            .is_some_and(|container| !container.attachments.is_empty())
+    }
 }
 
 pub struct DockerMonitor<A> {

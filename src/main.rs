@@ -355,7 +355,19 @@ where
                 changed |= monitor.remove_container(runtime_state, &event.id);
             }
             "create" | "start" | "rename" | "update" | "connect" | "disconnect" => {
-                changed |= monitor.refresh_container(runtime_state, &event.id)?;
+                let container_changed = monitor.refresh_container(runtime_state, &event.id)?;
+                changed |= container_changed;
+                if should_delay_apply_for_create(
+                    &event.action,
+                    container_changed,
+                    runtime_state.container_has_attachments(&event.id),
+                ) {
+                    debug!(
+                        container_id = %event.id,
+                        "container created without network attachments; delaying firewall apply"
+                    );
+                    changed = false;
+                }
             }
             _ => {}
         },
@@ -380,6 +392,10 @@ where
         },
     }
     Ok(changed)
+}
+
+fn should_delay_apply_for_create(action: &str, changed: bool, has_attachments: bool) -> bool {
+    action == "create" && changed && !has_attachments
 }
 
 fn enforce_fail_closed_defaults(snapshot: &mut portcullis::model::RuntimeSnapshot) {
@@ -427,7 +443,7 @@ impl DockerSocketEventStream {
         let mut stream = UnixStream::connect(socket_path)
             .map_err(|error| MainError::ServiceState(error.to_string()))?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(Duration::from_millis(100)))
             .map_err(|error| MainError::ServiceState(error.to_string()))?;
 
         let since = current_unix_epoch_seconds()?;
@@ -665,5 +681,13 @@ mod tests {
         let event =
             parse_container_event_line("173;foo=bar\r\n").expect("event parse should succeed");
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn should_delay_apply_for_create_when_changed_without_attachments() {
+        assert!(should_delay_apply_for_create("create", true, false));
+        assert!(!should_delay_apply_for_create("create", true, true));
+        assert!(!should_delay_apply_for_create("start", true, false));
+        assert!(!should_delay_apply_for_create("create", false, false));
     }
 }
