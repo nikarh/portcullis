@@ -233,11 +233,11 @@ mod tests {
 
         RuntimeSnapshot {
             containers: vec![ContainerSnapshot {
-                id: "abc".to_string(),
+                id: "abc".into(),
                 name: "web".to_string(),
                 labels,
                 attachments: vec![NetworkAttachment {
-                    network_id: "net0".to_string(),
+                    network_id: "net0".into(),
                     network_name: "bridge".to_string(),
                     ip_address: attachment_ip,
                     gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),

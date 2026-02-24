@@ -11,7 +11,7 @@ use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
 use crate::labels::{LabelParseError, parse_host_dns_servers, parse_policy};
-use crate::model::{ContainerSnapshot, NetworkAttachment, RuntimeSnapshot};
+use crate::model::{ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, RuntimeSnapshot};
 
 #[derive(Debug, Error)]
 pub enum MonitorError {
@@ -92,8 +92,8 @@ impl NetworkRuntimeData {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeState {
-    containers: BTreeMap<String, ContainerSnapshot>,
-    networks: HashMap<String, NetworkRuntimeData>,
+    containers: BTreeMap<ContainerId, ContainerSnapshot>,
+    networks: HashMap<NetworkId, NetworkRuntimeData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,20 +102,20 @@ pub(crate) enum RuntimeStateAction {
         snapshot: Box<ContainerSnapshot>,
     },
     RemoveContainer {
-        container_id: String,
+        container_id: ContainerId,
     },
     RemoveContainerAttachment {
-        container_id: String,
-        network_id: String,
+        container_id: ContainerId,
+        network_id: NetworkId,
     },
     UpsertNetwork {
-        network_id: String,
+        network_id: NetworkId,
         subnet: IpNet,
         gateway: Option<IpAddr>,
         enforced: bool,
     },
     RemoveNetwork {
-        network_id: String,
+        network_id: NetworkId,
     },
 }
 
@@ -134,17 +134,17 @@ impl RuntimeState {
         }
     }
 
-    fn remove_container(&mut self, container_id: &str) -> bool {
+    fn remove_container(&mut self, container_id: &ContainerId) -> bool {
         self.containers.remove(container_id).is_some()
     }
 
-    fn remove_network(&mut self, network_id: &str) -> bool {
+    fn remove_network(&mut self, network_id: &NetworkId) -> bool {
         let mut changed = self.networks.remove(network_id).is_some();
         for container in self.containers.values_mut() {
             let previous_len = container.attachments.len();
             container
                 .attachments
-                .retain(|attachment| attachment.network_id != network_id);
+                .retain(|attachment| &attachment.network_id != network_id);
             if container.attachments.len() != previous_len {
                 changed = true;
             }
@@ -233,7 +233,7 @@ where
         let mut state = RuntimeState::default();
         for network in networks {
             if let Some(data) = NetworkRuntimeData::try_new(&network)? {
-                state.networks.insert(network.id, data);
+                state.networks.insert(network.id.into(), data);
             }
         }
         for summary in containers {
@@ -267,7 +267,7 @@ where
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         match event.action {
             DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
-                container_id: event.id.clone(),
+                container_id: event.id.as_str().into(),
             })),
             DockerEventAction::Create => Self::create_container_action(event),
             DockerEventAction::Rename => Ok(Self::rename_container_action(state, event)),
@@ -283,7 +283,7 @@ where
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         match event.action {
             DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveNetwork {
-                network_id: event.id.clone(),
+                network_id: event.id.as_str().into(),
             })),
             DockerEventAction::Create | DockerEventAction::Update => {
                 self.inspect_network_action(&event.id)
@@ -311,14 +311,15 @@ where
             let Some(address) = endpoint.ip_address else {
                 continue;
             };
-            let network_id = endpoint
+            let network_id: NetworkId = endpoint
                 .network_id
                 .ok_or_else(|| MonitorError::MissingNetworkId {
                     container_id: inspect.id.clone(),
                     network_name: network_name.to_string(),
-                })?;
+                })?
+                .into();
             if !state.networks.contains_key(&network_id) {
-                let network_data = match self.api.inspect_network(&network_id) {
+                let network_data = match self.api.inspect_network(network_id.as_str()) {
                     Ok(network) => NetworkRuntimeData::try_new(&network)?,
                     Err(error) if is_not_found(&error) => None,
                     Err(error) => return Err(error),
@@ -346,7 +347,7 @@ where
         }
 
         Ok(ContainerSnapshot {
-            id: inspect.id,
+            id: inspect.id.into(),
             name: inspect.name,
             labels: labels.into_iter().collect(),
             attachments,
@@ -366,7 +367,7 @@ where
         let host_dns_servers = parse_host_dns_servers(&labels)?;
         let runtime_dns_servers = inspect.runtime_dns_servers();
         let mut attachments = Vec::new();
-        let mut network_cache: HashMap<String, Option<NetworkRuntimeData>> = state
+        let mut network_cache: HashMap<NetworkId, Option<NetworkRuntimeData>> = state
             .networks
             .iter()
             .map(|(network_id, data)| (network_id.clone(), Some(*data)))
@@ -376,16 +377,17 @@ where
             let Some(address) = endpoint.ip_address else {
                 continue;
             };
-            let network_id = endpoint
+            let network_id: NetworkId = endpoint
                 .network_id
                 .ok_or_else(|| MonitorError::MissingNetworkId {
                     container_id: inspect.id.clone(),
                     network_name: network_name.to_string(),
-                })?;
+                })?
+                .into();
             let network_data = if let Some(value) = network_cache.get(&network_id) {
                 *value
             } else {
-                let value = match self.api.inspect_network(&network_id) {
+                let value = match self.api.inspect_network(network_id.as_str()) {
                     Ok(network) => NetworkRuntimeData::try_new(&network)?,
                     Err(error) if is_not_found(&error) => None,
                     Err(error) => return Err(error),
@@ -412,7 +414,7 @@ where
         }
 
         Ok(ContainerSnapshot {
-            id: inspect.id,
+            id: inspect.id.into(),
             name: inspect.name,
             labels: labels.into_iter().collect(),
             attachments,
@@ -436,7 +438,7 @@ where
                 }))
             }
             Err(error) if is_not_found(&error) => Ok(Some(RuntimeStateAction::RemoveContainer {
-                container_id: container_id.to_string(),
+                container_id: container_id.into(),
             })),
             Err(error) => Err(error),
         }
@@ -456,7 +458,7 @@ where
             .unwrap_or(event.id.as_str())
             .to_string();
         let snapshot = ContainerSnapshot {
-            id: event.id.clone(),
+            id: event.id.as_str().into(),
             name,
             labels: labels.into_iter().collect(),
             attachments: Vec::new(),
@@ -473,7 +475,7 @@ where
         state: &RuntimeState,
         event: &DockerEvent,
     ) -> Option<RuntimeStateAction> {
-        let existing = state.containers.get(&event.id)?;
+        let existing = state.containers.get(event.id.as_str())?;
         let name = event
             .name
             .as_deref()
@@ -494,7 +496,7 @@ where
         state: &RuntimeState,
         event: &DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        let Some(existing) = state.containers.get(&event.id) else {
+        let Some(existing) = state.containers.get(event.id.as_str()) else {
             return Ok(None);
         };
         let labels = event_portcullis_labels(&event.attributes);
@@ -525,10 +527,12 @@ where
 
         let requires_refresh = state
             .containers
-            .get(container_id)
+            .get(container_id.as_str())
             .and_then(|snapshot| snapshot.policy.as_ref())
             .is_some()
-            || state.networks.contains_key(&event.id);
+            || state
+                .networks
+                .contains_key(&NetworkId::from(event.id.as_str()));
 
         if !requires_refresh {
             trace!(
@@ -547,18 +551,18 @@ where
         event: &DockerEvent,
     ) -> Option<RuntimeStateAction> {
         let container_id = event.attributes.get("container")?;
-        let container = state.containers.get(container_id)?;
+        let container = state.containers.get(container_id.as_str())?;
         if !container
             .attachments
             .iter()
-            .any(|attachment| attachment.network_id == event.id)
+            .any(|attachment| attachment.network_id == NetworkId::from(event.id.as_str()))
         {
             return None;
         }
 
         Some(RuntimeStateAction::RemoveContainerAttachment {
-            container_id: container_id.clone(),
-            network_id: event.id.clone(),
+            container_id: container_id.as_str().into(),
+            network_id: event.id.as_str().into(),
         })
     }
 
@@ -571,19 +575,19 @@ where
             Ok(network) => {
                 if let Some(data) = NetworkRuntimeData::try_new(&network)? {
                     Ok(Some(RuntimeStateAction::UpsertNetwork {
-                        network_id: network_id.to_string(),
+                        network_id: network_id.into(),
                         subnet: data.subnet,
                         gateway: data.gateway,
                         enforced: data.enforced,
                     }))
                 } else {
                     Ok(Some(RuntimeStateAction::RemoveNetwork {
-                        network_id: network_id.to_string(),
+                        network_id: network_id.into(),
                     }))
                 }
             }
             Err(error) if is_not_found(&error) => Ok(Some(RuntimeStateAction::RemoveNetwork {
-                network_id: network_id.to_string(),
+                network_id: network_id.into(),
             })),
             Err(error) => Err(error),
         }
@@ -607,9 +611,10 @@ where
             let Some(address) = endpoint.ip_address else {
                 continue;
             };
-            let Some(network_id) = endpoint.network_id.clone() else {
+            let Some(network_id_raw) = endpoint.network_id.clone() else {
                 return Ok(None);
             };
+            let network_id: NetworkId = network_id_raw.into();
             let Some(network_data) = state.networks.get(&network_id).copied() else {
                 return Ok(None);
             };
@@ -627,7 +632,7 @@ where
         }
 
         Ok(Some(ContainerSnapshot {
-            id: summary.id.clone(),
+            id: summary.id.clone().into(),
             name: summary.name(),
             labels: labels.into_iter().collect(),
             attachments,
@@ -1052,7 +1057,7 @@ fn detect_runtime_changes(
     let Some(previous_snapshot) = previous else {
         for container in &current.containers {
             changes.push(RuntimeChange::ContainerAdded {
-                id: container.id.clone(),
+                id: container.id.to_string(),
                 name: container.name.clone(),
             });
         }
@@ -1081,7 +1086,7 @@ fn detect_runtime_changes(
             }
         } else {
             changes.push(RuntimeChange::ContainerAdded {
-                id: container.id.clone(),
+                id: container.id.to_string(),
                 name: container.name.clone(),
             });
         }
@@ -1090,7 +1095,7 @@ fn detect_runtime_changes(
     for (container_id, container) in &previous_by_id {
         if !current_by_id.contains_key(container_id) {
             changes.push(RuntimeChange::ContainerRemoved {
-                id: container.id.clone(),
+                id: container.id.to_string(),
                 name: container.name.clone(),
             });
         }
@@ -1113,7 +1118,7 @@ fn detect_label_changes(
         let current_value = current.labels.get(&key).cloned();
         if previous_value != current_value {
             changes.push(RuntimeChange::LabelChanged {
-                container_id: current.id.clone(),
+                container_id: current.id.to_string(),
                 key,
                 previous: previous_value,
                 current: current_value,
@@ -1141,8 +1146,8 @@ fn detect_attachment_changes(
     for (key, attachment) in &current_keys {
         if !previous_keys.contains_key(key) {
             changes.push(RuntimeChange::AttachmentAdded {
-                container_id: current.id.clone(),
-                network_id: attachment.network_id.clone(),
+                container_id: current.id.to_string(),
+                network_id: attachment.network_id.to_string(),
                 ip_address: attachment.ip_address,
                 subnet: attachment.subnet,
             });
@@ -1152,8 +1157,8 @@ fn detect_attachment_changes(
     for (key, attachment) in &previous_keys {
         if !current_keys.contains_key(key) {
             changes.push(RuntimeChange::AttachmentRemoved {
-                container_id: previous.id.clone(),
-                network_id: attachment.network_id.clone(),
+                container_id: previous.id.to_string(),
+                network_id: attachment.network_id.to_string(),
                 ip_address: attachment.ip_address,
                 subnet: attachment.subnet,
             });
@@ -1696,7 +1701,7 @@ mod tests {
 
         assert_eq!(snapshot.containers.len(), 1);
         let container = &snapshot.containers[0];
-        assert_eq!(container.id, "abc");
+        assert_eq!(container.id, "abc".into());
         assert_eq!(container.attachments.len(), 1);
         assert!(container.policy.is_some());
         assert!(snapshot.enforced_network_subnets.is_empty());
@@ -1706,7 +1711,7 @@ mod tests {
     fn docker_monitor_skips_endpoints_without_ip() {
         let mut api = MockDockerApi {
             containers_list: vec![DockerContainerSummary {
-                id: "abc".to_string(),
+                id: "abc".into(),
                 names: Some(vec!["/web".to_string()]),
                 labels: Some(IndexMap::new()),
                 host_config: None,
@@ -1907,14 +1912,14 @@ mod tests {
     #[test]
     fn docker_container_event_relevance_filters_noise() {
         let relevant = DockerEvent {
-            id: "abc".to_string(),
+            id: "abc".into(),
             action: DockerEventAction::Create,
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
             attributes: HashMap::new(),
         };
         let not_relevant = DockerEvent {
-            id: "abc".to_string(),
+            id: "abc".into(),
             action: DockerEventAction::Resize,
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
@@ -1939,7 +1944,7 @@ mod tests {
         let monitor = DockerMonitor::new(api);
         let state = RuntimeState::default();
         let event = DockerEvent {
-            id: "abc".to_string(),
+            id: "abc".into(),
             action: DockerEventAction::Create,
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
@@ -1985,14 +1990,14 @@ mod tests {
         let monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
         state.apply_action(RuntimeStateAction::UpsertNetwork {
-            network_id: "net0".to_string(),
+            network_id: "net0".into(),
             subnet: "172.20.0.0/16".parse().expect("valid subnet"),
             gateway: None,
             enforced: true,
         });
         state.apply_action(RuntimeStateAction::UpsertContainer {
             snapshot: Box::new(ContainerSnapshot {
-                id: "abc".to_string(),
+                id: "abc".into(),
                 name: "web".to_string(),
                 labels: [("portcullis.enable".to_string(), "true".to_string())]
                     .into_iter()
@@ -2036,11 +2041,11 @@ mod tests {
         let mut state = RuntimeState::default();
         state.apply_action(RuntimeStateAction::UpsertContainer {
             snapshot: Box::new(ContainerSnapshot {
-                id: "abc".to_string(),
+                id: "abc".into(),
                 name: "web".to_string(),
                 labels: HashMap::new(),
                 attachments: vec![NetworkAttachment {
-                    network_id: "net0".to_string(),
+                    network_id: "net0".into(),
                     network_name: "pc-managed".to_string(),
                     ip_address: "172.20.0.2".parse().expect("valid ip"),
                     gateway: None,
@@ -2180,7 +2185,7 @@ mod tests {
             .expect("inspect network should succeed");
         assert!(matches!(
             action,
-            Some(RuntimeStateAction::UpsertNetwork { network_id, .. }) if network_id == "net0"
+            Some(RuntimeStateAction::UpsertNetwork { network_id, .. }) if network_id == "net0".into()
         ));
     }
 
@@ -2221,7 +2226,7 @@ mod tests {
             .expect("collect state should succeed");
         let container_before = state.snapshot().containers[0].attachments.len();
         assert_eq!(container_before, 1);
-        assert!(state.remove_network("net0"));
+        assert!(state.remove_network(&"net0".into()));
         let container_after = state.snapshot().containers[0].attachments.len();
         assert_eq!(container_after, 0);
     }
@@ -2262,14 +2267,14 @@ mod tests {
 
         RuntimeSnapshot {
             containers: vec![ContainerSnapshot {
-                id: container_id.to_string(),
+                id: container_id.into(),
                 name: name.to_string(),
                 labels: label_map
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
                 attachments: vec![NetworkAttachment {
-                    network_id: network_id.to_string(),
+                    network_id: network_id.into(),
                     network_name: network_name.to_string(),
                     ip_address: parsed_ip,
                     gateway: None,

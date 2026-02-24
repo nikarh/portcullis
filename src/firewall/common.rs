@@ -301,7 +301,7 @@ fn collect_container_targets(snapshot: &RuntimeSnapshot) -> HashMap<String, Vec<
     let mut by_key: HashMap<String, BTreeSet<IpAddr>> = HashMap::new();
 
     for container in &snapshot.containers {
-        let mut keys = vec![container.id.clone(), container.name.clone()];
+        let mut keys = vec![container.id.to_string(), container.name.clone()];
         if let Some(trimmed) = container.name.strip_prefix('/') {
             keys.push(trimmed.to_string());
         }
@@ -498,7 +498,7 @@ fn append_icc_allow_list_rules(
     container_targets: &HashMap<String, Vec<IpAddr>>,
 ) {
     for rule in icc_allow {
-        let Some(destinations) = container_targets.get(&rule.target_container) else {
+        let Some(destinations) = container_targets.get(rule.target_container.as_str()) else {
             continue;
         };
         for destination in destinations {
@@ -583,11 +583,11 @@ mod tests {
 
         RuntimeSnapshot {
             containers: vec![ContainerSnapshot {
-                id: "abc".to_string(),
+                id: "abc".into(),
                 name: "web".to_string(),
                 labels,
                 attachments: vec![NetworkAttachment {
-                    network_id: "net0".to_string(),
+                    network_id: "net0".into(),
                     network_name: "bridge".to_string(),
                     ip_address: source_ip,
                     gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
@@ -654,11 +654,11 @@ mod tests {
         };
 
         snapshot.containers.push(ContainerSnapshot {
-            id: "peer".to_string(),
+            id: "peer".into(),
             name: "/peer".to_string(),
             labels: HashMap::new(),
             attachments: vec![NetworkAttachment {
-                network_id: "net0".to_string(),
+                network_id: "net0".into(),
                 network_name: "bridge".to_string(),
                 ip_address: peer_ip,
                 gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
@@ -673,7 +673,7 @@ mod tests {
         if let Some(policy) = &mut snapshot.containers[0].policy {
             policy.icc_mode = crate::model::IccMode::AllowListed;
             policy.icc_allow = vec![crate::model::IccAllowRule {
-                target_container: "db".to_string(),
+                target_container: "db".into(),
                 ports: vec![PortSpec {
                     protocol: Protocol::Tcp,
                     port: 5432,
