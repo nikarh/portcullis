@@ -30,7 +30,7 @@ Implemented:
 - Docker reports `iptables` => use iptables backend
 - Long-running daemon mode:
 - Startup cleanup to recover from unclean previous exits.
-- Continuous Docker container+network event subscription over Docker Unix socket and policy re-apply on relevant events.
+- Continuous Docker container+network event subscription over Docker Unix socket with incremental runtime-state updates for relevant events.
 - Graceful cleanup on shutdown (SIGINT/SIGTERM via signal handler).
 - Structured logging with `info` / `debug` / `trace` levels.
 
@@ -62,7 +62,7 @@ flowchart LR
 4. Resolve hostname targets and cache resulting IPs.
 5. Generate backend-specific firewall operations.
 6. Apply default-deny egress plus explicit allow rules.
-7. Enter event loop and refresh policy when relevant Docker container/network events arrive.
+7. Enter event loop, update only affected container/network runtime objects, then refresh policy.
 8. On shutdown, attempt cleanup of managed rules/chains/tables.
 
 ## Quick Start

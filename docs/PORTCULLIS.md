@@ -74,6 +74,13 @@ Portcullis exists to provide:
 - `GET /networks/{id}`
 - `GET /info` (for firewall backend detection)
 
+Event loop behavior:
+- On startup, Portcullis builds an in-memory runtime state from Docker.
+- During steady-state, Portcullis subscribes to Docker `container` and `network` events and performs targeted updates:
+- container events refresh/remove only the affected container object,
+- network events refresh/remove only the affected network object and then refresh only attached containers.
+- Full daemon-wide re-scan is not performed on each event.
+
 Collected data includes:
 - container IDs and names,
 - labels,
