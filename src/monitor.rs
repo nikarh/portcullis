@@ -302,7 +302,7 @@ where
 
                 Ok(Some(RuntimeStateAction::RenameContainer {
                     container_id: event.id.into(),
-                    name,
+                    name: normalize_container_name(name),
                 }))
             }
             _ => Ok(None),
@@ -383,7 +383,7 @@ where
 
         Ok(ContainerSnapshot {
             id: inspect.id.into(),
-            name: inspect.name,
+            name: normalize_container_name(inspect.name),
             attachments,
             runtime_dns_servers,
             policy,
@@ -422,7 +422,7 @@ where
         Ok(Some(RuntimeStateAction::CreateContainer {
             snapshot: Box::new(ContainerSnapshot {
                 id: event.id.into(),
-                name,
+                name: normalize_container_name(name),
                 attachments: Vec::new(),
                 runtime_dns_servers: HashSet::new(),
                 policy,
@@ -570,6 +570,7 @@ impl SocketDockerApi {
         trace!(
             path,
             body_len = body.len(),
+            body = body,
             "docker api json response received"
         );
         serde_json::from_str::<T>(&body)
@@ -1009,6 +1010,15 @@ fn attachment_key(attachment: &NetworkAttachment) -> String {
     format!("{}|{}", attachment.network_id, attachment.ip_address)
 }
 
+fn normalize_container_name(value: String) -> String {
+    let trimmed = value.trim_start_matches('/');
+    if trimmed.is_empty() {
+        value
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DockerContainerSummary {
     #[serde(rename = "Id")]
@@ -1025,11 +1035,13 @@ pub struct DockerContainerSummary {
 
 impl DockerContainerSummary {
     fn name(&self) -> String {
-        self.names
-            .as_ref()
-            .and_then(|values| values.first())
-            .cloned()
-            .unwrap_or_else(|| self.id.clone())
+        normalize_container_name(
+            self.names
+                .as_ref()
+                .and_then(|values| values.first())
+                .cloned()
+                .unwrap_or_else(|| self.id.clone()),
+        )
     }
 
     fn runtime_dns_servers(&self) -> HashSet<IpAddr> {

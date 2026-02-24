@@ -401,9 +401,6 @@ fn collect_container_targets(snapshot: &RuntimeSnapshot) -> HashMap<String, Vec<
 
     for container in &snapshot.containers {
         let mut keys = vec![container.id.to_string(), container.name.clone()];
-        if let Some(trimmed) = container.name.strip_prefix('/') {
-            keys.push(trimmed.to_string());
-        }
         for attachment in &container.attachments {
             for alias in &attachment.aliases {
                 keys.push(alias.clone());
