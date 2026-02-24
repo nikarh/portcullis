@@ -110,14 +110,15 @@ impl IptablesRunner for CommandIptablesRunner {
 
 pub struct IptablesFirewall<R> {
     runner: R,
+    use_ipset: bool,
 }
 
 impl<R> IptablesFirewall<R>
 where
     R: IptablesRunner,
 {
-    pub const fn new(runner: R) -> Self {
-        Self { runner }
+    pub const fn new(runner: R, use_ipset: bool) -> Self {
+        Self { runner, use_ipset }
     }
 
     pub fn apply_with_dns(
@@ -125,8 +126,7 @@ where
         snapshot: &RuntimeSnapshot,
         resolver: &mut dyn HostnameIpResolver,
     ) -> Result<(), FirewallError> {
-        let use_ipset = detect_ipset_available();
-        if use_ipset {
+        if self.use_ipset {
             info!("ipset detected; using ipset-backed hostname rules");
         } else {
             info!("ipset not detected; using direct iptables hostname rules");
@@ -138,7 +138,7 @@ where
         )?;
 
         let commands =
-            build_apply_commands_with_dns(snapshot, resolver, use_ipset, STAGING_CHAIN_NAME)?;
+            build_apply_commands_with_dns(snapshot, resolver, self.use_ipset, STAGING_CHAIN_NAME)?;
         let mut restore_lines = Vec::new();
         for command in commands {
             if command.program == "iptables" {
@@ -226,8 +226,14 @@ fn is_ignorable_cleanup_stderr(stderr: &str) -> bool {
 
 impl IptablesFirewall<CommandIptablesRunner> {
     #[must_use]
-    pub const fn with_cli() -> Self {
-        Self::new(CommandIptablesRunner)
+    pub fn with_cli() -> Self {
+        let use_ipset = detect_ipset_available();
+        if use_ipset {
+            info!("ipset detected at startup; enabling ipset-backed hostname rules");
+        } else {
+            info!("ipset not detected at startup; using direct iptables hostname rules");
+        }
+        Self::new(CommandIptablesRunner, use_ipset)
     }
 }
 
@@ -1005,7 +1011,7 @@ mod tests {
 COMMIT
 ",
         );
-        let firewall = IptablesFirewall::new(runner);
+        let firewall = IptablesFirewall::new(runner, false);
         let result = firewall.cleanup();
         assert!(result.is_ok());
     }
