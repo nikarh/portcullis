@@ -463,7 +463,7 @@ where
     fn create_container_action(
         event: &DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        let labels = event_portcullis_labels(&event.attributes);
+        let labels = event_attributes_as_labels(&event.attributes);
         let policy = parse_policy(&labels)?;
         let host_dns_servers = parse_host_dns_servers(&labels)?;
 
@@ -514,7 +514,7 @@ where
         let Some(existing) = state.containers.get(event.id.as_str()) else {
             return Ok(None);
         };
-        let labels = event_portcullis_labels(&event.attributes);
+        let labels = event_attributes_as_labels(&event.attributes);
         let policy = parse_policy(&labels)?;
         let host_dns_servers = parse_host_dns_servers(&labels)?;
 
@@ -660,10 +660,9 @@ fn policy_uses_runtime_dns(policy: &crate::model::ContainerPolicy) -> bool {
         .any(|target| matches!(target, crate::model::DnsTarget::Runtime))
 }
 
-fn event_portcullis_labels(attributes: &HashMap<String, String>) -> IndexMap<String, String> {
+fn event_attributes_as_labels(attributes: &HashMap<String, String>) -> IndexMap<String, String> {
     attributes
         .iter()
-        .filter(|(key, _)| key.starts_with("portcullis."))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
