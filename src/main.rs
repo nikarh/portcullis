@@ -267,8 +267,8 @@ fn run(config: &Config) -> Result<(), MainError> {
                 );
 
                 let update_result = monitor
-                    .resolve_event_actions(&event)
-                    .map(|actions| runtime_state.apply_actions(actions))
+                    .resolve_event_action(&runtime_state, &event)
+                    .map(|action| action.is_some_and(|value| runtime_state.apply_action(value)))
                     .map_err(MainError::from);
 
                 match update_result {
@@ -499,7 +499,6 @@ fn build_events_path(since: i64) -> Result<String, MainError> {
         "type": ["container", "network"],
         "event": [
             "create",
-            "start",
             "rename",
             "update",
             "destroy",
