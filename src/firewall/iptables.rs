@@ -24,7 +24,7 @@ struct CommandSpec {
 pub trait IptablesRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<(), FirewallError>;
     fn run_iptables_restore(&self, lines: &[String]) -> Result<(), FirewallError>;
-    fn run_shell_batch(&self, script: &str) -> Result<(), FirewallError>;
+    fn read_iptables_save_filter(&self) -> Result<String, FirewallError>;
 }
 
 pub struct CommandIptablesRunner;
@@ -92,15 +92,14 @@ impl IptablesRunner for CommandIptablesRunner {
         })
     }
 
-    fn run_shell_batch(&self, script: &str) -> Result<(), FirewallError> {
-        trace!(program = "sh", args = ?["-c"], script, "executing firewall shell batch");
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(script)
+    fn read_iptables_save_filter(&self) -> Result<String, FirewallError> {
+        trace!(program = "iptables-save", args = ?["-t", "filter"], "reading firewall filter table");
+        let output = Command::new("iptables-save")
+            .args(["-t", "filter"])
             .output()
             .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
         if output.status.success() {
-            return Ok(());
+            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
         }
         Err(FirewallError::CommandFailure {
             code: output.status.code().unwrap_or(-1),
@@ -175,16 +174,9 @@ where
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
-        // Single-shell cleanup avoids many process spawns on startup/shutdown.
-        let cleanup_script = "\
-iptables -D DOCKER-USER -j PORTCULLIS_EGRESS 2>/dev/null || true
-iptables -D DOCKER-USER -j PORTCULLIS_EGRESS_NEXT 2>/dev/null || true
-iptables -F PORTCULLIS_EGRESS 2>/dev/null || true
-iptables -X PORTCULLIS_EGRESS 2>/dev/null || true
-iptables -F PORTCULLIS_EGRESS_NEXT 2>/dev/null || true
-iptables -X PORTCULLIS_EGRESS_NEXT 2>/dev/null || true
-";
-        self.runner.run_shell_batch(cleanup_script)?;
+        let filter_rules = self.runner.read_iptables_save_filter()?;
+        let cleanup_lines = build_cleanup_restore_lines(&filter_rules);
+        self.runner.run_iptables_restore(&cleanup_lines)?;
 
         info!("iptables cleanup completed");
         Ok(())
@@ -734,6 +726,62 @@ fn iptables_restore_line(args: &[String]) -> String {
     args.join(" ")
 }
 
+fn docker_user_jump_target(line: &str) -> Option<&str> {
+    if !line.starts_with("-A DOCKER-USER ") {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == "-j" {
+            return parts.next();
+        }
+    }
+    None
+}
+
+fn build_cleanup_restore_lines(filter_rules: &str) -> Vec<String> {
+    let mut has_egress_chain = false;
+    let mut has_staging_chain = false;
+    let mut egress_jump_count = 0usize;
+    let mut staging_jump_count = 0usize;
+
+    for line in filter_rules.lines() {
+        if line.starts_with(':') {
+            if line.starts_with(&format!(":{CHAIN_NAME} ")) {
+                has_egress_chain = true;
+            } else if line.starts_with(&format!(":{STAGING_CHAIN_NAME} ")) {
+                has_staging_chain = true;
+            }
+            continue;
+        }
+        if let Some(target) = docker_user_jump_target(line) {
+            if target == CHAIN_NAME {
+                egress_jump_count += 1;
+            } else if target == STAGING_CHAIN_NAME {
+                staging_jump_count += 1;
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    for _ in 0..egress_jump_count {
+        lines.push(format!("-D {DOCKER_USER_CHAIN} -j {CHAIN_NAME}"));
+    }
+    for _ in 0..staging_jump_count {
+        lines.push(format!("-D {DOCKER_USER_CHAIN} -j {STAGING_CHAIN_NAME}"));
+    }
+    if has_egress_chain {
+        lines.push(format!("-F {CHAIN_NAME}"));
+        lines.push(format!("-X {CHAIN_NAME}"));
+    }
+    if has_staging_chain {
+        lines.push(format!("-F {STAGING_CHAIN_NAME}"));
+        lines.push(format!("-X {STAGING_CHAIN_NAME}"));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -896,12 +944,17 @@ mod tests {
 
     struct MockIptablesRunner {
         results: Mutex<VecDeque<Result<(), FirewallError>>>,
+        save_filter_output: String,
     }
 
     impl MockIptablesRunner {
-        fn new(results: Vec<Result<(), FirewallError>>) -> Self {
+        fn new_with_save(
+            results: Vec<Result<(), FirewallError>>,
+            save_filter_output: &str,
+        ) -> Self {
             Self {
                 results: Mutex::new(VecDeque::from(results)),
+                save_filter_output: save_filter_output.to_string(),
             }
         }
     }
@@ -923,12 +976,8 @@ mod tests {
             guard.pop_front().unwrap_or(Ok(()))
         }
 
-        fn run_shell_batch(&self, _script: &str) -> Result<(), FirewallError> {
-            let mut guard = self
-                .results
-                .lock()
-                .expect("failed to lock mock iptables runner");
-            guard.pop_front().unwrap_or(Ok(()))
+        fn read_iptables_save_filter(&self) -> Result<String, FirewallError> {
+            Ok(self.save_filter_output.clone())
         }
     }
 
@@ -944,11 +993,48 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_runs_as_single_shell_batch() {
-        let runner = MockIptablesRunner::new(vec![Ok(())]);
+    fn cleanup_runs_via_single_iptables_restore_batch() {
+        let runner = MockIptablesRunner::new_with_save(
+            vec![Ok(())],
+            "\
+*filter
+:INPUT ACCEPT [0:0]
+:DOCKER-USER - [0:0]
+:PORTCULLIS_EGRESS - [0:0]
+-A DOCKER-USER -j PORTCULLIS_EGRESS
+COMMIT
+",
+        );
         let firewall = IptablesFirewall::new(runner);
         let result = firewall.cleanup();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn build_cleanup_restore_lines_detects_existing_rules() {
+        let lines = build_cleanup_restore_lines(
+            "\
+*filter
+:INPUT ACCEPT [0:0]
+:DOCKER-USER - [0:0]
+:PORTCULLIS_EGRESS - [0:0]
+:PORTCULLIS_EGRESS_NEXT - [0:0]
+-A DOCKER-USER -j PORTCULLIS_EGRESS
+-A DOCKER-USER -j PORTCULLIS_EGRESS_NEXT
+COMMIT
+",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "-D DOCKER-USER -j PORTCULLIS_EGRESS".to_string(),
+                "-D DOCKER-USER -j PORTCULLIS_EGRESS_NEXT".to_string(),
+                "-F PORTCULLIS_EGRESS".to_string(),
+                "-X PORTCULLIS_EGRESS".to_string(),
+                "-F PORTCULLIS_EGRESS_NEXT".to_string(),
+                "-X PORTCULLIS_EGRESS_NEXT".to_string(),
+            ]
+        );
     }
 
     #[test]
