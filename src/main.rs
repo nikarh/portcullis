@@ -372,7 +372,7 @@ impl DockerSocketEventStream {
 
         let since = current_unix_epoch_seconds()?;
         let request = format!(
-            "GET /events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D&since={since} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+            "GET /events?filters=%7B%22type%22%3A%5B%22container%22%2C%22network%22%5D%7D&since={since} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
         );
         stream
             .write_all(request.as_bytes())
@@ -435,7 +435,7 @@ fn parse_container_event_line(line: &str) -> Result<Option<DockerContainerEvent>
         .map_err(|error| MainError::ServiceState(format!("invalid docker event json: {error}")))?;
     let action = parsed.action.or(parsed.status).unwrap_or_default();
     let kind = parsed.kind.or(parsed.event_type).unwrap_or_default();
-    if !kind.is_empty() && kind != "container" {
+    if !kind.is_empty() && kind != "container" && kind != "network" {
         return Ok(None);
     }
     let actor_id = parsed.actor.as_ref().and_then(|actor| actor.id.clone());
@@ -551,8 +551,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_container_event_line_ignores_non_container_event() {
-        let line = "{\"Type\":\"network\",\"Action\":\"connect\",\"Actor\":{\"ID\":\"net0\"}}";
+    fn parse_container_event_line_parses_network_event() {
+        let line = "{\"Type\":\"network\",\"Action\":\"create\",\"Actor\":{\"ID\":\"net0\",\"Attributes\":{\"name\":\"pc-managed\"}}}";
+        let event = parse_container_event_line(line).expect("event parse should succeed");
+        assert_eq!(
+            event,
+            Some(DockerContainerEvent {
+                id: "net0".to_string(),
+                action: "create".to_string(),
+                name: Some("pc-managed".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_container_event_line_ignores_unrelated_event_type() {
+        let line = "{\"Type\":\"volume\",\"Action\":\"create\",\"Actor\":{\"ID\":\"vol0\"}}";
         let event = parse_container_event_line(line).expect("event parse should succeed");
         assert!(event.is_none());
     }
