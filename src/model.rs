@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -30,7 +29,7 @@ pub struct EgressRule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IccAllowRule {
-    pub target_container: ContainerId,
+    pub target_container: String,
     pub ports: Vec<PortSpec>,
 }
 
@@ -59,81 +58,19 @@ pub struct ContainerPolicy {
     pub dns_targets: Vec<DnsTarget>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ContainerId(String);
-
-impl ContainerId {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ContainerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl From<String> for ContainerId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for ContainerId {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NetworkId(String);
-
-impl NetworkId {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for NetworkId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl From<String> for NetworkId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for NetworkId {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkAttachment {
-    pub network_id: NetworkId,
+    pub network_id: String,
+    pub network_name: String,
     pub ip_address: IpAddr,
+    pub gateway: Option<IpAddr>,
+    pub subnet: IpNet,
     pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkSnapshot {
-    pub id: NetworkId,
-    pub name: String,
-    pub subnet: IpNet,
-    pub gateway: Option<IpAddr>,
-    pub enforced: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSnapshot {
-    pub id: ContainerId,
+    pub id: String,
     pub name: String,
     pub labels: HashMap<String, String>,
     pub attachments: Vec<NetworkAttachment>,
@@ -145,6 +82,5 @@ pub struct ContainerSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
     pub containers: Vec<ContainerSnapshot>,
-    pub networks: Vec<NetworkSnapshot>,
     pub enforced_network_subnets: Vec<IpNet>,
 }
