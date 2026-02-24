@@ -24,6 +24,7 @@ struct CommandSpec {
 pub trait IptablesRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<(), FirewallError>;
     fn run_iptables_restore(&self, lines: &[String]) -> Result<(), FirewallError>;
+    fn run_shell_batch(&self, script: &str) -> Result<(), FirewallError>;
 }
 
 pub struct CommandIptablesRunner;
@@ -81,6 +82,22 @@ impl IptablesRunner for CommandIptablesRunner {
         }
         let output = child
             .wait_with_output()
+            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(FirewallError::CommandFailure {
+            code: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    fn run_shell_batch(&self, script: &str) -> Result<(), FirewallError> {
+        trace!(program = "sh", args = ?["-c"], script, "executing firewall shell batch");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
             .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
         if output.status.success() {
             return Ok(());
@@ -158,10 +175,16 @@ where
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
-        self.delete_jump_to_chain(CHAIN_NAME)?;
-        self.delete_jump_to_chain(STAGING_CHAIN_NAME)?;
-        self.cleanup_chain(CHAIN_NAME)?;
-        self.cleanup_chain(STAGING_CHAIN_NAME)?;
+        // Single-shell cleanup avoids many process spawns on startup/shutdown.
+        let cleanup_script = "\
+iptables -D DOCKER-USER -j PORTCULLIS_EGRESS 2>/dev/null || true
+iptables -D DOCKER-USER -j PORTCULLIS_EGRESS_NEXT 2>/dev/null || true
+iptables -F PORTCULLIS_EGRESS 2>/dev/null || true
+iptables -X PORTCULLIS_EGRESS 2>/dev/null || true
+iptables -F PORTCULLIS_EGRESS_NEXT 2>/dev/null || true
+iptables -X PORTCULLIS_EGRESS_NEXT 2>/dev/null || true
+";
+        self.runner.run_shell_batch(cleanup_script)?;
 
         info!("iptables cleanup completed");
         Ok(())
@@ -899,6 +922,14 @@ mod tests {
                 .expect("failed to lock mock iptables runner");
             guard.pop_front().unwrap_or(Ok(()))
         }
+
+        fn run_shell_batch(&self, _script: &str) -> Result<(), FirewallError> {
+            let mut guard = self
+                .results
+                .lock()
+                .expect("failed to lock mock iptables runner");
+            guard.pop_front().unwrap_or(Ok(()))
+        }
     }
 
     #[test]
@@ -913,15 +944,8 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_ignores_missing_jump_target_error() {
-        let runner = MockIptablesRunner::new(vec![
-            Err(FirewallError::CommandFailure {
-                code: 2,
-                stderr: "iptables v1.8.11 (legacy): Couldn't load target `PORTCULLIS_EGRESS':No such file or directory".to_string(),
-            }),
-            Ok(()),
-            Ok(()),
-        ]);
+    fn cleanup_runs_as_single_shell_batch() {
+        let runner = MockIptablesRunner::new(vec![Ok(())]);
         let firewall = IptablesFirewall::new(runner);
         let result = firewall.cleanup();
         assert!(result.is_ok());
