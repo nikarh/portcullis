@@ -350,23 +350,10 @@ fn apply_runtime_state(
 
 fn enforce_fail_closed_defaults(snapshot: &mut crate::model::RuntimeSnapshot) {
     for container in &mut snapshot.containers {
-        match &mut container.policy {
-            Some(policy) => {
-                if !policy.enabled {
-                    policy.enabled = true;
-                    policy.egress.clear();
-                    policy.icc_allow.clear();
-                }
-            }
-            None => {
-                container.policy = Some(crate::model::ContainerPolicy {
-                    enabled: true,
-                    icc_mode: crate::model::IccMode::Allow,
-                    egress: Vec::new(),
-                    icc_allow: Vec::new(),
-                    dns_targets: vec![crate::model::DnsTarget::Docker],
-                });
-            }
+        if !container.policy.enabled {
+            container.policy.enabled = true;
+            container.policy.egress.clear();
+            container.policy.icc_allow.clear();
         }
     }
 }

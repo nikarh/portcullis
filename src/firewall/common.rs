@@ -25,9 +25,7 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
     let container_targets = collect_container_targets(snapshot);
 
     for container in &snapshot.containers {
-        let Some(policy) = &container.policy else {
-            continue;
-        };
+        let policy = &container.policy;
 
         if !policy.enabled {
             continue;
@@ -41,7 +39,7 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
                 gateway,
                 &policy.dns_targets,
                 &container.runtime_dns_servers,
-                &container.host_dns_servers,
+                &container.parsed_labels.host_dns_servers,
             );
 
             match policy.icc_mode {
@@ -118,9 +116,7 @@ pub fn build_apply_commands_with_dns(
     let container_targets = collect_container_targets(snapshot);
 
     for container in &snapshot.containers {
-        let Some(policy) = &container.policy else {
-            continue;
-        };
+        let policy = &container.policy;
 
         if !policy.enabled {
             continue;
@@ -134,7 +130,7 @@ pub fn build_apply_commands_with_dns(
                 gateway,
                 &policy.dns_targets,
                 &container.runtime_dns_servers,
-                &container.host_dns_servers,
+                &container.parsed_labels.host_dns_servers,
             );
 
             match policy.icc_mode {
@@ -275,9 +271,7 @@ fn collect_managed_sources(snapshot: &RuntimeSnapshot) -> ManagedSources {
     let mut ipv6 = Vec::new();
 
     for container in &snapshot.containers {
-        let Some(policy) = &container.policy else {
-            continue;
-        };
+        let policy = &container.policy;
 
         if !policy.enabled {
             continue;
@@ -579,9 +573,6 @@ mod tests {
     }
 
     fn snapshot_with_hostname_rule() -> RuntimeSnapshot {
-        let labels: HashMap<String, String> =
-            [("portcullis.enable".to_string(), "true".to_string())].into();
-
         let source_ip: IpAddr = match "172.18.0.2".parse() {
             Ok(value) => value,
             Err(error) => panic!("failed to parse source ip: {error}"),
@@ -595,15 +586,14 @@ mod tests {
             containers: vec![ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                labels,
+                parsed_labels: crate::model::ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: source_ip,
                     aliases: vec!["web".to_string()],
                 }],
                 runtime_dns_servers: HashSet::new(),
-                host_dns_servers: HashSet::new(),
-                policy: Some(ContainerPolicy {
+                policy: ContainerPolicy {
                     enabled: true,
                     icc_mode: crate::model::IccMode::Allow,
                     egress: vec![EgressRule {
@@ -615,7 +605,7 @@ mod tests {
                     }],
                     icc_allow: Vec::new(),
                     dns_targets: vec![crate::model::DnsTarget::Docker],
-                }),
+                },
             }],
             networks: HashMap::from([(
                 "net0".into(),
@@ -649,10 +639,8 @@ mod tests {
     fn build_apply_script_with_dns_reports_resolve_error() {
         let mut resolver = MockResolver;
         let mut snapshot = snapshot_with_hostname_rule();
-        if let Some(policy) = &mut snapshot.containers[0].policy {
-            policy.egress[0].target =
-                crate::model::EgressTarget::Hostname("bad.example.com".to_string());
-        }
+        snapshot.containers[0].policy.egress[0].target =
+            crate::model::EgressTarget::Hostname("bad.example.com".to_string());
 
         let script = build_apply_script_with_dns(&snapshot, &mut resolver);
         assert!(matches!(script, Err(FirewallError::DnsResolve { .. })));
@@ -668,27 +656,24 @@ mod tests {
         snapshot.containers.push(ContainerSnapshot {
             id: "peer".into(),
             name: "/peer".to_string(),
-            labels: HashMap::new(),
+            parsed_labels: crate::model::ParsedContainerLabels::default(),
             attachments: vec![NetworkAttachment {
                 network_id: "net0".into(),
                 ip_address: peer_ip,
                 aliases: vec!["db".to_string()],
             }],
             runtime_dns_servers: HashSet::new(),
-            host_dns_servers: HashSet::new(),
-            policy: None,
+            policy: crate::model::ContainerPolicy::default(),
         });
 
-        if let Some(policy) = &mut snapshot.containers[0].policy {
-            policy.icc_mode = crate::model::IccMode::AllowListed;
-            policy.icc_allow = vec![crate::model::IccAllowRule {
-                target_container: "db".into(),
-                ports: vec![PortSpec {
-                    protocol: Protocol::Tcp,
-                    port: 5432,
-                }],
-            }];
-        }
+        snapshot.containers[0].policy.icc_mode = crate::model::IccMode::AllowListed;
+        snapshot.containers[0].policy.icc_allow = vec![crate::model::IccAllowRule {
+            target_container: "db".into(),
+            ports: vec![PortSpec {
+                protocol: Protocol::Tcp,
+                port: 5432,
+            }],
+        }];
 
         let script = build_apply_script(&snapshot);
         assert!(script.contains("ip daddr 172.18.0.10 tcp dport 5432 accept"));

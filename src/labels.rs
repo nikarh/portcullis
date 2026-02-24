@@ -51,16 +51,20 @@ pub enum LabelParseError {
     InvalidHostDnsResolver(String, String),
 }
 
-pub fn parse_policy(
-    labels: &IndexMap<String, String>,
-) -> Result<Option<ContainerPolicy>, LabelParseError> {
+pub fn parse_policy(labels: &IndexMap<String, String>) -> Result<ContainerPolicy, LabelParseError> {
     let enabled = match labels.get(ENABLE_LABEL) {
         None => false,
         Some(value) => parse_bool(ENABLE_LABEL, value)?,
     };
 
     if !enabled {
-        return Ok(None);
+        return Ok(ContainerPolicy {
+            enabled: false,
+            icc_mode: IccMode::Allow,
+            egress: Vec::new(),
+            icc_allow: Vec::new(),
+            dns_targets: vec![DnsTarget::Docker],
+        });
     }
 
     let icc_mode = match labels.get(ICC_MODE_LABEL) {
@@ -105,13 +109,13 @@ pub fn parse_policy(
         parsed
     };
 
-    Ok(Some(ContainerPolicy {
+    Ok(ContainerPolicy {
         enabled,
         icc_mode,
         egress,
         icc_allow,
         dns_targets,
-    }))
+    })
 }
 
 pub fn parse_host_dns_servers(
@@ -343,10 +347,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_policy_returns_none_when_not_enabled() {
+    fn parse_policy_returns_disabled_when_not_enabled() {
         let parsed = parse_policy(&labels(&[("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443")]))
             .expect("parser should not fail");
-        assert!(parsed.is_none());
+        assert!(!parsed.enabled);
     }
 
     #[test]
@@ -358,8 +362,7 @@ mod tests {
             ("portcullis.egress.1", "host:api.example.com,tcp:443"),
             ("portcullis.icc.allow.0", "container:db,tcp:5432"),
         ]))
-        .expect("parser should not fail")
-        .expect("policy should be enabled");
+        .expect("parser should not fail");
 
         assert_eq!(parsed.icc_mode, IccMode::Deny);
         assert_eq!(parsed.egress.len(), 2);
@@ -386,8 +389,7 @@ mod tests {
             ("portcullis.enable", "true"),
             ("portcullis.egress.0", "ip:10.0.0.0/8,tcp:443"),
         ]))
-        .expect("parser should not fail")
-        .expect("policy should be enabled");
+        .expect("parser should not fail");
 
         assert_eq!(parsed.icc_mode, IccMode::Allow);
         assert!(parsed.icc_allow.is_empty());
@@ -501,8 +503,7 @@ mod tests {
             ("portcullis.icc.mode", "allow-listed"),
             ("portcullis.icc.allow.0", "container:redis,tcp:6379"),
         ]))
-        .expect("parser should not fail")
-        .expect("policy should be enabled");
+        .expect("parser should not fail");
 
         assert_eq!(parsed.icc_mode, IccMode::AllowListed);
         assert_eq!(parsed.icc_allow.len(), 1);
@@ -519,8 +520,7 @@ mod tests {
             ("portcullis.dns.3", "ip:1.1.1.1"),
             ("portcullis.dns.4", "*"),
         ]))
-        .expect("parser should not fail")
-        .expect("policy should be enabled");
+        .expect("parser should not fail");
 
         assert_eq!(parsed.dns_targets.len(), 5);
         assert_eq!(parsed.dns_targets[0], DnsTarget::Docker);

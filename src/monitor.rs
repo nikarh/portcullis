@@ -12,7 +12,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::labels::{LabelParseError, parse_host_dns_servers, parse_policy};
 use crate::model::{
-    ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, NetworkSnapshot, RuntimeSnapshot,
+    ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, NetworkSnapshot,
+    ParsedContainerLabels, RuntimeSnapshot,
 };
 
 #[derive(Debug, Error)]
@@ -369,10 +370,9 @@ where
         Ok(ContainerSnapshot {
             id: inspect.id.into(),
             name: inspect.name,
-            labels: labels.into_iter().collect(),
+            parsed_labels: ParsedContainerLabels { host_dns_servers },
             attachments,
             runtime_dns_servers,
-            host_dns_servers,
             policy,
         })
     }
@@ -433,10 +433,9 @@ where
         Ok(ContainerSnapshot {
             id: inspect.id.into(),
             name: inspect.name,
-            labels: labels.into_iter().collect(),
+            parsed_labels: ParsedContainerLabels { host_dns_servers },
             attachments,
             runtime_dns_servers,
-            host_dns_servers,
             policy,
         })
     }
@@ -477,10 +476,9 @@ where
         let snapshot = ContainerSnapshot {
             id: event.id.as_str().into(),
             name,
-            labels: labels.into_iter().collect(),
+            parsed_labels: ParsedContainerLabels { host_dns_servers },
             attachments: Vec::new(),
             runtime_dns_servers: HashSet::new(),
-            host_dns_servers,
             policy,
         };
         Ok(Some(RuntimeStateAction::UpsertContainer {
@@ -525,9 +523,8 @@ where
         }
 
         let mut snapshot = existing.clone();
-        snapshot.labels = labels.into_iter().collect();
         snapshot.policy = policy;
-        snapshot.host_dns_servers = host_dns_servers;
+        snapshot.parsed_labels = ParsedContainerLabels { host_dns_servers };
         Ok(Some(RuntimeStateAction::UpsertContainer {
             snapshot: Box::new(snapshot),
         }))
@@ -545,8 +542,7 @@ where
         let requires_refresh = state
             .containers
             .get(container_id.as_str())
-            .and_then(|snapshot| snapshot.policy.as_ref())
-            .is_some()
+            .is_some_and(|snapshot| snapshot.policy.enabled)
             || state
                 .networks
                 .contains_key(&NetworkId::from(event.id.as_str()));
@@ -620,7 +616,7 @@ where
         let host_dns_servers = parse_host_dns_servers(&labels)?;
         let runtime_dns_servers = summary.runtime_dns_servers();
 
-        if policy_uses_runtime_dns(policy.as_ref()) && runtime_dns_servers.is_empty() {
+        if policy_uses_runtime_dns(&policy) && runtime_dns_servers.is_empty() {
             return Ok(None);
         }
 
@@ -649,22 +645,19 @@ where
         Ok(Some(ContainerSnapshot {
             id: summary.id.clone().into(),
             name: summary.name(),
-            labels: labels.into_iter().collect(),
+            parsed_labels: ParsedContainerLabels { host_dns_servers },
             attachments,
             runtime_dns_servers,
-            host_dns_servers,
             policy,
         }))
     }
 }
 
-fn policy_uses_runtime_dns(policy: Option<&crate::model::ContainerPolicy>) -> bool {
-    policy.is_some_and(|value| {
-        value
-            .dns_targets
-            .iter()
-            .any(|target| matches!(target, crate::model::DnsTarget::Runtime))
-    })
+fn policy_uses_runtime_dns(policy: &crate::model::ContainerPolicy) -> bool {
+    policy
+        .dns_targets
+        .iter()
+        .any(|target| matches!(target, crate::model::DnsTarget::Runtime))
 }
 
 fn event_portcullis_labels(attributes: &HashMap<String, String>) -> IndexMap<String, String> {
@@ -970,12 +963,6 @@ pub(crate) enum RuntimeChange {
         id: String,
         name: String,
     },
-    LabelChanged {
-        container_id: String,
-        key: String,
-        previous: Option<String>,
-        current: Option<String>,
-    },
     AttachmentAdded {
         container_id: String,
         network_id: String,
@@ -1027,11 +1014,6 @@ impl RuntimeChangeTracker {
                 RuntimeChange::PolicyChanged { container_id } => {
                     info!(container_id = %container_id, "container policy changed");
                     debug!(?change, "container policy change detail");
-                }
-                RuntimeChange::LabelChanged {
-                    container_id, key, ..
-                } => {
-                    debug!(container_id = %container_id, label_key = %key, ?change, "container label changed");
                 }
                 RuntimeChange::AttachmentAdded {
                     container_id,
@@ -1088,7 +1070,6 @@ fn detect_runtime_changes(
 
     for (container_id, container) in &current_by_id {
         if let Some(previous_container) = previous_by_id.get(container_id) {
-            detect_label_changes(&mut changes, previous_container, container);
             detect_attachment_changes(&mut changes, previous_container, container);
             if previous_container.policy != container.policy {
                 changes.push(RuntimeChange::PolicyChanged {
@@ -1113,29 +1094,6 @@ fn detect_runtime_changes(
     }
 
     changes
-}
-
-fn detect_label_changes(
-    changes: &mut Vec<RuntimeChange>,
-    previous: &ContainerSnapshot,
-    current: &ContainerSnapshot,
-) {
-    let mut keys = BTreeSet::new();
-    keys.extend(previous.labels.keys().cloned());
-    keys.extend(current.labels.keys().cloned());
-
-    for key in keys {
-        let previous_value = previous.labels.get(&key).cloned();
-        let current_value = current.labels.get(&key).cloned();
-        if previous_value != current_value {
-            changes.push(RuntimeChange::LabelChanged {
-                container_id: current.id.to_string(),
-                key,
-                previous: previous_value,
-                current: current_value,
-            });
-        }
-    }
 }
 
 fn detect_attachment_changes(
@@ -1709,7 +1667,7 @@ mod tests {
         let container = &snapshot.containers[0];
         assert_eq!(container.id, "abc".into());
         assert_eq!(container.attachments.len(), 1);
-        assert!(container.policy.is_some());
+        assert!(container.policy.enabled);
         assert!(snapshot.enforced_network_subnets.is_empty());
     }
 
@@ -2006,12 +1964,9 @@ mod tests {
             snapshot: Box::new(ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                labels: [("portcullis.enable".to_string(), "true".to_string())]
-                    .into_iter()
-                    .collect(),
+                parsed_labels: ParsedContainerLabels::default(),
                 attachments: Vec::new(),
                 runtime_dns_servers: HashSet::new(),
-                host_dns_servers: HashSet::new(),
                 policy: parse_policy(&IndexMap::from([(
                     "portcullis.enable".to_string(),
                     "true".to_string(),
@@ -2050,15 +2005,14 @@ mod tests {
             snapshot: Box::new(ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                labels: HashMap::new(),
+                parsed_labels: ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: "172.20.0.2".parse().expect("valid ip"),
                     aliases: Vec::new(),
                 }],
                 runtime_dns_servers: HashSet::new(),
-                host_dns_servers: HashSet::new(),
-                policy: None,
+                policy: crate::model::ContainerPolicy::default(),
             }),
         });
         let event = DockerEvent {
@@ -2273,17 +2227,13 @@ mod tests {
             containers: vec![ContainerSnapshot {
                 id: container_id.into(),
                 name: name.to_string(),
-                labels: label_map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+                parsed_labels: ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: network_id.into(),
                     ip_address: parsed_ip,
                     aliases: vec![name.to_string()],
                 }],
                 runtime_dns_servers: HashSet::new(),
-                host_dns_servers: HashSet::new(),
                 policy: match parse_policy(&label_map) {
                     Ok(value) => value,
                     Err(error) => panic!("failed to parse policy fixture: {error}"),
@@ -2351,10 +2301,11 @@ mod tests {
         );
 
         let changes = detect_runtime_changes(Some(&previous), &current);
-        assert!(changes.iter().any(|change| matches!(
-            change,
-            RuntimeChange::LabelChanged { key, .. } if key == "portcullis.egress.0"
-        )));
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, RuntimeChange::PolicyChanged { .. }))
+        );
         assert!(
             changes
                 .iter()

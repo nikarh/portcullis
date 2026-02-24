@@ -215,9 +215,6 @@ mod tests {
     }
 
     fn sample_snapshot() -> RuntimeSnapshot {
-        let labels: HashMap<String, String> =
-            [("portcullis.enable".to_string(), "true".to_string())].into();
-
         let attachment_ip: std::net::IpAddr = match "172.18.0.2".parse() {
             Ok(value) => value,
             Err(error) => panic!("failed to parse attachment ip in fixture: {error}"),
@@ -235,15 +232,14 @@ mod tests {
             containers: vec![ContainerSnapshot {
                 id: "abc".into(),
                 name: "web".to_string(),
-                labels,
+                parsed_labels: crate::model::ParsedContainerLabels::default(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: attachment_ip,
                     aliases: vec!["web".to_string()],
                 }],
                 runtime_dns_servers: HashSet::new(),
-                host_dns_servers: HashSet::new(),
-                policy: Some(ContainerPolicy {
+                policy: ContainerPolicy {
                     enabled: true,
                     icc_mode: IccMode::Deny,
                     egress: vec![EgressRule {
@@ -255,7 +251,7 @@ mod tests {
                     }],
                     icc_allow: Vec::new(),
                     dns_targets: vec![crate::model::DnsTarget::Docker],
-                }),
+                },
             }],
             networks: HashMap::from([(
                 "net0".into(),
