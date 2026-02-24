@@ -18,8 +18,8 @@ use portcullis::firewall::{
 };
 use portcullis::logging::{self, LogLevel, LoggingError};
 use portcullis::monitor::{
-    DockerContainerEvent, DockerFirewallBackend, DockerMonitor, MonitorError, RuntimeChangeTracker,
-    SocketDockerApi,
+    DockerEvent, DockerEventKind, DockerFirewallBackend, DockerMonitor, MonitorError,
+    RuntimeChangeTracker, RuntimeState, SocketDockerApi,
 };
 use serde::Deserialize;
 
@@ -228,9 +228,10 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let mut tracker = RuntimeChangeTracker::new();
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
+    let mut runtime_state = monitor.collect_state()?;
     let mut event_stream = connect_event_stream(&config.docker_socket)?;
-    apply_snapshot(
-        &monitor,
+    apply_runtime_state(
+        &runtime_state,
         &firewall,
         &mut tracker,
         &mut dns_cache,
@@ -254,18 +255,30 @@ fn run(config: &Config) -> Result<(), MainError> {
 
                 info!(
                     action = %event.action,
-                    container_id = %event.id,
-                    container_name = ?event.name,
+                    object_id = %event.id,
+                    object_name = ?event.name,
+                    kind = ?event.kind,
                     "docker event requires firewall refresh"
                 );
-                if let Err(error) = apply_snapshot(
-                    &monitor,
-                    &firewall,
-                    &mut tracker,
-                    &mut dns_cache,
-                    config.fail_closed,
-                ) {
-                    error!(%error, "firewall refresh failed; continuing");
+                let update_result = apply_event_update(&monitor, &mut runtime_state, &event);
+                match update_result {
+                    Ok(false) => {
+                        trace!(event = ?event, "docker event produced no policy state changes");
+                    }
+                    Ok(true) => {
+                        if let Err(error) = apply_runtime_state(
+                            &runtime_state,
+                            &firewall,
+                            &mut tracker,
+                            &mut dns_cache,
+                            config.fail_closed,
+                        ) {
+                            error!(%error, "firewall refresh failed; continuing");
+                        }
+                    }
+                    Err(error) => {
+                        error!(%error, "runtime state refresh failed; continuing");
+                    }
                 }
             }
             Ok(None) => {}
@@ -300,17 +313,14 @@ fn connect_event_stream(socket: &str) -> Result<DockerSocketEventStream, MainErr
     Ok(stream)
 }
 
-fn apply_snapshot<A>(
-    monitor: &DockerMonitor<A>,
+fn apply_runtime_state(
+    runtime_state: &RuntimeState,
     firewall: &ActiveFirewall,
     tracker: &mut RuntimeChangeTracker,
     dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
     fail_closed: bool,
-) -> Result<(), MainError>
-where
-    A: portcullis::monitor::DockerApi,
-{
-    let mut snapshot = monitor.snapshot()?;
+) -> Result<(), MainError> {
+    let mut snapshot = runtime_state.snapshot();
     if fail_closed {
         enforce_fail_closed_defaults(&mut snapshot);
     }
@@ -320,6 +330,46 @@ where
     firewall.apply(&snapshot, dns_cache)?;
     info!("firewall rules applied");
     Ok(())
+}
+
+fn apply_event_update<A>(
+    monitor: &DockerMonitor<A>,
+    runtime_state: &mut RuntimeState,
+    event: &DockerEvent,
+) -> Result<bool, MainError>
+where
+    A: portcullis::monitor::DockerApi,
+{
+    let mut changed = false;
+    match event.kind {
+        DockerEventKind::Container => match event.action.as_str() {
+            "destroy" => {
+                changed |= monitor.remove_container(runtime_state, &event.id);
+            }
+            "create" | "start" | "attach" | "detach" | "restart" | "stop" | "die" | "kill"
+            | "rename" | "update" | "connect" | "disconnect" | "pause" | "unpause" => {
+                changed |= monitor.refresh_container(runtime_state, &event.id)?;
+            }
+            _ => {}
+        },
+        DockerEventKind::Network => match event.action.as_str() {
+            "destroy" => {
+                changed |= monitor.remove_network(runtime_state, &event.id);
+            }
+            "create" | "update" | "connect" | "disconnect" => {
+                let container_ids = monitor.refresh_network(runtime_state, &event.id)?;
+                changed = true;
+                for container_id in container_ids {
+                    changed |= monitor.refresh_container(runtime_state, &container_id)?;
+                }
+                if let Some(container_id) = event.attributes.get("container") {
+                    changed |= monitor.refresh_container(runtime_state, container_id)?;
+                }
+            }
+            _ => {}
+        },
+    }
+    Ok(changed)
 }
 
 fn enforce_fail_closed_defaults(snapshot: &mut portcullis::model::RuntimeSnapshot) {
@@ -402,7 +452,7 @@ impl DockerSocketEventStream {
         Ok(Self { reader })
     }
 
-    fn next_event(&mut self) -> Result<Option<DockerContainerEvent>, MainError> {
+    fn next_event(&mut self) -> Result<Option<DockerEvent>, MainError> {
         let mut line = String::new();
         match self.reader.read_line(&mut line) {
             Ok(0) => Err(MainError::ServiceState(
@@ -422,7 +472,7 @@ impl DockerSocketEventStream {
     }
 }
 
-fn parse_container_event_line(line: &str) -> Result<Option<DockerContainerEvent>, MainError> {
+fn parse_container_event_line(line: &str) -> Result<Option<DockerEvent>, MainError> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -435,22 +485,35 @@ fn parse_container_event_line(line: &str) -> Result<Option<DockerContainerEvent>
         .map_err(|error| MainError::ServiceState(format!("invalid docker event json: {error}")))?;
     let action = parsed.action.or(parsed.status).unwrap_or_default();
     let kind = parsed.kind.or(parsed.event_type).unwrap_or_default();
+    let kind = kind.to_lowercase();
     if !kind.is_empty() && kind != "container" && kind != "network" {
         return Ok(None);
     }
+    let kind = match kind.as_str() {
+        "network" => DockerEventKind::Network,
+        _ => DockerEventKind::Container,
+    };
     let actor_id = parsed.actor.as_ref().and_then(|actor| actor.id.clone());
     let id = parsed.id.or(actor_id).unwrap_or_default();
     if id.is_empty() || action.is_empty() {
         return Ok(None);
     }
 
-    let name = parsed
+    let attributes = parsed
         .actor
         .as_ref()
         .and_then(|actor| actor.attributes.as_ref())
-        .and_then(|attributes| attributes.get("name").cloned());
+        .cloned()
+        .unwrap_or_default();
+    let name = attributes.get("name").cloned();
 
-    Ok(Some(DockerContainerEvent { id, action, name }))
+    Ok(Some(DockerEvent {
+        id,
+        action,
+        name,
+        kind,
+        attributes,
+    }))
 }
 
 fn is_chunk_size_line(line: &str) -> bool {
@@ -542,10 +605,15 @@ mod tests {
         let event = parse_container_event_line(line).expect("event parse should succeed");
         assert_eq!(
             event,
-            Some(DockerContainerEvent {
+            Some(DockerEvent {
                 id: "abc".to_string(),
                 action: "start".to_string(),
                 name: Some("web".to_string()),
+                kind: DockerEventKind::Container,
+                attributes: std::collections::BTreeMap::from([(
+                    "name".to_string(),
+                    "web".to_string(),
+                )]),
             })
         );
     }
@@ -556,10 +624,15 @@ mod tests {
         let event = parse_container_event_line(line).expect("event parse should succeed");
         assert_eq!(
             event,
-            Some(DockerContainerEvent {
+            Some(DockerEvent {
                 id: "net0".to_string(),
                 action: "create".to_string(),
                 name: Some("pc-managed".to_string()),
+                kind: DockerEventKind::Network,
+                attributes: std::collections::BTreeMap::from([(
+                    "name".to_string(),
+                    "pc-managed".to_string(),
+                )]),
             })
         );
     }
