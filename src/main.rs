@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::str::FromStr;
@@ -366,11 +367,13 @@ where
                 let (network_result, container_ids) =
                     monitor.refresh_network(runtime_state, &event.id)?;
                 changed |= network_result.changed;
-                for container_id in container_ids {
-                    changed |= monitor.refresh_container(runtime_state, &container_id)?;
-                }
+                let mut impacted = BTreeSet::new();
+                impacted.extend(container_ids);
                 if let Some(container_id) = event.attributes.get("container") {
-                    changed |= monitor.refresh_container(runtime_state, container_id)?;
+                    impacted.insert(container_id.clone());
+                }
+                for container_id in impacted {
+                    changed |= monitor.refresh_container(runtime_state, &container_id)?;
                 }
             }
             _ => {}
