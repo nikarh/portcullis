@@ -270,14 +270,7 @@ where
             }
         }
         for summary in containers {
-            if let Some(snapshot) =
-                Self::try_build_container_snapshot_from_summary(&state, &summary)?
-            {
-                state.containers.insert(snapshot.id.clone(), snapshot);
-                continue;
-            }
-            let inspect = self.api.inspect_container(&summary.id)?;
-            let snapshot = self.build_container_snapshot(&mut state, inspect)?;
+            let snapshot = Self::build_container_snapshot_from_summary(&state, &summary)?;
             state.containers.insert(snapshot.id.clone(), snapshot);
         }
         Ok(state)
@@ -334,60 +327,6 @@ where
             }
             _ => Ok(None),
         }
-    }
-
-    fn build_container_snapshot(
-        &self,
-        state: &mut RuntimeState,
-        inspect: DockerContainerInspect,
-    ) -> Result<ContainerSnapshot, MonitorError> {
-        let policy = parse_policy(&inspect.config.labels)?;
-        let runtime_dns_servers = inspect.runtime_dns_servers();
-        let mut attachments = Vec::new();
-
-        for (network_name, endpoint) in inspect.network_endpoints() {
-            let Some(address) = endpoint.ip_address else {
-                continue;
-            };
-            let network_id: NetworkId = endpoint
-                .network_id
-                .ok_or_else(|| MonitorError::MissingNetworkId {
-                    container_id: inspect.id.clone(),
-                    network_name: network_name.to_string(),
-                })?
-                .into();
-            if !state.networks.contains_key(&network_id) {
-                let network_data = match self.api.inspect_network(network_id.as_str()) {
-                    Ok(network) => NetworkRuntimeData::try_new(&network)?,
-                    Err(error) if is_not_found(&error) => None,
-                    Err(error) => return Err(error),
-                };
-                if let Some(data) = network_data {
-                    state.networks.insert(network_id.clone(), data);
-                }
-            }
-            let Some(_network_data) = state.networks.get(&network_id) else {
-                warn!(
-                    network_id = %network_id,
-                    container_id = %inspect.id,
-                    "skipping attachment on network without subnet"
-                );
-                continue;
-            };
-            attachments.push(NetworkAttachment {
-                network_id,
-                ip_address: address,
-                aliases: endpoint.aliases.unwrap_or_default(),
-            });
-        }
-
-        Ok(ContainerSnapshot {
-            id: inspect.id.into(),
-            name: inspect.name,
-            attachments,
-            runtime_dns_servers,
-            policy,
-        })
     }
 
     fn build_container_snapshot_from_inspect(
@@ -568,16 +507,12 @@ where
         }
     }
 
-    fn try_build_container_snapshot_from_summary(
+    fn build_container_snapshot_from_summary(
         state: &RuntimeState,
         summary: &DockerContainerSummary,
-    ) -> Result<Option<ContainerSnapshot>, MonitorError> {
+    ) -> Result<ContainerSnapshot, MonitorError> {
         let policy = parse_policy(&summary.labels)?;
         let runtime_dns_servers = summary.runtime_dns_servers();
-
-        if policy_uses_runtime_dns(&policy) && runtime_dns_servers.is_empty() {
-            return Ok(None);
-        }
 
         let mut attachments = Vec::new();
         for (_network_name, endpoint) in summary.network_endpoints() {
@@ -585,15 +520,12 @@ where
                 continue;
             };
             let Some(network_id_raw) = endpoint.network_id.clone() else {
-                return Ok(None);
+                continue;
             };
             let network_id: NetworkId = network_id_raw.into();
             let Some(_network_data) = state.networks.get(&network_id) else {
-                return Ok(None);
+                continue;
             };
-            if endpoint.aliases.is_none() {
-                return Ok(None);
-            }
             attachments.push(NetworkAttachment {
                 network_id,
                 ip_address: address,
@@ -601,21 +533,14 @@ where
             });
         }
 
-        Ok(Some(ContainerSnapshot {
+        Ok(ContainerSnapshot {
             id: summary.id.clone().into(),
             name: summary.name(),
             attachments,
             runtime_dns_servers,
             policy,
-        }))
+        })
     }
-}
-
-fn policy_uses_runtime_dns(policy: &crate::model::ContainerPolicy) -> bool {
-    policy
-        .dns_targets
-        .iter()
-        .any(|target| matches!(target, crate::model::DnsTarget::Runtime))
 }
 
 fn is_not_found(error: &MonitorError) -> bool {
