@@ -27,8 +27,8 @@ use crate::monitor::{
     DockerEvent, DockerEventAction, DockerEventKind, DockerFirewallBackend, DockerMonitor,
     MonitorError, RuntimeChangeTracker, RuntimeState, SocketDockerApi,
 };
-use serde::Deserialize;
 use indexmap::IndexMap;
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirewallBackend {
@@ -164,6 +164,13 @@ enum ActiveFirewall {
 }
 
 impl ActiveFirewall {
+    fn initialize(&self) -> Result<(), FirewallError> {
+        match self {
+            Self::Nftables(_) => Ok(()),
+            Self::Iptables(firewall) => firewall.initialize(),
+        }
+    }
+
     fn apply(
         &self,
         snapshot: &crate::model::RuntimeSnapshot,
@@ -221,6 +228,7 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     info!("performing startup firewall cleanup");
     firewall.cleanup()?;
+    firewall.initialize()?;
 
     let terminate = Arc::new(AtomicBool::new(false));
     let terminate_flag = Arc::clone(&terminate);
@@ -600,10 +608,7 @@ mod tests {
                 action: DockerEventAction::Start,
                 name: Some("web".to_string()),
                 kind: DockerEventKind::Container,
-                attributes: indexmap::IndexMap::from([(
-                    "name".to_string(),
-                    "web".to_string(),
-                )]),
+                attributes: indexmap::IndexMap::from([("name".to_string(), "web".to_string(),)]),
             })
         );
     }

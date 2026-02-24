@@ -126,8 +126,6 @@ where
         snapshot: &RuntimeSnapshot,
         resolver: &mut dyn HostnameIpResolver,
     ) -> Result<(), FirewallError> {
-        self.ensure_chain_and_jump()?;
-
         let commands =
             build_apply_commands_with_dns(snapshot, resolver, self.use_ipset, CHAIN_NAME)?;
         let mut restore_lines = Vec::new();
@@ -144,16 +142,7 @@ where
         Ok(())
     }
 
-    pub fn cleanup(&self) -> Result<(), FirewallError> {
-        let filter_rules = self.runner.read_iptables_save_filter()?;
-        let cleanup_lines = build_cleanup_restore_lines(&filter_rules);
-        self.runner.run_iptables_restore(&cleanup_lines)?;
-
-        info!("iptables cleanup completed");
-        Ok(())
-    }
-
-    fn ensure_chain_and_jump(&self) -> Result<(), FirewallError> {
+    pub fn initialize(&self) -> Result<(), FirewallError> {
         match self
             .runner
             .run("iptables", &["-N".to_string(), CHAIN_NAME.to_string()])
@@ -167,38 +156,30 @@ where
         match self.runner.run(
             "iptables",
             &[
-                "-C".to_string(),
+                "-I".to_string(),
                 DOCKER_USER_CHAIN.to_string(),
+                "1".to_string(),
                 "-j".to_string(),
                 CHAIN_NAME.to_string(),
             ],
         ) {
             Ok(()) => {}
             Err(FirewallError::CommandFailure { stderr, .. })
-                if is_ignorable_cleanup_stderr(&stderr) =>
-            {
-                self.runner.run(
-                    "iptables",
-                    &[
-                        "-I".to_string(),
-                        DOCKER_USER_CHAIN.to_string(),
-                        "1".to_string(),
-                        "-j".to_string(),
-                        CHAIN_NAME.to_string(),
-                    ],
-                )?;
-            }
+                if stderr.contains("exists") || stderr.contains("Bad rule") => {}
             Err(error) => return Err(error),
         }
 
         Ok(())
     }
-}
 
-fn is_ignorable_cleanup_stderr(stderr: &str) -> bool {
-    stderr.contains("No chain/target/match by that name")
-        || stderr.contains("Bad rule")
-        || (stderr.contains("Couldn't load target") && stderr.contains("No such file or directory"))
+    pub fn cleanup(&self) -> Result<(), FirewallError> {
+        let filter_rules = self.runner.read_iptables_save_filter()?;
+        let cleanup_lines = build_cleanup_restore_lines(&filter_rules);
+        self.runner.run_iptables_restore(&cleanup_lines)?;
+
+        info!("iptables cleanup completed");
+        Ok(())
+    }
 }
 
 impl IptablesFirewall<CommandIptablesRunner> {
