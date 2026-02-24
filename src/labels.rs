@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use ipnet::IpNet;
@@ -13,6 +14,7 @@ const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
 const ICC_ALLOW_PREFIX: &str = "portcullis.icc.allow.";
 const DNS_PREFIX: &str = "portcullis.dns.";
+const DNS_HOST_PREFIX: &str = "portcullis.dns.host.";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LabelParseError {
@@ -44,6 +46,8 @@ pub enum LabelParseError {
     MissingPorts(String),
     #[error("invalid dns target in {0}: {1}")]
     InvalidDnsTarget(String, String),
+    #[error("invalid host dns resolver in {0}: {1}")]
+    InvalidHostDnsResolver(String, String),
 }
 
 pub fn parse_policy(
@@ -107,6 +111,27 @@ pub fn parse_policy(
         icc_allow,
         dns_targets,
     }))
+}
+
+pub fn parse_host_dns_servers(
+    labels: &BTreeMap<String, String>,
+) -> Result<Vec<IpAddr>, LabelParseError> {
+    let values = collect_indexed_values(
+        labels,
+        DNS_HOST_PREFIX,
+        LabelParseError::InvalidDnsIndex,
+        LabelParseError::DuplicateDnsIndex,
+    )?;
+    let mut parsed = Vec::with_capacity(values.len());
+    for (_, key, value) in values {
+        let ip = value
+            .parse::<IpAddr>()
+            .map_err(|_| LabelParseError::InvalidHostDnsResolver(key.clone(), value.clone()))?;
+        parsed.push(ip);
+    }
+    parsed.sort_unstable();
+    parsed.dedup();
+    Ok(parsed)
 }
 
 fn collect_indexed_values(
@@ -530,6 +555,28 @@ mod tests {
         assert!(matches!(
             error,
             LabelParseError::InvalidContainerTarget(_, _)
+        ));
+    }
+
+    #[test]
+    fn parse_host_dns_servers_parses_resolvers() {
+        let parsed = parse_host_dns_servers(&labels(&[
+            ("portcullis.dns.host.0", "1.1.1.1"),
+            ("portcullis.dns.host.1", "8.8.8.8"),
+        ]))
+        .expect("host dns resolvers should parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_string(), "1.1.1.1");
+        assert_eq!(parsed[1].to_string(), "8.8.8.8");
+    }
+
+    #[test]
+    fn parse_host_dns_servers_rejects_invalid_ip() {
+        let error = parse_host_dns_servers(&labels(&[("portcullis.dns.host.0", "not-ip")]))
+            .expect_err("invalid host dns resolver should fail");
+        assert!(matches!(
+            error,
+            LabelParseError::InvalidHostDnsResolver(_, _)
         ));
     }
 }

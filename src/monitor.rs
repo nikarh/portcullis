@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
@@ -10,7 +9,7 @@ use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
-use crate::labels::{LabelParseError, parse_policy};
+use crate::labels::{LabelParseError, parse_host_dns_servers, parse_policy};
 use crate::model::{ContainerSnapshot, NetworkAttachment, RuntimeSnapshot};
 
 #[derive(Debug, Error)]
@@ -42,13 +41,13 @@ pub enum MonitorError {
         label: String,
         value: String,
     },
-    #[error("failed to read resolv.conf for container {container_id}: {message}")]
-    ResolvConfRead {
-        container_id: String,
-        message: String,
-    },
     #[error(transparent)]
     LabelParse(#[from] LabelParseError),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetworkRefreshResult {
+    pub changed: bool,
 }
 
 pub trait DockerApi {
@@ -131,7 +130,7 @@ where
 
         let mut state = RuntimeState::default();
         for network_id in network_ids {
-            self.refresh_network(&mut state, &network_id)?;
+            let _ = self.refresh_network(&mut state, &network_id)?;
         }
         for container_id in container_ids {
             let _ = self.refresh_container(&mut state, &container_id)?;
@@ -148,8 +147,9 @@ where
         match self.api.inspect_container(container_id) {
             Ok(inspect) => {
                 let snapshot = self.build_container_snapshot(state, inspect)?;
+                let changed = state.containers.get(container_id) != Some(&snapshot);
                 state.containers.insert(snapshot.id.clone(), snapshot);
-                Ok(true)
+                Ok(changed)
             }
             Err(error) if is_not_found(&error) => {
                 Ok(state.containers.remove(container_id).is_some())
@@ -166,29 +166,33 @@ where
         &self,
         state: &mut RuntimeState,
         network_id: &str,
-    ) -> Result<Vec<String>, MonitorError> {
+    ) -> Result<(NetworkRefreshResult, Vec<String>), MonitorError> {
         debug!(%network_id, "refreshing network state");
         match self.api.inspect_network(network_id) {
             Ok(network) => {
                 let attached_container_ids = network.attached_container_ids();
-                match Self::network_runtime_data(&network)? {
-                    Some(data) => {
-                        state.networks.insert(network_id.to_string(), data);
-                    }
-                    None => {
-                        state.networks.remove(network_id);
-                    }
+                let previous = state.networks.get(network_id).copied();
+                if let Some(data) = Self::network_runtime_data(&network)? {
+                    state.networks.insert(network_id.to_string(), data);
+                    let changed = previous != Some(data);
+                    Ok((NetworkRefreshResult { changed }, attached_container_ids))
+                } else {
+                    let changed = state.networks.remove(network_id).is_some();
+                    Ok((NetworkRefreshResult { changed }, attached_container_ids))
                 }
-                Ok(attached_container_ids)
             }
             Err(error) if is_not_found(&error) => {
-                state.networks.remove(network_id);
+                let mut changed = state.networks.remove(network_id).is_some();
                 for container in state.containers.values_mut() {
+                    let before = container.attachments.len();
                     container
                         .attachments
                         .retain(|attachment| attachment.network_id != network_id);
+                    if before != container.attachments.len() {
+                        changed = true;
+                    }
                 }
-                Ok(Vec::new())
+                Ok((NetworkRefreshResult { changed }, Vec::new()))
             }
             Err(error) => Err(error),
         }
@@ -242,8 +246,8 @@ where
     ) -> Result<ContainerSnapshot, MonitorError> {
         let labels = inspect.labels();
         let policy = parse_policy(&labels)?;
+        let host_dns_servers = parse_host_dns_servers(&labels)?;
         let runtime_dns_servers = inspect.runtime_dns_servers();
-        let host_dns_servers = inspect.host_dns_servers()?;
         let mut attachments = Vec::new();
 
         for (network_name, endpoint) in inspect.network_endpoints() {
@@ -546,21 +550,7 @@ impl DockerEvent {
         match self.kind {
             DockerEventKind::Container => matches!(
                 self.action.as_str(),
-                "create"
-                    | "start"
-                    | "attach"
-                    | "detach"
-                    | "restart"
-                    | "stop"
-                    | "die"
-                    | "kill"
-                    | "destroy"
-                    | "rename"
-                    | "update"
-                    | "connect"
-                    | "disconnect"
-                    | "pause"
-                    | "unpause"
+                "create" | "start" | "destroy" | "rename" | "update" | "connect" | "disconnect"
             ),
             DockerEventKind::Network => {
                 matches!(
@@ -810,8 +800,6 @@ pub struct DockerContainerInspect {
     pub config: Option<DockerContainerConfig>,
     #[serde(rename = "HostConfig")]
     pub host_config: Option<DockerHostConfig>,
-    #[serde(rename = "ResolvConfPath")]
-    pub resolv_conf_path: Option<String>,
     #[serde(rename = "NetworkSettings")]
     pub network_settings: Option<DockerNetworkSettings>,
 }
@@ -836,30 +824,6 @@ impl DockerContainerInspect {
         values.sort_unstable();
         values.dedup();
         values
-    }
-
-    fn host_dns_servers(&self) -> Result<Vec<IpAddr>, MonitorError> {
-        let Some(path) = &self.resolv_conf_path else {
-            return Ok(Vec::new());
-        };
-        let content = fs::read_to_string(path).map_err(|error| MonitorError::ResolvConfRead {
-            container_id: self.id.clone(),
-            message: error.to_string(),
-        })?;
-        let mut values = Vec::new();
-        for line in content.lines().map(str::trim) {
-            if !line.starts_with("nameserver ") {
-                continue;
-            }
-            if let Some(value) = line.split_whitespace().nth(1)
-                && let Ok(ip) = value.parse::<IpAddr>()
-            {
-                values.push(ip);
-            }
-        }
-        values.sort_unstable();
-        values.dedup();
-        Ok(values)
     }
 
     fn network_endpoints(&self) -> Vec<(&str, DockerEndpoint)> {
@@ -1128,7 +1092,6 @@ mod tests {
                 labels: Some(label_map),
             }),
             host_config: None,
-            resolv_conf_path: None,
             network_settings: Some(DockerNetworkSettings {
                 networks: Some(networks),
             }),
@@ -1241,7 +1204,6 @@ mod tests {
                 labels: Some(BTreeMap::new()),
             }),
             host_config: None,
-            resolv_conf_path: None,
             network_settings: Some(DockerNetworkSettings {
                 networks: Some(networks),
             }),
@@ -1428,7 +1390,7 @@ mod tests {
     fn docker_container_event_relevance_filters_noise() {
         let relevant = DockerEvent {
             id: "abc".to_string(),
-            action: "attach".to_string(),
+            action: "start".to_string(),
             name: Some("web".to_string()),
             kind: DockerEventKind::Container,
             attributes: BTreeMap::new(),
@@ -1516,7 +1478,7 @@ mod tests {
 
         let monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
-        let mut ids = monitor
+        let (_, mut ids) = monitor
             .refresh_network(&mut state, "net0")
             .expect("refresh network should succeed");
         ids.sort_unstable();

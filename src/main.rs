@@ -236,6 +236,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         &mut tracker,
         &mut dns_cache,
         config.fail_closed,
+        true,
     )?;
 
     info!("subscribed to docker container events");
@@ -272,6 +273,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                             &mut tracker,
                             &mut dns_cache,
                             config.fail_closed,
+                            false,
                         ) {
                             error!(%error, "firewall refresh failed; continuing");
                         }
@@ -319,6 +321,7 @@ fn apply_runtime_state(
     tracker: &mut RuntimeChangeTracker,
     dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
     fail_closed: bool,
+    force_apply: bool,
 ) -> Result<(), MainError> {
     let mut snapshot = runtime_state.snapshot();
     if fail_closed {
@@ -327,6 +330,10 @@ fn apply_runtime_state(
     let changes = tracker.detect_and_log(&snapshot);
     debug!(change_count = changes.len(), "runtime changes computed");
     trace!(?snapshot, "runtime snapshot for firewall apply");
+    if !force_apply && changes.is_empty() {
+        debug!("skipping firewall apply because no runtime changes were detected");
+        return Ok(());
+    }
     firewall.apply(&snapshot, dns_cache)?;
     info!("firewall rules applied");
     Ok(())
@@ -346,8 +353,7 @@ where
             "destroy" => {
                 changed |= monitor.remove_container(runtime_state, &event.id);
             }
-            "create" | "start" | "attach" | "detach" | "restart" | "stop" | "die" | "kill"
-            | "rename" | "update" | "connect" | "disconnect" | "pause" | "unpause" => {
+            "create" | "start" | "rename" | "update" | "connect" | "disconnect" => {
                 changed |= monitor.refresh_container(runtime_state, &event.id)?;
             }
             _ => {}
@@ -357,8 +363,9 @@ where
                 changed |= monitor.remove_network(runtime_state, &event.id);
             }
             "create" | "update" | "connect" | "disconnect" => {
-                let container_ids = monitor.refresh_network(runtime_state, &event.id)?;
-                changed = true;
+                let (network_result, container_ids) =
+                    monitor.refresh_network(runtime_state, &event.id)?;
+                changed |= network_result.changed;
                 for container_id in container_ids {
                     changed |= monitor.refresh_container(runtime_state, &container_id)?;
                 }
