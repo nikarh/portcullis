@@ -68,8 +68,9 @@ Portcullis exists to provide:
 
 ### 5.1 Runtime Discovery
 - `monitor` module talks directly to Docker Engine HTTP API over the configured Unix socket:
-- `GET /containers/json`
+- `GET /containers/json?all=1`
 - `GET /containers/{id}/json`
+- `GET /networks`
 - `GET /networks/{id}`
 - `GET /info` (for firewall backend detection)
 
