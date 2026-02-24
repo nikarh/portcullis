@@ -194,12 +194,15 @@ where
         let subnet = match network.primary_subnet() {
             Ok(value) => value,
             Err(MonitorError::MissingNetworkSubnet(_)) => {
-                debug!(
-                    network_id = %network.id,
-                    network_name = %network.name,
-                    "ignoring docker network without subnet"
-                );
-                return Ok(None);
+                if matches!(network.name.as_str(), "host" | "none") {
+                    debug!(
+                        network_id = %network.id,
+                        network_name = %network.name,
+                        "ignoring builtin docker network without subnet"
+                    );
+                    return Ok(None);
+                }
+                return Err(MonitorError::MissingNetworkSubnet(network.id.clone()));
             }
             Err(error) => return Err(error),
         };
@@ -1287,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn docker_monitor_ignores_networks_without_subnet() {
+    fn docker_monitor_ignores_host_network_without_subnet() {
         let mut api = MockDockerApi::default();
         api.network_ids.push("net-no-subnet".to_string());
         api.networks.insert(
@@ -1299,6 +1302,23 @@ mod tests {
         let snapshot = monitor.snapshot().expect("snapshot should succeed");
         assert!(snapshot.containers.is_empty());
         assert!(snapshot.enforced_network_subnets.is_empty());
+    }
+
+    #[test]
+    fn docker_monitor_errors_on_non_builtin_network_without_subnet() {
+        let mut api = MockDockerApi::default();
+        api.network_ids.push("net-no-subnet".to_string());
+        api.networks.insert(
+            "net-no-subnet".to_string(),
+            network_without_subnet("net-no-subnet", "custom-net"),
+        );
+
+        let monitor = DockerMonitor::new(api);
+        let result = monitor.snapshot();
+        assert!(matches!(
+            result,
+            Err(MonitorError::MissingNetworkSubnet(ref id)) if id == "net-no-subnet"
+        ));
     }
 
     #[test]
