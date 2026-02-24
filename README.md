@@ -127,11 +127,13 @@ portcullis.dns.1=host
 portcullis.dns.2=runtime
 portcullis.dns.3=ip:1.1.1.1
 portcullis.dns.4=*
+portcullis.dns.host.0=192.168.1.1
+portcullis.dns.host.1=8.8.8.8
 ```
 
 DNS entry meanings:
 - `docker`: allow Docker internal resolver endpoint for that attachment (gateway-derived).
-- `host`: allow nameservers found in container `resolv.conf` (host-propagated path).
+- `host`: allow only IPs explicitly defined via `portcullis.dns.host.<n>=<ip>`.
 - `runtime`: allow DNS configured via container runtime (`docker run --dns` / Compose `dns`).
 - `ip:<addr>`: allow a specific resolver IP.
 - `*`: allow DNS to any destination (`udp/53` and `tcp/53`).

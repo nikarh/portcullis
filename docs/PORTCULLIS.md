@@ -100,6 +100,7 @@ Collected data includes:
 - `portcullis.icc.allow.<n>=container:<id|name|alias>,<proto:port>[,<proto:port>...]`
 - `portcullis.network.enforce=true` (Docker network label; baseline subnet deny)
 - `portcullis.dns.<n>=docker|host|runtime|ip:<addr>|*`
+- `portcullis.dns.host.<n>=<ip>` (required when using `host` DNS target)
 
 Policy compile output is normalized into strongly typed rules.
 
