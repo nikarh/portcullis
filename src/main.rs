@@ -338,6 +338,7 @@ fn enforce_fail_closed_defaults(snapshot: &mut portcullis::model::RuntimeSnapsho
                     icc_mode: portcullis::model::IccMode::Allow,
                     egress: Vec::new(),
                     icc_allow: Vec::new(),
+                    dns_targets: vec![portcullis::model::DnsTarget::Docker],
                 });
             }
         }

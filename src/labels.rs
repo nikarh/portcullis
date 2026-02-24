@@ -5,13 +5,14 @@ use ipnet::IpNet;
 use thiserror::Error;
 
 use crate::model::{
-    ContainerPolicy, EgressRule, EgressTarget, IccAllowRule, IccMode, PortSpec, Protocol,
+    ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode, PortSpec, Protocol,
 };
 
 const ENABLE_LABEL: &str = "portcullis.enable";
 const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
 const ICC_ALLOW_PREFIX: &str = "portcullis.icc.allow.";
+const DNS_PREFIX: &str = "portcullis.dns.";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LabelParseError {
@@ -23,6 +24,10 @@ pub enum LabelParseError {
     InvalidEgressIndex(String),
     #[error("duplicate egress index in key: {0}")]
     DuplicateEgressIndex(String),
+    #[error("invalid dns index in key: {0}")]
+    InvalidDnsIndex(String),
+    #[error("duplicate dns index in key: {0}")]
+    DuplicateDnsIndex(String),
     #[error("invalid egress value for {0}: {1}")]
     InvalidEgress(String, String),
     #[error("invalid ICC allow value for {0}: {1}")]
@@ -37,6 +42,8 @@ pub enum LabelParseError {
     InvalidPortSpec(String, String),
     #[error("no ports defined in {0}")]
     MissingPorts(String),
+    #[error("invalid dns target in {0}: {1}")]
+    InvalidDnsTarget(String, String),
 }
 
 pub fn parse_policy(
@@ -56,8 +63,24 @@ pub fn parse_policy(
         Some(mode) => parse_icc_mode(mode)?,
     };
 
-    let keyed_values = collect_indexed_values(labels, EGRESS_PREFIX)?;
-    let icc_allow_values = collect_indexed_values(labels, ICC_ALLOW_PREFIX)?;
+    let keyed_values = collect_indexed_values(
+        labels,
+        EGRESS_PREFIX,
+        LabelParseError::InvalidEgressIndex,
+        LabelParseError::DuplicateEgressIndex,
+    )?;
+    let icc_allow_values = collect_indexed_values(
+        labels,
+        ICC_ALLOW_PREFIX,
+        LabelParseError::InvalidEgressIndex,
+        LabelParseError::DuplicateEgressIndex,
+    )?;
+    let dns_values = collect_indexed_values(
+        labels,
+        DNS_PREFIX,
+        LabelParseError::InvalidDnsIndex,
+        LabelParseError::DuplicateDnsIndex,
+    )?;
 
     let mut egress = Vec::with_capacity(keyed_values.len());
     for (_, key, value) in keyed_values {
@@ -67,18 +90,30 @@ pub fn parse_policy(
     for (_, key, value) in icc_allow_values {
         icc_allow.push(parse_icc_allow_value(&key, &value)?);
     }
+    let dns_targets = if dns_values.is_empty() {
+        vec![DnsTarget::Docker]
+    } else {
+        let mut parsed = Vec::with_capacity(dns_values.len());
+        for (_, key, value) in dns_values {
+            parsed.push(parse_dns_target(&key, &value)?);
+        }
+        parsed
+    };
 
     Ok(Some(ContainerPolicy {
         enabled,
         icc_mode,
         egress,
         icc_allow,
+        dns_targets,
     }))
 }
 
 fn collect_indexed_values(
     labels: &BTreeMap<String, String>,
     prefix: &str,
+    invalid_index: fn(String) -> LabelParseError,
+    duplicate_index: fn(String) -> LabelParseError,
 ) -> Result<Vec<(String, String, String)>, LabelParseError> {
     let mut indices = BTreeSet::new();
     let mut keyed_values = Vec::new();
@@ -94,11 +129,11 @@ fn collect_indexed_values(
                 .chars()
                 .all(|character| character.is_ascii_digit())
         {
-            return Err(LabelParseError::InvalidEgressIndex(key.clone()));
+            return Err(invalid_index(key.clone()));
         }
 
         if !indices.insert(index_part.to_string()) {
-            return Err(LabelParseError::DuplicateEgressIndex(key.clone()));
+            return Err(duplicate_index(key.clone()));
         }
 
         keyed_values.push((index_part.to_string(), key.clone(), value.clone()));
@@ -106,6 +141,26 @@ fn collect_indexed_values(
 
     keyed_values.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(keyed_values)
+}
+
+fn parse_dns_target(key: &str, value: &str) -> Result<DnsTarget, LabelParseError> {
+    match value {
+        "docker" => Ok(DnsTarget::Docker),
+        "host" => Ok(DnsTarget::Host),
+        "runtime" => Ok(DnsTarget::Runtime),
+        "*" => Ok(DnsTarget::Any),
+        _ => {
+            if let Some(ip) = value.strip_prefix("ip:")
+                && let Ok(parsed) = ip.parse()
+            {
+                return Ok(DnsTarget::Ip(parsed));
+            }
+            Err(LabelParseError::InvalidDnsTarget(
+                key.to_string(),
+                value.to_string(),
+            ))
+        }
+    }
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, LabelParseError> {
@@ -252,7 +307,7 @@ fn split_once_colon<'a>(key: &str, part: &'a str) -> Result<(&'a str, &'a str), 
 mod tests {
     use super::*;
 
-    use crate::model::{EgressTarget, IccMode, Protocol};
+    use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol};
 
     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
@@ -297,6 +352,7 @@ mod tests {
         assert_eq!(parsed.icc_allow.len(), 1);
         assert_eq!(parsed.icc_allow[0].target_container, "db");
         assert_eq!(parsed.icc_allow[0].ports[0].port, 5432);
+        assert_eq!(parsed.dns_targets, vec![DnsTarget::Docker]);
     }
 
     #[test]
@@ -426,6 +482,41 @@ mod tests {
         assert_eq!(parsed.icc_mode, IccMode::AllowListed);
         assert_eq!(parsed.icc_allow.len(), 1);
         assert_eq!(parsed.icc_allow[0].target_container, "redis");
+    }
+
+    #[test]
+    fn parse_policy_parses_dns_targets() {
+        let parsed = parse_policy(&labels(&[
+            ("portcullis.enable", "true"),
+            ("portcullis.dns.0", "docker"),
+            ("portcullis.dns.1", "host"),
+            ("portcullis.dns.2", "runtime"),
+            ("portcullis.dns.3", "ip:1.1.1.1"),
+            ("portcullis.dns.4", "*"),
+        ]))
+        .expect("parser should not fail")
+        .expect("policy should be enabled");
+
+        assert_eq!(parsed.dns_targets.len(), 5);
+        assert_eq!(parsed.dns_targets[0], DnsTarget::Docker);
+        assert_eq!(parsed.dns_targets[1], DnsTarget::Host);
+        assert_eq!(parsed.dns_targets[2], DnsTarget::Runtime);
+        assert_eq!(
+            parsed.dns_targets[3],
+            DnsTarget::Ip("1.1.1.1".parse().expect("ip should parse"))
+        );
+        assert_eq!(parsed.dns_targets[4], DnsTarget::Any);
+    }
+
+    #[test]
+    fn parse_policy_rejects_invalid_dns_target() {
+        let error = parse_policy(&labels(&[
+            ("portcullis.enable", "true"),
+            ("portcullis.dns.0", "bad"),
+        ]))
+        .expect_err("invalid dns target should be rejected");
+
+        assert!(matches!(error, LabelParseError::InvalidDnsTarget(_, _)));
     }
 
     #[test]

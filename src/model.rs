@@ -41,11 +41,21 @@ pub enum IccMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsTarget {
+    Docker,
+    Host,
+    Runtime,
+    Ip(IpAddr),
+    Any,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerPolicy {
     pub enabled: bool,
     pub icc_mode: IccMode,
     pub egress: Vec<EgressRule>,
     pub icc_allow: Vec<IccAllowRule>,
+    pub dns_targets: Vec<DnsTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +74,8 @@ pub struct ContainerSnapshot {
     pub name: String,
     pub labels: BTreeMap<String, String>,
     pub attachments: Vec<NetworkAttachment>,
+    pub runtime_dns_servers: Vec<IpAddr>,
+    pub host_dns_servers: Vec<IpAddr>,
     pub policy: Option<ContainerPolicy>,
 }
 

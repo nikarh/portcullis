@@ -262,6 +262,8 @@ mod tests {
                     subnet,
                     aliases: vec!["web".to_string()],
                 }],
+                runtime_dns_servers: Vec::new(),
+                host_dns_servers: Vec::new(),
                 policy: Some(ContainerPolicy {
                     enabled: true,
                     icc_mode: IccMode::Deny,
@@ -273,6 +275,7 @@ mod tests {
                         }],
                     }],
                     icc_allow: Vec::new(),
+                    dns_targets: vec![crate::model::DnsTarget::Docker],
                 }),
             }],
             enforced_network_subnets: Vec::new(),

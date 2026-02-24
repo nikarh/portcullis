@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
@@ -40,6 +41,11 @@ pub enum MonitorError {
         network_id: String,
         label: String,
         value: String,
+    },
+    #[error("failed to read resolv.conf for container {container_id}: {message}")]
+    ResolvConfRead {
+        container_id: String,
+        message: String,
     },
     #[error(transparent)]
     LabelParse(#[from] LabelParseError),
@@ -84,6 +90,8 @@ where
             let inspect = self.api.inspect_container(&container_id)?;
             let labels = inspect.labels();
             let policy = parse_policy(&labels)?;
+            let runtime_dns_servers = inspect.runtime_dns_servers();
+            let host_dns_servers = inspect.host_dns_servers()?;
 
             let mut attachments = Vec::new();
             for (network_name, endpoint) in inspect.network_endpoints() {
@@ -133,6 +141,8 @@ where
                 name: inspect.name,
                 labels,
                 attachments,
+                runtime_dns_servers,
+                host_dns_servers,
                 policy,
             });
         }
@@ -634,6 +644,10 @@ pub struct DockerContainerInspect {
     pub name: String,
     #[serde(rename = "Config")]
     pub config: Option<DockerContainerConfig>,
+    #[serde(rename = "HostConfig")]
+    pub host_config: Option<DockerHostConfig>,
+    #[serde(rename = "ResolvConfPath")]
+    pub resolv_conf_path: Option<String>,
     #[serde(rename = "NetworkSettings")]
     pub network_settings: Option<DockerNetworkSettings>,
 }
@@ -644,6 +658,44 @@ impl DockerContainerInspect {
             .as_ref()
             .and_then(|config| config.labels.clone())
             .unwrap_or_default()
+    }
+
+    fn runtime_dns_servers(&self) -> Vec<IpAddr> {
+        let mut values: Vec<IpAddr> = self
+            .host_config
+            .as_ref()
+            .and_then(|config| config.dns.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
+
+    fn host_dns_servers(&self) -> Result<Vec<IpAddr>, MonitorError> {
+        let Some(path) = &self.resolv_conf_path else {
+            return Ok(Vec::new());
+        };
+        let content = fs::read_to_string(path).map_err(|error| MonitorError::ResolvConfRead {
+            container_id: self.id.clone(),
+            message: error.to_string(),
+        })?;
+        let mut values = Vec::new();
+        for line in content.lines().map(str::trim) {
+            if !line.starts_with("nameserver ") {
+                continue;
+            }
+            if let Some(value) = line.split_whitespace().nth(1)
+                && let Ok(ip) = value.parse::<IpAddr>()
+            {
+                values.push(ip);
+            }
+        }
+        values.sort_unstable();
+        values.dedup();
+        Ok(values)
     }
 
     fn network_endpoints(&self) -> Vec<(&str, DockerEndpoint)> {
@@ -664,6 +716,12 @@ impl DockerContainerInspect {
 pub struct DockerContainerConfig {
     #[serde(rename = "Labels")]
     pub labels: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerHostConfig {
+    #[serde(rename = "Dns")]
+    pub dns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -869,6 +927,8 @@ mod tests {
             config: Some(DockerContainerConfig {
                 labels: Some(label_map),
             }),
+            host_config: None,
+            resolv_conf_path: None,
             network_settings: Some(DockerNetworkSettings {
                 networks: Some(networks),
             }),
@@ -948,6 +1008,8 @@ mod tests {
             config: Some(DockerContainerConfig {
                 labels: Some(BTreeMap::new()),
             }),
+            host_config: None,
+            resolv_conf_path: None,
             network_settings: Some(DockerNetworkSettings {
                 networks: Some(networks),
             }),
@@ -1164,6 +1226,8 @@ mod tests {
                     subnet: parsed_subnet,
                     aliases: vec![name.to_string()],
                 }],
+                runtime_dns_servers: Vec::new(),
+                host_dns_servers: Vec::new(),
                 policy: match parse_policy(&label_map) {
                     Ok(value) => value,
                     Err(error) => panic!("failed to parse policy fixture: {error}"),

@@ -3,7 +3,7 @@ use std::net::IpAddr;
 
 use crate::dns::HostnameIpResolver;
 use crate::firewall::FirewallError;
-use crate::model::{EgressTarget, IccMode, Protocol, RuntimeSnapshot};
+use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol, RuntimeSnapshot};
 use tracing::trace;
 
 pub const TABLE_FAMILY: &str = "inet";
@@ -33,7 +33,14 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
         }
 
         for attachment in &container.attachments {
-            append_implicit_dns_allow_rules(&mut lines, attachment.ip_address, attachment.gateway);
+            append_dns_policy_rules(
+                &mut lines,
+                attachment.ip_address,
+                attachment.gateway,
+                &policy.dns_targets,
+                &container.runtime_dns_servers,
+                &container.host_dns_servers,
+            );
 
             match policy.icc_mode {
                 IccMode::Deny => {
@@ -121,7 +128,14 @@ pub fn build_apply_commands_with_dns(
         }
 
         for attachment in &container.attachments {
-            append_implicit_dns_allow_rules(&mut lines, attachment.ip_address, attachment.gateway);
+            append_dns_policy_rules(
+                &mut lines,
+                attachment.ip_address,
+                attachment.gateway,
+                &policy.dns_targets,
+                &container.runtime_dns_servers,
+                &container.host_dns_servers,
+            );
 
             match policy.icc_mode {
                 IccMode::Deny => {
@@ -382,33 +396,99 @@ fn build_default_drop_rule(source: IpAddr) -> String {
     }
 }
 
-fn append_implicit_dns_allow_rules(
+fn append_dns_policy_rules(
     lines: &mut Vec<String>,
     source: IpAddr,
     gateway: Option<IpAddr>,
+    dns_targets: &[DnsTarget],
+    runtime_dns_servers: &[IpAddr],
+    host_dns_servers: &[IpAddr],
 ) {
-    let Some(destination) = gateway else {
-        return;
-    };
+    let mut allow_any = false;
+    let mut destinations = BTreeSet::new();
+    for target in dns_targets {
+        match target {
+            DnsTarget::Docker => {
+                if let Some(value) = gateway {
+                    destinations.insert(value);
+                }
+            }
+            DnsTarget::Host => {
+                for value in host_dns_servers {
+                    destinations.insert(*value);
+                }
+            }
+            DnsTarget::Runtime => {
+                for value in runtime_dns_servers {
+                    destinations.insert(*value);
+                }
+            }
+            DnsTarget::Ip(value) => {
+                destinations.insert(*value);
+            }
+            DnsTarget::Any => {
+                allow_any = true;
+            }
+        }
+    }
 
-    match (source, destination) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+    match source {
+        IpAddr::V4(src) => {
+            if allow_any {
+                lines.push(format!(
+                    "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} udp dport 53 accept"
+                ));
+                lines.push(format!(
+                    "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} tcp dport 53 accept"
+                ));
+            } else {
+                for destination in &destinations {
+                    let IpAddr::V4(dst) = destination else {
+                        continue;
+                    };
+                    lines.push(format!(
+                        "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} ip daddr {dst} udp dport 53 accept"
+                    ));
+                    lines.push(format!(
+                        "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} ip daddr {dst} tcp dport 53 accept"
+                    ));
+                }
+            }
             lines.push(format!(
-                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} ip daddr {dst} udp dport 53 accept"
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} udp dport 53 drop"
             ));
             lines.push(format!(
-                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} ip daddr {dst} tcp dport 53 accept"
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip saddr {src} tcp dport 53 drop"
             ));
         }
-        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+        IpAddr::V6(src) => {
+            if allow_any {
+                lines.push(format!(
+                    "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} udp dport 53 accept"
+                ));
+                lines.push(format!(
+                    "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} tcp dport 53 accept"
+                ));
+            } else {
+                for destination in &destinations {
+                    let IpAddr::V6(dst) = destination else {
+                        continue;
+                    };
+                    lines.push(format!(
+                        "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} ip6 daddr {dst} udp dport 53 accept"
+                    ));
+                    lines.push(format!(
+                        "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} ip6 daddr {dst} tcp dport 53 accept"
+                    ));
+                }
+            }
             lines.push(format!(
-                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} ip6 daddr {dst} udp dport 53 accept"
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} udp dport 53 drop"
             ));
             lines.push(format!(
-                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} ip6 daddr {dst} tcp dport 53 accept"
+                "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} ip6 saddr {src} tcp dport 53 drop"
             ));
         }
-        _ => {}
     }
 }
 
@@ -528,6 +608,8 @@ mod tests {
                     subnet,
                     aliases: vec!["web".to_string()],
                 }],
+                runtime_dns_servers: Vec::new(),
+                host_dns_servers: Vec::new(),
                 policy: Some(ContainerPolicy {
                     enabled: true,
                     icc_mode: crate::model::IccMode::Allow,
@@ -539,6 +621,7 @@ mod tests {
                         }],
                     }],
                     icc_allow: Vec::new(),
+                    dns_targets: vec![crate::model::DnsTarget::Docker],
                 }),
             }],
             enforced_network_subnets: Vec::new(),
@@ -596,6 +679,8 @@ mod tests {
                 subnet,
                 aliases: vec!["db".to_string()],
             }],
+            runtime_dns_servers: Vec::new(),
+            host_dns_servers: Vec::new(),
             policy: None,
         });
 

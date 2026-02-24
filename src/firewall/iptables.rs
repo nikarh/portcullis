@@ -5,7 +5,7 @@ use std::process::Command;
 use tracing::{info, trace};
 
 use crate::dns::HostnameIpResolver;
-use crate::model::{EgressTarget, IccMode, Protocol, RuntimeSnapshot};
+use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol, RuntimeSnapshot};
 
 use super::FirewallError;
 
@@ -191,6 +191,9 @@ fn build_apply_commands_with_dns(
                 chain_name,
                 source_ipv4,
                 attachment.gateway,
+                &policy.dns_targets,
+                &container.runtime_dns_servers,
+                &container.host_dns_servers,
             );
 
             if policy.icc_mode == IccMode::Deny {
@@ -485,12 +488,79 @@ fn append_implicit_dns_allow_commands(
     chain_name: &str,
     source_ipv4: std::net::Ipv4Addr,
     gateway: Option<IpAddr>,
+    dns_targets: &[DnsTarget],
+    runtime_dns_servers: &[IpAddr],
+    host_dns_servers: &[IpAddr],
 ) {
-    let Some(IpAddr::V4(destination_ipv4)) = gateway else {
-        return;
-    };
+    let mut allow_any = false;
+    let mut destinations = BTreeSet::new();
+    for target in dns_targets {
+        match target {
+            DnsTarget::Docker => {
+                if let Some(IpAddr::V4(value)) = gateway {
+                    destinations.insert(value);
+                }
+            }
+            DnsTarget::Host => {
+                for value in host_dns_servers {
+                    if let IpAddr::V4(v4) = value {
+                        destinations.insert(*v4);
+                    }
+                }
+            }
+            DnsTarget::Runtime => {
+                for value in runtime_dns_servers {
+                    if let IpAddr::V4(v4) = value {
+                        destinations.insert(*v4);
+                    }
+                }
+            }
+            DnsTarget::Ip(IpAddr::V4(value)) => {
+                destinations.insert(*value);
+            }
+            DnsTarget::Ip(IpAddr::V6(_)) => {}
+            DnsTarget::Any => allow_any = true,
+        }
+    }
 
     for protocol in ["udp", "tcp"] {
+        if allow_any {
+            commands.push(CommandSpec {
+                program: "iptables",
+                args: vec![
+                    "-A".to_string(),
+                    chain_name.to_string(),
+                    "-s".to_string(),
+                    format!("{source_ipv4}/32"),
+                    "-p".to_string(),
+                    protocol.to_string(),
+                    "--dport".to_string(),
+                    "53".to_string(),
+                    "-j".to_string(),
+                    "ACCEPT".to_string(),
+                ],
+            });
+        } else {
+            for destination_ipv4 in &destinations {
+                commands.push(CommandSpec {
+                    program: "iptables",
+                    args: vec![
+                        "-A".to_string(),
+                        chain_name.to_string(),
+                        "-s".to_string(),
+                        format!("{source_ipv4}/32"),
+                        "-d".to_string(),
+                        format!("{destination_ipv4}/32"),
+                        "-p".to_string(),
+                        protocol.to_string(),
+                        "--dport".to_string(),
+                        "53".to_string(),
+                        "-j".to_string(),
+                        "ACCEPT".to_string(),
+                    ],
+                });
+            }
+        }
         commands.push(CommandSpec {
             program: "iptables",
             args: vec![
@@ -498,14 +568,12 @@ fn append_implicit_dns_allow_commands(
                 chain_name.to_string(),
                 "-s".to_string(),
                 format!("{source_ipv4}/32"),
-                "-d".to_string(),
-                format!("{destination_ipv4}/32"),
                 "-p".to_string(),
                 protocol.to_string(),
                 "--dport".to_string(),
                 "53".to_string(),
                 "-j".to_string(),
-                "ACCEPT".to_string(),
+                "DROP".to_string(),
             ],
         });
     }
@@ -644,6 +712,8 @@ mod tests {
                     subnet,
                     aliases: vec!["web".to_string(), "app".to_string()],
                 }],
+                runtime_dns_servers: Vec::new(),
+                host_dns_servers: Vec::new(),
                 policy: Some(ContainerPolicy {
                     enabled: true,
                     icc_mode: IccMode::Allow,
@@ -655,6 +725,7 @@ mod tests {
                         }],
                     }],
                     icc_allow: Vec::new(),
+                    dns_targets: vec![crate::model::DnsTarget::Docker],
                 }),
             }],
             enforced_network_subnets: Vec::new(),
@@ -704,6 +775,8 @@ mod tests {
                 subnet,
                 aliases: vec!["db".to_string()],
             }],
+            runtime_dns_servers: Vec::new(),
+            host_dns_servers: Vec::new(),
             policy: None,
         });
         if let Some(policy) = &mut snapshot.containers[0].policy {
