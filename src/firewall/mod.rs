@@ -1,4 +1,3 @@
-mod cli;
 mod common;
 mod iptables;
 #[allow(unsafe_code)]
@@ -10,12 +9,8 @@ use tracing::{info, warn};
 use crate::dns::HostnameIpResolver;
 use crate::model::RuntimeSnapshot;
 
-pub use cli::CommandNftRunner;
 pub use common::{
-    build_apply_commands, build_apply_commands_with_dns, build_apply_script,
-    build_apply_script_with_dns, build_cleanup_commands, build_cleanup_script,
-    build_refresh_commands, build_refresh_commands_with_dns, build_refresh_script,
-    build_refresh_script_with_dns,
+    build_apply_commands_with_dns, build_cleanup_commands, build_refresh_commands_with_dns,
 };
 pub use iptables::{CommandIptablesRunner, IptablesFirewall};
 pub use libnftables::LibNftablesRunner;
@@ -26,10 +21,6 @@ pub enum FirewallError {
     CommandExecution(String),
     #[error("firewall command failed with code {code}: {stderr}")]
     CommandFailure { code: i32, stderr: String },
-    #[error("failed to open nft stdin")]
-    MissingStdin,
-    #[error("failed to write nft script to stdin: {0}")]
-    StdinWrite(String),
     #[error("failed to create libnftables context")]
     LibContextCreate,
     #[error("failed to configure libnftables {buffer}: return code {code}")]
@@ -60,8 +51,9 @@ where
         Self { runner }
     }
 
+    #[cfg(test)]
     pub fn apply(&self, snapshot: &RuntimeSnapshot) -> Result<(), FirewallError> {
-        let commands = build_refresh_commands(snapshot);
+        let commands = common::build_refresh_commands(snapshot);
         let command_count = commands.len();
         info!(
             command_count,
@@ -71,7 +63,7 @@ where
         match self.runner.run_commands(&commands) {
             Ok(()) => Ok(()),
             Err(error) if is_missing_table_error(&error) => {
-                let init_commands = build_apply_commands(snapshot);
+                let init_commands = common::build_apply_commands(snapshot);
                 self.runner.run_commands(&init_commands)
             }
             Err(error) => Err(error),
@@ -135,13 +127,6 @@ fn is_missing_table_error(error: &FirewallError) -> bool {
             stderr.contains("No such file") || stderr.contains("No such file or directory")
         }
         _ => false,
-    }
-}
-
-impl NftablesFirewall<CommandNftRunner> {
-    #[must_use]
-    pub const fn with_cli() -> Self {
-        Self::new(CommandNftRunner)
     }
 }
 

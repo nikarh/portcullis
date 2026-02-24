@@ -12,6 +12,7 @@ pub const CHAIN_NAME: &str = "egress";
 const FORWARD_HOOK_PRIORITY: i32 = -1;
 
 #[must_use]
+#[cfg(test)]
 pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
     let mut lines = vec![
         format!("add table {TABLE_FAMILY} {TABLE_NAME}"),
@@ -86,6 +87,7 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
 }
 
 #[must_use]
+#[cfg(test)]
 pub fn build_refresh_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
     let mut commands = build_apply_commands(snapshot);
     commands.remove(0);
@@ -94,13 +96,9 @@ pub fn build_refresh_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
 }
 
 #[must_use]
+#[cfg(test)]
 pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
     build_apply_commands(snapshot).join("\n")
-}
-
-#[must_use]
-pub fn build_refresh_script(snapshot: &RuntimeSnapshot) -> String {
-    build_refresh_commands(snapshot).join("\n")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -251,6 +249,7 @@ pub fn build_refresh_commands_with_dns(
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 pub fn build_apply_script_with_dns(
     snapshot: &RuntimeSnapshot,
     resolver: &mut dyn HostnameIpResolver,
@@ -258,22 +257,9 @@ pub fn build_apply_script_with_dns(
     Ok(build_apply_commands_with_dns(snapshot, resolver)?.join("\n"))
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn build_refresh_script_with_dns(
-    snapshot: &RuntimeSnapshot,
-    resolver: &mut dyn HostnameIpResolver,
-) -> Result<String, FirewallError> {
-    Ok(build_refresh_commands_with_dns(snapshot, resolver)?.join("\n"))
-}
-
 #[must_use]
 pub fn build_cleanup_commands() -> Vec<String> {
     vec![format!("delete table {TABLE_FAMILY} {TABLE_NAME}")]
-}
-
-#[must_use]
-pub fn build_cleanup_script() -> String {
-    format!("{}\n", build_cleanup_commands().join("\n"))
 }
 
 #[derive(Debug, Default)]

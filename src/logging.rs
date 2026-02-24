@@ -47,11 +47,6 @@ impl FromStr for LogLevel {
     }
 }
 
-pub fn init_logging() -> Result<(), LoggingError> {
-    let filter = default_env_filter();
-    init_subscriber(filter)
-}
-
 pub fn init_logging_with_level(level: LogLevel) -> Result<(), LoggingError> {
     let filter = EnvFilter::new(format!(
         "{},portcullis={}",
@@ -70,6 +65,7 @@ fn init_subscriber(filter: EnvFilter) -> Result<(), LoggingError> {
         .map_err(|error| LoggingError::Init(error.to_string()))
 }
 
+#[cfg(test)]
 fn default_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,portcullis=info"))
 }
