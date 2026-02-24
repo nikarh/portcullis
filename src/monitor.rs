@@ -256,43 +256,28 @@ where
         event: &DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         match event.kind {
-            DockerEventKind::Container => Self::resolve_container_event_action(state, event),
-            DockerEventKind::Network => self.resolve_network_event_action(state, event),
-        }
-    }
-
-    fn resolve_container_event_action(
-        state: &RuntimeState,
-        event: &DockerEvent,
-    ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        match event.action {
-            DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
-                container_id: event.id.clone(),
-            })),
-            DockerEventAction::Create => Self::create_container_action(event),
-            DockerEventAction::Rename => Ok(Self::rename_container_action(state, event)),
-            DockerEventAction::Update => Self::update_container_action(state, event),
-            _ => Ok(None),
-        }
-    }
-
-    fn resolve_network_event_action(
-        &self,
-        state: &RuntimeState,
-        event: &DockerEvent,
-    ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        match event.action {
-            DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveNetwork {
-                network_id: event.id.clone(),
-            })),
-            DockerEventAction::Create | DockerEventAction::Update => {
-                self.inspect_network_action(&event.id)
-            }
-            DockerEventAction::Connect => self.resolve_network_connect_action(state, event),
-            DockerEventAction::Disconnect => {
-                Ok(Self::resolve_network_disconnect_action(state, event))
-            }
-            _ => Ok(None),
+            DockerEventKind::Container => match event.action {
+                DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
+                    container_id: event.id.clone(),
+                })),
+                DockerEventAction::Create => Self::create_container_action(event),
+                DockerEventAction::Rename => Ok(Self::rename_container_action(state, event)),
+                DockerEventAction::Update => Self::update_container_action(state, event),
+                _ => Ok(None),
+            },
+            DockerEventKind::Network => match event.action {
+                DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveNetwork {
+                    network_id: event.id.clone(),
+                })),
+                DockerEventAction::Create | DockerEventAction::Update => {
+                    self.inspect_network_action(&event.id)
+                }
+                DockerEventAction::Connect => self.resolve_network_connect_action(state, event),
+                DockerEventAction::Disconnect => {
+                    Ok(Self::resolve_network_disconnect_action(state, event))
+                }
+                _ => Ok(None),
+            },
         }
     }
 
