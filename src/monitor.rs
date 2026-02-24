@@ -8,7 +8,7 @@ use std::str::FromStr;
 use ipnet::IpNet;
 use serde::Deserialize;
 use thiserror::Error;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::labels::{LabelParseError, parse_policy};
 use crate::model::{ContainerSnapshot, NetworkAttachment, RuntimeSnapshot};
@@ -90,13 +90,15 @@ where
 
         for network_id in network_ids {
             debug!(%network_id, "inspecting network for subnet");
-            let network = self.api.inspect_network(&network_id)?;
-            let subnet = network.primary_subnet()?;
-            let gateway = network.primary_gateway()?;
-            let enforce_network_policy = network.is_portcullis_network_enforced()?;
-            network_data.insert(network_id, (subnet, gateway, enforce_network_policy));
-            if enforce_network_policy {
-                enforced_network_subnets.insert(subnet);
+            match self.inspect_network_data(&network_id) {
+                Ok(Some((subnet, gateway, enforce_network_policy))) => {
+                    network_data.insert(network_id, (subnet, gateway, enforce_network_policy));
+                    if enforce_network_policy {
+                        enforced_network_subnets.insert(subnet);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
         }
 
@@ -127,10 +129,16 @@ where
                         *cached
                     } else {
                         debug!(%network_id, "inspecting network for subnet");
-                        let network = self.api.inspect_network(&network_id)?;
-                        let subnet = network.primary_subnet()?;
-                        let gateway = network.primary_gateway()?;
-                        let enforce_network_policy = network.is_portcullis_network_enforced()?;
+                        let Some((subnet, gateway, enforce_network_policy)) =
+                            self.inspect_network_data(&network_id)?
+                        else {
+                            warn!(
+                                network_id = %network_id,
+                                container_id = %inspect.id,
+                                "skipping attachment on network without subnet"
+                            );
+                            continue;
+                        };
                         network_data.insert(
                             network_id.clone(),
                             (subnet, gateway, enforce_network_policy),
@@ -176,6 +184,28 @@ where
 
     pub fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
         self.api.firewall_backend()
+    }
+
+    fn inspect_network_data(
+        &self,
+        network_id: &str,
+    ) -> Result<Option<(IpNet, Option<IpAddr>, bool)>, MonitorError> {
+        let network = self.api.inspect_network(network_id)?;
+        let subnet = match network.primary_subnet() {
+            Ok(value) => value,
+            Err(MonitorError::MissingNetworkSubnet(_)) => {
+                debug!(
+                    network_id = %network.id,
+                    network_name = %network.name,
+                    "ignoring docker network without subnet"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let gateway = network.primary_gateway()?;
+        let enforce_network_policy = network.is_portcullis_network_enforced()?;
+        Ok(Some((subnet, gateway, enforce_network_policy)))
     }
 }
 
@@ -988,6 +1018,20 @@ mod tests {
         }
     }
 
+    fn network_without_subnet(id: &str, name: &str) -> DockerNetworkInspect {
+        DockerNetworkInspect {
+            id: id.to_string(),
+            name: name.to_string(),
+            ipam: Some(DockerIpam {
+                config: Some(vec![DockerIpamConfig {
+                    subnet: None,
+                    gateway: None,
+                }]),
+            }),
+            labels: None,
+        }
+    }
+
     #[test]
     fn docker_monitor_builds_snapshot_with_policy_and_attachments() {
         let mut api = MockDockerApi {
@@ -1240,6 +1284,21 @@ mod tests {
             snapshot.enforced_network_subnets[0].to_string(),
             "172.22.0.0/16"
         );
+    }
+
+    #[test]
+    fn docker_monitor_ignores_networks_without_subnet() {
+        let mut api = MockDockerApi::default();
+        api.network_ids.push("net-no-subnet".to_string());
+        api.networks.insert(
+            "net-no-subnet".to_string(),
+            network_without_subnet("net-no-subnet", "host"),
+        );
+
+        let monitor = DockerMonitor::new(api);
+        let snapshot = monitor.snapshot().expect("snapshot should succeed");
+        assert!(snapshot.containers.is_empty());
+        assert!(snapshot.enforced_network_subnets.is_empty());
     }
 
     #[test]
