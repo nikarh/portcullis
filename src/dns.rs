@@ -12,10 +12,8 @@ pub enum DnsError {
     LookupFailed { host: String, message: String },
 }
 
-pub trait HostnameIpResolver {
-    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError>;
-}
-
+/// `UpstreamResolver` is a trait that defines a method for resolving hostnames to IP addresses
+/// by querying an upstream DNS server.
 pub trait UpstreamResolver {
     fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError>;
 }
@@ -26,16 +24,14 @@ pub struct SystemUpstreamResolver;
 impl UpstreamResolver for SystemUpstreamResolver {
     fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         trace!(%host, "performing system DNS lookup");
-        let addresses = (host, 0)
+        let ips: Vec<_> = (host, 0)
             .to_socket_addrs()
             .map_err(|error| DnsError::LookupFailed {
                 host: host.to_string(),
                 message: error.to_string(),
-            })?;
-
-        let mut ips: Vec<IpAddr> = addresses.map(|address| address.ip()).collect();
-        ips.sort_unstable();
-        ips.dedup();
+            })?
+            .map(|address| address.ip())
+            .collect();
 
         trace!(%host, result_count = ips.len(), ?ips, "system DNS lookup result");
         Ok(ips)
@@ -125,13 +121,8 @@ where
             }
         }
     }
-}
 
-impl<R> HostnameIpResolver for DnsProxyCache<R>
-where
-    R: UpstreamResolver,
-{
-    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
+    pub fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
         let now = Instant::now();
         self.purge_expired(now);
 
