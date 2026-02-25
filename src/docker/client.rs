@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
+use crate::docker::normalize_socket_path;
 use crate::docker::raw::{
     DockerContainerInspect, DockerContainerSummary, DockerFirewallInfo, DockerInfo,
     DockerNetworkInspect,
@@ -123,14 +124,6 @@ impl DockerApi for DockerClient {
             "iptables" => Ok(DockerFirewallBackend::Iptables),
             _ => Err(DockerError::UnsupportedFirewallBackend(backend)),
         }
-    }
-}
-
-pub(crate) fn normalize_socket_path(socket: &str) -> String {
-    if let Some(path) = socket.strip_prefix("unix://") {
-        path.to_string()
-    } else {
-        socket.to_string()
     }
 }
 

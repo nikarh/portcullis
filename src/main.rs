@@ -371,9 +371,4 @@ mod tests {
         let result = parse_config(args);
         assert!(matches!(result, Err(MainError::InvalidFirewallBackend(_))));
     }
-
-    #[test]
-    fn docker_client_construction_accepts_unix_prefixed_path() {
-        let _ = crate::docker::client::normalize_socket_path("unix:///var/run/docker.sock");
-    }
 }

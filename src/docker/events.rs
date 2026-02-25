@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::docker::client::{DockerError, normalize_socket_path};
+use crate::docker::client::DockerError;
+use crate::docker::normalize_socket_path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
