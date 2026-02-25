@@ -49,8 +49,8 @@ pub struct DockerClient {
 }
 
 impl DockerClient {
-    pub fn connect(socket: String) -> Result<Self, DockerError> {
-        let socket_path = normalize_socket_path(&socket);
+    pub fn connect(socket: &str) -> Result<Self, DockerError> {
+        let socket_path = normalize_socket_path(socket);
         let stream = UnixStream::connect(&socket_path)
             .map_err(|error| DockerError::SocketIo(error.to_string()))?;
         Ok(Self {

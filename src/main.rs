@@ -166,9 +166,9 @@ fn run(config: &Config) -> Result<(), MainError> {
         "portcullis prototype started"
     );
 
-    let monitor_client = DockerClient::connect(config.docker_socket.clone())?;
+    let monitor_client = DockerClient::connect(&config.docker_socket)?;
     let mut monitor = DockerMonitor::new(monitor_client);
-    let mut event_client = DockerEventClient::connect(config.docker_socket.clone())?;
+    let mut event_client = DockerEventClient::connect(&config.docker_socket)?;
 
     let selected_backend = match config.firewall_backend {
         FirewallBackend::Auto => match monitor.firewall_backend()? {
@@ -269,7 +269,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                 if terminate.load(Ordering::Relaxed) {
                     break;
                 }
-                match DockerEventClient::connect(config.docker_socket.clone()) {
+                match DockerEventClient::connect(&config.docker_socket) {
                     Ok(client) => event_client = client,
                     Err(reconnect_error) => {
                         error!(%reconnect_error, "docker event stream reconnect failed; retrying");

@@ -71,8 +71,8 @@ pub struct DockerEventClient {
 }
 
 impl DockerEventClient {
-    pub fn connect(socket: String) -> Result<Self, DockerError> {
-        let socket_path = normalize_socket_path(&socket);
+    pub fn connect(socket: &str) -> Result<Self, DockerError> {
+        let socket_path = normalize_socket_path(socket);
         let reader = connect_subscribed_reader(&socket_path)?;
         Ok(Self { reader })
     }
