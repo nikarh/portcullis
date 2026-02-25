@@ -222,7 +222,7 @@ where
     }
 
     #[cfg(test)]
-    pub fn snapshot(&self) -> Result<RuntimeSnapshot, MonitorError> {
+    pub fn snapshot(&mut self) -> Result<RuntimeSnapshot, MonitorError> {
         let state = self.collect_state()?;
         let snapshot = state.snapshot();
         info!(
@@ -233,11 +233,11 @@ where
         Ok(snapshot)
     }
 
-    pub fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
+    pub fn firewall_backend(&mut self) -> Result<DockerFirewallBackend, MonitorError> {
         self.api.firewall_backend().map_err(Into::into)
     }
 
-    pub fn collect_state(&self) -> Result<RuntimeState, MonitorError> {
+    pub fn collect_state(&mut self) -> Result<RuntimeState, MonitorError> {
         debug!("collecting docker runtime state");
         let networks = self.api.list_networks()?;
         let containers = self.api.list_containers()?;
@@ -256,7 +256,7 @@ where
     }
 
     pub fn resolve_event_action(
-        &self,
+        &mut self,
         state: &RuntimeState,
         event: DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
@@ -289,7 +289,7 @@ where
     }
 
     fn resolve_network_event_action(
-        &self,
+        &mut self,
         state: &RuntimeState,
         event: &DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
@@ -309,7 +309,7 @@ where
     }
 
     fn build_container_snapshot_from_inspect(
-        &self,
+        &mut self,
         state: &RuntimeState,
         inspect: DockerContainerInspect,
     ) -> Result<ContainerSnapshot, MonitorError> {
@@ -370,7 +370,7 @@ where
     }
 
     fn inspect_container_action(
-        &self,
+        &mut self,
         state: &RuntimeState,
         container_id: &str,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
@@ -410,7 +410,7 @@ where
     }
 
     fn resolve_network_connect_action(
-        &self,
+        &mut self,
         state: &RuntimeState,
         event: &DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
@@ -459,7 +459,7 @@ where
     }
 
     fn inspect_network_action(
-        &self,
+        &mut self,
         network_id: &str,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         debug!(%network_id, "resolving network runtime state action");
@@ -821,16 +821,16 @@ mod tests {
     }
 
     impl DockerApi for MockDockerApi {
-        fn list_containers(&self) -> Result<Vec<DockerContainerSummary>, DockerError> {
+        fn list_containers(&mut self) -> Result<Vec<DockerContainerSummary>, DockerError> {
             Ok(self.containers_list.clone())
         }
 
-        fn list_networks(&self) -> Result<Vec<DockerNetworkInspect>, DockerError> {
+        fn list_networks(&mut self) -> Result<Vec<DockerNetworkInspect>, DockerError> {
             Ok(self.networks_list.clone())
         }
 
         fn inspect_container(
-            &self,
+            &mut self,
             container_id: &str,
         ) -> Result<DockerContainerInspect, DockerError> {
             self.inspect_container_requests
@@ -845,7 +845,10 @@ mod tests {
                 })
         }
 
-        fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, DockerError> {
+        fn inspect_network(
+            &mut self,
+            network_id: &str,
+        ) -> Result<DockerNetworkInspect, DockerError> {
             self.inspect_network_requests
                 .borrow_mut()
                 .push(network_id.to_string());
@@ -858,7 +861,7 @@ mod tests {
                 })
         }
 
-        fn firewall_backend(&self) -> Result<DockerFirewallBackend, DockerError> {
+        fn firewall_backend(&mut self) -> Result<DockerFirewallBackend, DockerError> {
             Ok(DockerFirewallBackend::Nftables)
         }
     }
@@ -1006,7 +1009,7 @@ mod tests {
         api.networks_list
             .push(network_inspect("net0", "bridge", "172.18.0.0/16"));
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let snapshot = match monitor.snapshot() {
             Ok(value) => value,
             Err(error) => panic!("snapshot should succeed: {error}"),
@@ -1044,7 +1047,7 @@ mod tests {
         api.networks_list
             .push(network_inspect("net0", "bridge", "172.18.0.0/16"));
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let snapshot = match monitor.snapshot() {
             Ok(value) => value,
             Err(error) => panic!("snapshot should succeed: {error}"),
@@ -1119,7 +1122,7 @@ mod tests {
         api.networks_list
             .push(network_inspect("net0", "bridge", "172.18.0.0/16"));
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let result = monitor.snapshot();
         assert!(result.is_err());
     }
@@ -1145,7 +1148,7 @@ mod tests {
         api.networks.insert("net0".to_string(), network.clone());
         api.networks_list.push(network);
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let snapshot = monitor.snapshot().expect("snapshot should succeed");
         assert_eq!(snapshot.enforced_network_subnets.len(), 1);
         assert_eq!(
@@ -1186,7 +1189,7 @@ mod tests {
     #[test]
     fn create_event_uses_event_attributes_without_container_inspect() {
         let api = MockDockerApi::default();
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let state = RuntimeState::default();
         let event = DockerEvent {
             id: "abc".into(),
@@ -1232,7 +1235,7 @@ mod tests {
                 "172.20.0.2",
             ),
         );
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
         state.apply_action(RuntimeStateAction::UpsertNetwork {
             network_id: "net0".into(),
@@ -1278,7 +1281,7 @@ mod tests {
     #[test]
     fn network_disconnect_uses_cached_attachment_without_queries() {
         let api = MockDockerApi::default();
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
         state.apply_action(RuntimeStateAction::CreateContainer {
             snapshot: Box::new(ContainerSnapshot {
@@ -1323,7 +1326,7 @@ mod tests {
         api.networks_list.push(network.clone());
         api.networks.insert("net0".to_string(), network);
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let snapshot = monitor.snapshot().expect("snapshot should succeed");
         assert!(snapshot.containers.is_empty());
         assert_eq!(snapshot.enforced_network_subnets.len(), 1);
@@ -1342,7 +1345,7 @@ mod tests {
         api.networks
             .insert("net-no-subnet".to_string(), host_network);
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let snapshot = monitor.snapshot().expect("snapshot should succeed");
         assert!(snapshot.containers.is_empty());
         assert!(snapshot.enforced_network_subnets.is_empty());
@@ -1358,7 +1361,7 @@ mod tests {
             network_without_subnet("net-no-subnet", "custom-net"),
         );
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let result = monitor.snapshot();
         assert!(matches!(
             result,
@@ -1378,7 +1381,7 @@ mod tests {
         api.networks_list.push(network.clone());
         api.networks.insert("net-overlay".to_string(), network);
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let snapshot = monitor.snapshot().expect("snapshot should succeed");
         assert!(snapshot.containers.is_empty());
         assert!(snapshot.enforced_network_subnets.is_empty());
@@ -1415,7 +1418,7 @@ mod tests {
             network_inspect("net0", "pc-managed", "172.19.0.0/16"),
         );
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let action = monitor
             .inspect_network_action("net0")
             .expect("inspect network should succeed");
@@ -1456,7 +1459,7 @@ mod tests {
             network_inspect("net0", "bridge", "172.18.0.0/16"),
         );
 
-        let monitor = DockerMonitor::new(api);
+        let mut monitor = DockerMonitor::new(api);
         let mut state = monitor
             .collect_state()
             .expect("collect state should succeed");

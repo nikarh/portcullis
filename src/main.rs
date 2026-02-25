@@ -21,7 +21,7 @@ use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
 use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
-use crate::docker::{DockerClient, DockerError, DockerEventStream, DockerFirewallBackend};
+use crate::docker::{DockerClient, DockerError, DockerEventClient, DockerFirewallBackend};
 use crate::firewall::{ActiveFirewall, FirewallError};
 use crate::logging::{LogLevel, LoggingError};
 use crate::monitor::{DockerMonitor, MonitorError, RuntimeChangeTracker, RuntimeState};
@@ -166,8 +166,9 @@ fn run(config: &Config) -> Result<(), MainError> {
         "portcullis prototype started"
     );
 
-    let monitor = DockerMonitor::new(DockerClient::new(config.docker_socket.clone()));
-    let event_client = DockerClient::new(config.docker_socket.clone());
+    let monitor_client = DockerClient::connect(config.docker_socket.clone())?;
+    let mut monitor = DockerMonitor::new(monitor_client);
+    let mut event_client = DockerEventClient::connect(config.docker_socket.clone())?;
 
     let selected_backend = match config.firewall_backend {
         FirewallBackend::Auto => match monitor.firewall_backend()? {
@@ -202,7 +203,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     let mut tracker = RuntimeChangeTracker::new();
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.collect_state()?;
-    let mut event_stream = connect_event_stream(&event_client)?;
+    info!("docker event stream connected");
 
     apply_runtime_state(
         &runtime_state,
@@ -220,7 +221,7 @@ fn run(config: &Config) -> Result<(), MainError> {
             break;
         }
 
-        match event_stream.next_event() {
+        match event_client.next_event() {
             Ok(Some(event)) => {
                 trace!(event = ?event, "docker event received");
                 if !event.is_relevant_for_policy_refresh() {
@@ -268,8 +269,8 @@ fn run(config: &Config) -> Result<(), MainError> {
                 if terminate.load(Ordering::Relaxed) {
                     break;
                 }
-                match connect_event_stream(&event_client) {
-                    Ok(stream) => event_stream = stream,
+                match DockerEventClient::connect(config.docker_socket.clone()) {
+                    Ok(client) => event_client = client,
                     Err(reconnect_error) => {
                         error!(%reconnect_error, "docker event stream reconnect failed; retrying");
                         thread::sleep(Duration::from_secs(1));
@@ -286,12 +287,6 @@ fn run(config: &Config) -> Result<(), MainError> {
     }
     info!("shutdown cleanup completed");
     Ok(())
-}
-
-fn connect_event_stream(client: &DockerClient) -> Result<DockerEventStream, MainError> {
-    let stream = client.subscribe_events()?;
-    info!("docker event stream connected");
-    Ok(stream)
 }
 
 fn apply_runtime_state(
@@ -379,6 +374,6 @@ mod tests {
 
     #[test]
     fn docker_client_construction_accepts_unix_prefixed_path() {
-        let _client = DockerClient::new("unix:///var/run/docker.sock".to_string());
+        let _ = crate::docker::client::normalize_socket_path("unix:///var/run/docker.sock");
     }
 }

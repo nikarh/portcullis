@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::docker::client::DockerError;
+use crate::docker::client::{DockerError, normalize_socket_path};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -65,47 +65,15 @@ impl DockerEvent {
     }
 }
 
-pub struct DockerEventStream {
+#[derive(Debug)]
+pub struct DockerEventClient {
     reader: BufReader<UnixStream>,
 }
 
-impl DockerEventStream {
-    pub(crate) fn connect(socket_path: &str) -> Result<Self, DockerError> {
-        let mut stream = UnixStream::connect(socket_path)
-            .map_err(|error| DockerError::ServiceState(error.to_string()))?;
-        stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(|error| DockerError::ServiceState(error.to_string()))?;
-
-        let since = current_unix_epoch_seconds()?;
-        let path = build_events_path(since)?;
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| DockerError::ServiceState(error.to_string()))?;
-
-        let mut reader = BufReader::new(stream);
-        let mut status_line = String::new();
-        reader
-            .read_line(&mut status_line)
-            .map_err(|error| DockerError::ServiceState(error.to_string()))?;
-        if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
-            return Err(DockerError::ServiceState(format!(
-                "docker events subscribe failed: {status_line}"
-            )));
-        }
-
-        loop {
-            let mut header_line = String::new();
-            reader
-                .read_line(&mut header_line)
-                .map_err(|error| DockerError::ServiceState(error.to_string()))?;
-            if header_line == "\r\n" {
-                break;
-            }
-        }
-
+impl DockerEventClient {
+    pub fn connect(socket: String) -> Result<Self, DockerError> {
+        let socket_path = normalize_socket_path(&socket);
+        let reader = connect_subscribed_reader(&socket_path)?;
         Ok(Self { reader })
     }
 
@@ -127,6 +95,45 @@ impl DockerEventStream {
             Err(error) => Err(DockerError::ServiceState(error.to_string())),
         }
     }
+}
+
+fn connect_subscribed_reader(socket_path: &str) -> Result<BufReader<UnixStream>, DockerError> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|error| DockerError::ServiceState(error.to_string()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(|error| DockerError::ServiceState(error.to_string()))?;
+
+    let since = current_unix_epoch_seconds()?;
+    let path = build_events_path(since)?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| DockerError::ServiceState(error.to_string()))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|error| DockerError::ServiceState(error.to_string()))?;
+    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+        return Err(DockerError::ServiceState(format!(
+            "docker events subscribe failed: {status_line}"
+        )));
+    }
+
+    loop {
+        let mut header_line = String::new();
+        reader
+            .read_line(&mut header_line)
+            .map_err(|error| DockerError::ServiceState(error.to_string()))?;
+        if header_line == "\r\n" {
+            break;
+        }
+    }
+
+    Ok(reader)
 }
 
 fn current_unix_epoch_seconds() -> Result<i64, DockerError> {

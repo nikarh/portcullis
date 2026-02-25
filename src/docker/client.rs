@@ -1,16 +1,14 @@
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
-use serde::Deserialize;
-use thiserror::Error;
-use tracing::{debug, trace};
-
-use crate::docker::events::DockerEventStream;
 use crate::docker::raw::{
     DockerContainerInspect, DockerContainerSummary, DockerFirewallInfo, DockerInfo,
     DockerNetworkInspect,
 };
+use serde::Deserialize;
+use thiserror::Error;
+use tracing::{debug, trace};
 
 #[derive(Debug, Error)]
 pub enum DockerError {
@@ -29,11 +27,14 @@ pub enum DockerError {
 }
 
 pub trait DockerApi {
-    fn list_containers(&self) -> Result<Vec<DockerContainerSummary>, DockerError>;
-    fn list_networks(&self) -> Result<Vec<DockerNetworkInspect>, DockerError>;
-    fn inspect_container(&self, container_id: &str) -> Result<DockerContainerInspect, DockerError>;
-    fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, DockerError>;
-    fn firewall_backend(&self) -> Result<DockerFirewallBackend, DockerError>;
+    fn list_containers(&mut self) -> Result<Vec<DockerContainerSummary>, DockerError>;
+    fn list_networks(&mut self) -> Result<Vec<DockerNetworkInspect>, DockerError>;
+    fn inspect_container(
+        &mut self,
+        container_id: &str,
+    ) -> Result<DockerContainerInspect, DockerError>;
+    fn inspect_network(&mut self, network_id: &str) -> Result<DockerNetworkInspect, DockerError>;
+    fn firewall_backend(&mut self) -> Result<DockerFirewallBackend, DockerError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,27 +43,22 @@ pub enum DockerFirewallBackend {
     Iptables,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DockerClient {
-    socket_path: String,
+    stream: BufReader<UnixStream>,
 }
 
 impl DockerClient {
-    #[must_use]
-    pub fn new(socket: String) -> Self {
-        let socket_path = if let Some(path) = socket.strip_prefix("unix://") {
-            path.to_string()
-        } else {
-            socket
-        };
-        Self { socket_path }
+    pub fn connect(socket: String) -> Result<Self, DockerError> {
+        let socket_path = normalize_socket_path(&socket);
+        let stream = UnixStream::connect(&socket_path)
+            .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+        Ok(Self {
+            stream: BufReader::new(stream),
+        })
     }
 
-    pub fn subscribe_events(&self) -> Result<DockerEventStream, DockerError> {
-        DockerEventStream::connect(&self.socket_path)
-    }
-
-    fn request_json<T>(&self, path: &str) -> Result<T, DockerError>
+    fn request_json<T>(&mut self, path: &str) -> Result<T, DockerError>
     where
         T: for<'de> Deserialize<'de>,
     {
@@ -77,44 +73,44 @@ impl DockerClient {
             .map_err(|error| DockerError::InvalidJson(error.to_string()))
     }
 
-    fn request_raw(&self, path: &str) -> Result<String, DockerError> {
-        debug!(socket = %self.socket_path, path, "docker api request");
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+    fn request_raw(&mut self, path: &str) -> Result<String, DockerError> {
+        debug!(path, "docker api request");
+
         let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        stream
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+        self.stream
+            .get_mut()
             .write_all(request.as_bytes())
             .map_err(|error| DockerError::SocketIo(error.to_string()))?;
-
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
+        self.stream
+            .get_mut()
+            .flush()
             .map_err(|error| DockerError::SocketIo(error.to_string()))?;
-        let response_text = String::from_utf8(response)
-            .map_err(|error| DockerError::InvalidHttpResponse(error.to_string()))?;
-        parse_http_response(&response_text)
+        parse_http_response(self.stream.by_ref())
     }
 }
 
 impl DockerApi for DockerClient {
-    fn list_containers(&self) -> Result<Vec<DockerContainerSummary>, DockerError> {
+    fn list_containers(&mut self) -> Result<Vec<DockerContainerSummary>, DockerError> {
         self.request_json("/containers/json?all=1")
     }
 
-    fn list_networks(&self) -> Result<Vec<DockerNetworkInspect>, DockerError> {
+    fn list_networks(&mut self) -> Result<Vec<DockerNetworkInspect>, DockerError> {
         self.request_json("/networks")
     }
 
-    fn inspect_container(&self, container_id: &str) -> Result<DockerContainerInspect, DockerError> {
+    fn inspect_container(
+        &mut self,
+        container_id: &str,
+    ) -> Result<DockerContainerInspect, DockerError> {
         self.request_json(&format!("/containers/{container_id}/json"))
     }
 
-    fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, DockerError> {
+    fn inspect_network(&mut self, network_id: &str) -> Result<DockerNetworkInspect, DockerError> {
         self.request_json(&format!("/networks/{network_id}"))
     }
 
-    fn firewall_backend(&self) -> Result<DockerFirewallBackend, DockerError> {
+    fn firewall_backend(&mut self) -> Result<DockerFirewallBackend, DockerError> {
         debug!("detecting docker firewall backend");
         let info: DockerInfo = self.request_json("/info")?;
         let backend = info
@@ -130,20 +126,37 @@ impl DockerApi for DockerClient {
     }
 }
 
-fn parse_http_response(response: &str) -> Result<String, DockerError> {
-    let Some((head, body)) = response.split_once("\r\n\r\n") else {
-        return Err(DockerError::InvalidHttpResponse(
-            "missing HTTP header separator".to_string(),
-        ));
-    };
-    let mut lines = head.lines();
-    let Some(status_line) = lines.next() else {
+pub(crate) fn normalize_socket_path(socket: &str) -> String {
+    if let Some(path) = socket.strip_prefix("unix://") {
+        path.to_string()
+    } else {
+        socket.to_string()
+    }
+}
+
+fn parse_http_response<R>(reader: &mut R) -> Result<String, DockerError>
+where
+    R: BufRead,
+{
+    let mut status_line = String::new();
+    let status_len = reader
+        .read_line(&mut status_line)
+        .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+    if status_len == 0 {
         return Err(DockerError::InvalidHttpResponse(
             "missing HTTP status line".to_string(),
         ));
-    };
+    }
+
     let mut headers = BTreeMap::new();
-    for line in lines {
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -161,7 +174,7 @@ fn parse_http_response(response: &str) -> Result<String, DockerError> {
         DockerError::InvalidHttpResponse(format!("invalid HTTP status code: {error}"))
     })?;
 
-    let parsed_body = decode_http_body(body, &headers)?;
+    let parsed_body = decode_http_body(reader, &headers)?;
 
     if !(200..=299).contains(&status) {
         return Err(DockerError::ApiHttpStatus {
@@ -173,105 +186,120 @@ fn parse_http_response(response: &str) -> Result<String, DockerError> {
     Ok(parsed_body)
 }
 
-fn decode_http_body(
-    raw_body: &str,
+fn decode_http_body<R>(
+    reader: &mut R,
     headers: &BTreeMap<String, String>,
-) -> Result<String, DockerError> {
+) -> Result<String, DockerError>
+where
+    R: BufRead,
+{
     let transfer_encoding = headers
         .get("transfer-encoding")
         .map(String::as_str)
         .unwrap_or_default();
     if transfer_encoding.contains("chunked") {
-        return decode_chunked_body(raw_body);
+        return decode_chunked_body(reader);
     }
 
-    Ok(raw_body.to_string())
+    if let Some(content_length) = headers.get("content-length") {
+        let size = content_length.parse::<usize>().map_err(|error| {
+            DockerError::InvalidHttpResponse(format!("invalid content-length: {error}"))
+        })?;
+        if size == 0 {
+            return Ok(String::new());
+        }
+
+        let mut bytes = vec![0u8; size];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+        return String::from_utf8(bytes)
+            .map_err(|error| DockerError::InvalidHttpResponse(error.to_string()));
+    }
+
+    Ok(String::new())
 }
 
-fn decode_chunked_body(raw_body: &str) -> Result<String, DockerError> {
-    let bytes = raw_body.as_bytes();
-    let mut cursor = 0usize;
+fn decode_chunked_body<R>(reader: &mut R) -> Result<String, DockerError>
+where
+    R: BufRead,
+{
     let mut decoded = Vec::new();
 
     loop {
-        let Some(line_end) = find_crlf(bytes, cursor) else {
+        let mut size_line = String::new();
+        let size_len = reader
+            .read_line(&mut size_line)
+            .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+        if size_len == 0 {
             return Err(DockerError::InvalidHttpResponse(
-                "chunked response missing chunk size line terminator".to_string(),
+                "chunked response missing chunk size line".to_string(),
             ));
-        };
-
-        let size_bytes = bytes.get(cursor..line_end).ok_or_else(|| {
-            DockerError::InvalidHttpResponse(
-                "chunked response missing chunk size bytes".to_string(),
-            )
-        })?;
-        let size_line = std::str::from_utf8(size_bytes).map_err(|error| {
-            DockerError::InvalidHttpResponse(format!("invalid chunk size line encoding: {error}"))
-        })?;
+        }
         let size_hex = size_line.split(';').next().unwrap_or_default().trim();
         let chunk_size = usize::from_str_radix(size_hex, 16).map_err(|error| {
             DockerError::InvalidHttpResponse(format!("invalid chunk size `{size_hex}`: {error}"))
         })?;
-        cursor = line_end + 2;
 
         if chunk_size == 0 {
+            consume_chunked_trailers(reader)?;
             break;
         }
 
-        let chunk_end = cursor
-            .checked_add(chunk_size)
-            .ok_or_else(|| DockerError::InvalidHttpResponse("chunk size overflow".to_string()))?;
-        let terminator_end = chunk_end.checked_add(2).ok_or_else(|| {
-            DockerError::InvalidHttpResponse("chunk terminator overflow".to_string())
-        })?;
-        if terminator_end > bytes.len() {
-            return Err(DockerError::InvalidHttpResponse(
-                "chunked response truncated before chunk end".to_string(),
-            ));
-        }
+        let mut chunk = vec![0u8; chunk_size];
+        reader
+            .read_exact(&mut chunk)
+            .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+        decoded.extend_from_slice(&chunk);
 
-        let chunk = bytes.get(cursor..chunk_end).ok_or_else(|| {
-            DockerError::InvalidHttpResponse("chunked response missing chunk bytes".to_string())
-        })?;
-        decoded.extend_from_slice(chunk);
-
-        let terminator = bytes.get(chunk_end..terminator_end).ok_or_else(|| {
-            DockerError::InvalidHttpResponse(
-                "chunked response missing chunk terminator".to_string(),
-            )
-        })?;
-        if terminator != b"\r\n" {
+        let mut terminator = [0u8; 2];
+        reader
+            .read_exact(&mut terminator)
+            .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+        if terminator != *b"\r\n" {
             return Err(DockerError::InvalidHttpResponse(
                 "chunked response missing chunk terminator".to_string(),
             ));
         }
-
-        cursor = terminator_end;
     }
 
     String::from_utf8(decoded).map_err(|error| DockerError::InvalidHttpResponse(error.to_string()))
 }
 
-fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
-    let tail = bytes.get(start..)?;
-    tail.windows(2)
-        .position(|window| window == b"\r\n")
-        .map(|offset| start + offset)
+fn consume_chunked_trailers<R>(reader: &mut R) -> Result<(), DockerError>
+where
+    R: BufRead,
+{
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| DockerError::SocketIo(error.to_string()))?;
+        if line == "\r\n" || line.is_empty() {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn socket_client_construction_accepts_unix_prefixed_path() {
-        let _client = DockerClient::new("unix:///var/run/docker.sock".to_string());
+        assert_eq!(
+            normalize_socket_path("unix:///var/run/docker.sock"),
+            "/var/run/docker.sock"
+        );
     }
 
     #[test]
     fn parse_http_response_returns_body_on_success() {
-        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
-        let body = parse_http_response(response).expect("response should parse");
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+        let mut cursor = Cursor::new(response);
+        let body = parse_http_response(&mut cursor).expect("response should parse");
         assert_eq!(body, "{\"ok\":true}");
     }
 
@@ -287,14 +315,16 @@ mod tests {
             "0\r\n",
             "\r\n"
         );
-        let body = parse_http_response(response).expect("chunked response should parse");
+        let mut cursor = Cursor::new(response.as_bytes());
+        let body = parse_http_response(&mut cursor).expect("chunked response should parse");
         assert_eq!(body, "{\"a\":1}");
     }
 
     #[test]
     fn parse_http_response_rejects_non_success_status() {
         let response = "HTTP/1.1 404 Not Found\r\n\r\nnot found";
-        let result = parse_http_response(response);
+        let mut cursor = Cursor::new(response.as_bytes());
+        let result = parse_http_response(&mut cursor);
         assert!(matches!(
             result,
             Err(DockerError::ApiHttpStatus { status: 404, .. })
@@ -312,7 +342,8 @@ mod tests {
             "0\r\n",
             "\r\n"
         );
-        let result = parse_http_response(response);
+        let mut cursor = Cursor::new(response.as_bytes());
+        let result = parse_http_response(&mut cursor);
         assert!(matches!(result, Err(DockerError::InvalidHttpResponse(_))));
     }
 }
