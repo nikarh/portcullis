@@ -1,15 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::os::unix::net::UnixStream;
-use std::str::FromStr;
 
-use indexmap::IndexMap;
 use ipnet::IpNet;
-use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
+use crate::docker::raw::{
+    DockerContainerInspect, DockerContainerSummary, DockerContainerSummaryEndpoint, DockerEndpoint,
+    DockerHostConfig, DockerNetworkInspect,
+};
+use crate::docker::{
+    DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind, DockerFirewallBackend,
+};
 use crate::labels::{LabelParseError, parse_policy};
 use crate::model::{
     ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, NetworkSnapshot, RuntimeSnapshot,
@@ -17,16 +19,8 @@ use crate::model::{
 
 #[derive(Debug, Error)]
 pub enum MonitorError {
-    #[error("docker socket I/O failed: {0}")]
-    SocketIo(String),
-    #[error("docker api request failed with status {status}: {body}")]
-    ApiHttpStatus { status: u16, body: String },
-    #[error("invalid HTTP response from docker api: {0}")]
-    InvalidHttpResponse(String),
-    #[error("invalid JSON from docker output: {0}")]
-    InvalidJson(String),
-    #[error("unsupported docker firewall backend: {0}")]
-    UnsupportedFirewallBackend(String),
+    #[error(transparent)]
+    Docker(#[from] DockerError),
     #[error("missing network id in container {container_id} attachment {network_name}")]
     MissingNetworkId {
         container_id: String,
@@ -44,21 +38,6 @@ pub enum MonitorError {
     },
     #[error(transparent)]
     LabelParse(#[from] LabelParseError),
-}
-
-pub trait DockerApi {
-    fn list_containers(&self) -> Result<Vec<DockerContainerSummary>, MonitorError>;
-    fn list_networks(&self) -> Result<Vec<DockerNetworkInspect>, MonitorError>;
-    fn inspect_container(&self, container_id: &str)
-    -> Result<DockerContainerInspect, MonitorError>;
-    fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError>;
-    fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DockerFirewallBackend {
-    Nftables,
-    Iptables,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,9 +60,9 @@ impl NetworkRuntimeData {
             return Ok(None);
         }
 
-        let subnet = network.primary_subnet()?;
-        let gateway = network.primary_gateway()?;
-        let enforce_network_policy = network.is_portcullis_network_enforced()?;
+        let subnet = network_primary_subnet(network)?;
+        let gateway = network_primary_gateway(network)?;
+        let enforce_network_policy = is_portcullis_network_enforced(network)?;
 
         Ok(Some(Self {
             name: network.name.clone(),
@@ -255,7 +234,7 @@ where
     }
 
     pub fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
-        self.api.firewall_backend()
+        self.api.firewall_backend().map_err(Into::into)
     }
 
     pub fn collect_state(&self) -> Result<RuntimeState, MonitorError> {
@@ -335,7 +314,7 @@ where
         inspect: DockerContainerInspect,
     ) -> Result<ContainerSnapshot, MonitorError> {
         let policy = parse_policy(&inspect.config.labels)?;
-        let runtime_dns_servers = inspect.runtime_dns_servers();
+        let runtime_dns_servers = runtime_dns_servers(inspect.host_config.as_ref());
 
         let mut attachments = Vec::new();
         let mut network_cache: HashMap<NetworkId, Option<NetworkRuntimeData>> = state
@@ -344,7 +323,7 @@ where
             .map(|(network_id, data)| (network_id.clone(), Some(data.clone())))
             .collect();
 
-        for (network_name, endpoint) in inspect.network_endpoints() {
+        for (network_name, endpoint) in container_inspect_network_endpoints(&inspect) {
             let Some(address) = endpoint.ip_address else {
                 continue;
             };
@@ -361,7 +340,7 @@ where
                 let value = match self.api.inspect_network(network_id.as_str()) {
                     Ok(network) => NetworkRuntimeData::try_new(&network)?,
                     Err(error) if is_not_found(&error) => None,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.into()),
                 };
                 network_cache.insert(network_id.clone(), value.clone());
                 value
@@ -406,7 +385,7 @@ where
             Err(error) if is_not_found(&error) => Ok(Some(RuntimeStateAction::RemoveContainer {
                 container_id: container_id.into(),
             })),
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -503,7 +482,7 @@ where
             Err(error) if is_not_found(&error) => Ok(Some(RuntimeStateAction::RemoveNetwork {
                 network_id: network_id.into(),
             })),
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -512,10 +491,10 @@ where
         summary: &DockerContainerSummary,
     ) -> Result<ContainerSnapshot, MonitorError> {
         let policy = parse_policy(&summary.labels)?;
-        let runtime_dns_servers = summary.runtime_dns_servers();
+        let runtime_dns_servers = runtime_dns_servers(summary.host_config.as_ref());
 
         let mut attachments = Vec::new();
-        for (_network_name, endpoint) in summary.network_endpoints() {
+        for (_network_name, endpoint) in container_summary_network_endpoints(summary) {
             let Some(address) = endpoint.ip_address else {
                 continue;
             };
@@ -535,7 +514,7 @@ where
 
         Ok(ContainerSnapshot {
             id: summary.id.clone().into(),
-            name: summary.name(),
+            name: container_summary_name(summary),
             attachments,
             runtime_dns_servers,
             policy,
@@ -543,287 +522,118 @@ where
     }
 }
 
-fn is_not_found(error: &MonitorError) -> bool {
-    matches!(error, MonitorError::ApiHttpStatus { status: 404, .. })
+fn is_not_found(error: &DockerError) -> bool {
+    matches!(error, DockerError::ApiHttpStatus { status: 404, .. })
 }
 
-pub struct SocketDockerApi {
-    socket_path: String,
+fn network_primary_subnet(network: &DockerNetworkInspect) -> Result<IpNet, MonitorError> {
+    let subnet = network
+        .ipam
+        .as_ref()
+        .and_then(|ipam| ipam.config.as_ref())
+        .and_then(|configs| configs.iter().find_map(|config| config.subnet.clone()))
+        .ok_or_else(|| MonitorError::MissingNetworkSubnet(network.id.clone()))?;
+
+    subnet
+        .parse::<IpNet>()
+        .map_err(|_| MonitorError::InvalidNetworkSubnet {
+            network_id: network.id.clone(),
+            subnet,
+        })
 }
 
-impl SocketDockerApi {
-    #[must_use]
-    pub fn new(socket: String) -> Self {
-        let socket_path = if let Some(path) = socket.strip_prefix("unix://") {
-            path.to_string()
-        } else {
-            socket
-        };
-        Self { socket_path }
-    }
+fn network_primary_gateway(network: &DockerNetworkInspect) -> Result<Option<IpAddr>, MonitorError> {
+    let gateway = network
+        .ipam
+        .as_ref()
+        .and_then(|ipam| ipam.config.as_ref())
+        .and_then(|configs| configs.iter().find_map(|config| config.gateway.clone()));
 
-    fn request_json<T>(&self, path: &str) -> Result<T, MonitorError>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
-        let body = self.request_raw(path)?;
-        trace!(
-            path,
-            body_len = body.len(),
-            body = body,
-            "docker api json response received"
-        );
-        serde_json::from_str::<T>(&body)
-            .map_err(|error| MonitorError::InvalidJson(error.to_string()))
-    }
-
-    fn request_raw(&self, path: &str) -> Result<String, MonitorError> {
-        debug!(socket = %self.socket_path, path, "docker api request");
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .map_err(|error| MonitorError::SocketIo(error.to_string()))?;
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| MonitorError::SocketIo(error.to_string()))?;
-
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .map_err(|error| MonitorError::SocketIo(error.to_string()))?;
-        let response_text = String::from_utf8(response)
-            .map_err(|error| MonitorError::InvalidHttpResponse(error.to_string()))?;
-        parse_http_response(&response_text)
-    }
-}
-
-impl DockerApi for SocketDockerApi {
-    fn list_containers(&self) -> Result<Vec<DockerContainerSummary>, MonitorError> {
-        let summaries: Vec<DockerContainerSummary> = self.request_json("/containers/json?all=1")?;
-        trace!(
-            container_count = summaries.len(),
-            "parsed docker container summaries"
-        );
-        Ok(summaries)
-    }
-
-    fn list_networks(&self) -> Result<Vec<DockerNetworkInspect>, MonitorError> {
-        let networks: Vec<DockerNetworkInspect> = self.request_json("/networks")?;
-        trace!(network_count = networks.len(), "parsed docker networks");
-        Ok(networks)
-    }
-
-    fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> Result<DockerContainerInspect, MonitorError> {
-        self.request_json(&format!("/containers/{container_id}/json"))
-    }
-
-    fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError> {
-        self.request_json(&format!("/networks/{network_id}"))
-    }
-
-    fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
-        debug!("detecting docker firewall backend");
-        let info: DockerInfo = self.request_json("/info")?;
-        let backend = info
-            .firewall_backend
-            .and_then(DockerFirewallInfo::into_backend)
-            .unwrap_or_else(|| "iptables".to_string())
-            .to_lowercase();
-        match backend.as_str() {
-            "nftables" => Ok(DockerFirewallBackend::Nftables),
-            "iptables" => Ok(DockerFirewallBackend::Iptables),
-            _ => Err(MonitorError::UnsupportedFirewallBackend(backend)),
-        }
-    }
-}
-
-fn parse_http_response(response: &str) -> Result<String, MonitorError> {
-    let Some((head, body)) = response.split_once("\r\n\r\n") else {
-        return Err(MonitorError::InvalidHttpResponse(
-            "missing HTTP header separator".to_string(),
-        ));
+    let Some(value) = gateway else {
+        return Ok(None);
     };
-    let mut lines = head.lines();
-    let Some(status_line) = lines.next() else {
-        return Err(MonitorError::InvalidHttpResponse(
-            "missing HTTP status line".to_string(),
-        ));
+
+    let value = value
+        .parse::<IpAddr>()
+        .map_err(|_| MonitorError::InvalidNetworkSubnet {
+            network_id: network.id.clone(),
+            subnet: value,
+        })?;
+
+    Ok(Some(value))
+}
+
+fn is_portcullis_network_enforced(network: &DockerNetworkInspect) -> Result<bool, MonitorError> {
+    const LABEL_KEY: &str = "portcullis.network.enforce";
+    let Some(value) = network
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_KEY))
+        .cloned()
+    else {
+        return Ok(false);
     };
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        headers.insert(key.trim().to_lowercase(), value.trim().to_lowercase());
+    match value.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(MonitorError::InvalidNetworkLabel {
+            network_id: network.id.clone(),
+            label: LABEL_KEY.to_string(),
+            value,
+        }),
     }
-
-    let mut parts = status_line.split_whitespace();
-    let _http_version = parts.next();
-    let Some(status_code) = parts.next() else {
-        return Err(MonitorError::InvalidHttpResponse(
-            "missing HTTP status code".to_string(),
-        ));
-    };
-    let status = status_code.parse::<u16>().map_err(|error| {
-        MonitorError::InvalidHttpResponse(format!("invalid HTTP status code: {error}"))
-    })?;
-
-    let parsed_body = decode_http_body(body, &headers)?;
-
-    if !(200..=299).contains(&status) {
-        return Err(MonitorError::ApiHttpStatus {
-            status,
-            body: parsed_body.trim().to_string(),
-        });
-    }
-
-    Ok(parsed_body)
 }
 
-fn decode_http_body(
-    raw_body: &str,
-    headers: &BTreeMap<String, String>,
-) -> Result<String, MonitorError> {
-    let transfer_encoding = headers
-        .get("transfer-encoding")
-        .map(String::as_str)
-        .unwrap_or_default();
-    if transfer_encoding.contains("chunked") {
-        return decode_chunked_body(raw_body);
-    }
-
-    Ok(raw_body.to_string())
+fn runtime_dns_servers(host_config: Option<&DockerHostConfig>) -> HashSet<IpAddr> {
+    host_config
+        .and_then(|config| config.dns.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.parse().ok())
+        .collect()
 }
 
-fn decode_chunked_body(raw_body: &str) -> Result<String, MonitorError> {
-    let bytes = raw_body.as_bytes();
-    let mut cursor = 0usize;
-    let mut decoded = Vec::new();
-
-    loop {
-        let Some(line_end) = find_crlf(bytes, cursor) else {
-            return Err(MonitorError::InvalidHttpResponse(
-                "chunked response missing chunk size line terminator".to_string(),
-            ));
-        };
-
-        let size_bytes = bytes.get(cursor..line_end).ok_or_else(|| {
-            MonitorError::InvalidHttpResponse(
-                "chunked response missing chunk size bytes".to_string(),
-            )
-        })?;
-        let size_line = std::str::from_utf8(size_bytes).map_err(|error| {
-            MonitorError::InvalidHttpResponse(format!("invalid chunk size line encoding: {error}"))
-        })?;
-        let size_hex = size_line.split(';').next().unwrap_or_default().trim();
-        let chunk_size = usize::from_str_radix(size_hex, 16).map_err(|error| {
-            MonitorError::InvalidHttpResponse(format!("invalid chunk size `{size_hex}`: {error}"))
-        })?;
-        cursor = line_end + 2;
-
-        if chunk_size == 0 {
-            break;
-        }
-
-        let chunk_end = cursor
-            .checked_add(chunk_size)
-            .ok_or_else(|| MonitorError::InvalidHttpResponse("chunk size overflow".to_string()))?;
-        let terminator_end = chunk_end.checked_add(2).ok_or_else(|| {
-            MonitorError::InvalidHttpResponse("chunk terminator overflow".to_string())
-        })?;
-        if terminator_end > bytes.len() {
-            return Err(MonitorError::InvalidHttpResponse(
-                "chunked response truncated before chunk end".to_string(),
-            ));
-        }
-
-        let chunk = bytes.get(cursor..chunk_end).ok_or_else(|| {
-            MonitorError::InvalidHttpResponse("chunked response missing chunk bytes".to_string())
-        })?;
-        decoded.extend_from_slice(chunk);
-
-        let terminator = bytes.get(chunk_end..terminator_end).ok_or_else(|| {
-            MonitorError::InvalidHttpResponse(
-                "chunked response missing chunk terminator".to_string(),
-            )
-        })?;
-        if terminator != b"\r\n" {
-            return Err(MonitorError::InvalidHttpResponse(
-                "chunked response missing chunk terminator".to_string(),
-            ));
-        }
-
-        cursor = terminator_end;
-    }
-
-    String::from_utf8(decoded).map_err(|error| MonitorError::InvalidHttpResponse(error.to_string()))
+fn container_inspect_network_endpoints(
+    inspect: &DockerContainerInspect,
+) -> Vec<(&str, DockerEndpoint)> {
+    inspect
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .map(|networks| {
+            networks
+                .iter()
+                .map(|(name, endpoint)| (name.as_str(), endpoint.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
-    let tail = bytes.get(start..)?;
-    tail.windows(2)
-        .position(|window| window == b"\r\n")
-        .map(|offset| start + offset)
+fn container_summary_network_endpoints(
+    summary: &DockerContainerSummary,
+) -> Vec<(&str, DockerContainerSummaryEndpoint)> {
+    summary
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .map(|networks| {
+            networks
+                .iter()
+                .map(|(name, endpoint)| (name.as_str(), endpoint.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DockerEventKind {
-    Container,
-    Network,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DockerEventAction {
-    Create,
-    Start,
-    Rename,
-    Update,
-    Destroy,
-    Connect,
-    Disconnect,
-    Attach,
-    Detach,
-    Restart,
-    Stop,
-    Die,
-    Kill,
-    Pause,
-    Unpause,
-    Resize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DockerEvent {
-    pub id: String,
-    pub action: DockerEventAction,
-    pub name: Option<String>,
-    pub kind: DockerEventKind,
-    pub attributes: IndexMap<String, String>,
-}
-
-impl DockerEvent {
-    #[must_use]
-    pub fn is_relevant_for_policy_refresh(&self) -> bool {
-        match self.kind {
-            DockerEventKind::Container => matches!(
-                self.action,
-                DockerEventAction::Create | DockerEventAction::Destroy | DockerEventAction::Rename
-            ),
-            DockerEventKind::Network => matches!(
-                self.action,
-                DockerEventAction::Create
-                    | DockerEventAction::Destroy
-                    | DockerEventAction::Update
-                    | DockerEventAction::Connect
-                    | DockerEventAction::Disconnect
-            ),
-        }
-    }
+fn container_summary_name(summary: &DockerContainerSummary) -> String {
+    normalize_container_name(
+        summary
+            .names
+            .as_ref()
+            .and_then(|values| values.first())
+            .cloned()
+            .unwrap_or_else(|| summary.id.clone()),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -986,322 +796,19 @@ fn normalize_container_name(value: String) -> String {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerContainerSummary {
-    #[serde(rename = "Id")]
-    pub id: String,
-    #[serde(rename = "Names")]
-    pub names: Option<Vec<String>>,
-    #[serde(rename = "Labels", default)]
-    pub labels: IndexMap<String, String>,
-    #[serde(rename = "HostConfig")]
-    pub host_config: Option<DockerHostConfig>,
-    #[serde(rename = "NetworkSettings")]
-    pub network_settings: Option<DockerContainerSummaryNetworkSettings>,
-}
-
-impl DockerContainerSummary {
-    fn name(&self) -> String {
-        normalize_container_name(
-            self.names
-                .as_ref()
-                .and_then(|values| values.first())
-                .cloned()
-                .unwrap_or_else(|| self.id.clone()),
-        )
-    }
-
-    fn runtime_dns_servers(&self) -> HashSet<IpAddr> {
-        self.host_config
-            .as_ref()
-            .and_then(|config| config.dns.as_ref())
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.parse().ok())
-            .collect()
-    }
-
-    fn network_endpoints(&self) -> Vec<(&str, DockerContainerSummaryEndpoint)> {
-        self.network_settings
-            .as_ref()
-            .and_then(|settings| settings.networks.as_ref())
-            .map(|networks| {
-                networks
-                    .iter()
-                    .map(|(name, endpoint)| (name.as_str(), endpoint.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerContainerSummaryNetworkSettings {
-    #[serde(rename = "Networks")]
-    pub networks: Option<BTreeMap<String, DockerContainerSummaryEndpoint>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerContainerSummaryEndpoint {
-    #[serde(rename = "NetworkID")]
-    pub network_id: Option<String>,
-    #[serde(rename = "IPAddress")]
-    #[serde(deserialize_with = "deserialize_optional_ipaddr")]
-    pub ip_address: Option<IpAddr>,
-    #[serde(rename = "Aliases")]
-    pub aliases: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerContainerInspect {
-    #[serde(rename = "Id")]
-    pub id: String,
-    #[serde(rename = "Name")]
-    pub name: String,
-    #[serde(rename = "Config", default)]
-    pub config: DockerContainerConfig,
-    #[serde(rename = "HostConfig")]
-    pub host_config: Option<DockerHostConfig>,
-    #[serde(rename = "NetworkSettings")]
-    pub network_settings: Option<DockerNetworkSettings>,
-}
-
-impl DockerContainerInspect {
-    fn runtime_dns_servers(&self) -> HashSet<IpAddr> {
-        self.host_config
-            .as_ref()
-            .and_then(|config| config.dns.as_ref())
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.parse().ok())
-            .collect()
-    }
-
-    fn network_endpoints(&self) -> Vec<(&str, DockerEndpoint)> {
-        self.network_settings
-            .as_ref()
-            .and_then(|settings| settings.networks.as_ref())
-            .map(|networks| {
-                networks
-                    .iter()
-                    .map(|(name, endpoint)| (name.as_str(), endpoint.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct DockerContainerConfig {
-    #[serde(rename = "Labels", default)]
-    pub labels: IndexMap<String, String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerHostConfig {
-    #[serde(rename = "Dns")]
-    pub dns: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerNetworkSettings {
-    #[serde(rename = "Networks")]
-    pub networks: Option<BTreeMap<String, DockerEndpoint>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerEndpoint {
-    #[serde(rename = "NetworkID")]
-    pub network_id: Option<String>,
-    #[serde(rename = "IPAddress")]
-    #[serde(deserialize_with = "deserialize_optional_ipaddr")]
-    pub ip_address: Option<IpAddr>,
-    #[serde(rename = "Aliases")]
-    pub aliases: Option<Vec<String>>,
-}
-
-fn deserialize_optional_ipaddr<'de, D>(deserializer: D) -> Result<Option<IpAddr>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    trimmed
-        .parse::<IpAddr>()
-        .map(Some)
-        .map_err(serde::de::Error::custom)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerNetworkInspect {
-    #[serde(rename = "Id")]
-    pub id: String,
-    #[serde(rename = "Name")]
-    pub name: String,
-    #[serde(rename = "Driver")]
-    pub driver: DockerNetworkDriver,
-    #[serde(rename = "IPAM")]
-    pub ipam: Option<DockerIpam>,
-    #[serde(rename = "Labels")]
-    pub labels: Option<IndexMap<String, String>>,
-}
-
-impl DockerNetworkInspect {
-    fn primary_subnet(&self) -> Result<IpNet, MonitorError> {
-        let subnet = self
-            .ipam
-            .as_ref()
-            .and_then(|ipam| ipam.config.as_ref())
-            .and_then(|configs| configs.iter().find_map(|config| config.subnet.clone()))
-            .ok_or_else(|| MonitorError::MissingNetworkSubnet(self.id.clone()))?;
-
-        IpNet::from_str(&subnet).map_err(|_| MonitorError::InvalidNetworkSubnet {
-            network_id: self.id.clone(),
-            subnet,
-        })
-    }
-
-    fn primary_gateway(&self) -> Result<Option<IpAddr>, MonitorError> {
-        let gateway = self
-            .ipam
-            .as_ref()
-            .and_then(|ipam| ipam.config.as_ref())
-            .and_then(|configs| configs.iter().find_map(|config| config.gateway.clone()));
-
-        let Some(value) = gateway else {
-            return Ok(None);
-        };
-
-        let value = value
-            .parse::<IpAddr>()
-            .map_err(|_| MonitorError::InvalidNetworkSubnet {
-                network_id: self.id.clone(),
-                subnet: value,
-            })?;
-
-        Ok(Some(value))
-    }
-
-    fn is_portcullis_network_enforced(&self) -> Result<bool, MonitorError> {
-        const LABEL_KEY: &str = "portcullis.network.enforce";
-        let Some(value) = self
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(LABEL_KEY))
-            .cloned()
-        else {
-            return Ok(false);
-        };
-        match value.as_str() {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            _ => Err(MonitorError::InvalidNetworkLabel {
-                network_id: self.id.clone(),
-                label: LABEL_KEY.to_string(),
-                value,
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DockerNetworkDriver {
-    Bridge,
-    Host,
-    Ipvlan,
-    Macvlan,
-    None,
-    Overlay,
-    Other(String),
-}
-
-impl DockerNetworkDriver {
-    fn is_bridge(&self) -> bool {
-        matches!(self, Self::Bridge)
-    }
-}
-
-impl From<String> for DockerNetworkDriver {
-    fn from(value: String) -> Self {
-        match value.to_lowercase().as_str() {
-            "bridge" => Self::Bridge,
-            "host" => Self::Host,
-            "ipvlan" => Self::Ipvlan,
-            "macvlan" => Self::Macvlan,
-            "none" | "null" => Self::None,
-            "overlay" => Self::Overlay,
-            _ => Self::Other(value),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for DockerNetworkDriver {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(Self::from(value))
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerIpam {
-    #[serde(rename = "Config")]
-    pub config: Option<Vec<DockerIpamConfig>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerIpamConfig {
-    #[serde(rename = "Subnet")]
-    pub subnet: Option<String>,
-    #[serde(rename = "Gateway")]
-    pub gateway: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerInfo {
-    #[serde(rename = "FirewallBackend")]
-    pub firewall_backend: Option<DockerFirewallInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum DockerFirewallInfo {
-    Value(String),
-    Object {
-        #[serde(rename = "Driver")]
-        driver: Option<String>,
-        #[serde(rename = "Backend")]
-        backend: Option<String>,
-        #[serde(rename = "Name")]
-        name: Option<String>,
-    },
-}
-
-impl DockerFirewallInfo {
-    fn into_backend(self) -> Option<String> {
-        match self {
-            Self::Value(value) => Some(value),
-            Self::Object {
-                driver,
-                backend,
-                name,
-            } => driver.or(backend).or(name),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::cell::RefCell;
+
+    use indexmap::IndexMap;
+    use serde::Deserialize;
+
+    use crate::docker::raw::{
+        DockerContainerConfig, DockerContainerSummaryNetworkSettings, DockerIpam, DockerIpamConfig,
+        DockerNetworkDriver, DockerNetworkSettings,
+    };
 
     #[derive(Default)]
     struct MockDockerApi {
@@ -1314,44 +821,44 @@ mod tests {
     }
 
     impl DockerApi for MockDockerApi {
-        fn list_containers(&self) -> Result<Vec<DockerContainerSummary>, MonitorError> {
+        fn list_containers(&self) -> Result<Vec<DockerContainerSummary>, DockerError> {
             Ok(self.containers_list.clone())
         }
 
-        fn list_networks(&self) -> Result<Vec<DockerNetworkInspect>, MonitorError> {
+        fn list_networks(&self) -> Result<Vec<DockerNetworkInspect>, DockerError> {
             Ok(self.networks_list.clone())
         }
 
         fn inspect_container(
             &self,
             container_id: &str,
-        ) -> Result<DockerContainerInspect, MonitorError> {
+        ) -> Result<DockerContainerInspect, DockerError> {
             self.inspect_container_requests
                 .borrow_mut()
                 .push(container_id.to_string());
             self.containers
                 .get(container_id)
                 .cloned()
-                .ok_or_else(|| MonitorError::ApiHttpStatus {
+                .ok_or_else(|| DockerError::ApiHttpStatus {
                     status: 404,
                     body: format!("container not found: {container_id}"),
                 })
         }
 
-        fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, MonitorError> {
+        fn inspect_network(&self, network_id: &str) -> Result<DockerNetworkInspect, DockerError> {
             self.inspect_network_requests
                 .borrow_mut()
                 .push(network_id.to_string());
             self.networks
                 .get(network_id)
                 .cloned()
-                .ok_or_else(|| MonitorError::ApiHttpStatus {
+                .ok_or_else(|| DockerError::ApiHttpStatus {
                     status: 404,
                     body: format!("network not found: {network_id}"),
                 })
         }
 
-        fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
+        fn firewall_backend(&self) -> Result<DockerFirewallBackend, DockerError> {
             Ok(DockerFirewallBackend::Nftables)
         }
     }
@@ -1565,8 +1072,7 @@ mod tests {
 
         let inspect: DockerContainerInspect =
             serde_json::from_str(inspect_json).expect("container inspect should deserialize");
-        let endpoint = inspect
-            .network_endpoints()
+        let endpoint = container_inspect_network_endpoints(&inspect)
             .into_iter()
             .next()
             .expect("expected one endpoint")
@@ -1646,73 +1152,6 @@ mod tests {
             snapshot.enforced_network_subnets[0].to_string(),
             "172.18.0.0/16"
         );
-    }
-
-    #[test]
-    fn parse_http_response_returns_body_on_success() {
-        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
-        let body = parse_http_response(response).expect("response should parse");
-        assert_eq!(body, "{\"ok\":true}");
-    }
-
-    #[test]
-    fn parse_http_response_decodes_chunked_body() {
-        let response = concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "Transfer-Encoding: chunked\r\n",
-            "Content-Type: application/json\r\n",
-            "\r\n",
-            "7\r\n",
-            "{\"a\":1}\r\n",
-            "0\r\n",
-            "\r\n"
-        );
-        let body = parse_http_response(response).expect("chunked response should parse");
-        assert_eq!(body, "{\"a\":1}");
-    }
-
-    #[test]
-    fn parse_http_response_rejects_non_success_status() {
-        let response = "HTTP/1.1 404 Not Found\r\n\r\nnot found";
-        let result = parse_http_response(response);
-        assert!(matches!(
-            result,
-            Err(MonitorError::ApiHttpStatus { status: 404, .. })
-        ));
-    }
-
-    #[test]
-    fn firewall_backend_info_parsing_supports_string_and_object_shapes() {
-        let info_value: DockerInfo = serde_json::from_str(r#"{"FirewallBackend":"nftables"}"#)
-            .expect("docker info value shape should parse");
-        let info_object: DockerInfo =
-            serde_json::from_str(r#"{"FirewallBackend":{"Driver":"iptables"}}"#)
-                .expect("docker info object shape should parse");
-
-        let value_backend = info_value
-            .firewall_backend
-            .and_then(DockerFirewallInfo::into_backend);
-        let object_backend = info_object
-            .firewall_backend
-            .and_then(DockerFirewallInfo::into_backend);
-
-        assert_eq!(value_backend.as_deref(), Some("nftables"));
-        assert_eq!(object_backend.as_deref(), Some("iptables"));
-    }
-
-    #[test]
-    fn parse_http_response_rejects_invalid_chunk_size() {
-        let response = concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "Transfer-Encoding: chunked\r\n",
-            "\r\n",
-            "ZZ\r\n",
-            "{}\r\n",
-            "0\r\n",
-            "\r\n"
-        );
-        let result = parse_http_response(response);
-        assert!(matches!(result, Err(MonitorError::InvalidHttpResponse(_))));
     }
 
     #[test]
@@ -2031,7 +1470,7 @@ mod tests {
     #[test]
     fn docker_network_primary_subnet_parses_first_subnet() {
         let network = network_inspect("net0", "bridge", "172.18.0.0/16");
-        let subnet = match network.primary_subnet() {
+        let subnet = match network_primary_subnet(&network) {
             Ok(value) => value,
             Err(error) => panic!("primary_subnet should succeed: {error}"),
         };

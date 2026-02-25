@@ -1,4 +1,5 @@
 mod dns;
+mod docker;
 mod firewall;
 mod labels;
 mod logging;
@@ -6,30 +7,24 @@ mod model;
 mod monitor;
 
 use std::ffi::OsString;
-use std::fmt::Write as FmtWrite;
-use std::io::{BufRead, BufReader, Write as _};
-use std::os::unix::net::UnixStream;
+use std::io::Write as _;
 use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use pico_args::Arguments;
 use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
 use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
+use crate::docker::{DockerClient, DockerError, DockerEventStream, DockerFirewallBackend};
 use crate::firewall::{ActiveFirewall, FirewallError};
 use crate::logging::{LogLevel, LoggingError};
-use crate::monitor::{
-    DockerEvent, DockerEventAction, DockerEventKind, DockerFirewallBackend, DockerMonitor,
-    MonitorError, RuntimeChangeTracker, RuntimeState, SocketDockerApi,
-};
-use indexmap::IndexMap;
-use serde::Deserialize;
+use crate::monitor::{DockerMonitor, MonitorError, RuntimeChangeTracker, RuntimeState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirewallBackend {
@@ -82,12 +77,12 @@ enum MainError {
     Logging(#[from] LoggingError),
     #[error("monitoring failed: {0}")]
     Monitor(#[from] MonitorError),
+    #[error("docker client failed: {0}")]
+    Docker(#[from] DockerError),
     #[error("firewall apply failed: {0}")]
     Firewall(#[from] FirewallError),
     #[error("failed to install signal handler: {0}")]
     SignalHandler(String),
-    #[error("service state error: {0}")]
-    ServiceState(String),
 }
 
 fn main() {
@@ -171,8 +166,8 @@ fn run(config: &Config) -> Result<(), MainError> {
         "portcullis prototype started"
     );
 
-    let api = SocketDockerApi::new(config.docker_socket.clone());
-    let monitor = DockerMonitor::new(api);
+    let monitor = DockerMonitor::new(DockerClient::new(config.docker_socket.clone()));
+    let event_client = DockerClient::new(config.docker_socket.clone());
 
     let selected_backend = match config.firewall_backend {
         FirewallBackend::Auto => match monitor.firewall_backend()? {
@@ -207,7 +202,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     let mut tracker = RuntimeChangeTracker::new();
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.collect_state()?;
-    let mut event_stream = connect_event_stream(&config.docker_socket)?;
+    let mut event_stream = connect_event_stream(&event_client)?;
 
     apply_runtime_state(
         &runtime_state,
@@ -273,7 +268,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                 if terminate.load(Ordering::Relaxed) {
                     break;
                 }
-                match connect_event_stream(&config.docker_socket) {
+                match connect_event_stream(&event_client) {
                     Ok(stream) => event_stream = stream,
                     Err(reconnect_error) => {
                         error!(%reconnect_error, "docker event stream reconnect failed; retrying");
@@ -293,8 +288,8 @@ fn run(config: &Config) -> Result<(), MainError> {
     Ok(())
 }
 
-fn connect_event_stream(socket: &str) -> Result<DockerSocketEventStream, MainError> {
-    let stream = DockerSocketEventStream::connect(socket)?;
+fn connect_event_stream(client: &DockerClient) -> Result<DockerEventStream, MainError> {
+    let stream = client.subscribe_events()?;
     info!("docker event stream connected");
     Ok(stream)
 }
@@ -331,183 +326,6 @@ fn enforce_fail_closed_defaults(snapshot: &mut crate::model::RuntimeSnapshot) {
             container.policy.icc_allow.clear();
         }
     }
-}
-
-fn current_unix_epoch_seconds() -> Result<i64, MainError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| MainError::ServiceState(error.to_string()))?;
-    i64::try_from(duration.as_secs()).map_err(|error| MainError::ServiceState(error.to_string()))
-}
-
-struct DockerSocketEventStream {
-    reader: BufReader<UnixStream>,
-}
-
-impl DockerSocketEventStream {
-    fn connect(socket: &str) -> Result<Self, MainError> {
-        let socket_path = if let Some(path) = socket.strip_prefix("unix://") {
-            path
-        } else {
-            socket
-        };
-
-        let mut stream = UnixStream::connect(socket_path)
-            .map_err(|error| MainError::ServiceState(error.to_string()))?;
-        stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(|error| MainError::ServiceState(error.to_string()))?;
-
-        let since = current_unix_epoch_seconds()?;
-        let path = build_events_path(since)?;
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| MainError::ServiceState(error.to_string()))?;
-
-        let mut reader = BufReader::new(stream);
-        let mut status_line = String::new();
-        reader
-            .read_line(&mut status_line)
-            .map_err(|error| MainError::ServiceState(error.to_string()))?;
-        if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
-            return Err(MainError::ServiceState(format!(
-                "docker events subscribe failed: {status_line}"
-            )));
-        }
-
-        loop {
-            let mut header_line = String::new();
-            reader
-                .read_line(&mut header_line)
-                .map_err(|error| MainError::ServiceState(error.to_string()))?;
-            if header_line == "\r\n" {
-                break;
-            }
-        }
-
-        Ok(Self { reader })
-    }
-
-    fn next_event(&mut self) -> Result<Option<DockerEvent>, MainError> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => Err(MainError::ServiceState(
-                "docker event stream closed".to_string(),
-            )),
-            Ok(_) => parse_container_event_line(&line),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(MainError::ServiceState(error.to_string())),
-        }
-    }
-}
-
-fn parse_container_event_line(line: &str) -> Result<Option<DockerEvent>, MainError> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    if is_chunk_size_line(trimmed) {
-        return Ok(None);
-    }
-
-    let parsed: DockerEventLine = serde_json::from_str(trimmed)
-        .map_err(|error| MainError::ServiceState(format!("invalid docker event json: {error}")))?;
-    let action = parsed.action.or(parsed.status);
-    let kind = parsed.kind.or(parsed.event_type);
-    let Some(action) = action else {
-        return Ok(None);
-    };
-    let kind = kind.unwrap_or(DockerEventKind::Container);
-    let actor_id = parsed.actor.as_ref().and_then(|actor| actor.id.clone());
-    let id = parsed.id.or(actor_id).unwrap_or_default();
-    if id.is_empty() {
-        return Ok(None);
-    }
-
-    let attributes = parsed.actor.and_then(|a| a.attributes).unwrap_or_default();
-    let name = attributes.get("name").cloned();
-
-    Ok(Some(DockerEvent {
-        id,
-        action,
-        name,
-        kind,
-        attributes,
-    }))
-}
-
-fn is_chunk_size_line(line: &str) -> bool {
-    let size_part = line.split(';').next().unwrap_or_default().trim();
-    !size_part.is_empty() && size_part.chars().all(|ch| ch.is_ascii_hexdigit())
-}
-
-fn build_events_path(since: i64) -> Result<String, MainError> {
-    let filters = serde_json::json!({
-        "type": ["container", "network"],
-        "event": [
-            "create",
-            "rename",
-            "update",
-            "destroy",
-            "connect",
-            "disconnect"
-        ]
-    });
-    let raw = serde_json::to_string(&filters)
-        .map_err(|error| MainError::ServiceState(error.to_string()))?;
-    Ok(format!(
-        "/events?filters={}&since={since}",
-        percent_encode_query_value(&raw)
-    ))
-}
-
-fn percent_encode_query_value(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(char::from(byte));
-            }
-            _ => {
-                encoded.push('%');
-                let _ = write!(encoded, "{byte:02X}");
-            }
-        }
-    }
-    encoded
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DockerEventLine {
-    #[serde(rename = "Type")]
-    event_type: Option<DockerEventKind>,
-    #[serde(rename = "type")]
-    kind: Option<DockerEventKind>,
-    #[serde(rename = "Action")]
-    action: Option<DockerEventAction>,
-    #[serde(rename = "status")]
-    status: Option<DockerEventAction>,
-    #[serde(rename = "id")]
-    id: Option<String>,
-    #[serde(rename = "Actor")]
-    actor: Option<DockerEventActor>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DockerEventActor {
-    #[serde(rename = "ID")]
-    id: Option<String>,
-    #[serde(rename = "Attributes")]
-    attributes: Option<IndexMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -560,73 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_api_construction_accepts_unix_prefixed_path() {
-        let _api = SocketDockerApi::new("unix:///var/run/docker.sock".to_string());
-    }
-
-    #[test]
-    fn parse_container_event_line_parses_container_event() {
-        let line = "{\"Type\":\"container\",\"Action\":\"start\",\"Actor\":{\"ID\":\"abc\",\"Attributes\":{\"name\":\"web\"}}}";
-        let event = parse_container_event_line(line).expect("event parse should succeed");
-        assert_eq!(
-            event,
-            Some(DockerEvent {
-                id: "abc".to_string(),
-                action: DockerEventAction::Start,
-                name: Some("web".to_string()),
-                kind: DockerEventKind::Container,
-                attributes: indexmap::IndexMap::from([("name".to_string(), "web".to_string(),)]),
-            })
-        );
-    }
-
-    #[test]
-    fn parse_container_event_line_parses_network_event() {
-        let line = "{\"Type\":\"network\",\"Action\":\"create\",\"Actor\":{\"ID\":\"net0\",\"Attributes\":{\"name\":\"pc-managed\"}}}";
-        let event = parse_container_event_line(line).expect("event parse should succeed");
-        assert_eq!(
-            event,
-            Some(DockerEvent {
-                id: "net0".to_string(),
-                action: DockerEventAction::Create,
-                name: Some("pc-managed".to_string()),
-                kind: DockerEventKind::Network,
-                attributes: indexmap::IndexMap::from([(
-                    "name".to_string(),
-                    "pc-managed".to_string(),
-                )]),
-            })
-        );
-    }
-
-    #[test]
-    fn parse_container_event_line_ignores_unrelated_event_type() {
-        let line = "{\"Type\":\"volume\",\"Action\":\"create\",\"Actor\":{\"ID\":\"vol0\"}}";
-        let result = parse_container_event_line(line);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_container_event_line_ignores_chunk_size_lines() {
-        let event = parse_container_event_line("173\r\n").expect("event parse should succeed");
-        assert!(event.is_none());
-    }
-
-    #[test]
-    fn parse_container_event_line_ignores_chunk_size_with_extensions() {
-        let event =
-            parse_container_event_line("173;foo=bar\r\n").expect("event parse should succeed");
-        assert!(event.is_none());
-    }
-
-    #[test]
-    fn build_events_path_includes_type_and_event_filters() {
-        let path = build_events_path(123).expect("events path should build");
-        assert!(path.starts_with("/events?filters="));
-        assert!(path.contains("&since=123"));
-        assert!(path.contains("%22type%22"));
-        assert!(path.contains("%22event%22"));
-        assert!(path.contains("connect"));
-        assert!(path.contains("disconnect"));
+    fn docker_client_construction_accepts_unix_prefixed_path() {
+        let _client = DockerClient::new("unix:///var/run/docker.sock".to_string());
     }
 }
