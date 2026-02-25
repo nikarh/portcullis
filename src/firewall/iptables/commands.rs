@@ -4,13 +4,13 @@ use std::net::Ipv4Addr;
 use crate::model::Protocol;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct CommandBuffer<'a> {
-    pub(crate) ipset: Vec<IpsetCommand>,
-    pub(crate) iptables: Vec<IptablesCommand<'a>>,
+pub struct CommandBuffer<'a> {
+    pub ipset: Vec<IpsetCommand>,
+    pub iptables: Vec<IptablesCommand<'a>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum IptablesCommand<'a> {
+pub enum IptablesCommand<'a> {
     FlushChain {
         chain: &'a str,
     },
@@ -62,13 +62,13 @@ pub(crate) enum IptablesCommand<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Ipv4Destination {
+pub enum Ipv4Destination {
     Address(Ipv4Addr),
     Cidr(ipnet::Ipv4Net),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IpsetCommand {
+pub enum IpsetCommand {
     Create {
         host_hash: u64,
     },

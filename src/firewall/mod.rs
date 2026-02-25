@@ -12,7 +12,11 @@ pub use nftables::NftablesFirewall;
 #[derive(Debug, Error)]
 pub enum FirewallError {
     #[error("failed to run firewall command: {0}")]
-    CommandExecution(String),
+    CommandExecution(#[from] std::io::Error),
+    #[error("failed to format firewall command script: {0}")]
+    CommandScriptFormat(#[from] std::fmt::Error),
+    #[error("{program} stdin unavailable")]
+    CommandStdinUnavailable { program: &'static str },
     #[error("firewall command failed with code {code}: {stderr}")]
     CommandFailure { code: i32, stderr: String },
     #[error("failed to create libnftables context")]

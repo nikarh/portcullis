@@ -21,6 +21,7 @@ use pico_args::Arguments;
 use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
+use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
 use crate::firewall::{ActiveFirewall, FirewallError};
 use crate::logging::{LogLevel, LoggingError};
 use crate::monitor::{
@@ -204,11 +205,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     .map_err(|error| MainError::SignalHandler(error.to_string()))?;
 
     let mut tracker = RuntimeChangeTracker::new();
-    let mut dns_cache = crate::dns::DnsProxyCache::new(
-        crate::dns::SystemUpstreamResolver,
-        Duration::from_secs(300),
-        2048,
-    );
+    let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.collect_state()?;
     let mut event_stream = connect_event_stream(&config.docker_socket)?;
 
@@ -306,7 +303,7 @@ fn apply_runtime_state(
     runtime_state: &RuntimeState,
     firewall: &ActiveFirewall,
     tracker: &mut RuntimeChangeTracker,
-    dns_cache: &mut crate::dns::DnsProxyCache<crate::dns::SystemUpstreamResolver>,
+    dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
     fail_closed: bool,
     force_apply: bool,
 ) -> Result<(), MainError> {

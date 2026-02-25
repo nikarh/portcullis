@@ -46,7 +46,7 @@ pub enum MonitorError {
     LabelParse(#[from] LabelParseError),
 }
 
-pub(crate) trait DockerApi {
+pub trait DockerApi {
     fn list_containers(&self) -> Result<Vec<DockerContainerSummary>, MonitorError>;
     fn list_networks(&self) -> Result<Vec<DockerNetworkInspect>, MonitorError>;
     fn inspect_container(&self, container_id: &str)
@@ -56,7 +56,7 @@ pub(crate) trait DockerApi {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DockerFirewallBackend {
+pub enum DockerFirewallBackend {
     Nftables,
     Iptables,
 }
@@ -95,13 +95,13 @@ impl NetworkRuntimeData {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RuntimeState {
+pub struct RuntimeState {
     containers: BTreeMap<ContainerId, ContainerSnapshot>,
     networks: HashMap<NetworkId, NetworkRuntimeData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RuntimeStateAction {
+pub enum RuntimeStateAction {
     CreateContainer {
         snapshot: Box<ContainerSnapshot>,
     },
@@ -130,7 +130,7 @@ pub(crate) enum RuntimeStateAction {
 
 impl RuntimeState {
     #[must_use]
-    pub(crate) fn snapshot(&self) -> RuntimeSnapshot {
+    pub fn snapshot(&self) -> RuntimeSnapshot {
         let mut enforced_network_subnets = BTreeSet::new();
         for network in self.networks.values() {
             if network.enforced {
@@ -177,7 +177,7 @@ impl RuntimeState {
         changed
     }
 
-    pub(crate) fn apply_action(&mut self, action: RuntimeStateAction) -> bool {
+    pub fn apply_action(&mut self, action: RuntimeStateAction) -> bool {
         match action {
             RuntimeStateAction::CreateContainer { snapshot } => {
                 let container_id = snapshot.id.clone();
@@ -230,7 +230,7 @@ impl RuntimeState {
     }
 }
 
-pub(crate) struct DockerMonitor<A> {
+pub struct DockerMonitor<A> {
     api: A,
 }
 
@@ -238,7 +238,7 @@ impl<A> DockerMonitor<A>
 where
     A: DockerApi,
 {
-    pub(crate) const fn new(api: A) -> Self {
+    pub const fn new(api: A) -> Self {
         Self { api }
     }
 
@@ -254,11 +254,11 @@ where
         Ok(snapshot)
     }
 
-    pub(crate) fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
+    pub fn firewall_backend(&self) -> Result<DockerFirewallBackend, MonitorError> {
         self.api.firewall_backend()
     }
 
-    pub(crate) fn collect_state(&self) -> Result<RuntimeState, MonitorError> {
+    pub fn collect_state(&self) -> Result<RuntimeState, MonitorError> {
         debug!("collecting docker runtime state");
         let networks = self.api.list_networks()?;
         let containers = self.api.list_containers()?;
@@ -276,7 +276,7 @@ where
         Ok(state)
     }
 
-    pub(crate) fn resolve_event_action(
+    pub fn resolve_event_action(
         &self,
         state: &RuntimeState,
         event: DockerEvent,
@@ -547,13 +547,13 @@ fn is_not_found(error: &MonitorError) -> bool {
     matches!(error, MonitorError::ApiHttpStatus { status: 404, .. })
 }
 
-pub(crate) struct SocketDockerApi {
+pub struct SocketDockerApi {
     socket_path: String,
 }
 
 impl SocketDockerApi {
     #[must_use]
-    pub(crate) fn new(socket: String) -> Self {
+    pub fn new(socket: String) -> Self {
         let socket_path = if let Some(path) = socket.strip_prefix("unix://") {
             path.to_string()
         } else {
@@ -771,14 +771,14 @@ fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum DockerEventKind {
+pub enum DockerEventKind {
     Container,
     Network,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum DockerEventAction {
+pub enum DockerEventAction {
     Create,
     Start,
     Rename,
@@ -798,7 +798,7 @@ pub(crate) enum DockerEventAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DockerEvent {
+pub struct DockerEvent {
     pub id: String,
     pub action: DockerEventAction,
     pub name: Option<String>,
@@ -827,7 +827,7 @@ impl DockerEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RuntimeChange {
+pub enum RuntimeChange {
     ContainerAdded {
         id: String,
         name: String,
@@ -852,17 +852,17 @@ pub(crate) enum RuntimeChange {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct RuntimeChangeTracker {
+pub struct RuntimeChangeTracker {
     previous: Option<RuntimeSnapshot>,
 }
 
 impl RuntimeChangeTracker {
     #[must_use]
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self { previous: None }
     }
 
-    pub(crate) fn detect_and_log(&mut self, current: &RuntimeSnapshot) -> Vec<RuntimeChange> {
+    pub fn detect_and_log(&mut self, current: &RuntimeSnapshot) -> Vec<RuntimeChange> {
         let changes = detect_runtime_changes(self.previous.as_ref(), current);
 
         if changes.is_empty() {
@@ -874,40 +874,7 @@ impl RuntimeChangeTracker {
             );
         }
 
-        for change in &changes {
-            match change {
-                RuntimeChange::ContainerAdded { id, name } => {
-                    info!(%id, %name, "container added");
-                    debug!(?change, "container state change detail");
-                }
-                RuntimeChange::ContainerRemoved { id, name } => {
-                    info!(%id, %name, "container removed");
-                    debug!(?change, "container state change detail");
-                }
-                RuntimeChange::PolicyChanged { container_id } => {
-                    info!(container_id = %container_id, "container policy changed");
-                    debug!(?change, "container policy change detail");
-                }
-                RuntimeChange::AttachmentAdded {
-                    container_id,
-                    network_id,
-                    ip_address,
-                } => {
-                    info!(container_id = %container_id, network_id = %network_id, %ip_address, "container network attachment added");
-                    debug!(?change, "network attachment change detail");
-                }
-                RuntimeChange::AttachmentRemoved {
-                    container_id,
-                    network_id,
-                    ip_address,
-                } => {
-                    info!(container_id = %container_id, network_id = %network_id, %ip_address, "container network attachment removed");
-                    debug!(?change, "network attachment change detail");
-                }
-            }
-        }
-
-        trace!(?changes, "full docker runtime change set");
+        trace!(?changes, "docker runtime changes");
         self.previous = Some(current.clone());
         changes
     }

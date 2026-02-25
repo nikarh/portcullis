@@ -4,8 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
-use std::process::Command;
-use std::process::Stdio;
+use std::process::{Command, Output, Stdio};
 
 use tracing::{info, trace};
 
@@ -19,8 +18,8 @@ const CHAIN_NAME: &str = "PORTCULLIS_EGRESS";
 const STAGING_CHAIN_NAME: &str = "PORTCULLIS_EGRESS_NEXT";
 const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
 
-pub(crate) trait IptablesRunner {
-    fn run(&self, program: &str, args: &[String]) -> Result<(), FirewallError>;
+pub trait IptablesRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<(), FirewallError>;
     fn run_iptables_restore(&self, commands: &[IptablesCommand<'_>]) -> Result<(), FirewallError>;
     fn run_ipset_restore(&self, commands: &[IpsetCommand]) -> Result<(), FirewallError>;
     fn read_iptables_save_filter(&self) -> Result<String, FirewallError>;
@@ -28,22 +27,24 @@ pub(crate) trait IptablesRunner {
 
 pub struct CommandIptablesRunner;
 
+fn ensure_success(output: Output) -> Result<Output, FirewallError> {
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    Err(FirewallError::CommandFailure {
+        code: output.status.code().unwrap_or(-1),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
+
 impl IptablesRunner for CommandIptablesRunner {
-    fn run(&self, program: &str, args: &[String]) -> Result<(), FirewallError> {
+    fn run(&self, program: &str, args: &[&str]) -> Result<(), FirewallError> {
         trace!(program, args = ?args, "executing firewall command");
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+        let output = Command::new(program).args(args).output()?;
+        ensure_success(output)?;
 
-        if output.status.success() {
-            return Ok(());
-        }
-
-        Err(FirewallError::CommandFailure {
-            code: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
+        Ok(())
     }
 
     fn run_iptables_restore(&self, commands: &[IptablesCommand<'_>]) -> Result<(), FirewallError> {
@@ -62,33 +63,23 @@ impl IptablesRunner for CommandIptablesRunner {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+            .spawn()?;
         let mut script = String::from("*filter\n");
         for command in commands {
-            writeln!(&mut script, "{command}")
-                .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+            writeln!(&mut script, "{command}")?;
         }
         script.push_str("COMMIT\n");
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(script.as_bytes())
-                .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+            stdin.write_all(script.as_bytes())?;
         } else {
-            return Err(FirewallError::CommandExecution(
-                "iptables-restore stdin unavailable".to_string(),
-            ));
+            return Err(FirewallError::CommandStdinUnavailable {
+                program: "iptables-restore",
+            });
         }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(FirewallError::CommandFailure {
-            code: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
+        let output = child.wait_with_output()?;
+        ensure_success(output)?;
+
+        Ok(())
     }
 
     fn run_ipset_restore(&self, commands: &[IpsetCommand]) -> Result<(), FirewallError> {
@@ -107,47 +98,29 @@ impl IptablesRunner for CommandIptablesRunner {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+            .spawn()?;
         let mut script = String::new();
         for command in commands {
-            writeln!(&mut script, "{command}")
-                .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+            writeln!(&mut script, "{command}")?;
         }
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(script.as_bytes())
-                .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+            stdin.write_all(script.as_bytes())?;
         } else {
-            return Err(FirewallError::CommandExecution(
-                "ipset restore stdin unavailable".to_string(),
-            ));
+            return Err(FirewallError::CommandStdinUnavailable { program: "ipset" });
         }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(FirewallError::CommandFailure {
-            code: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
+        let output = child.wait_with_output()?;
+        ensure_success(output)?;
+
+        Ok(())
     }
 
     fn read_iptables_save_filter(&self) -> Result<String, FirewallError> {
         trace!(program = "iptables-save", args = ?["-t", "filter"], "reading firewall filter table");
         let output = Command::new("iptables-save")
             .args(["-t", "filter"])
-            .output()
-            .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-        }
-        Err(FirewallError::CommandFailure {
-            code: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
+            .output()?;
+        let output = ensure_success(output)?;
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }
 
@@ -171,6 +144,7 @@ where
     ) -> Result<(), FirewallError> {
         let commands =
             build_apply_commands_with_dns(snapshot, resolver, self.use_ipset, CHAIN_NAME)?;
+
         self.runner.run_ipset_restore(&commands.ipset)?;
         self.runner.run_iptables_restore(&commands.iptables)?;
 
@@ -178,10 +152,7 @@ where
     }
 
     pub fn initialize(&self) -> Result<(), FirewallError> {
-        match self
-            .runner
-            .run("iptables", &["-N".to_string(), CHAIN_NAME.to_string()])
-        {
+        match self.runner.run("iptables", &["-N", CHAIN_NAME]) {
             Ok(()) => {}
             Err(FirewallError::CommandFailure { stderr, .. })
                 if stderr.contains("Chain already exists") => {}
@@ -190,13 +161,7 @@ where
 
         match self.runner.run(
             "iptables",
-            &[
-                "-I".to_string(),
-                DOCKER_USER_CHAIN.to_string(),
-                "1".to_string(),
-                "-j".to_string(),
-                CHAIN_NAME.to_string(),
-            ],
+            &["-I", DOCKER_USER_CHAIN, "1", "-j", CHAIN_NAME],
         ) {
             Ok(()) => {}
             Err(FirewallError::CommandFailure { stderr, .. })
@@ -237,6 +202,7 @@ fn build_apply_commands_with_dns<'a>(
     chain_name: &'a str,
 ) -> Result<CommandBuffer<'a>, FirewallError> {
     let mut commands = CommandBuffer::default();
+
     commands
         .iptables
         .push(IptablesCommand::FlushChain { chain: chain_name });
@@ -589,14 +555,6 @@ fn collect_container_targets(snapshot: &RuntimeSnapshot) -> HashMap<String, Vec<
         .collect()
 }
 
-#[cfg(test)]
-fn command_line(command: &impl std::fmt::Display) -> Result<String, FirewallError> {
-    let mut line = String::new();
-    write!(&mut line, "{command}")
-        .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
-    Ok(line)
-}
-
 fn docker_user_jump_target(line: &str) -> Option<&str> {
     if !line.starts_with("-A DOCKER-USER ") {
         return None;
@@ -679,10 +637,6 @@ mod tests {
         PortSpec,
     };
 
-    fn command_to_line(command: &impl std::fmt::Display) -> String {
-        command_line(command).expect("command should render to line")
-    }
-
     struct MockResolver;
 
     impl HostnameIpResolver for MockResolver {
@@ -760,11 +714,17 @@ mod tests {
             Err(error) => panic!("expected command build to succeed: {error}"),
         };
 
-        assert!(value.iptables.iter().map(command_to_line).any(|line| {
-            line.contains("-d 1.1.1.1/32")
-                && line.contains("--dport 443")
-                && line.contains("ACCEPT")
-        }));
+        assert!(
+            value
+                .iptables
+                .iter()
+                .map(std::string::ToString::to_string)
+                .any(|line| {
+                    line.contains("-d 1.1.1.1/32")
+                        && line.contains("--dport 443")
+                        && line.contains("ACCEPT")
+                })
+        );
     }
 
     #[test]
@@ -812,9 +772,13 @@ mod tests {
         let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
             .expect("expected command build to succeed");
         assert!(
-            commands.iptables.iter().map(command_to_line).any(|line| {
-                line.contains("-d 172.18.0.10/32") && line.contains("--dport 5432")
-            })
+            commands
+                .iptables
+                .iter()
+                .map(std::string::ToString::to_string)
+                .any(|line| {
+                    line.contains("-d 172.18.0.10/32") && line.contains("--dport 5432")
+                })
         );
     }
 
@@ -828,7 +792,7 @@ mod tests {
             commands
                 .iptables
                 .iter()
-                .map(command_to_line)
+                .map(std::string::ToString::to_string)
                 .any(|line| line.contains("-A MYCHAIN "))
         );
     }
@@ -851,7 +815,7 @@ mod tests {
     }
 
     impl IptablesRunner for MockIptablesRunner {
-        fn run(&self, _program: &str, _args: &[String]) -> Result<(), FirewallError> {
+        fn run(&self, _program: &str, _args: &[&str]) -> Result<(), FirewallError> {
             let mut guard = self
                 .results
                 .lock()
@@ -888,10 +852,11 @@ mod tests {
 
     #[test]
     fn iptables_command_display_formats_line() {
-        let line = command_to_line(&IptablesCommand::DropSourceIp {
+        let line = IptablesCommand::DropSourceIp {
             chain: "PORTCULLIS_EGRESS",
             source: "172.18.0.2".parse().expect("source fixture should parse"),
-        });
+        }
+        .to_string();
         assert_eq!(line, "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -j DROP");
     }
 
@@ -927,7 +892,10 @@ COMMIT
 COMMIT
 ",
         );
-        let lines: Vec<String> = commands.iter().map(command_to_line).collect();
+        let lines: Vec<String> = commands
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         assert_eq!(
             lines,
             vec![
@@ -957,7 +925,7 @@ COMMIT
             commands
                 .iptables
                 .iter()
-                .map(command_to_line)
+                .map(std::string::ToString::to_string)
                 .any(|line| line.contains("--match-set pc_h4_"))
         );
     }
@@ -977,7 +945,7 @@ COMMIT
             commands
                 .iptables
                 .iter()
-                .map(command_to_line)
+                .map(std::string::ToString::to_string)
                 .any(|line| line == "-A PORTCULLIS_EGRESS -s 172.18.0.0/16 -j DROP")
         );
     }
@@ -991,7 +959,7 @@ COMMIT
         assert!(commands
             .iptables
             .iter()
-            .map(command_to_line)
+            .map(std::string::ToString::to_string)
             .any(|line| {
                 line
                     == "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p udp --dport 53 -j ACCEPT"
@@ -999,7 +967,7 @@ COMMIT
         assert!(commands
             .iptables
             .iter()
-            .map(command_to_line)
+            .map(std::string::ToString::to_string)
             .any(|line| {
                 line
                     == "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p tcp --dport 53 -j ACCEPT"

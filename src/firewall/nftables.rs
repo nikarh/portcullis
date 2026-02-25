@@ -14,7 +14,7 @@ pub const TABLE_NAME: &str = "portcullis";
 pub const CHAIN_NAME: &str = "egress";
 const FORWARD_HOOK_PRIORITY: i32 = -1;
 
-pub(crate) trait NftRunner {
+pub trait NftRunner {
     fn run_commands(&self, commands: &[String]) -> Result<(), FirewallError>;
 }
 
