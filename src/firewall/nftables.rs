@@ -5,7 +5,7 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use super::FirewallError;
-use crate::dns::HostnameIpResolver;
+use crate::dns::{DnsProxyCache, UpstreamResolver};
 use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeSnapshot};
 use tracing::{info, trace, warn};
 
@@ -49,10 +49,10 @@ where
         }
     }
 
-    pub fn apply_with_dns(
+    pub fn apply_with_dns<Dns: UpstreamResolver>(
         &self,
         snapshot: &RuntimeSnapshot,
-        resolver: &mut dyn HostnameIpResolver,
+        resolver: &mut DnsProxyCache<Dns>,
     ) -> Result<(), FirewallError> {
         let commands = build_refresh_commands_with_dns(snapshot, resolver)?;
         let command_count = commands.len();
@@ -207,7 +207,7 @@ pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
 #[allow(clippy::too_many_lines)]
 pub fn build_apply_commands_with_dns(
     snapshot: &RuntimeSnapshot,
-    resolver: &mut dyn HostnameIpResolver,
+    resolver: &mut DnsProxyCache<impl UpstreamResolver>,
 ) -> Result<Vec<String>, FirewallError> {
     let mut lines = vec![
         format!("add table {TABLE_FAMILY} {TABLE_NAME}"),
@@ -341,7 +341,7 @@ pub fn build_apply_commands_with_dns(
 #[allow(clippy::too_many_lines)]
 pub fn build_refresh_commands_with_dns(
     snapshot: &RuntimeSnapshot,
-    resolver: &mut dyn HostnameIpResolver,
+    resolver: &mut DnsProxyCache<impl UpstreamResolver>,
 ) -> Result<Vec<String>, FirewallError> {
     let mut commands = build_apply_commands_with_dns(snapshot, resolver)?;
     commands.remove(0);
@@ -353,7 +353,7 @@ pub fn build_refresh_commands_with_dns(
 #[cfg(test)]
 pub fn build_apply_script_with_dns(
     snapshot: &RuntimeSnapshot,
-    resolver: &mut dyn HostnameIpResolver,
+    resolver: &mut DnsProxyCache<impl UpstreamResolver>,
 ) -> Result<String, FirewallError> {
     Ok(build_apply_commands_with_dns(snapshot, resolver)?.join("\n"))
 }
@@ -640,9 +640,9 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod common_tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use std::time::Duration;
 
-    use crate::dns::{DnsError, HostnameIpResolver};
+    use crate::dns::{DnsError, DnsProxyCache, UpstreamResolver};
     use crate::model::{
         ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, NetworkSnapshot,
         PortSpec, Protocol,
@@ -652,14 +652,14 @@ mod common_tests {
 
     struct MockResolver;
 
-    impl HostnameIpResolver for MockResolver {
-        fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
+    impl UpstreamResolver for MockResolver {
+        fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
             if host == "api.example.com" {
                 let ip: IpAddr = match "1.1.1.1".parse() {
                     Ok(value) => value,
                     Err(error) => panic!("failed to parse test ip: {error}"),
                 };
-                return Ok(Arc::from(vec![ip].into_boxed_slice()));
+                return Ok(vec![ip]);
             }
 
             Err(DnsError::LookupFailed {
@@ -719,7 +719,7 @@ mod common_tests {
 
     #[test]
     fn build_apply_script_with_dns_adds_sets_and_rules() {
-        let mut resolver = MockResolver;
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let script = build_apply_script_with_dns(&snapshot_with_hostname_rule(), &mut resolver);
         assert!(script.is_ok());
         let value = match script {
@@ -733,7 +733,7 @@ mod common_tests {
 
     #[test]
     fn build_apply_script_with_dns_reports_resolve_error() {
-        let mut resolver = MockResolver;
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let mut snapshot = snapshot_with_hostname_rule();
         snapshot.containers[0].policy.egress[0].target =
             crate::model::EgressTarget::Hostname("bad.example.com".to_string());

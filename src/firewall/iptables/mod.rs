@@ -8,7 +8,7 @@ use std::process::{Command, Output, Stdio};
 
 use tracing::{info, trace};
 
-use crate::dns::HostnameIpResolver;
+use crate::dns::{DnsProxyCache, UpstreamResolver};
 use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeSnapshot};
 use commands::{CommandBuffer, IpsetCommand, IptablesCommand, Ipv4Destination};
 
@@ -137,10 +137,10 @@ where
         Self { runner, use_ipset }
     }
 
-    pub fn apply_with_dns(
+    pub fn apply_with_dns<Dns: UpstreamResolver>(
         &self,
         snapshot: &RuntimeSnapshot,
-        resolver: &mut dyn HostnameIpResolver,
+        resolver: &mut DnsProxyCache<Dns>,
     ) -> Result<(), FirewallError> {
         let commands =
             build_apply_commands_with_dns(snapshot, resolver, self.use_ipset, CHAIN_NAME)?;
@@ -195,9 +195,9 @@ impl IptablesFirewall<CommandIptablesRunner> {
     }
 }
 
-fn build_apply_commands_with_dns<'a>(
+fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
     snapshot: &RuntimeSnapshot,
-    resolver: &mut dyn HostnameIpResolver,
+    resolver: &mut DnsProxyCache<Dns>,
     use_ipset: bool,
     chain_name: &'a str,
 ) -> Result<CommandBuffer<'a>, FirewallError> {
@@ -320,7 +320,7 @@ fn append_ip_target_commands<'a>(
 fn append_hostname_target_commands<'a>(
     commands: &mut CommandBuffer<'a>,
     chain_name: &'a str,
-    resolver: &mut dyn HostnameIpResolver,
+    resolver: &mut DnsProxyCache<impl UpstreamResolver>,
     source_ipv4: Ipv4Addr,
     host: &str,
     ports: &[crate::model::PortSpec],
@@ -625,13 +625,13 @@ fn build_cleanup_restore_commands(filter_rules: &str) -> Vec<IptablesCommand<'st
 mod tests {
     use std::collections::VecDeque;
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use ipnet::IpNet;
 
     use super::*;
-    use crate::dns::{DnsError, HostnameIpResolver};
+    use crate::dns::{DnsError, DnsProxyCache, UpstreamResolver};
     use crate::model::{
         ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, NetworkSnapshot,
         PortSpec,
@@ -639,14 +639,14 @@ mod tests {
 
     struct MockResolver;
 
-    impl HostnameIpResolver for MockResolver {
-        fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
+    impl UpstreamResolver for MockResolver {
+        fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
             if host == "api.example.com" {
                 let ip: IpAddr = match "1.1.1.1".parse() {
                     Ok(value) => value,
                     Err(error) => panic!("failed to parse ip fixture: {error}"),
                 };
-                return Ok(Arc::from(vec![ip].into_boxed_slice()));
+                return Ok(vec![ip]);
             }
             Err(DnsError::LookupFailed {
                 host: host.to_string(),
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn build_commands_includes_iptables_for_hostname_without_ipset() {
-        let mut resolver = MockResolver;
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands =
             build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, CHAIN_NAME);
         assert!(commands.is_ok());
@@ -768,7 +768,7 @@ mod tests {
             }],
         }];
 
-        let mut resolver = MockResolver;
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
             .expect("expected command build to succeed");
         assert!(
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn build_commands_target_supplied_chain_name() {
-        let mut resolver = MockResolver;
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands =
             build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, "MYCHAIN")
                 .expect("commands");
@@ -911,7 +911,7 @@ COMMIT
 
     #[test]
     fn build_commands_includes_ipset_for_hostname_with_ipset() {
-        let mut resolver = MockResolver;
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands =
             build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, true, CHAIN_NAME)
                 .expect("expected command build to succeed");
@@ -938,7 +938,7 @@ COMMIT
                 .parse()
                 .expect("subnet fixture should parse"),
         );
-        let mut resolver = MockResolver;
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
             .expect("expected command build to succeed");
         assert!(
@@ -952,7 +952,7 @@ COMMIT
 
     #[test]
     fn build_commands_adds_dns_allows_for_gateway_by_default() {
-        let mut resolver = MockResolver;
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands =
             build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, CHAIN_NAME)
                 .expect("expected command build to succeed");
