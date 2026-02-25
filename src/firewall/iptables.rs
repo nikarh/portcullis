@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::{self, Write as _};
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 use std::process::Stdio;
 
@@ -16,9 +17,175 @@ const STAGING_CHAIN_NAME: &str = "PORTCULLIS_EGRESS_NEXT";
 const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandSpec {
-    program: &'static str,
-    args: Vec<String>,
+enum CommandSpec<'a> {
+    Iptables(IptablesCommand<'a>),
+    Ipset(IpsetCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IptablesCommand<'a> {
+    AcceptIpPort {
+        chain: &'a str,
+        source: Ipv4Addr,
+        destination: Ipv4Destination,
+        protocol: Protocol,
+        port: u16,
+    },
+    AcceptMatchSetPort {
+        chain: &'a str,
+        source: Ipv4Addr,
+        host_hash: u64,
+        protocol: Protocol,
+        port: u16,
+    },
+    AcceptDns {
+        chain: &'a str,
+        source: Ipv4Addr,
+        destination: Option<Ipv4Addr>,
+        protocol: Protocol,
+    },
+    DropDns {
+        chain: &'a str,
+        source: Ipv4Addr,
+        protocol: Protocol,
+    },
+    DropIcc {
+        chain: &'a str,
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+    },
+    DropSourceIp {
+        chain: &'a str,
+        source: Ipv4Addr,
+    },
+    DropSourceSubnet {
+        chain: &'a str,
+        subnet: ipnet::Ipv4Net,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ipv4Destination {
+    Address(Ipv4Addr),
+    Cidr(ipnet::Ipv4Net),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpsetCommand {
+    Create {
+        host_hash: u64,
+    },
+    Flush {
+        host_hash: u64,
+    },
+    Add {
+        host_hash: u64,
+        destination: Ipv4Addr,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostSetName(u64);
+
+impl fmt::Display for HostSetName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "pc_h4_{:016x}", self.0)
+    }
+}
+
+impl fmt::Display for CommandSpec<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Iptables(value) => value.fmt(f),
+            Self::Ipset(value) => value.fmt(f),
+        }
+    }
+}
+
+impl fmt::Display for IptablesCommand<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AcceptIpPort {
+                chain,
+                source,
+                destination,
+                protocol,
+                port,
+            } => {
+                write!(f, "-A {chain} -s {source}/32 -d ")?;
+                match destination {
+                    Ipv4Destination::Address(value) => write!(f, "{value}/32")?,
+                    Ipv4Destination::Cidr(value) => write!(f, "{value}")?,
+                }
+                write!(
+                    f,
+                    " -p {} --dport {port} -j ACCEPT",
+                    protocol_name(*protocol)
+                )
+            }
+            Self::AcceptMatchSetPort {
+                chain,
+                source,
+                host_hash,
+                protocol,
+                port,
+            } => write!(
+                f,
+                "-A {chain} -s {source}/32 -m set --match-set {} dst -p {} --dport {port} -j ACCEPT",
+                HostSetName(*host_hash),
+                protocol_name(*protocol)
+            ),
+            Self::AcceptDns {
+                chain,
+                source,
+                destination,
+                protocol,
+            } => {
+                write!(f, "-A {chain} -s {source}/32 ")?;
+                if let Some(value) = destination {
+                    write!(f, "-d {value}/32 ")?;
+                }
+                write!(f, "-p {} --dport 53 -j ACCEPT", protocol_name(*protocol))
+            }
+            Self::DropDns {
+                chain,
+                source,
+                protocol,
+            } => write!(
+                f,
+                "-A {chain} -s {source}/32 -p {} --dport 53 -j DROP",
+                protocol_name(*protocol)
+            ),
+            Self::DropIcc {
+                chain,
+                source,
+                destination,
+            } => write!(f, "-A {chain} -s {source}/32 -d {destination}/32 -j DROP"),
+            Self::DropSourceIp { chain, source } => {
+                write!(f, "-A {chain} -s {source}/32 -j DROP")
+            }
+            Self::DropSourceSubnet { chain, subnet } => {
+                write!(f, "-A {chain} -s {subnet} -j DROP")
+            }
+        }
+    }
+}
+
+impl fmt::Display for IpsetCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Create { host_hash } => {
+                write!(f, "create {} hash:ip -exist", HostSetName(*host_hash))
+            }
+            Self::Flush { host_hash } => write!(f, "flush {}", HostSetName(*host_hash)),
+            Self::Add {
+                host_hash,
+                destination,
+            } => {
+                write!(f, "add {} {destination} -exist", HostSetName(*host_hash))
+            }
+        }
+    }
 }
 
 pub trait IptablesRunner {
@@ -177,12 +344,13 @@ where
         let mut ipset_restore_lines = Vec::new();
         restore_lines.push(format!("-F {CHAIN_NAME}"));
         for command in commands {
-            if command.program == "iptables" {
-                restore_lines.push(iptables_restore_line(&command.args));
-            } else if command.program == "ipset" {
-                ipset_restore_lines.push(command_line(&command.args));
-            } else {
-                self.runner.run(command.program, &command.args)?;
+            match command {
+                CommandSpec::Iptables(_) => {
+                    restore_lines.push(command_line(&command)?);
+                }
+                CommandSpec::Ipset(_) => {
+                    ipset_restore_lines.push(command_line(&command)?);
+                }
             }
         }
         self.runner.run_ipset_restore(&ipset_restore_lines)?;
@@ -244,12 +412,12 @@ impl IptablesFirewall<CommandIptablesRunner> {
     }
 }
 
-fn build_apply_commands_with_dns(
+fn build_apply_commands_with_dns<'a>(
     snapshot: &RuntimeSnapshot,
     resolver: &mut dyn HostnameIpResolver,
     use_ipset: bool,
-    chain_name: &str,
-) -> Result<Vec<CommandSpec>, FirewallError> {
+    chain_name: &'a str,
+) -> Result<Vec<CommandSpec<'a>>, FirewallError> {
     let mut commands = Vec::new();
 
     let managed_ipv4 = collect_managed_ipv4(snapshot);
@@ -292,15 +460,14 @@ fn build_apply_commands_with_dns(
             for rule in &policy.egress {
                 match &rule.target {
                     EgressTarget::IpCidr(cidr) => {
-                        if cidr.addr().is_ipv6() {
+                        let ipnet::IpNet::V4(destination) = cidr else {
                             continue;
-                        }
-
+                        };
                         append_ip_target_commands(
                             &mut commands,
                             chain_name,
                             source_ipv4,
-                            &cidr.to_string(),
+                            *destination,
                             &rule.ports,
                         );
                     }
@@ -330,62 +497,44 @@ fn build_apply_commands_with_dns(
     Ok(commands)
 }
 
-fn append_icc_drop_commands(
-    commands: &mut Vec<CommandSpec>,
-    chain_name: &str,
-    source_ipv4: std::net::Ipv4Addr,
-    managed_ipv4: &[std::net::Ipv4Addr],
+fn append_icc_drop_commands<'a>(
+    commands: &mut Vec<CommandSpec<'a>>,
+    chain_name: &'a str,
+    source_ipv4: Ipv4Addr,
+    managed_ipv4: &[Ipv4Addr],
 ) {
     for destination in managed_ipv4 {
-        commands.push(CommandSpec {
-            program: "iptables",
-            args: vec![
-                "-A".to_string(),
-                chain_name.to_string(),
-                "-s".to_string(),
-                format!("{source_ipv4}/32"),
-                "-d".to_string(),
-                format!("{destination}/32"),
-                "-j".to_string(),
-                "DROP".to_string(),
-            ],
-        });
+        commands.push(CommandSpec::Iptables(IptablesCommand::DropIcc {
+            chain: chain_name,
+            source: source_ipv4,
+            destination: *destination,
+        }));
     }
 }
 
-fn append_ip_target_commands(
-    commands: &mut Vec<CommandSpec>,
-    chain_name: &str,
-    source_ipv4: std::net::Ipv4Addr,
-    destination: &str,
+fn append_ip_target_commands<'a>(
+    commands: &mut Vec<CommandSpec<'a>>,
+    chain_name: &'a str,
+    source_ipv4: Ipv4Addr,
+    destination: ipnet::Ipv4Net,
     ports: &[crate::model::PortSpec],
 ) {
     for port in ports {
-        commands.push(CommandSpec {
-            program: "iptables",
-            args: vec![
-                "-A".to_string(),
-                chain_name.to_string(),
-                "-s".to_string(),
-                format!("{source_ipv4}/32"),
-                "-d".to_string(),
-                destination.to_string(),
-                "-p".to_string(),
-                protocol_name(port.protocol).to_string(),
-                "--dport".to_string(),
-                port.port.to_string(),
-                "-j".to_string(),
-                "ACCEPT".to_string(),
-            ],
-        });
+        commands.push(CommandSpec::Iptables(IptablesCommand::AcceptIpPort {
+            chain: chain_name,
+            source: source_ipv4,
+            destination: Ipv4Destination::Cidr(destination),
+            protocol: port.protocol,
+            port: port.port,
+        }));
     }
 }
 
-fn append_hostname_target_commands(
-    commands: &mut Vec<CommandSpec>,
-    chain_name: &str,
+fn append_hostname_target_commands<'a>(
+    commands: &mut Vec<CommandSpec<'a>>,
+    chain_name: &'a str,
     resolver: &mut dyn HostnameIpResolver,
-    source_ipv4: std::net::Ipv4Addr,
+    source_ipv4: Ipv4Addr,
     host: &str,
     ports: &[crate::model::PortSpec],
     use_ipset: bool,
@@ -396,7 +545,7 @@ fn append_hostname_target_commands(
             host: host.to_string(),
             message: error.to_string(),
         })?;
-    let destination_ipv4: Vec<std::net::Ipv4Addr> = addresses
+    let destination_ipv4: Vec<Ipv4Addr> = addresses
         .iter()
         .filter_map(|address| match address {
             IpAddr::V4(value) => Some(*value),
@@ -405,87 +554,42 @@ fn append_hostname_target_commands(
         .collect();
 
     if use_ipset {
-        let set_name = set_name_for_host(host);
-        commands.push(CommandSpec {
-            program: "ipset",
-            args: vec![
-                "create".to_string(),
-                set_name.clone(),
-                "hash:ip".to_string(),
-                "-exist".to_string(),
-            ],
-        });
-        commands.push(CommandSpec {
-            program: "ipset",
-            args: vec!["flush".to_string(), set_name.clone()],
-        });
+        let host_hash = fnv1a_64(host.as_bytes());
+        commands.push(CommandSpec::Ipset(IpsetCommand::Create { host_hash }));
+        commands.push(CommandSpec::Ipset(IpsetCommand::Flush { host_hash }));
 
         for destination in &destination_ipv4 {
-            commands.push(CommandSpec {
-                program: "ipset",
-                args: vec![
-                    "add".to_string(),
-                    set_name.clone(),
-                    destination.to_string(),
-                    "-exist".to_string(),
-                ],
-            });
+            commands.push(CommandSpec::Ipset(IpsetCommand::Add {
+                host_hash,
+                destination: *destination,
+            }));
         }
 
         for port in ports {
-            commands.push(CommandSpec {
-                program: "iptables",
-                args: vec![
-                    "-A".to_string(),
-                    chain_name.to_string(),
-                    "-s".to_string(),
-                    format!("{source_ipv4}/32"),
-                    "-m".to_string(),
-                    "set".to_string(),
-                    "--match-set".to_string(),
-                    set_name.clone(),
-                    "dst".to_string(),
-                    "-p".to_string(),
-                    protocol_name(port.protocol).to_string(),
-                    "--dport".to_string(),
-                    port.port.to_string(),
-                    "-j".to_string(),
-                    "ACCEPT".to_string(),
-                ],
-            });
+            commands.push(CommandSpec::Iptables(IptablesCommand::AcceptMatchSetPort {
+                chain: chain_name,
+                source: source_ipv4,
+                host_hash,
+                protocol: port.protocol,
+                port: port.port,
+            }));
         }
     } else {
         for port in ports {
             for destination in &destination_ipv4 {
-                commands.push(CommandSpec {
-                    program: "iptables",
-                    args: vec![
-                        "-A".to_string(),
-                        chain_name.to_string(),
-                        "-s".to_string(),
-                        format!("{source_ipv4}/32"),
-                        "-d".to_string(),
-                        format!("{destination}/32"),
-                        "-p".to_string(),
-                        protocol_name(port.protocol).to_string(),
-                        "--dport".to_string(),
-                        port.port.to_string(),
-                        "-j".to_string(),
-                        "ACCEPT".to_string(),
-                    ],
-                });
+                commands.push(CommandSpec::Iptables(IptablesCommand::AcceptIpPort {
+                    chain: chain_name,
+                    source: source_ipv4,
+                    destination: Ipv4Destination::Address(*destination),
+                    protocol: port.protocol,
+                    port: port.port,
+                }));
             }
         }
     }
 
     Ok(())
 }
-
-fn set_name_for_host(host: &str) -> String {
-    let hash = fnv1a_64(host.as_bytes());
-    format!("pc_h4_{hash:016x}")
-}
-
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -502,25 +606,18 @@ fn detect_ipset_available() -> bool {
     }
 }
 
-fn append_default_drop_command(
-    commands: &mut Vec<CommandSpec>,
-    chain_name: &str,
-    source_ipv4: std::net::Ipv4Addr,
+fn append_default_drop_command<'a>(
+    commands: &mut Vec<CommandSpec<'a>>,
+    chain_name: &'a str,
+    source_ipv4: Ipv4Addr,
 ) {
-    commands.push(CommandSpec {
-        program: "iptables",
-        args: vec![
-            "-A".to_string(),
-            chain_name.to_string(),
-            "-s".to_string(),
-            format!("{source_ipv4}/32"),
-            "-j".to_string(),
-            "DROP".to_string(),
-        ],
-    });
+    commands.push(CommandSpec::Iptables(IptablesCommand::DropSourceIp {
+        chain: chain_name,
+        source: source_ipv4,
+    }));
 }
 
-fn collect_managed_ipv4(snapshot: &RuntimeSnapshot) -> Vec<std::net::Ipv4Addr> {
+fn collect_managed_ipv4(snapshot: &RuntimeSnapshot) -> Vec<Ipv4Addr> {
     let mut values = BTreeSet::new();
     for container in &snapshot.containers {
         let policy = &container.policy;
@@ -545,33 +642,26 @@ fn network_gateway(snapshot: &RuntimeSnapshot, network_id: &NetworkId) -> Option
         .and_then(|network| network.gateway)
 }
 
-fn append_enforced_network_drop_commands(
-    commands: &mut Vec<CommandSpec>,
-    chain_name: &str,
+fn append_enforced_network_drop_commands<'a>(
+    commands: &mut Vec<CommandSpec<'a>>,
+    chain_name: &'a str,
     subnets: &[ipnet::IpNet],
 ) {
     for subnet in subnets {
         let ipnet::IpNet::V4(value) = subnet else {
             continue;
         };
-        commands.push(CommandSpec {
-            program: "iptables",
-            args: vec![
-                "-A".to_string(),
-                chain_name.to_string(),
-                "-s".to_string(),
-                value.to_string(),
-                "-j".to_string(),
-                "DROP".to_string(),
-            ],
-        });
+        commands.push(CommandSpec::Iptables(IptablesCommand::DropSourceSubnet {
+            chain: chain_name,
+            subnet: *value,
+        }));
     }
 }
 
-fn append_implicit_dns_allow_commands(
-    commands: &mut Vec<CommandSpec>,
-    chain_name: &str,
-    source_ipv4: std::net::Ipv4Addr,
+fn append_implicit_dns_allow_commands<'a>(
+    commands: &mut Vec<CommandSpec<'a>>,
+    chain_name: &'a str,
+    source_ipv4: Ipv4Addr,
     gateway: Option<IpAddr>,
     dns_targets: &[DnsTarget],
     runtime_dns_servers: &HashSet<IpAddr>,
@@ -601,58 +691,33 @@ fn append_implicit_dns_allow_commands(
     }
 
     for protocol in ["udp", "tcp"] {
+        let protocol = if protocol == "udp" {
+            Protocol::Udp
+        } else {
+            Protocol::Tcp
+        };
         if allow_any {
-            commands.push(CommandSpec {
-                program: "iptables",
-                args: vec![
-                    "-A".to_string(),
-                    chain_name.to_string(),
-                    "-s".to_string(),
-                    format!("{source_ipv4}/32"),
-                    "-p".to_string(),
-                    protocol.to_string(),
-                    "--dport".to_string(),
-                    "53".to_string(),
-                    "-j".to_string(),
-                    "ACCEPT".to_string(),
-                ],
-            });
+            commands.push(CommandSpec::Iptables(IptablesCommand::AcceptDns {
+                chain: chain_name,
+                source: source_ipv4,
+                destination: None,
+                protocol,
+            }));
         } else {
             for destination_ipv4 in &destinations {
-                commands.push(CommandSpec {
-                    program: "iptables",
-                    args: vec![
-                        "-A".to_string(),
-                        chain_name.to_string(),
-                        "-s".to_string(),
-                        format!("{source_ipv4}/32"),
-                        "-d".to_string(),
-                        format!("{destination_ipv4}/32"),
-                        "-p".to_string(),
-                        protocol.to_string(),
-                        "--dport".to_string(),
-                        "53".to_string(),
-                        "-j".to_string(),
-                        "ACCEPT".to_string(),
-                    ],
-                });
+                commands.push(CommandSpec::Iptables(IptablesCommand::AcceptDns {
+                    chain: chain_name,
+                    source: source_ipv4,
+                    destination: Some(*destination_ipv4),
+                    protocol,
+                }));
             }
         }
-        commands.push(CommandSpec {
-            program: "iptables",
-            args: vec![
-                "-A".to_string(),
-                chain_name.to_string(),
-                "-s".to_string(),
-                format!("{source_ipv4}/32"),
-                "-p".to_string(),
-                protocol.to_string(),
-                "--dport".to_string(),
-                "53".to_string(),
-                "-j".to_string(),
-                "DROP".to_string(),
-            ],
-        });
+        commands.push(CommandSpec::Iptables(IptablesCommand::DropDns {
+            chain: chain_name,
+            source: source_ipv4,
+            protocol,
+        }));
     }
 }
 
@@ -663,12 +728,12 @@ fn protocol_name(protocol: Protocol) -> &'static str {
     }
 }
 
-fn append_icc_allow_list_commands(
-    commands: &mut Vec<CommandSpec>,
-    chain_name: &str,
-    source_ipv4: std::net::Ipv4Addr,
+fn append_icc_allow_list_commands<'a>(
+    commands: &mut Vec<CommandSpec<'a>>,
+    chain_name: &'a str,
+    source_ipv4: Ipv4Addr,
     rules: &[crate::model::IccAllowRule],
-    container_targets: &HashMap<String, Vec<std::net::Ipv4Addr>>,
+    container_targets: &HashMap<String, Vec<Ipv4Addr>>,
 ) {
     for rule in rules {
         let Some(destinations) = container_targets.get(rule.target_container.as_str()) else {
@@ -676,32 +741,20 @@ fn append_icc_allow_list_commands(
         };
         for destination in destinations {
             for port in &rule.ports {
-                commands.push(CommandSpec {
-                    program: "iptables",
-                    args: vec![
-                        "-A".to_string(),
-                        chain_name.to_string(),
-                        "-s".to_string(),
-                        format!("{source_ipv4}/32"),
-                        "-d".to_string(),
-                        format!("{destination}/32"),
-                        "-p".to_string(),
-                        protocol_name(port.protocol).to_string(),
-                        "--dport".to_string(),
-                        port.port.to_string(),
-                        "-j".to_string(),
-                        "ACCEPT".to_string(),
-                    ],
-                });
+                commands.push(CommandSpec::Iptables(IptablesCommand::AcceptIpPort {
+                    chain: chain_name,
+                    source: source_ipv4,
+                    destination: Ipv4Destination::Address(*destination),
+                    protocol: port.protocol,
+                    port: port.port,
+                }));
             }
         }
     }
 }
 
-fn collect_container_targets(
-    snapshot: &RuntimeSnapshot,
-) -> HashMap<String, Vec<std::net::Ipv4Addr>> {
-    let mut by_key: HashMap<String, BTreeSet<std::net::Ipv4Addr>> = HashMap::new();
+fn collect_container_targets(snapshot: &RuntimeSnapshot) -> HashMap<String, Vec<Ipv4Addr>> {
+    let mut by_key: HashMap<String, BTreeSet<Ipv4Addr>> = HashMap::new();
 
     for container in &snapshot.containers {
         let mut keys = vec![container.id.to_string(), container.name.clone()];
@@ -727,12 +780,16 @@ fn collect_container_targets(
         .collect()
 }
 
-fn iptables_restore_line(args: &[String]) -> String {
-    command_line(args)
+#[cfg(test)]
+fn iptables_restore_line(command: &IptablesCommand<'_>) -> Result<String, FirewallError> {
+    command_line(&CommandSpec::Iptables(command.clone()))
 }
 
-fn command_line(args: &[String]) -> String {
-    args.join(" ")
+fn command_line(command: &CommandSpec<'_>) -> Result<String, FirewallError> {
+    let mut line = String::new();
+    write!(&mut line, "{command}")
+        .map_err(|error| FirewallError::CommandExecution(error.to_string()))?;
+    Ok(line)
 }
 
 fn docker_user_jump_target(line: &str) -> Option<&str> {
@@ -806,6 +863,10 @@ mod tests {
         ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, NetworkSnapshot,
         PortSpec,
     };
+
+    fn command_to_line(command: &CommandSpec<'_>) -> String {
+        command_line(command).expect("command should render to line")
+    }
 
     struct MockResolver;
 
@@ -884,12 +945,10 @@ mod tests {
             Err(error) => panic!("expected command build to succeed: {error}"),
         };
 
-        assert!(value.iter().any(|command| {
-            command.program == "iptables"
-                && command.args.iter().any(|arg| arg == "-d")
-                && command.args.iter().any(|arg| arg == "1.1.1.1/32")
-                && command.args.iter().any(|arg| arg == "--dport")
-                && command.args.iter().any(|arg| arg == "443")
+        assert!(value.iter().map(command_to_line).any(|line| {
+            line.contains("-d 1.1.1.1/32")
+                && line.contains("--dport 443")
+                && line.contains("ACCEPT")
         }));
     }
 
@@ -937,13 +996,12 @@ mod tests {
         let mut resolver = MockResolver;
         let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
             .expect("expected command build to succeed");
-        assert!(commands.iter().any(|command| {
-            command.program == "iptables"
-                && command.args.iter().any(|arg| arg == "-d")
-                && command.args.iter().any(|arg| arg == "172.18.0.10/32")
-                && command.args.iter().any(|arg| arg == "--dport")
-                && command.args.iter().any(|arg| arg == "5432")
-        }));
+        assert!(
+            commands
+                .iter()
+                .map(command_to_line)
+                .any(|line| line.contains("-d 172.18.0.10/32") && line.contains("--dport 5432"))
+        );
     }
 
     #[test]
@@ -952,9 +1010,12 @@ mod tests {
         let commands =
             build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, "MYCHAIN")
                 .expect("commands");
-        assert!(commands.iter().any(|command| {
-            command.program == "iptables" && command.args.iter().any(|arg| arg == "MYCHAIN")
-        }));
+        assert!(
+            commands
+                .iter()
+                .map(command_to_line)
+                .any(|line| line.contains("-A MYCHAIN "))
+        );
     }
 
     struct MockIptablesRunner {
@@ -1009,13 +1070,14 @@ mod tests {
 
     #[test]
     fn iptables_restore_line_joins_arguments() {
-        let line = iptables_restore_line(&[
-            "-A".to_string(),
-            "PORTCULLIS_EGRESS".to_string(),
-            "-j".to_string(),
-            "DROP".to_string(),
-        ]);
-        assert_eq!(line, "-A PORTCULLIS_EGRESS -j DROP");
+        let line = iptables_restore_line(&IptablesCommand::DropSourceIp {
+            chain: "PORTCULLIS_EGRESS",
+            source: "172.18.0.2".parse().expect("source fixture should parse"),
+        });
+        assert_eq!(
+            line.expect("line should render"),
+            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -j DROP"
+        );
     }
 
     #[test]
@@ -1069,19 +1131,17 @@ COMMIT
         let commands =
             build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, true, CHAIN_NAME)
                 .expect("expected command build to succeed");
-        assert!(commands.iter().any(|command| {
-            command.program == "ipset"
-                && command.args.first() == Some(&"create".to_string())
-                && command
-                    .args
-                    .get(1)
-                    .is_some_and(|name| name.starts_with("pc_h4_"))
-        }));
-        assert!(commands.iter().any(|command| {
-            command.program == "iptables"
-                && command.args.iter().any(|arg| arg == "--match-set")
-                && command.args.iter().any(|arg| arg.starts_with("pc_h4_"))
-        }));
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, CommandSpec::Ipset(IpsetCommand::Create { .. })))
+        );
+        assert!(
+            commands
+                .iter()
+                .map(command_to_line)
+                .any(|line| line.contains("--match-set pc_h4_"))
+        );
     }
 
     #[test]
@@ -1095,18 +1155,12 @@ COMMIT
         let mut resolver = MockResolver;
         let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
             .expect("expected command build to succeed");
-        assert!(commands.iter().any(|command| {
-            command.program == "iptables"
-                && command.args
-                    == vec![
-                        "-A".to_string(),
-                        CHAIN_NAME.to_string(),
-                        "-s".to_string(),
-                        "172.18.0.0/16".to_string(),
-                        "-j".to_string(),
-                        "DROP".to_string(),
-                    ]
-        }));
+        assert!(
+            commands
+                .iter()
+                .map(command_to_line)
+                .any(|line| line == "-A PORTCULLIS_EGRESS -s 172.18.0.0/16 -j DROP")
+        );
     }
 
     #[test]
@@ -1115,41 +1169,19 @@ COMMIT
         let commands =
             build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, CHAIN_NAME)
                 .expect("expected command build to succeed");
-        assert!(commands.iter().any(|command| {
-            command.program == "iptables"
-                && command.args
-                    == vec![
-                        "-A".to_string(),
-                        CHAIN_NAME.to_string(),
-                        "-s".to_string(),
-                        "172.18.0.2/32".to_string(),
-                        "-d".to_string(),
-                        "172.18.0.1/32".to_string(),
-                        "-p".to_string(),
-                        "udp".to_string(),
-                        "--dport".to_string(),
-                        "53".to_string(),
-                        "-j".to_string(),
-                        "ACCEPT".to_string(),
-                    ]
-        }));
-        assert!(commands.iter().any(|command| {
-            command.program == "iptables"
-                && command.args
-                    == vec![
-                        "-A".to_string(),
-                        CHAIN_NAME.to_string(),
-                        "-s".to_string(),
-                        "172.18.0.2/32".to_string(),
-                        "-d".to_string(),
-                        "172.18.0.1/32".to_string(),
-                        "-p".to_string(),
-                        "tcp".to_string(),
-                        "--dport".to_string(),
-                        "53".to_string(),
-                        "-j".to_string(),
-                        "ACCEPT".to_string(),
-                    ]
-        }));
+        assert!(commands
+            .iter()
+            .map(command_to_line)
+            .any(|line| {
+                line
+                    == "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p udp --dport 53 -j ACCEPT"
+            }));
+        assert!(commands
+            .iter()
+            .map(command_to_line)
+            .any(|line| {
+                line
+                    == "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p tcp --dport 53 -j ACCEPT"
+            }));
     }
 }
