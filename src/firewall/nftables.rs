@@ -6,8 +6,7 @@ use std::sync::Mutex;
 
 use super::FirewallError;
 use crate::dns::{DnsProxyCache, UpstreamResolver};
-use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeSnapshot};
-use crate::monitor::RuntimeState;
+use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeState};
 use tracing::{info, trace, warn};
 
 pub const TABLE_FAMILY: &str = "inet";
@@ -100,7 +99,7 @@ fn is_missing_table_error(error: &FirewallError) -> bool {
 
 #[must_use]
 #[cfg(test)]
-pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
+pub fn build_apply_commands(snapshot: &RuntimeState) -> Vec<String> {
     let mut lines = vec![
         format!("add table {TABLE_FAMILY} {TABLE_NAME}"),
         format!(
@@ -111,13 +110,8 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
     let managed_sources = collect_managed_sources(snapshot);
     let container_targets = collect_container_targets(snapshot);
 
-    for container in &snapshot.containers {
+    for container in snapshot.containers.values() {
         let policy = &container.policy;
-
-        if !policy.enabled {
-            continue;
-        }
-
         for attachment in &container.attachments {
             let gateway = network_gateway(snapshot, &attachment.network_id);
             append_dns_policy_rules(
@@ -166,29 +160,20 @@ pub fn build_apply_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
         }
     }
 
-    append_enforced_network_baseline_drop_rules(&mut lines, &snapshot.enforced_network_subnets);
+    append_enforced_network_baseline_drop_rules(&mut lines, &snapshot.network_subnets());
 
     lines
 }
 
 #[must_use]
 #[cfg(test)]
-pub fn build_refresh_commands(snapshot: &RuntimeSnapshot) -> Vec<String> {
-    let mut commands = build_apply_commands(snapshot);
-    commands.remove(0);
-    commands.insert(0, format!("flush table {TABLE_FAMILY} {TABLE_NAME}"));
-    commands
-}
-
-#[must_use]
-#[cfg(test)]
-pub fn build_apply_script(snapshot: &RuntimeSnapshot) -> String {
+pub fn build_apply_script(snapshot: &RuntimeState) -> String {
     build_apply_commands(snapshot).join("\n")
 }
 
 #[allow(clippy::too_many_lines)]
 pub fn build_apply_commands_with_dns(
-    snapshot: &RuntimeSnapshot,
+    snapshot: &RuntimeState,
     resolver: &mut DnsProxyCache<impl UpstreamResolver>,
 ) -> Result<Vec<String>, FirewallError> {
     let mut lines = vec![
@@ -201,13 +186,8 @@ pub fn build_apply_commands_with_dns(
     let managed_sources = collect_managed_sources(snapshot);
     let container_targets = collect_container_targets(snapshot);
 
-    for container in &snapshot.containers {
+    for container in snapshot.containers.values() {
         let policy = &container.policy;
-
-        if !policy.enabled {
-            continue;
-        }
-
         for attachment in &container.attachments {
             let gateway = network_gateway(snapshot, &attachment.network_id);
             append_dns_policy_rules(
@@ -315,14 +295,14 @@ pub fn build_apply_commands_with_dns(
         }
     }
 
-    append_enforced_network_baseline_drop_rules(&mut lines, &snapshot.enforced_network_subnets);
+    append_enforced_network_baseline_drop_rules(&mut lines, &snapshot.network_subnets());
 
     Ok(lines)
 }
 
 #[allow(clippy::too_many_lines)]
 pub fn build_refresh_commands_with_dns(
-    snapshot: &RuntimeSnapshot,
+    snapshot: &RuntimeState,
     resolver: &mut DnsProxyCache<impl UpstreamResolver>,
 ) -> Result<Vec<String>, FirewallError> {
     let mut commands = build_apply_commands_with_dns(snapshot, resolver)?;
@@ -334,7 +314,7 @@ pub fn build_refresh_commands_with_dns(
 #[allow(clippy::too_many_lines)]
 #[cfg(test)]
 pub fn build_apply_script_with_dns(
-    snapshot: &RuntimeSnapshot,
+    snapshot: &RuntimeState,
     resolver: &mut DnsProxyCache<impl UpstreamResolver>,
 ) -> Result<String, FirewallError> {
     Ok(build_apply_commands_with_dns(snapshot, resolver)?.join("\n"))
@@ -351,17 +331,11 @@ struct ManagedSources {
     ipv6: Vec<String>,
 }
 
-fn collect_managed_sources(snapshot: &RuntimeSnapshot) -> ManagedSources {
+fn collect_managed_sources(snapshot: &RuntimeState) -> ManagedSources {
     let mut ipv4 = Vec::new();
     let mut ipv6 = Vec::new();
 
-    for container in &snapshot.containers {
-        let policy = &container.policy;
-
-        if !policy.enabled {
-            continue;
-        }
-
+    for container in snapshot.containers.values() {
         for attachment in &container.attachments {
             match attachment.ip_address {
                 IpAddr::V4(value) => ipv4.push(value.to_string()),
@@ -378,10 +352,10 @@ fn collect_managed_sources(snapshot: &RuntimeSnapshot) -> ManagedSources {
     ManagedSources { ipv4, ipv6 }
 }
 
-fn collect_container_targets(snapshot: &RuntimeSnapshot) -> HashMap<String, Vec<IpAddr>> {
+fn collect_container_targets(snapshot: &RuntimeState) -> HashMap<String, Vec<IpAddr>> {
     let mut by_key: HashMap<String, BTreeSet<IpAddr>> = HashMap::new();
 
-    for container in &snapshot.containers {
+    for container in snapshot.containers.values() {
         let mut keys = vec![container.id.to_string(), container.name.clone()];
         for attachment in &container.attachments {
             for alias in &attachment.aliases {
@@ -566,7 +540,7 @@ fn append_enforced_network_baseline_drop_rules(lines: &mut Vec<String>, subnets:
     }
 }
 
-fn network_gateway(snapshot: &RuntimeSnapshot, network_id: &NetworkId) -> Option<IpAddr> {
+fn network_gateway(snapshot: &RuntimeState, network_id: &NetworkId) -> Option<IpAddr> {
     snapshot
         .networks
         .get(network_id)
@@ -651,7 +625,7 @@ mod common_tests {
         }
     }
 
-    fn snapshot_with_hostname_rule() -> RuntimeSnapshot {
+    fn state_with_hostname_rule() -> RuntimeState {
         let source_ip: IpAddr = match "172.18.0.2".parse() {
             Ok(value) => value,
             Err(error) => panic!("failed to parse source ip: {error}"),
@@ -661,30 +635,34 @@ mod common_tests {
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
 
-        RuntimeSnapshot {
-            containers: vec![Container {
-                id: "abc".into(),
-                name: "web".to_string(),
-                attachments: vec![NetworkAttachment {
-                    network_id: "net0".into(),
-                    ip_address: source_ip,
-                    aliases: vec!["web".to_string()],
-                }],
-                runtime_dns_servers: HashSet::new(),
-                policy: ContainerPolicy {
-                    enabled: true,
-                    icc_mode: crate::model::IccMode::Allow,
-                    egress: vec![EgressRule {
-                        target: crate::model::EgressTarget::Hostname("api.example.com".to_string()),
-                        ports: vec![PortSpec {
-                            protocol: Protocol::Tcp,
-                            port: 443,
-                        }],
+        RuntimeState {
+            containers: HashMap::from([(
+                "abc".into(),
+                Container {
+                    id: "abc".into(),
+                    name: "web".to_string(),
+                    attachments: vec![NetworkAttachment {
+                        network_id: "net0".into(),
+                        ip_address: source_ip,
+                        aliases: vec!["web".to_string()],
                     }],
-                    icc_allow: Vec::new(),
-                    dns_targets: vec![crate::model::DnsTarget::Docker],
+                    runtime_dns_servers: HashSet::new(),
+                    policy: ContainerPolicy {
+                        icc_mode: crate::model::IccMode::Allow,
+                        egress: vec![EgressRule {
+                            target: crate::model::EgressTarget::Hostname(
+                                "api.example.com".to_string(),
+                            ),
+                            ports: vec![PortSpec {
+                                protocol: Protocol::Tcp,
+                                port: 443,
+                            }],
+                        }],
+                        icc_allow: Vec::new(),
+                        dns_targets: vec![crate::model::DnsTarget::Docker],
+                    },
                 },
-            }],
+            )]),
             networks: HashMap::from([(
                 "net0".into(),
                 NetworkSnapshot {
@@ -692,17 +670,15 @@ mod common_tests {
                     name: "bridge".to_string(),
                     subnet,
                     gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                    enforced: false,
                 },
             )]),
-            enforced_network_subnets: Vec::new(),
         }
     }
 
     #[test]
     fn build_apply_script_with_dns_adds_sets_and_rules() {
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
-        let script = build_apply_script_with_dns(&snapshot_with_hostname_rule(), &mut resolver);
+        let script = build_apply_script_with_dns(&state_with_hostname_rule(), &mut resolver);
         assert!(script.is_ok());
         let value = match script {
             Ok(content) => content,
@@ -716,35 +692,53 @@ mod common_tests {
     #[test]
     fn build_apply_script_with_dns_reports_resolve_error() {
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
-        let mut snapshot = snapshot_with_hostname_rule();
-        snapshot.containers[0].policy.egress[0].target =
-            crate::model::EgressTarget::Hostname("bad.example.com".to_string());
+        let mut state = state_with_hostname_rule();
+        state
+            .containers
+            .get_mut("abc")
+            .expect("abc fixture container should exist")
+            .policy
+            .egress[0]
+            .target = crate::model::EgressTarget::Hostname("bad.example.com".to_string());
 
-        let script = build_apply_script_with_dns(&snapshot, &mut resolver);
+        let script = build_apply_script_with_dns(&state, &mut resolver);
         assert!(matches!(script, Err(FirewallError::DnsResolve { .. })));
     }
 
     #[test]
     fn build_apply_script_with_icc_allowlisted_alias_target() {
-        let mut snapshot = snapshot_with_hostname_rule();
+        let mut state = state_with_hostname_rule();
         let peer_ip: IpAddr = match "172.18.0.10".parse() {
             Ok(value) => value,
             Err(error) => panic!("failed to parse peer ip: {error}"),
         };
-        snapshot.containers.push(Container {
-            id: "peer".into(),
-            name: "/peer".to_string(),
-            attachments: vec![NetworkAttachment {
-                network_id: "net0".into(),
-                ip_address: peer_ip,
-                aliases: vec!["db".to_string()],
-            }],
-            runtime_dns_servers: HashSet::new(),
-            policy: crate::model::ContainerPolicy::default(),
-        });
+        state.containers.insert(
+            "peer".into(),
+            Container {
+                id: "peer".into(),
+                name: "/peer".to_string(),
+                attachments: vec![NetworkAttachment {
+                    network_id: "net0".into(),
+                    ip_address: peer_ip,
+                    aliases: vec!["db".to_string()],
+                }],
+                runtime_dns_servers: HashSet::new(),
+                policy: crate::model::ContainerPolicy::default(),
+            },
+        );
 
-        snapshot.containers[0].policy.icc_mode = crate::model::IccMode::AllowListed;
-        snapshot.containers[0].policy.icc_allow = vec![crate::model::IccAllowRule {
+        state
+            .containers
+            .get_mut("abc")
+            .expect("abc fixture container should exist")
+            .policy
+            .icc_mode = crate::model::IccMode::AllowListed;
+        state
+            .containers
+            .get_mut("abc")
+            .expect("abc fixture container should exist")
+            .policy
+            .icc_allow = vec![crate::model::IccAllowRule {
             target_container: "db".into(),
             ports: vec![PortSpec {
                 protocol: Protocol::Tcp,
@@ -752,31 +746,25 @@ mod common_tests {
             }],
         }];
 
-        let script = build_apply_script(&snapshot);
+        let script = build_apply_script(&state);
         assert!(script.contains("ip daddr 172.18.0.10 tcp dport 5432 accept"));
     }
 
     #[test]
     fn build_apply_script_uses_pre_docker_forward_priority() {
-        let script = build_apply_script(&snapshot_with_hostname_rule());
+        let script = build_apply_script(&state_with_hostname_rule());
         assert!(script.contains("hook forward priority -1"));
     }
 
     #[test]
     fn build_apply_script_adds_baseline_drop_for_enforced_network() {
-        let mut snapshot = snapshot_with_hostname_rule();
-        snapshot.enforced_network_subnets.push(
-            "172.18.0.0/16"
-                .parse()
-                .expect("subnet fixture should parse"),
-        );
-        let script = build_apply_script(&snapshot);
+        let script = build_apply_script(&state_with_hostname_rule());
         assert!(script.contains("ip saddr 172.18.0.0/16 drop"));
     }
 
     #[test]
     fn build_apply_script_adds_dns_allows_for_network_gateway() {
-        let script = build_apply_script(&snapshot_with_hostname_rule());
+        let script = build_apply_script(&state_with_hostname_rule());
         assert!(script.contains("ip daddr 172.18.0.1 udp dport 53 accept"));
         assert!(script.contains("ip daddr 172.18.0.1 tcp dport 53 accept"));
     }
@@ -1212,7 +1200,7 @@ mod firewall_tests {
         }
     }
 
-    fn sample_snapshot() -> RuntimeSnapshot {
+    fn sample_state() -> RuntimeState {
         let attachment_ip: std::net::IpAddr = match "172.18.0.2".parse() {
             Ok(value) => value,
             Err(error) => panic!("failed to parse attachment ip in fixture: {error}"),
@@ -1226,30 +1214,32 @@ mod firewall_tests {
             Err(error) => panic!("failed to parse destination cidr in fixture: {error}"),
         };
 
-        RuntimeSnapshot {
-            containers: vec![Container {
-                id: "abc".into(),
-                name: "web".to_string(),
-                attachments: vec![NetworkAttachment {
-                    network_id: "net0".into(),
-                    ip_address: attachment_ip,
-                    aliases: vec!["web".to_string()],
-                }],
-                runtime_dns_servers: HashSet::new(),
-                policy: ContainerPolicy {
-                    enabled: true,
-                    icc_mode: IccMode::Deny,
-                    egress: vec![EgressRule {
-                        target: EgressTarget::IpCidr(dst_cidr),
-                        ports: vec![PortSpec {
-                            protocol: Protocol::Tcp,
-                            port: 443,
-                        }],
+        RuntimeState {
+            containers: HashMap::from([(
+                "abc".into(),
+                Container {
+                    id: "abc".into(),
+                    name: "web".to_string(),
+                    attachments: vec![NetworkAttachment {
+                        network_id: "net0".into(),
+                        ip_address: attachment_ip,
+                        aliases: vec!["web".to_string()],
                     }],
-                    icc_allow: Vec::new(),
-                    dns_targets: vec![crate::model::DnsTarget::Docker],
+                    runtime_dns_servers: HashSet::new(),
+                    policy: ContainerPolicy {
+                        icc_mode: IccMode::Deny,
+                        egress: vec![EgressRule {
+                            target: EgressTarget::IpCidr(dst_cidr),
+                            ports: vec![PortSpec {
+                                protocol: Protocol::Tcp,
+                                port: 443,
+                            }],
+                        }],
+                        icc_allow: Vec::new(),
+                        dns_targets: vec![crate::model::DnsTarget::Docker],
+                    },
                 },
-            }],
+            )]),
             networks: HashMap::from([(
                 "net0".into(),
                 NetworkSnapshot {
@@ -1257,10 +1247,8 @@ mod firewall_tests {
                     name: "bridge".to_string(),
                     subnet,
                     gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                    enforced: false,
                 },
             )]),
-            enforced_network_subnets: Vec::new(),
         }
     }
 
@@ -1268,14 +1256,14 @@ mod firewall_tests {
     fn apply_uses_refresh_commands() {
         let runner = RecordingRunner::new();
         let firewall = NftablesFirewall::new(runner.clone());
-        let snapshot = sample_snapshot();
+        let state = sample_state();
         let mut resolver = DnsProxyCache::new(
             super::common_tests::MockResolver,
             Duration::from_secs(300),
             128,
         );
 
-        let result = firewall.apply(&snapshot, &mut resolver);
+        let result = firewall.apply(&state, &mut resolver);
         assert!(result.is_ok());
 
         let scripts = runner.scripts();

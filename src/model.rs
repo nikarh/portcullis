@@ -121,7 +121,6 @@ pub enum DnsTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerPolicy {
-    pub enabled: bool,
     pub icc_mode: IccMode,
     pub egress: Vec<EgressRule>,
     pub icc_allow: Vec<IccAllowRule>,
@@ -131,7 +130,6 @@ pub struct ContainerPolicy {
 impl Default for ContainerPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
             icc_mode: IccMode::Allow,
             egress: Vec::new(),
             icc_allow: Vec::new(),
@@ -153,7 +151,6 @@ pub struct NetworkSnapshot {
     pub name: String,
     pub subnet: IpNet,
     pub gateway: Option<IpAddr>,
-    pub enforced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,9 +162,111 @@ pub struct Container {
     pub policy: ContainerPolicy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeSnapshot {
-    pub containers: Vec<Container>,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeState {
+    pub containers: HashMap<ContainerId, Container>,
     pub networks: HashMap<NetworkId, NetworkSnapshot>,
-    pub enforced_network_subnets: Vec<IpNet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeStateAction {
+    CreateContainer {
+        container: Box<Container>,
+    },
+    RenameContainer {
+        container_id: ContainerId,
+        name: String,
+    },
+    RemoveContainer {
+        container_id: ContainerId,
+    },
+    RemoveContainerAttachment {
+        container_id: ContainerId,
+        network_id: NetworkId,
+    },
+    UpsertNetwork {
+        network_id: NetworkId,
+        network_name: String,
+        subnet: IpNet,
+        gateway: Option<IpAddr>,
+    },
+    RemoveNetwork {
+        network_id: NetworkId,
+    },
+}
+
+impl RuntimeState {
+    fn remove_network(&mut self, network_id: &NetworkId) -> bool {
+        let mut changed = self.networks.remove(network_id).is_some();
+        for container in self.containers.values_mut() {
+            let previous_len = container.attachments.len();
+            container
+                .attachments
+                .retain(|attachment| &attachment.network_id != network_id);
+            if container.attachments.len() != previous_len {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn apply_action(&mut self, action: RuntimeStateAction) -> bool {
+        match action {
+            RuntimeStateAction::CreateContainer { container } => {
+                let container_id = container.id.clone();
+                self.containers.insert(container_id, *container);
+                true
+            }
+            RuntimeStateAction::RenameContainer { container_id, name } => {
+                if let Some(container) = self.containers.get_mut(&container_id) {
+                    container.name = name;
+                    return true;
+                }
+                false
+            }
+            RuntimeStateAction::RemoveContainer { container_id } => self
+                .containers
+                .remove(&container_id)
+                .is_some_and(|container| !container.attachments.is_empty()),
+            RuntimeStateAction::RemoveContainerAttachment {
+                container_id,
+                network_id,
+            } => {
+                if let Some(container) = self.containers.get_mut(&container_id) {
+                    let previous_len = container.attachments.len();
+                    container
+                        .attachments
+                        .retain(|attachment| attachment.network_id != network_id);
+                    return container.attachments.len() != previous_len;
+                }
+                false
+            }
+            RuntimeStateAction::UpsertNetwork {
+                network_id,
+                network_name,
+                subnet,
+                gateway,
+            } => {
+                self.networks.insert(
+                    network_id.clone(),
+                    NetworkSnapshot {
+                        id: network_id,
+                        name: network_name,
+                        subnet,
+                        gateway,
+                    },
+                );
+                true
+            }
+            RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
+        }
+    }
+
+    #[must_use]
+    pub fn network_subnets(&self) -> Vec<IpNet> {
+        self.networks
+            .values()
+            .map(|network| network.subnet)
+            .collect()
+    }
 }

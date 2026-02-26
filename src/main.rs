@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use pico_args::Arguments;
 use thiserror::Error;
-use tracing::{debug, error, info, trace};
+use tracing::{error, info, trace};
 
 use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
 use crate::docker::{
@@ -161,7 +161,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         "portcullis prototype started"
     );
 
-    let monitor_client = DockerClient::connect(&config.docker_socket)?;
+    let mut monitor_client = DockerClient::connect(&config.docker_socket)?;
 
     let selected_backend = match config.firewall_backend {
         FirewallBackend::Auto => match monitor_client.firewall_backend()? {
@@ -198,7 +198,6 @@ fn run(config: &Config) -> Result<(), MainError> {
     })
     .map_err(|error| MainError::SignalHandler(error.to_string()))?;
 
-    let mut tracker = RuntimeChangeTracker::new();
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.collect_state()?;
 

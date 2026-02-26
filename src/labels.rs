@@ -8,7 +8,6 @@ use crate::model::{
     ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode, PortSpec, Protocol,
 };
 
-const ENABLE_LABEL: &str = "portcullis.enable";
 const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
 const ICC_ALLOW_PREFIX: &str = "portcullis.icc.allow.";
@@ -16,8 +15,6 @@ const DNS_PREFIX: &str = "portcullis.dns.";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LabelParseError {
-    #[error("invalid boolean value for {0}: {1}")]
-    InvalidBool(String, String),
     #[error("invalid ICC mode value: {0}")]
     InvalidIccMode(String),
     #[error("invalid egress value for {0}: {1}")]
@@ -39,21 +36,6 @@ pub enum LabelParseError {
 }
 
 pub fn parse_policy(labels: &IndexMap<String, String>) -> Result<ContainerPolicy, LabelParseError> {
-    let enabled = match labels.get(ENABLE_LABEL) {
-        None => false,
-        Some(value) => parse_bool(ENABLE_LABEL, value)?,
-    };
-
-    if !enabled {
-        return Ok(ContainerPolicy {
-            enabled: false,
-            icc_mode: IccMode::Allow,
-            egress: Vec::new(),
-            icc_allow: Vec::new(),
-            dns_targets: vec![DnsTarget::Docker],
-        });
-    }
-
     let icc_mode = match labels.get(ICC_MODE_LABEL) {
         None => IccMode::Allow,
         Some(mode) => parse_icc_mode(mode)?,
@@ -78,7 +60,6 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> Result<ContainerPolicy
     }
 
     Ok(ContainerPolicy {
-        enabled,
         icc_mode,
         egress,
         icc_allow,
@@ -103,17 +84,6 @@ fn parse_dns_target(key: &str, value: &str) -> Result<DnsTarget, LabelParseError
                 value.to_string(),
             ))
         }
-    }
-}
-
-fn parse_bool(key: &str, value: &str) -> Result<bool, LabelParseError> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(LabelParseError::InvalidBool(
-            key.to_string(),
-            value.to_string(),
-        )),
     }
 }
 
@@ -260,10 +230,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_policy_returns_disabled_when_not_enabled() {
+    fn parse_policy_parses_rules_without_enable_label() {
         let parsed = parse_policy(&labels(&[("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443")]))
             .expect("parser should not fail");
-        assert!(!parsed.enabled);
+        assert_eq!(parsed.icc_mode, IccMode::Allow);
+        assert_eq!(parsed.egress.len(), 1);
     }
 
     #[test]
@@ -306,17 +277,6 @@ mod tests {
 
         assert_eq!(parsed.icc_mode, IccMode::Allow);
         assert!(parsed.icc_allow.is_empty());
-    }
-
-    #[test]
-    fn parse_policy_rejects_invalid_enable_bool() {
-        let error = parse_policy(&labels(&[("portcullis.enable", "yes")]))
-            .expect_err("invalid bool should be rejected");
-
-        assert_eq!(
-            error,
-            LabelParseError::InvalidBool("portcullis.enable".to_string(), "yes".to_string())
-        );
     }
 
     #[test]

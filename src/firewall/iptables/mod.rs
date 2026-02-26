@@ -9,8 +9,7 @@ use std::process::{Command, Output, Stdio};
 use tracing::{info, trace};
 
 use crate::dns::{DnsProxyCache, UpstreamResolver};
-use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeSnapshot};
-use crate::monitor::RuntimeState;
+use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeState};
 use commands::{CommandBuffer, IpsetCommand, IptablesCommand, Ipv4Destination};
 
 use super::FirewallError;
@@ -196,7 +195,7 @@ impl IptablesFirewall<CommandIptablesRunner> {
 }
 
 fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
-    snapshot: &RuntimeSnapshot,
+    state: &RuntimeState,
     resolver: &mut DnsProxyCache<Dns>,
     use_ipset: bool,
     chain_name: &'a str,
@@ -207,21 +206,17 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
         .iptables
         .push(IptablesCommand::FlushChain { chain: chain_name });
 
-    let managed_ipv4 = collect_managed_ipv4(snapshot);
-    let container_targets = collect_container_targets(snapshot);
+    let managed_ipv4 = collect_managed_ipv4(state);
+    let container_targets = collect_container_targets(state);
 
-    for container in &snapshot.containers {
+    for container in state.containers.values() {
         let policy = &container.policy;
-
-        if !policy.enabled {
-            continue;
-        }
 
         for attachment in &container.attachments {
             let IpAddr::V4(source_ipv4) = attachment.ip_address else {
                 continue;
             };
-            let gateway = network_gateway(snapshot, &attachment.network_id);
+            let gateway = network_gateway(state, &attachment.network_id);
             append_implicit_dns_allow_commands(
                 &mut commands,
                 chain_name,
@@ -275,11 +270,7 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
             append_default_drop_command(&mut commands, chain_name, source_ipv4);
         }
     }
-    append_enforced_network_drop_commands(
-        &mut commands,
-        chain_name,
-        &snapshot.enforced_network_subnets,
-    );
+    append_enforced_network_drop_commands(&mut commands, chain_name, &state.network_subnets());
 
     Ok(commands)
 }
@@ -404,14 +395,9 @@ fn append_default_drop_command<'a>(
     });
 }
 
-fn collect_managed_ipv4(snapshot: &RuntimeSnapshot) -> Vec<Ipv4Addr> {
+fn collect_managed_ipv4(state: &RuntimeState) -> Vec<Ipv4Addr> {
     let mut values = BTreeSet::new();
-    for container in &snapshot.containers {
-        let policy = &container.policy;
-        if !policy.enabled {
-            continue;
-        }
-
+    for container in state.containers.values() {
         for attachment in &container.attachments {
             if let IpAddr::V4(value) = attachment.ip_address {
                 values.insert(value);
@@ -422,8 +408,8 @@ fn collect_managed_ipv4(snapshot: &RuntimeSnapshot) -> Vec<Ipv4Addr> {
     values.into_iter().collect()
 }
 
-fn network_gateway(snapshot: &RuntimeSnapshot, network_id: &NetworkId) -> Option<IpAddr> {
-    snapshot
+fn network_gateway(state: &RuntimeState, network_id: &NetworkId) -> Option<IpAddr> {
+    state
         .networks
         .get(network_id)
         .and_then(|network| network.gateway)
@@ -528,10 +514,10 @@ fn append_icc_allow_list_commands<'a>(
     }
 }
 
-fn collect_container_targets(snapshot: &RuntimeSnapshot) -> HashMap<String, Vec<Ipv4Addr>> {
+fn collect_container_targets(state: &RuntimeState) -> HashMap<String, Vec<Ipv4Addr>> {
     let mut by_key: HashMap<String, BTreeSet<Ipv4Addr>> = HashMap::new();
 
-    for container in &snapshot.containers {
+    for container in state.containers.values() {
         let mut keys = vec![container.id.to_string(), container.name.clone()];
         for attachment in &container.attachments {
             for alias in &attachment.aliases {
@@ -654,7 +640,7 @@ mod tests {
         }
     }
 
-    fn sample_snapshot() -> RuntimeSnapshot {
+    fn sample_state() -> RuntimeState {
         let source_ip: IpAddr = match "172.18.0.2".parse() {
             Ok(value) => value,
             Err(error) => panic!("failed to parse source ip: {error}"),
@@ -664,30 +650,32 @@ mod tests {
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
 
-        RuntimeSnapshot {
-            containers: vec![Container {
-                id: "abc".into(),
-                name: "web".to_string(),
-                attachments: vec![NetworkAttachment {
-                    network_id: "net0".into(),
-                    ip_address: source_ip,
-                    aliases: vec!["web".to_string(), "app".to_string()],
-                }],
-                runtime_dns_servers: HashSet::new(),
-                policy: ContainerPolicy {
-                    enabled: true,
-                    icc_mode: IccMode::Allow,
-                    egress: vec![EgressRule {
-                        target: EgressTarget::Hostname("api.example.com".to_string()),
-                        ports: vec![PortSpec {
-                            protocol: Protocol::Tcp,
-                            port: 443,
-                        }],
+        RuntimeState {
+            containers: HashMap::from([(
+                "abc".into(),
+                Container {
+                    id: "abc".into(),
+                    name: "web".to_string(),
+                    attachments: vec![NetworkAttachment {
+                        network_id: "net0".into(),
+                        ip_address: source_ip,
+                        aliases: vec!["web".to_string(), "app".to_string()],
                     }],
-                    icc_allow: Vec::new(),
-                    dns_targets: vec![crate::model::DnsTarget::Docker],
+                    runtime_dns_servers: HashSet::new(),
+                    policy: ContainerPolicy {
+                        icc_mode: IccMode::Allow,
+                        egress: vec![EgressRule {
+                            target: EgressTarget::Hostname("api.example.com".to_string()),
+                            ports: vec![PortSpec {
+                                protocol: Protocol::Tcp,
+                                port: 443,
+                            }],
+                        }],
+                        icc_allow: Vec::new(),
+                        dns_targets: vec![crate::model::DnsTarget::Docker],
+                    },
                 },
-            }],
+            )]),
             networks: HashMap::from([(
                 "net0".into(),
                 NetworkSnapshot {
@@ -695,10 +683,8 @@ mod tests {
                     name: "bridge".to_string(),
                     subnet,
                     gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                    enforced: false,
                 },
             )]),
-            enforced_network_subnets: Vec::new(),
         }
     }
 
@@ -706,7 +692,7 @@ mod tests {
     fn build_commands_includes_iptables_for_hostname_without_ipset() {
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands =
-            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, CHAIN_NAME);
+            build_apply_commands_with_dns(&sample_state(), &mut resolver, false, CHAIN_NAME);
         assert!(commands.is_ok());
         let value = match commands {
             Ok(items) => items,
@@ -728,7 +714,7 @@ mod tests {
 
     #[test]
     fn build_commands_include_icc_allowlisted_alias_target() {
-        let mut snapshot = sample_snapshot();
+        let mut state = sample_state();
         let peer_ip: IpAddr = match "172.18.0.10".parse() {
             Ok(value) => value,
             Err(error) => panic!("failed to parse peer ip: {error}"),
@@ -737,29 +723,41 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
-        snapshot.containers.push(Container {
-            id: "peer".into(),
-            name: "/peer".to_string(),
-            attachments: vec![NetworkAttachment {
-                network_id: "net0".into(),
-                ip_address: peer_ip,
-                aliases: vec!["db".to_string()],
-            }],
-            runtime_dns_servers: HashSet::new(),
-            policy: crate::model::ContainerPolicy::default(),
-        });
-        snapshot.networks.insert(
+        state.containers.insert(
+            "peer".into(),
+            Container {
+                id: "peer".into(),
+                name: "/peer".to_string(),
+                attachments: vec![NetworkAttachment {
+                    network_id: "net0".into(),
+                    ip_address: peer_ip,
+                    aliases: vec!["db".to_string()],
+                }],
+                runtime_dns_servers: HashSet::new(),
+                policy: crate::model::ContainerPolicy::default(),
+            },
+        );
+        state.networks.insert(
             "net0".into(),
             NetworkSnapshot {
                 id: "net0".into(),
                 name: "bridge".to_string(),
                 subnet,
                 gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                enforced: false,
             },
         );
-        snapshot.containers[0].policy.icc_mode = IccMode::AllowListed;
-        snapshot.containers[0].policy.icc_allow = vec![crate::model::IccAllowRule {
+        state
+            .containers
+            .get_mut("abc")
+            .expect("abc fixture container should exist")
+            .policy
+            .icc_mode = IccMode::AllowListed;
+        state
+            .containers
+            .get_mut("abc")
+            .expect("abc fixture container should exist")
+            .policy
+            .icc_allow = vec![crate::model::IccAllowRule {
             target_container: "db".into(),
             ports: vec![PortSpec {
                 protocol: Protocol::Tcp,
@@ -768,7 +766,7 @@ mod tests {
         }];
 
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
-        let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
+        let commands = build_apply_commands_with_dns(&state, &mut resolver, false, CHAIN_NAME)
             .expect("expected command build to succeed");
         assert!(
             commands
@@ -785,7 +783,7 @@ mod tests {
     fn build_commands_target_supplied_chain_name() {
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands =
-            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, "MYCHAIN")
+            build_apply_commands_with_dns(&sample_state(), &mut resolver, false, "MYCHAIN")
                 .expect("commands");
         assert!(
             commands
@@ -912,7 +910,7 @@ COMMIT
     fn build_commands_includes_ipset_for_hostname_with_ipset() {
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands =
-            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, true, CHAIN_NAME)
+            build_apply_commands_with_dns(&sample_state(), &mut resolver, true, CHAIN_NAME)
                 .expect("expected command build to succeed");
         assert!(
             commands
@@ -931,14 +929,9 @@ COMMIT
 
     #[test]
     fn build_commands_adds_baseline_drop_for_enforced_network() {
-        let mut snapshot = sample_snapshot();
-        snapshot.enforced_network_subnets.push(
-            "172.18.0.0/16"
-                .parse()
-                .expect("subnet fixture should parse"),
-        );
+        let state = sample_state();
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
-        let commands = build_apply_commands_with_dns(&snapshot, &mut resolver, false, CHAIN_NAME)
+        let commands = build_apply_commands_with_dns(&state, &mut resolver, false, CHAIN_NAME)
             .expect("expected command build to succeed");
         assert!(
             commands
@@ -953,7 +946,7 @@ COMMIT
     fn build_commands_adds_dns_allows_for_gateway_by_default() {
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands =
-            build_apply_commands_with_dns(&sample_snapshot(), &mut resolver, false, CHAIN_NAME)
+            build_apply_commands_with_dns(&sample_state(), &mut resolver, false, CHAIN_NAME)
                 .expect("expected command build to succeed");
         assert!(commands
             .iptables

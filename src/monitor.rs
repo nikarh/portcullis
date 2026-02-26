@@ -1,19 +1,19 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use ipnet::IpNet;
 use thiserror::Error;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::docker::raw::{
     DockerContainerInspect, DockerContainerSummary, DockerContainerSummaryEndpoint, DockerEndpoint,
     DockerHostConfig, DockerNetworkInspect,
 };
-use crate::docker::{
-    DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind, DockerFirewallBackend,
-};
+use crate::docker::{DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind};
 use crate::labels::{LabelParseError, parse_policy};
-use crate::model::{Container, ContainerId, NetworkAttachment, NetworkId, RuntimeSnapshot};
+use crate::model::{
+    Container, NetworkAttachment, NetworkId, NetworkSnapshot, RuntimeState, RuntimeStateAction,
+};
 
 #[derive(Debug, Error)]
 pub enum MonitorError {
@@ -26,8 +26,6 @@ pub enum MonitorError {
     },
     #[error("missing subnet for network id: {0}")]
     MissingNetworkSubnet(String),
-    #[error("missing gateway for network id: {0}")]
-    MissingNetworkGateway(String),
     #[error("invalid subnet in network id {network_id}: {subnet}")]
     InvalidNetworkSubnet { network_id: String, subnet: String },
     #[error("invalid gateway in network id {network_id}: {gateway}")]
@@ -42,146 +40,38 @@ pub enum MonitorError {
     LabelParse(#[from] LabelParseError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Network {
-    pub name: String,
-    pub subnet: IpNet,
-    pub gateway: IpAddr,
-}
-
-impl Network {
-    fn try_new(network: &DockerNetworkInspect) -> Result<Option<Self>, MonitorError> {
-        // Ignore non-bridge networks
-        if !network.driver.is_bridge() {
-            debug!(
-                network_id = %network.id,
-                network_name = %network.name,
-                driver = ?network.driver,
-                "ignoring unsupported docker network driver"
-            );
-            return Ok(None);
-        }
-
-        // Ignore non-portcullis networks
-        if !is_portcullis_network_enforced(&network)? {
-            debug!(
-                network_id = %network.id,
-                network_name = %network.name,
-                "ignoring non-portcullis network"
-            );
-            return Ok(None);
-        }
-
-        let (subnet, gateway) = network_primary_config(&network)?;
-
-        Ok(Some(Self {
-            name: network.name.clone(),
-            subnet,
-            gateway,
-        }))
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeState {
-    containers: HashMap<ContainerId, Container>,
-    networks: HashMap<NetworkId, Network>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeStateAction {
-    CreateContainer {
-        container: Box<Container>,
-    },
-    RenameContainer {
-        container_id: ContainerId,
-        name: String,
-    },
-    RemoveContainer {
-        container_id: ContainerId,
-    },
-    RemoveContainerAttachment {
-        container_id: ContainerId,
-        network_id: NetworkId,
-    },
-    UpsertNetwork {
-        network_id: NetworkId,
-        network_name: String,
-        subnet: IpNet,
-        gateway: IpAddr,
-    },
-    RemoveNetwork {
-        network_id: NetworkId,
-    },
-}
-
-impl RuntimeState {
-    fn remove_network(&mut self, network_id: &NetworkId) -> bool {
-        let mut changed = self.networks.remove(network_id).is_some();
-        for container in self.containers.values_mut() {
-            let previous_len = container.attachments.len();
-            container
-                .attachments
-                .retain(|attachment| &attachment.network_id != network_id);
-            if container.attachments.len() != previous_len {
-                changed = true;
-            }
-        }
-        changed
+fn network_from_inspect(
+    network: &DockerNetworkInspect,
+) -> Result<Option<NetworkSnapshot>, MonitorError> {
+    // Ignore non-bridge networks
+    if !network.driver.is_bridge() {
+        debug!(
+            network_id = %network.id,
+            network_name = %network.name,
+            driver = ?network.driver,
+            "ignoring unsupported docker network driver"
+        );
+        return Ok(None);
     }
 
-    pub fn apply_action(&mut self, action: RuntimeStateAction) -> bool {
-        match action {
-            RuntimeStateAction::CreateContainer {
-                container: snapshot,
-            } => {
-                let container_id = snapshot.id.clone();
-                self.containers.insert(container_id, *snapshot);
-
-                true
-            }
-            RuntimeStateAction::RenameContainer { container_id, name } => {
-                if let Some(container) = self.containers.get_mut(&container_id) {
-                    container.name = name;
-                    return true;
-                }
-                false
-            }
-            RuntimeStateAction::RemoveContainer { container_id } => self
-                .containers
-                .remove(&container_id)
-                .is_some_and(|c| !c.attachments.is_empty()),
-            RuntimeStateAction::RemoveContainerAttachment {
-                container_id,
-                network_id,
-            } => {
-                if let Some(container) = self.containers.get_mut(&container_id) {
-                    let previous_len = container.attachments.len();
-                    container
-                        .attachments
-                        .retain(|attachment| attachment.network_id != network_id);
-                    return container.attachments.len() != previous_len;
-                }
-                false
-            }
-            RuntimeStateAction::UpsertNetwork {
-                network_id,
-                network_name,
-                subnet,
-                gateway,
-            } => {
-                let next = Network {
-                    name: network_name,
-                    subnet,
-                    gateway,
-                };
-                self.networks.insert(network_id, next);
-
-                true
-            }
-            RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
-        }
+    // Ignore non-portcullis networks
+    if !is_portcullis_network_enforced(network)? {
+        debug!(
+            network_id = %network.id,
+            network_name = %network.name,
+            "ignoring non-portcullis network"
+        );
+        return Ok(None);
     }
+
+    let (subnet, gateway) = network_primary_config(network)?;
+
+    Ok(Some(NetworkSnapshot {
+        id: network.id.clone().into(),
+        name: network.name.clone(),
+        subnet,
+        gateway,
+    }))
 }
 
 pub struct DockerMonitor<A> {
@@ -204,13 +94,13 @@ where
 
         let mut state = RuntimeState::default();
         for network in networks {
-            if let Some(data) = Network::try_new(&network)? {
-                state.networks.insert(network.id.into(), data);
+            if let Some(data) = network_from_inspect(&network)? {
+                state.networks.insert(data.id.clone(), data);
             }
         }
         for summary in containers {
-            let snapshot = Self::build_container_snapshot_from_summary(&state, &summary)?;
-            state.containers.insert(snapshot.id.clone(), snapshot);
+            let container = Self::build_container_from_summary(&state, &summary)?;
+            state.containers.insert(container.id.clone(), container);
         }
         Ok(state)
     }
@@ -254,8 +144,7 @@ where
         }
     }
 
-    fn build_container_snapshot_from_inspect(
-        &mut self,
+    fn build_container_from_inspect(
         state: &RuntimeState,
         inspect: DockerContainerInspect,
     ) -> Result<Container, MonitorError> {
@@ -275,25 +164,14 @@ where
                     network_name: network_name.to_string(),
                 })?
                 .into();
-            let network_data = if let Some(value) = state.networks.get(&network_id) {
-                value.clone()
-            } else {
-                let value = match self.api.inspect_network(network_id.as_str()) {
-                    Ok(network) => Network::try_new(&network)?,
-                    Err(error) if is_not_found(&error) => None,
-                    Err(error) => return Err(error.into()),
-                };
-                network_cache.insert(network_id.clone(), value.clone());
-                value
-            };
-            let Some(_network_data) = network_data else {
+            if !state.networks.contains_key(&network_id) {
                 warn!(
                     network_id = %network_id,
                     container_id = %inspect.id,
-                    "skipping attachment on network without subnet"
+                    "skipping attachment on unmanaged network"
                 );
                 continue;
-            };
+            }
             attachments.push(NetworkAttachment {
                 network_id,
                 ip_address: address,
@@ -319,9 +197,9 @@ where
 
         match self.api.inspect_container(container_id) {
             Ok(inspect) => {
-                let snapshot = self.build_container_snapshot_from_inspect(state, inspect)?;
+                let container = Self::build_container_from_inspect(state, inspect)?;
                 Ok(Some(RuntimeStateAction::CreateContainer {
-                    container: Box::new(snapshot),
+                    container: Box::new(container),
                 }))
             }
             Err(error) if is_not_found(&error) => Ok(Some(RuntimeStateAction::RemoveContainer {
@@ -356,26 +234,20 @@ where
         state: &RuntimeState,
         event: &DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        let Some(container_id) = event.attributes.get("container") else {
-            return Ok(None);
-        };
-
-        let requires_refresh = state
-            .containers
-            .get(container_id.as_str())
-            .is_some_and(|snapshot| snapshot.policy.enabled)
-            || state
-                .networks
-                .contains_key(&NetworkId::from(event.id.as_str()));
-
-        if !requires_refresh {
+        if !state
+            .networks
+            .contains_key(&NetworkId::from(event.id.as_str()))
+        {
             trace!(
-                container_id = %container_id,
                 network_id = %event.id,
-                "network connect ignored for container without policy on unmanaged network"
+                "network connect ignored for unmanaged network"
             );
             return Ok(None);
         }
+
+        let Some(container_id) = event.attributes.get("container") else {
+            return Ok(None);
+        };
 
         self.inspect_container_action(state, container_id)
     }
@@ -407,10 +279,10 @@ where
         debug!(%network_id, "resolving network runtime state action");
         match self.api.inspect_network(network_id) {
             Ok(network) => {
-                if let Some(data) = Network::try_new(&network)? {
+                if let Some(data) = network_from_inspect(&network)? {
                     Ok(Some(RuntimeStateAction::UpsertNetwork {
                         network_id: network_id.into(),
-                        network_name: network.name.clone(),
+                        network_name: data.name,
                         subnet: data.subnet,
                         gateway: data.gateway,
                     }))
@@ -427,7 +299,7 @@ where
         }
     }
 
-    fn build_container_snapshot_from_summary(
+    fn build_container_from_summary(
         state: &RuntimeState,
         summary: &DockerContainerSummary,
     ) -> Result<Container, MonitorError> {
@@ -467,7 +339,9 @@ fn is_not_found(error: &DockerError) -> bool {
     matches!(error, DockerError::ApiHttpStatus { status: 404, .. })
 }
 
-fn network_primary_config(network: &DockerNetworkInspect) -> Result<(IpNet, IpAddr), MonitorError> {
+fn network_primary_config(
+    network: &DockerNetworkInspect,
+) -> Result<(IpNet, Option<IpAddr>), MonitorError> {
     let config = network
         .ipam
         .as_ref()
@@ -484,15 +358,18 @@ fn network_primary_config(network: &DockerNetworkInspect) -> Result<(IpNet, IpAd
             subnet: subnet.to_string(),
         })?;
 
-    let gateway = config
-        .and_then(|c| c.gateway.as_deref())
-        .ok_or_else(|| MonitorError::MissingNetworkGateway(network.id.clone()))?;
-    let gateway = gateway
-        .parse::<IpAddr>()
-        .map_err(|_| MonitorError::InvalidNetworkGateway {
-            network_id: network.id.clone(),
-            gateway: gateway.to_string(),
-        })?;
+    let gateway = config.and_then(|c| c.gateway.as_deref()).map(|value| {
+        value
+            .parse::<IpAddr>()
+            .map_err(|_| MonitorError::InvalidNetworkGateway {
+                network_id: network.id.clone(),
+                gateway: value.to_string(),
+            })
+    });
+    let gateway = match gateway {
+        Some(value) => Some(value?),
+        None => None,
+    };
 
     Ok((subnet, gateway))
 }
@@ -572,17 +449,17 @@ fn container_summary_name(summary: &DockerContainerSummary) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::cell::RefCell;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use indexmap::IndexMap;
-    use serde::Deserialize;
 
+    use super::*;
     use crate::docker::raw::{
         DockerContainerConfig, DockerContainerSummaryNetworkSettings, DockerIpam, DockerIpamConfig,
         DockerNetworkDriver, DockerNetworkSettings,
     };
+    use crate::docker::{DockerEvent, DockerFirewallBackend};
 
     #[derive(Default)]
     struct MockDockerApi {
@@ -640,41 +517,29 @@ mod tests {
         }
     }
 
-    fn container_inspect(
+    fn network_inspect(
         id: &str,
         name: &str,
-        labels: &[(&str, &str)],
-        network_name: &str,
-        network_id: &str,
-        address: &str,
-    ) -> DockerContainerInspect {
-        let label_map = labels
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect();
+        subnet: &str,
+        gateway: Option<&str>,
+        driver: DockerNetworkDriver,
+        enforce_label: Option<&str>,
+    ) -> DockerNetworkInspect {
+        let labels = enforce_label.map(|value| {
+            IndexMap::from([("portcullis.network.enforce".to_string(), value.to_string())])
+        });
 
-        let mut networks = BTreeMap::new();
-        let parsed_address: IpAddr = match address.parse() {
-            Ok(value) => value,
-            Err(error) => panic!("failed to parse IP address for test fixture: {error}"),
-        };
-        networks.insert(
-            network_name.to_string(),
-            DockerEndpoint {
-                network_id: Some(network_id.to_string()),
-                ip_address: Some(parsed_address),
-                aliases: Some(vec![name.to_string()]),
-            },
-        );
-
-        DockerContainerInspect {
+        DockerNetworkInspect {
             id: id.to_string(),
             name: name.to_string(),
-            config: DockerContainerConfig { labels: label_map },
-            host_config: None,
-            network_settings: Some(DockerNetworkSettings {
-                networks: Some(networks),
+            driver,
+            ipam: Some(DockerIpam {
+                config: Some(vec![DockerIpamConfig {
+                    subnet: Some(subnet.to_string()),
+                    gateway: gateway.map(std::string::ToString::to_string),
+                }]),
             }),
+            labels,
         }
     }
 
@@ -682,369 +547,176 @@ mod tests {
         id: &str,
         name: &str,
         labels: &[(&str, &str)],
-        network_name: &str,
-        network_id: &str,
-        address: &str,
+        networks: &[(&str, &str, &str)],
     ) -> DockerContainerSummary {
-        let label_map = labels
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect();
-        let mut networks = BTreeMap::new();
-        let parsed_address: IpAddr = match address.parse() {
-            Ok(value) => value,
-            Err(error) => panic!("failed to parse IP address for summary fixture: {error}"),
-        };
-        networks.insert(
-            network_name.to_string(),
-            DockerContainerSummaryEndpoint {
-                network_id: Some(network_id.to_string()),
-                ip_address: Some(parsed_address),
-                aliases: Some(vec![name.to_string()]),
-            },
-        );
+        let mut network_map = BTreeMap::new();
+        for (network_name, network_id, ip) in networks {
+            network_map.insert(
+                (*network_name).to_string(),
+                DockerContainerSummaryEndpoint {
+                    network_id: Some((*network_id).to_string()),
+                    ip_address: Some(ip.parse().expect("summary fixture ip should parse")),
+                    aliases: Some(vec![name.trim_start_matches('/').to_string()]),
+                },
+            );
+        }
+
         DockerContainerSummary {
             id: id.to_string(),
             names: Some(vec![name.to_string()]),
-            labels: label_map,
+            labels: labels
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
             host_config: None,
             network_settings: Some(DockerContainerSummaryNetworkSettings {
-                networks: Some(networks),
+                networks: Some(network_map),
             }),
         }
     }
 
-    fn network_inspect(id: &str, name: &str, subnet: &str) -> DockerNetworkInspect {
-        DockerNetworkInspect {
+    fn container_inspect(
+        id: &str,
+        name: &str,
+        labels: &[(&str, &str)],
+        networks: &[(&str, &str, &str)],
+    ) -> DockerContainerInspect {
+        let mut network_map = BTreeMap::new();
+        for (network_name, network_id, ip) in networks {
+            network_map.insert(
+                (*network_name).to_string(),
+                DockerEndpoint {
+                    network_id: Some((*network_id).to_string()),
+                    ip_address: Some(ip.parse().expect("inspect fixture ip should parse")),
+                    aliases: Some(vec![name.to_string()]),
+                },
+            );
+        }
+
+        DockerContainerInspect {
             id: id.to_string(),
             name: name.to_string(),
-            driver: DockerNetworkDriver::Bridge,
-            ipam: Some(DockerIpam {
-                config: Some(vec![DockerIpamConfig {
-                    subnet: Some(subnet.to_string()),
-                    gateway: None,
-                }]),
+            config: DockerContainerConfig {
+                labels: labels
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            },
+            host_config: None,
+            network_settings: Some(DockerNetworkSettings {
+                networks: Some(network_map),
             }),
-            labels: None,
         }
     }
 
-    fn network_without_subnet(id: &str, name: &str) -> DockerNetworkInspect {
-        DockerNetworkInspect {
-            id: id.to_string(),
-            name: name.to_string(),
-            driver: DockerNetworkDriver::Bridge,
-            ipam: Some(DockerIpam {
-                config: Some(vec![DockerIpamConfig {
-                    subnet: None,
-                    gateway: None,
-                }]),
-            }),
-            labels: None,
-        }
-    }
-
-    #[test]
-    fn docker_monitor_builds_snapshot_with_policy_and_attachments() {
-        let mut api = MockDockerApi {
-            containers_list: vec![container_summary(
-                "abc",
-                "/web",
-                &[
-                    ("portcullis.enable", "true"),
-                    ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443"),
-                ],
-                "bridge",
-                "net0",
-                "172.18.0.2",
-            )],
-            ..MockDockerApi::default()
-        };
-
-        api.containers.insert(
-            "abc".to_string(),
-            container_inspect(
-                "abc",
-                "web",
-                &[
-                    ("portcullis.enable", "true"),
-                    ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443"),
-                ],
-                "bridge",
-                "net0",
-                "172.18.0.2",
-            ),
-        );
-
-        api.networks.insert(
-            "net0".to_string(),
-            network_inspect("net0", "bridge", "172.18.0.0/16"),
-        );
-        api.networks_list
-            .push(network_inspect("net0", "bridge", "172.18.0.0/16"));
-
-        let mut monitor = DockerMonitor::new(api);
-        let snapshot = match monitor.snapshot() {
-            Ok(value) => value,
-            Err(error) => panic!("snapshot should succeed: {error}"),
-        };
-
-        assert_eq!(snapshot.containers.len(), 1);
-        let container = &snapshot.containers[0];
-        assert_eq!(container.id, "abc".into());
-        assert_eq!(container.attachments.len(), 1);
-        assert!(container.policy.enabled);
-        assert!(snapshot.enforced_network_subnets.is_empty());
-    }
-
-    #[test]
-    fn docker_monitor_skips_endpoints_without_ip() {
-        let mut api = MockDockerApi {
-            containers_list: vec![DockerContainerSummary {
-                id: "abc".into(),
-                names: Some(vec!["/web".to_string()]),
-                labels: IndexMap::new(),
-                host_config: None,
-                network_settings: Some(DockerContainerSummaryNetworkSettings {
-                    networks: Some(BTreeMap::from([(
-                        "bridge".to_string(),
-                        DockerContainerSummaryEndpoint {
-                            network_id: Some("net0".to_string()),
-                            ip_address: None,
-                            aliases: Some(vec!["web".to_string()]),
-                        },
-                    )])),
-                }),
-            }],
-            ..MockDockerApi::default()
-        };
-        api.networks_list
-            .push(network_inspect("net0", "bridge", "172.18.0.0/16"));
-
-        let mut monitor = DockerMonitor::new(api);
-        let snapshot = match monitor.snapshot() {
-            Ok(value) => value,
-            Err(error) => panic!("snapshot should succeed: {error}"),
-        };
-
-        assert_eq!(snapshot.containers[0].attachments.len(), 0);
-    }
-
-    #[test]
-    fn docker_endpoint_deserialization_treats_empty_ip_as_none() {
-        let inspect_json = r#"{
-          "Id": "abc",
-          "Name": "/web",
-          "Config": {"Labels": {}},
-          "NetworkSettings": {
-            "Networks": {
-              "bridge": {
-                "NetworkID": "net0",
-                "IPAddress": "",
-                "Aliases": ["web"]
-              }
-            }
-          }
-        }"#;
-
-        let inspect: DockerContainerInspect =
-            serde_json::from_str(inspect_json).expect("container inspect should deserialize");
-        let endpoint = container_inspect_network_endpoints(&inspect)
-            .into_iter()
-            .next()
-            .expect("expected one endpoint")
-            .1;
-        assert!(endpoint.ip_address.is_none());
-    }
-
-    #[test]
-    fn docker_monitor_fails_for_invalid_labels() {
-        let mut api = MockDockerApi {
-            containers_list: vec![container_summary(
-                "abc",
-                "/web",
-                &[
-                    ("portcullis.enable", "true"),
-                    ("portcullis.egress.0", "ip:bad,tcp:443"),
-                ],
-                "bridge",
-                "net0",
-                "172.18.0.2",
-            )],
-            ..MockDockerApi::default()
-        };
-
-        api.containers.insert(
-            "abc".to_string(),
-            container_inspect(
-                "abc",
-                "web",
-                &[
-                    ("portcullis.enable", "true"),
-                    ("portcullis.egress.0", "ip:bad,tcp:443"),
-                ],
-                "bridge",
-                "net0",
-                "172.18.0.2",
-            ),
-        );
-
-        api.networks.insert(
-            "net0".to_string(),
-            network_inspect("net0", "bridge", "172.18.0.0/16"),
-        );
-        api.networks_list
-            .push(network_inspect("net0", "bridge", "172.18.0.0/16"));
-
-        let mut monitor = DockerMonitor::new(api);
-        let result = monitor.snapshot();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn docker_monitor_collects_enforced_network_subnets_from_network_labels() {
-        let mut api = MockDockerApi {
-            containers_list: vec![container_summary(
-                "abc",
-                "/web",
-                &[("portcullis.enable", "true")],
-                "bridge",
-                "net0",
-                "172.18.0.2",
-            )],
-            ..MockDockerApi::default()
-        };
-        let mut network = network_inspect("net0", "bridge", "172.18.0.0/16");
-        network.labels = Some(IndexMap::from([(
-            "portcullis.network.enforce".to_string(),
-            "true".to_string(),
-        )]));
-        api.networks.insert("net0".to_string(), network.clone());
-        api.networks_list.push(network);
-
-        let mut monitor = DockerMonitor::new(api);
-        let snapshot = monitor.snapshot().expect("snapshot should succeed");
-        assert_eq!(snapshot.enforced_network_subnets.len(), 1);
-        assert_eq!(
-            snapshot.enforced_network_subnets[0].to_string(),
-            "172.18.0.0/16"
-        );
-    }
-
-    #[test]
-    fn docker_container_event_relevance_filters_noise() {
-        let relevant = DockerEvent {
-            id: "abc".into(),
-            action: DockerEventAction::Create,
-            name: Some("web".to_string()),
-            kind: DockerEventKind::Container,
-            attributes: IndexMap::new(),
-        };
-        let not_relevant = DockerEvent {
-            id: "abc".into(),
-            action: DockerEventAction::Resize,
-            name: Some("web".to_string()),
-            kind: DockerEventKind::Container,
-            attributes: IndexMap::new(),
-        };
-        let relevant_network = DockerEvent {
-            id: "net0".to_string(),
-            action: DockerEventAction::Disconnect,
-            name: Some("pc-managed".to_string()),
+    fn network_connect_event(network_id: &str, container_id: &str) -> DockerEvent {
+        DockerEvent {
+            id: network_id.to_string(),
+            action: DockerEventAction::Connect,
+            name: Some("managed-net".to_string()),
             kind: DockerEventKind::Network,
-            attributes: IndexMap::new(),
-        };
-
-        assert!(relevant.is_relevant_for_policy_refresh());
-        assert!(!not_relevant.is_relevant_for_policy_refresh());
-        assert!(relevant_network.is_relevant_for_policy_refresh());
+            attributes: IndexMap::from([("container".to_string(), container_id.to_string())]),
+        }
     }
 
     #[test]
-    fn create_event_uses_event_attributes_without_container_inspect() {
-        let api = MockDockerApi::default();
-        let mut monitor = DockerMonitor::new(api);
-        let state = RuntimeState::default();
-        let event = DockerEvent {
-            id: "abc".into(),
-            action: DockerEventAction::Create,
-            name: Some("web".to_string()),
-            kind: DockerEventKind::Container,
-            attributes: IndexMap::from([
-                ("name".to_string(), "web".to_string()),
-                ("image".to_string(), "alpine/curl:latest".to_string()),
-                ("portcullis.enable".to_string(), "true".to_string()),
-                (
-                    "portcullis.egress.1".to_string(),
-                    "host:example.com,tcp:443".to_string(),
-                ),
-            ]),
-        };
-
-        let action = monitor
-            .resolve_event_action(&state, event)
-            .expect("create event should resolve");
-        assert!(matches!(
-            action,
-            Some(RuntimeStateAction::CreateContainer { .. })
+    fn collect_state_keeps_all_containers_and_only_managed_attachments() {
+        let mut api = MockDockerApi::default();
+        api.networks_list.push(network_inspect(
+            "net0",
+            "managed",
+            "172.20.0.0/16",
+            Some("172.20.0.1"),
+            DockerNetworkDriver::Bridge,
+            Some("true"),
         ));
-        assert!(monitor.api.inspect_container_requests.borrow().is_empty());
+        api.networks_list.push(network_inspect(
+            "net1",
+            "unmanaged",
+            "172.21.0.0/16",
+            Some("172.21.0.1"),
+            DockerNetworkDriver::Bridge,
+            None,
+        ));
+        api.containers_list.push(container_summary(
+            "abc",
+            "/web",
+            &[("portcullis.egress.0", "host:api.example.com,tcp:443")],
+            &[
+                ("managed", "net0", "172.20.0.2"),
+                ("unmanaged", "net1", "172.21.0.2"),
+            ],
+        ));
+        api.containers_list.push(container_summary(
+            "def",
+            "/db",
+            &[],
+            &[("unmanaged", "net1", "172.21.0.3")],
+        ));
+
+        let mut monitor = DockerMonitor::new(api);
+        let state = monitor
+            .collect_state()
+            .expect("collect_state should succeed");
+
+        assert_eq!(state.networks.len(), 1);
+        assert!(state.networks.contains_key("net0"));
+        assert_eq!(state.containers.len(), 2);
+        assert_eq!(
+            state
+                .containers
+                .get("abc")
+                .expect("abc should be present")
+                .attachments
+                .len(),
+            1
+        );
+        assert!(
+            state
+                .containers
+                .get("def")
+                .expect("def should be present")
+                .attachments
+                .is_empty()
+        );
     }
 
     #[test]
     fn network_connect_uses_single_container_inspect_without_network_inspect() {
         let mut api = MockDockerApi::default();
-        api.networks.insert(
-            "net0".to_string(),
-            network_inspect("net0", "pc-managed", "172.20.0.0/16"),
-        );
         api.containers.insert(
             "abc".to_string(),
             container_inspect(
                 "abc",
-                "web",
-                &[("portcullis.enable", "true")],
-                "pc-managed",
-                "net0",
-                "172.20.0.2",
+                "/web",
+                &[("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443")],
+                &[("managed", "net0", "172.20.0.2")],
             ),
         );
+
         let mut monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
-        state.apply_action(RuntimeStateAction::UpsertNetwork {
-            network_id: "net0".into(),
-            network_name: "pc-managed".to_string(),
-            subnet: "172.20.0.0/16".parse().expect("valid subnet"),
-            gateway: None,
-            enforced: true,
-        });
-        state.apply_action(RuntimeStateAction::CreateContainer {
-            container: Box::new(Container {
-                id: "abc".into(),
-                name: "web".to_string(),
-                attachments: Vec::new(),
-                runtime_dns_servers: HashSet::new(),
-                policy: parse_policy(
-                    &[("portcullis.enable".to_string(), "true".to_string())].into(),
-                )
-                .expect("policy should parse"),
-            }),
-        });
-        let event = DockerEvent {
-            id: "net0".to_string(),
-            action: DockerEventAction::Connect,
-            name: Some("pc-managed".to_string()),
-            kind: DockerEventKind::Network,
-            attributes: [("container".to_string(), "abc".to_string())].into(),
-        };
+        state.networks.insert(
+            "net0".into(),
+            NetworkSnapshot {
+                id: "net0".into(),
+                name: "managed".to_string(),
+                subnet: "172.20.0.0/16".parse().expect("valid subnet"),
+                gateway: Some("172.20.0.1".parse().expect("valid gateway")),
+            },
+        );
 
         let action = monitor
-            .resolve_event_action(&state, event)
-            .expect("connect event should resolve");
-        assert!(matches!(
-            action,
-            Some(RuntimeStateAction::CreateContainer { .. })
-        ));
+            .resolve_event_action(&state, network_connect_event("net0", "abc"))
+            .expect("connect action should resolve");
+
+        match action {
+            Some(RuntimeStateAction::CreateContainer { container }) => {
+                assert_eq!(container.id.as_str(), "abc");
+                assert_eq!(container.attachments.len(), 1);
+            }
+            _ => panic!("expected create container action"),
+        }
         assert_eq!(
             monitor.api.inspect_container_requests.borrow().as_slice(),
             ["abc".to_string()]
@@ -1053,12 +725,61 @@ mod tests {
     }
 
     #[test]
+    fn network_connect_skips_unmanaged_networks_without_queries() {
+        let api = MockDockerApi::default();
+        let mut monitor = DockerMonitor::new(api);
+        let state = RuntimeState::default();
+
+        let action = monitor
+            .resolve_event_action(&state, network_connect_event("net-missing", "abc"))
+            .expect("connect action should resolve");
+
+        assert!(action.is_none());
+        assert!(monitor.api.inspect_container_requests.borrow().is_empty());
+        assert!(monitor.api.inspect_network_requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn network_connect_skips_unknown_container_network_attachments() {
+        let mut api = MockDockerApi::default();
+        api.containers.insert(
+            "abc".to_string(),
+            container_inspect("abc", "/web", &[], &[("other", "net-other", "172.30.0.2")]),
+        );
+
+        let mut monitor = DockerMonitor::new(api);
+        let mut state = RuntimeState::default();
+        state.networks.insert(
+            "net0".into(),
+            NetworkSnapshot {
+                id: "net0".into(),
+                name: "managed".to_string(),
+                subnet: "172.20.0.0/16".parse().expect("valid subnet"),
+                gateway: Some("172.20.0.1".parse().expect("valid gateway")),
+            },
+        );
+
+        let action = monitor
+            .resolve_event_action(&state, network_connect_event("net0", "abc"))
+            .expect("connect action should resolve");
+
+        match action {
+            Some(RuntimeStateAction::CreateContainer { container }) => {
+                assert!(container.attachments.is_empty());
+            }
+            _ => panic!("expected create container action"),
+        }
+        assert!(monitor.api.inspect_network_requests.borrow().is_empty());
+    }
+
+    #[test]
     fn network_disconnect_uses_cached_attachment_without_queries() {
         let api = MockDockerApi::default();
         let mut monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
-        state.apply_action(RuntimeStateAction::CreateContainer {
-            container: Box::new(Container {
+        state.containers.insert(
+            "abc".into(),
+            Container {
                 id: "abc".into(),
                 name: "web".to_string(),
                 attachments: vec![NetworkAttachment {
@@ -1068,19 +789,21 @@ mod tests {
                 }],
                 runtime_dns_servers: HashSet::new(),
                 policy: crate::model::ContainerPolicy::default(),
-            }),
-        });
+            },
+        );
+
         let event = DockerEvent {
             id: "net0".to_string(),
             action: DockerEventAction::Disconnect,
-            name: Some("pc-managed".to_string()),
+            name: Some("managed-net".to_string()),
             kind: DockerEventKind::Network,
-            attributes: [("container".to_string(), "abc".to_string())].into(),
+            attributes: IndexMap::from([("container".to_string(), "abc".to_string())]),
         };
 
         let action = monitor
             .resolve_event_action(&state, event)
-            .expect("disconnect event should resolve");
+            .expect("disconnect action should resolve");
+
         assert!(matches!(
             action,
             Some(RuntimeStateAction::RemoveContainerAttachment { .. })
@@ -1090,311 +813,110 @@ mod tests {
     }
 
     #[test]
-    fn docker_monitor_collects_enforced_subnets_without_running_containers() {
-        let mut api = MockDockerApi::default();
-        let mut network = network_inspect("net0", "pc-managed", "172.22.0.0/16");
-        network.labels = Some(IndexMap::from([(
-            "portcullis.network.enforce".to_string(),
-            "true".to_string(),
-        )]));
-        api.networks_list.push(network.clone());
-        api.networks.insert("net0".to_string(), network);
-
+    fn create_event_uses_event_attributes_without_container_inspect() {
+        let api = MockDockerApi::default();
         let mut monitor = DockerMonitor::new(api);
-        let snapshot = monitor.snapshot().expect("snapshot should succeed");
-        assert!(snapshot.containers.is_empty());
-        assert_eq!(snapshot.enforced_network_subnets.len(), 1);
-        assert_eq!(
-            snapshot.enforced_network_subnets[0].to_string(),
-            "172.22.0.0/16"
-        );
-    }
+        let state = RuntimeState::default();
 
-    #[test]
-    fn docker_monitor_ignores_host_network_without_subnet() {
-        let mut api = MockDockerApi::default();
-        let mut host_network = network_without_subnet("net-no-subnet", "host");
-        host_network.driver = DockerNetworkDriver::Host;
-        api.networks_list.push(host_network.clone());
-        api.networks
-            .insert("net-no-subnet".to_string(), host_network);
+        let event = DockerEvent {
+            id: "abc".to_string(),
+            action: DockerEventAction::Create,
+            name: Some("web".to_string()),
+            kind: DockerEventKind::Container,
+            attributes: IndexMap::from([(
+                "portcullis.egress.0".to_string(),
+                "host:api.example.com,tcp:443".to_string(),
+            )]),
+        };
 
-        let mut monitor = DockerMonitor::new(api);
-        let snapshot = monitor.snapshot().expect("snapshot should succeed");
-        assert!(snapshot.containers.is_empty());
-        assert!(snapshot.enforced_network_subnets.is_empty());
-    }
-
-    #[test]
-    fn docker_monitor_errors_on_bridge_network_without_subnet() {
-        let mut api = MockDockerApi::default();
-        api.networks_list
-            .push(network_without_subnet("net-no-subnet", "custom-net"));
-        api.networks.insert(
-            "net-no-subnet".to_string(),
-            network_without_subnet("net-no-subnet", "custom-net"),
-        );
-
-        let mut monitor = DockerMonitor::new(api);
-        let result = monitor.snapshot();
-        assert!(matches!(
-            result,
-            Err(MonitorError::MissingNetworkSubnet(ref id)) if id == "net-no-subnet"
-        ));
-    }
-
-    #[test]
-    fn docker_monitor_ignores_non_bridge_network_even_with_subnet() {
-        let mut api = MockDockerApi::default();
-        let mut network = network_inspect("net-overlay", "overlay-net", "172.23.0.0/16");
-        network.driver = DockerNetworkDriver::Overlay;
-        network.labels = Some(IndexMap::from([(
-            "portcullis.network.enforce".to_string(),
-            "true".to_string(),
-        )]));
-        api.networks_list.push(network.clone());
-        api.networks.insert("net-overlay".to_string(), network);
-
-        let mut monitor = DockerMonitor::new(api);
-        let snapshot = monitor.snapshot().expect("snapshot should succeed");
-        assert!(snapshot.containers.is_empty());
-        assert!(snapshot.enforced_network_subnets.is_empty());
-    }
-
-    #[test]
-    fn docker_network_driver_deserialization_maps_known_and_other_values() {
-        #[derive(Deserialize)]
-        struct DriverFixture {
-            #[serde(rename = "Driver")]
-            driver: DockerNetworkDriver,
-        }
-
-        let bridge: DriverFixture =
-            serde_json::from_str(r#"{"Driver":"bridge"}"#).expect("bridge should parse");
-        let none: DriverFixture =
-            serde_json::from_str(r#"{"Driver":"none"}"#).expect("none should parse");
-        let custom: DriverFixture =
-            serde_json::from_str(r#"{"Driver":"my-plugin"}"#).expect("custom should parse");
-
-        assert_eq!(bridge.driver, DockerNetworkDriver::Bridge);
-        assert_eq!(none.driver, DockerNetworkDriver::None);
-        assert_eq!(
-            custom.driver,
-            DockerNetworkDriver::Other("my-plugin".to_string())
-        );
-    }
-
-    #[test]
-    fn inspect_network_action_returns_upsert_network_action() {
-        let mut api = MockDockerApi::default();
-        api.networks.insert(
-            "net0".to_string(),
-            network_inspect("net0", "pc-managed", "172.19.0.0/16"),
-        );
-
-        let mut monitor = DockerMonitor::new(api);
         let action = monitor
-            .inspect_network_action("net0")
-            .expect("inspect network should succeed");
+            .resolve_event_action(&state, event)
+            .expect("create action should resolve");
+
         assert!(matches!(
             action,
+            Some(RuntimeStateAction::CreateContainer { .. })
+        ));
+        assert!(monitor.api.inspect_container_requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn network_create_upserts_only_managed_bridge_networks() {
+        let mut api = MockDockerApi::default();
+        api.networks.insert(
+            "net0".to_string(),
+            network_inspect(
+                "net0",
+                "managed",
+                "172.20.0.0/16",
+                Some("172.20.0.1"),
+                DockerNetworkDriver::Bridge,
+                Some("true"),
+            ),
+        );
+        api.networks.insert(
+            "net1".to_string(),
+            network_inspect(
+                "net1",
+                "unmanaged",
+                "172.21.0.0/16",
+                Some("172.21.0.1"),
+                DockerNetworkDriver::Bridge,
+                None,
+            ),
+        );
+        let mut monitor = DockerMonitor::new(api);
+
+        let managed_event = DockerEvent {
+            id: "net0".to_string(),
+            action: DockerEventAction::Create,
+            name: Some("managed".to_string()),
+            kind: DockerEventKind::Network,
+            attributes: IndexMap::new(),
+        };
+        let unmanaged_event = DockerEvent {
+            id: "net1".to_string(),
+            action: DockerEventAction::Create,
+            name: Some("unmanaged".to_string()),
+            kind: DockerEventKind::Network,
+            attributes: IndexMap::new(),
+        };
+
+        let managed = monitor
+            .resolve_event_action(&RuntimeState::default(), managed_event)
+            .expect("managed network action should resolve");
+        let unmanaged = monitor
+            .resolve_event_action(&RuntimeState::default(), unmanaged_event)
+            .expect("unmanaged network action should resolve");
+
+        assert!(matches!(
+            managed,
             Some(RuntimeStateAction::UpsertNetwork { network_id, .. }) if network_id == "net0".into()
+        ));
+        assert!(matches!(
+            unmanaged,
+            Some(RuntimeStateAction::RemoveNetwork { network_id }) if network_id == "net1".into()
         ));
     }
 
     #[test]
-    fn remove_network_prunes_container_attachments() {
-        let mut api = MockDockerApi {
-            containers_list: vec![container_summary(
-                "abc",
-                "/web",
-                &[("portcullis.enable", "true")],
-                "bridge",
-                "net0",
-                "172.18.0.2",
-            )],
-            ..MockDockerApi::default()
-        };
-        api.containers.insert(
-            "abc".to_string(),
-            container_inspect(
-                "abc",
-                "web",
-                &[("portcullis.enable", "true")],
-                "bridge",
-                "net0",
-                "172.18.0.2",
-            ),
-        );
-        api.networks_list
-            .push(network_inspect("net0", "bridge", "172.18.0.0/16"));
-        api.networks.insert(
-            "net0".to_string(),
-            network_inspect("net0", "bridge", "172.18.0.0/16"),
-        );
+    fn collect_state_rejects_invalid_network_enforce_label() {
+        let mut api = MockDockerApi::default();
+        api.networks_list.push(network_inspect(
+            "net0",
+            "managed",
+            "172.20.0.0/16",
+            Some("172.20.0.1"),
+            DockerNetworkDriver::Bridge,
+            Some("yes"),
+        ));
 
         let mut monitor = DockerMonitor::new(api);
-        let mut state = monitor
-            .collect_state()
-            .expect("collect state should succeed");
-        let container_before = state.snapshot().containers[0].attachments.len();
-        assert_eq!(container_before, 1);
-        assert!(state.remove_network(&"net0".into()));
-        let container_after = state.snapshot().containers[0].attachments.len();
-        assert_eq!(container_after, 0);
-    }
+        let result = monitor.collect_state();
 
-    #[test]
-    fn docker_network_primary_subnet_parses_first_subnet() {
-        let network = network_inspect("net0", "bridge", "172.18.0.0/16");
-        let subnet = match network_primary_subnet(&network) {
-            Ok(value) => value,
-            Err(error) => panic!("primary_subnet should succeed: {error}"),
-        };
-
-        assert_eq!(subnet.to_string(), "172.18.0.0/16");
-    }
-
-    fn runtime_snapshot(
-        container_id: &str,
-        name: &str,
-        labels: &[(&str, &str)],
-        network_id: &str,
-        network_name: &str,
-        ip_address: &str,
-        subnet: &str,
-    ) -> RuntimeSnapshot {
-        let label_map = labels
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect();
-
-        let parsed_ip = match ip_address.parse() {
-            Ok(value) => value,
-            Err(error) => panic!("failed to parse ip fixture: {error}"),
-        };
-        let parsed_subnet = match subnet.parse() {
-            Ok(value) => value,
-            Err(error) => panic!("failed to parse subnet fixture: {error}"),
-        };
-
-        RuntimeSnapshot {
-            containers: vec![Container {
-                id: container_id.into(),
-                name: name.to_string(),
-                attachments: vec![NetworkAttachment {
-                    network_id: network_id.into(),
-                    ip_address: parsed_ip,
-                    aliases: vec![name.to_string()],
-                }],
-                runtime_dns_servers: HashSet::new(),
-                policy: parse_policy(&label_map).unwrap(),
-            }],
-            networks: HashMap::from([(
-                network_id.into(),
-                NetworkSnapshot {
-                    id: network_id.into(),
-                    name: network_name.to_string(),
-                    subnet: parsed_subnet,
-                    gateway: None,
-                    enforced: false,
-                },
-            )]),
-            enforced_network_subnets: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn detect_runtime_changes_reports_additions_for_initial_snapshot() {
-        let current = runtime_snapshot(
-            "abc",
-            "web",
-            &[
-                ("portcullis.enable", "true"),
-                ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443"),
-            ],
-            "net0",
-            "bridge",
-            "172.18.0.2",
-            "172.18.0.0/16",
-        );
-
-        let changes = detect_runtime_changes(None, &current);
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(changes[0], RuntimeChange::ContainerAdded { .. }));
-    }
-
-    #[test]
-    fn detect_runtime_changes_reports_label_and_attachment_changes() {
-        let previous = runtime_snapshot(
-            "abc",
-            "web",
-            &[
-                ("portcullis.enable", "true"),
-                ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443"),
-            ],
-            "net0",
-            "bridge",
-            "172.18.0.2",
-            "172.18.0.0/16",
-        );
-        let current = runtime_snapshot(
-            "abc",
-            "web",
-            &[
-                ("portcullis.enable", "true"),
-                ("portcullis.egress.0", "ip:2.2.2.2/32,tcp:443"),
-            ],
-            "net1",
-            "backend",
-            "172.18.0.3",
-            "172.18.0.0/16",
-        );
-
-        let changes = detect_runtime_changes(Some(&previous), &current);
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change, RuntimeChange::PolicyChanged { .. }))
-        );
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change, RuntimeChange::AttachmentAdded { .. }))
-        );
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change, RuntimeChange::AttachmentRemoved { .. }))
-        );
-    }
-
-    #[test]
-    fn runtime_change_tracker_stores_previous_snapshot() {
-        let previous = runtime_snapshot(
-            "abc",
-            "web",
-            &[("portcullis.enable", "true")],
-            "net0",
-            "bridge",
-            "172.18.0.2",
-            "172.18.0.0/16",
-        );
-        let current = runtime_snapshot(
-            "abc",
-            "web",
-            &[("portcullis.enable", "false")],
-            "net0",
-            "bridge",
-            "172.18.0.2",
-            "172.18.0.0/16",
-        );
-
-        let mut tracker = RuntimeChangeTracker::new();
-        let first_changes = tracker.detect_and_log(&previous);
-        assert_eq!(first_changes.len(), 1);
-
-        let second_changes = tracker.detect_and_log(&current);
-        assert!(!second_changes.is_empty());
+        assert!(matches!(
+            result,
+            Err(MonitorError::InvalidNetworkLabel { .. })
+        ));
     }
 }

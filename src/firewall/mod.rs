@@ -4,8 +4,7 @@ mod nftables;
 use thiserror::Error;
 
 use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
-use crate::model::RuntimeSnapshot;
-use crate::monitor::RuntimeState;
+use crate::model::RuntimeState;
 
 pub use iptables::{CommandIptablesRunner, IptablesFirewall};
 pub use nftables::NftablesFirewall;
@@ -56,7 +55,7 @@ impl ActiveFirewall {
         }
     }
 
-    /// Apply the firewall rules for the given `RuntimeSnapshot`.
+    /// Apply firewall rules for the current runtime state.
     pub fn apply(
         &self,
         state: &RuntimeState,
