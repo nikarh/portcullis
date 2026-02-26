@@ -2,6 +2,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
+use std::ops::Deref;
 
 use ipnet::IpNet;
 
@@ -39,6 +40,14 @@ impl Borrow<str> for ContainerId {
     }
 }
 
+impl Deref for ContainerId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NetworkId(String);
 
@@ -69,6 +78,14 @@ impl From<&str> for NetworkId {
 
 impl Borrow<str> for NetworkId {
     fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for NetworkId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
         self.as_str()
     }
 }
@@ -146,7 +163,7 @@ pub struct NetworkAttachment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkSnapshot {
+pub struct Network {
     pub id: NetworkId,
     pub name: String,
     pub subnet: IpNet,
@@ -155,7 +172,6 @@ pub struct NetworkSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Container {
-    pub id: ContainerId,
     pub name: String,
     pub attachments: Vec<NetworkAttachment>,
     pub runtime_dns_servers: HashSet<IpAddr>,
@@ -165,12 +181,13 @@ pub struct Container {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeState {
     pub containers: HashMap<ContainerId, Container>,
-    pub networks: HashMap<NetworkId, NetworkSnapshot>,
+    pub networks: HashMap<NetworkId, Network>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeStateAction {
     CreateContainer {
+        id: ContainerId,
         container: Box<Container>,
     },
     RenameContainer {
@@ -212,9 +229,8 @@ impl RuntimeState {
 
     pub fn apply_action(&mut self, action: RuntimeStateAction) -> bool {
         match action {
-            RuntimeStateAction::CreateContainer { container } => {
-                let container_id = container.id.clone();
-                self.containers.insert(container_id, *container);
+            RuntimeStateAction::CreateContainer { id, container } => {
+                self.containers.insert(id, *container);
                 true
             }
             RuntimeStateAction::RenameContainer { container_id, name } => {
@@ -249,7 +265,7 @@ impl RuntimeState {
             } => {
                 self.networks.insert(
                     network_id.clone(),
-                    NetworkSnapshot {
+                    Network {
                         id: network_id,
                         name: network_name,
                         subnet,

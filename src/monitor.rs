@@ -12,7 +12,7 @@ use crate::docker::raw::{
 use crate::docker::{DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind};
 use crate::labels::{LabelParseError, parse_policy};
 use crate::model::{
-    Container, NetworkAttachment, NetworkId, NetworkSnapshot, RuntimeState, RuntimeStateAction,
+    Container, ContainerId, Network, NetworkAttachment, NetworkId, RuntimeState, RuntimeStateAction,
 };
 
 #[derive(Debug, Error)]
@@ -40,9 +40,7 @@ pub enum MonitorError {
     LabelParse(#[from] LabelParseError),
 }
 
-fn network_from_inspect(
-    network: &DockerNetworkInspect,
-) -> Result<Option<NetworkSnapshot>, MonitorError> {
+fn network_from_inspect(network: &DockerNetworkInspect) -> Result<Option<Network>, MonitorError> {
     // Ignore non-bridge networks
     if !network.driver.is_bridge() {
         debug!(
@@ -66,7 +64,7 @@ fn network_from_inspect(
 
     let (subnet, gateway) = network_primary_config(network)?;
 
-    Ok(Some(NetworkSnapshot {
+    Ok(Some(Network {
         id: network.id.clone().into(),
         name: network.name.clone(),
         subnet,
@@ -100,7 +98,7 @@ where
         }
         for summary in containers {
             let container = Self::build_container_from_summary(&state, &summary)?;
-            state.containers.insert(container.id.clone(), container);
+            state.containers.insert(summary.id.into(), container);
         }
         Ok(state)
     }
@@ -147,7 +145,7 @@ where
     fn build_container_from_inspect(
         state: &RuntimeState,
         inspect: DockerContainerInspect,
-    ) -> Result<Container, MonitorError> {
+    ) -> Result<(ContainerId, Box<Container>), MonitorError> {
         let policy = parse_policy(&inspect.config.labels)?;
         let runtime_dns_servers = runtime_dns_servers(inspect.host_config.as_ref());
 
@@ -179,13 +177,15 @@ where
             });
         }
 
-        Ok(Container {
-            id: inspect.id.into(),
-            name: inspect.name.trim_start_matches('/').to_string(),
-            attachments,
-            runtime_dns_servers,
-            policy,
-        })
+        Ok((
+            inspect.id.into(),
+            Box::new(Container {
+                name: inspect.name.trim_start_matches('/').to_string(),
+                attachments,
+                runtime_dns_servers,
+                policy,
+            }),
+        ))
     }
 
     fn inspect_container_action(
@@ -197,14 +197,9 @@ where
 
         match self.api.inspect_container(container_id) {
             Ok(inspect) => {
-                let container = Self::build_container_from_inspect(state, inspect)?;
-                Ok(Some(RuntimeStateAction::CreateContainer {
-                    container: Box::new(container),
-                }))
+                let (id, container) = Self::build_container_from_inspect(state, inspect)?;
+                Ok(Some(RuntimeStateAction::CreateContainer { id, container }))
             }
-            Err(error) if is_not_found(&error) => Ok(Some(RuntimeStateAction::RemoveContainer {
-                container_id: container_id.into(),
-            })),
             Err(error) => Err(error.into()),
         }
     }
@@ -219,8 +214,8 @@ where
         };
 
         Ok(Some(RuntimeStateAction::CreateContainer {
+            id: event.id.into(),
             container: Box::new(Container {
-                id: event.id.into(),
                 name: name.trim_start_matches('/').to_string(),
                 attachments: Vec::new(),
                 runtime_dns_servers: HashSet::new(),
@@ -307,26 +302,31 @@ where
         let runtime_dns_servers = runtime_dns_servers(summary.host_config.as_ref());
 
         let mut attachments = Vec::new();
-        for (_network_name, endpoint) in container_summary_network_endpoints(summary) {
-            let Some(address) = endpoint.ip_address else {
+        for (_, endpoint) in container_summary_network_endpoints(summary) {
+            let Some(ip_address) = endpoint.ip_address else {
                 continue;
             };
-            let Some(network_id_raw) = endpoint.network_id.clone() else {
+            let Some(network_id) = endpoint.network_id else {
                 continue;
             };
-            let network_id: NetworkId = network_id_raw.into();
-            let Some(_network_data) = state.networks.get(&network_id) else {
+            let network_id = network_id.into();
+
+            // Ignore unregistered network.
+            // NOTE: this can lead to problems if there are races in docker events and
+            // the network appears after container attachment
+            if !state.networks.contains_key(&network_id) {
                 continue;
-            };
+            }
+            let aliases = endpoint.aliases.unwrap_or_default();
+
             attachments.push(NetworkAttachment {
                 network_id,
-                ip_address: address,
-                aliases: endpoint.aliases.clone().unwrap_or_default(),
+                ip_address,
+                aliases,
             });
         }
 
         Ok(Container {
-            id: summary.id.clone().into(),
             name: container_summary_name(summary),
             attachments,
             runtime_dns_servers,
@@ -698,7 +698,7 @@ mod tests {
         let mut state = RuntimeState::default();
         state.networks.insert(
             "net0".into(),
-            NetworkSnapshot {
+            Network {
                 id: "net0".into(),
                 name: "managed".to_string(),
                 subnet: "172.20.0.0/16".parse().expect("valid subnet"),
@@ -751,7 +751,7 @@ mod tests {
         let mut state = RuntimeState::default();
         state.networks.insert(
             "net0".into(),
-            NetworkSnapshot {
+            Network {
                 id: "net0".into(),
                 name: "managed".to_string(),
                 subnet: "172.20.0.0/16".parse().expect("valid subnet"),

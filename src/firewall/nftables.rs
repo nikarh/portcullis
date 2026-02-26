@@ -355,8 +355,8 @@ fn collect_managed_sources(snapshot: &RuntimeState) -> ManagedSources {
 fn collect_container_targets(snapshot: &RuntimeState) -> HashMap<String, Vec<IpAddr>> {
     let mut by_key: HashMap<String, BTreeSet<IpAddr>> = HashMap::new();
 
-    for container in snapshot.containers.values() {
-        let mut keys = vec![container.id.to_string(), container.name.clone()];
+    for (id, container) in &snapshot.containers {
+        let mut keys = vec![id.to_string(), container.name.clone()];
         for attachment in &container.attachments {
             for alias in &attachment.aliases {
                 keys.push(alias.clone());
@@ -600,8 +600,7 @@ mod common_tests {
 
     use crate::dns::{DnsError, DnsProxyCache, UpstreamResolver};
     use crate::model::{
-        Container, ContainerPolicy, EgressRule, NetworkAttachment, NetworkSnapshot, PortSpec,
-        Protocol,
+        Container, ContainerPolicy, EgressRule, Network, NetworkAttachment, PortSpec, Protocol,
     };
 
     use super::*;
@@ -665,7 +664,7 @@ mod common_tests {
             )]),
             networks: HashMap::from([(
                 "net0".into(),
-                NetworkSnapshot {
+                Network {
                     id: "net0".into(),
                     name: "bridge".to_string(),
                     subnet,
@@ -1132,8 +1131,8 @@ mod firewall_tests {
     use super::*;
     use crate::dns::DnsProxyCache;
     use crate::model::{
-        Container, ContainerPolicy, EgressRule, EgressTarget, IccMode, NetworkAttachment,
-        NetworkSnapshot, PortSpec, Protocol,
+        Container, ContainerPolicy, EgressRule, EgressTarget, IccMode, Network, NetworkAttachment,
+        PortSpec, Protocol,
     };
 
     #[derive(Clone)]
@@ -1242,7 +1241,7 @@ mod firewall_tests {
             )]),
             networks: HashMap::from([(
                 "net0".into(),
-                NetworkSnapshot {
+                Network {
                     id: "net0".into(),
                     name: "bridge".to_string(),
                     subnet,

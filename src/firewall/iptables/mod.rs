@@ -6,10 +6,13 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::{Command, Output, Stdio};
 
+use ipnet::Ipv4Net;
 use tracing::{info, trace};
 
 use crate::dns::{DnsProxyCache, UpstreamResolver};
-use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeState};
+use crate::model::{
+    DnsTarget, EgressTarget, IccAllowRule, IccMode, NetworkId, PortSpec, Protocol, RuntimeState,
+};
 use commands::{CommandBuffer, IpsetCommand, IptablesCommand, Ipv4Destination};
 
 use super::FirewallError;
@@ -217,6 +220,7 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
                 continue;
             };
             let gateway = network_gateway(state, &attachment.network_id);
+
             append_implicit_dns_allow_commands(
                 &mut commands,
                 chain_name,
@@ -226,17 +230,21 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
                 &container.runtime_dns_servers,
             );
 
-            if policy.icc_mode == IccMode::Deny {
-                append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
-            } else if policy.icc_mode == IccMode::AllowListed {
-                append_icc_allow_list_commands(
-                    &mut commands,
-                    chain_name,
-                    source_ipv4,
-                    &policy.icc_allow,
-                    &container_targets,
-                );
-                append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
+            match policy.icc_mode {
+                IccMode::Allow => {}
+                IccMode::Deny => {
+                    append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
+                }
+                IccMode::AllowListed => {
+                    append_icc_allow_list_commands(
+                        &mut commands,
+                        chain_name,
+                        source_ipv4,
+                        &policy.icc_allow,
+                        &container_targets,
+                    );
+                    append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
+                }
             }
 
             for rule in &policy.egress {
@@ -270,6 +278,7 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
             append_default_drop_command(&mut commands, chain_name, source_ipv4);
         }
     }
+
     append_enforced_network_drop_commands(&mut commands, chain_name, &state.network_subnets());
 
     Ok(commands)
@@ -277,6 +286,7 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
 
 fn append_icc_drop_commands<'a>(
     commands: &mut CommandBuffer<'a>,
+
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
     managed_ipv4: &[Ipv4Addr],
@@ -292,10 +302,11 @@ fn append_icc_drop_commands<'a>(
 
 fn append_ip_target_commands<'a>(
     commands: &mut CommandBuffer<'a>,
+
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
-    destination: ipnet::Ipv4Net,
-    ports: &[crate::model::PortSpec],
+    destination: Ipv4Net,
+    ports: &[PortSpec],
 ) {
     for port in ports {
         commands.iptables.push(IptablesCommand::AcceptIpPort {
@@ -310,11 +321,12 @@ fn append_ip_target_commands<'a>(
 
 fn append_hostname_target_commands<'a>(
     commands: &mut CommandBuffer<'a>,
+
     chain_name: &'a str,
     resolver: &mut DnsProxyCache<impl UpstreamResolver>,
     source_ipv4: Ipv4Addr,
     host: &str,
-    ports: &[crate::model::PortSpec],
+    ports: &[PortSpec],
     use_ipset: bool,
 ) -> Result<(), FirewallError> {
     let addresses = resolver
@@ -323,6 +335,7 @@ fn append_hostname_target_commands<'a>(
             host: host.to_string(),
             message: error.to_string(),
         })?;
+
     let destination_ipv4: Vec<Ipv4Addr> = addresses
         .iter()
         .filter_map(|address| match address {
@@ -368,6 +381,8 @@ fn append_hostname_target_commands<'a>(
 
     Ok(())
 }
+
+/// TODO: This seems like a recipe for disaster
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -386,6 +401,7 @@ fn detect_ipset_available() -> bool {
 
 fn append_default_drop_command<'a>(
     commands: &mut CommandBuffer<'a>,
+
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
 ) {
@@ -397,6 +413,7 @@ fn append_default_drop_command<'a>(
 
 fn collect_managed_ipv4(state: &RuntimeState) -> Vec<Ipv4Addr> {
     let mut values = BTreeSet::new();
+
     for container in state.containers.values() {
         for attachment in &container.attachments {
             if let IpAddr::V4(value) = attachment.ip_address {
@@ -417,6 +434,7 @@ fn network_gateway(state: &RuntimeState, network_id: &NetworkId) -> Option<IpAdd
 
 fn append_enforced_network_drop_commands<'a>(
     commands: &mut CommandBuffer<'a>,
+
     chain_name: &'a str,
     subnets: &[ipnet::IpNet],
 ) {
@@ -433,6 +451,7 @@ fn append_enforced_network_drop_commands<'a>(
 
 fn append_implicit_dns_allow_commands<'a>(
     commands: &mut CommandBuffer<'a>,
+
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
     gateway: Option<IpAddr>,
@@ -491,9 +510,11 @@ fn append_implicit_dns_allow_commands<'a>(
 
 fn append_icc_allow_list_commands<'a>(
     commands: &mut CommandBuffer<'a>,
+
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
-    rules: &[crate::model::IccAllowRule],
+    rules: &[IccAllowRule],
+
     container_targets: &HashMap<String, Vec<Ipv4Addr>>,
 ) {
     for rule in rules {
@@ -514,14 +535,16 @@ fn append_icc_allow_list_commands<'a>(
     }
 }
 
-fn collect_container_targets(state: &RuntimeState) -> HashMap<String, Vec<Ipv4Addr>> {
-    let mut by_key: HashMap<String, BTreeSet<Ipv4Addr>> = HashMap::new();
+/// TODO: refactor, I dont understand what it does and why it creates seemingly identical BTreeSet per key
+fn collect_container_targets(state: &RuntimeState) -> HashMap<&str, BTreeSet<Ipv4Addr>> {
+    let mut by_key: HashMap<&str, BTreeSet<Ipv4Addr>> = HashMap::new();
 
-    for container in state.containers.values() {
-        let mut keys = vec![container.id.to_string(), container.name.clone()];
+    for (id, container) in &state.containers {
+        let mut keys: Vec<&str> = vec![&id, &container.name];
+
         for attachment in &container.attachments {
             for alias in &attachment.aliases {
-                keys.push(alias.clone());
+                keys.push(alias);
             }
         }
 
@@ -537,7 +560,7 @@ fn collect_container_targets(state: &RuntimeState) -> HashMap<String, Vec<Ipv4Ad
 
     by_key
         .into_iter()
-        .map(|(key, values)| (key, values.into_iter().collect()))
+        .map(|(key, values)| (key, values))
         .collect()
 }
 
@@ -579,6 +602,7 @@ fn build_cleanup_restore_commands(filter_rules: &str) -> Vec<IptablesCommand<'st
     }
 
     let mut commands = Vec::new();
+
     for _ in 0..egress_jump_count {
         commands.push(IptablesCommand::DeleteJump {
             chain: DOCKER_USER_CHAIN,
@@ -619,7 +643,7 @@ mod tests {
     use super::*;
     use crate::dns::{DnsError, DnsProxyCache, UpstreamResolver};
     use crate::model::{
-        Container, ContainerPolicy, EgressRule, NetworkAttachment, NetworkSnapshot, PortSpec,
+        Container, ContainerPolicy, EgressRule, Network, NetworkAttachment, PortSpec,
     };
 
     struct MockResolver;
@@ -678,7 +702,7 @@ mod tests {
             )]),
             networks: HashMap::from([(
                 "net0".into(),
-                NetworkSnapshot {
+                Network {
                     id: "net0".into(),
                     name: "bridge".to_string(),
                     subnet,
@@ -739,7 +763,7 @@ mod tests {
         );
         state.networks.insert(
             "net0".into(),
-            NetworkSnapshot {
+            Network {
                 id: "net0".into(),
                 name: "bridge".to_string(),
                 subnet,
