@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use super::FirewallError;
 use crate::dns::{DnsProxyCache, UpstreamResolver};
 use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeSnapshot};
+use crate::monitor::RuntimeState;
 use tracing::{info, trace, warn};
 
 pub const TABLE_FAMILY: &str = "inet";
@@ -30,41 +31,22 @@ where
         Self { runner }
     }
 
-    #[cfg(test)]
-    pub fn apply(&self, snapshot: &RuntimeSnapshot) -> Result<(), FirewallError> {
-        let commands = build_refresh_commands(snapshot);
-        let command_count = commands.len();
-        info!(
-            command_count,
-            container_count = snapshot.containers.len(),
-            "applying nftables changes"
-        );
-        match self.runner.run_commands(&commands) {
-            Ok(()) => Ok(()),
-            Err(error) if is_missing_table_error(&error) => {
-                let init_commands = build_apply_commands(snapshot);
-                self.runner.run_commands(&init_commands)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    pub fn apply_with_dns<Dns: UpstreamResolver>(
+    pub fn apply<Dns: UpstreamResolver>(
         &self,
-        snapshot: &RuntimeSnapshot,
+        state: &RuntimeState,
         resolver: &mut DnsProxyCache<Dns>,
     ) -> Result<(), FirewallError> {
-        let commands = build_refresh_commands_with_dns(snapshot, resolver)?;
+        let commands = build_refresh_commands_with_dns(state, resolver)?;
         let command_count = commands.len();
         info!(
             command_count,
-            container_count = snapshot.containers.len(),
+            container_count = state.containers.len(),
             "applying nftables changes with DNS sets"
         );
         match self.runner.run_commands(&commands) {
             Ok(()) => Ok(()),
             Err(error) if is_missing_table_error(&error) => {
-                let init_commands = build_apply_commands_with_dns(snapshot, resolver)?;
+                let init_commands = build_apply_commands_with_dns(state, resolver)?;
                 self.runner.run_commands(&init_commands)
             }
             Err(error) => Err(error),
@@ -644,13 +626,13 @@ mod common_tests {
 
     use crate::dns::{DnsError, DnsProxyCache, UpstreamResolver};
     use crate::model::{
-        ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, NetworkSnapshot,
-        PortSpec, Protocol,
+        Container, ContainerPolicy, EgressRule, NetworkAttachment, NetworkSnapshot, PortSpec,
+        Protocol,
     };
 
     use super::*;
 
-    struct MockResolver;
+    pub(super) struct MockResolver;
 
     impl UpstreamResolver for MockResolver {
         fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
@@ -680,7 +662,7 @@ mod common_tests {
         };
 
         RuntimeSnapshot {
-            containers: vec![ContainerSnapshot {
+            containers: vec![Container {
                 id: "abc".into(),
                 name: "web".to_string(),
                 attachments: vec![NetworkAttachment {
@@ -749,7 +731,7 @@ mod common_tests {
             Ok(value) => value,
             Err(error) => panic!("failed to parse peer ip: {error}"),
         };
-        snapshot.containers.push(ContainerSnapshot {
+        snapshot.containers.push(Container {
             id: "peer".into(),
             name: "/peer".to_string(),
             attachments: vec![NetworkAttachment {
@@ -1155,12 +1137,14 @@ mod libnftables_tests {
 mod firewall_tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use ipnet::IpNet;
 
     use super::*;
+    use crate::dns::DnsProxyCache;
     use crate::model::{
-        ContainerPolicy, ContainerSnapshot, EgressRule, EgressTarget, IccMode, NetworkAttachment,
+        Container, ContainerPolicy, EgressRule, EgressTarget, IccMode, NetworkAttachment,
         NetworkSnapshot, PortSpec, Protocol,
     };
 
@@ -1243,7 +1227,7 @@ mod firewall_tests {
         };
 
         RuntimeSnapshot {
-            containers: vec![ContainerSnapshot {
+            containers: vec![Container {
                 id: "abc".into(),
                 name: "web".to_string(),
                 attachments: vec![NetworkAttachment {
@@ -1285,8 +1269,13 @@ mod firewall_tests {
         let runner = RecordingRunner::new();
         let firewall = NftablesFirewall::new(runner.clone());
         let snapshot = sample_snapshot();
+        let mut resolver = DnsProxyCache::new(
+            super::common_tests::MockResolver,
+            Duration::from_secs(300),
+            128,
+        );
 
-        let result = firewall.apply(&snapshot);
+        let result = firewall.apply(&snapshot, &mut resolver);
         assert!(result.is_ok());
 
         let scripts = runner.scripts();

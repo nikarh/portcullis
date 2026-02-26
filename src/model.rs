@@ -157,7 +157,7 @@ pub struct NetworkSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContainerSnapshot {
+pub struct Container {
     pub id: ContainerId,
     pub name: String,
     pub attachments: Vec<NetworkAttachment>,
@@ -167,7 +167,7 @@ pub struct ContainerSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
-    pub containers: Vec<ContainerSnapshot>,
+    pub containers: Vec<Container>,
     pub networks: HashMap<NetworkId, NetworkSnapshot>,
     pub enforced_network_subnets: Vec<IpNet>,
 }

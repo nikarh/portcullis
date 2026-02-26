@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
 use crate::model::RuntimeSnapshot;
+use crate::monitor::RuntimeState;
 
 pub use iptables::{CommandIptablesRunner, IptablesFirewall};
 pub use nftables::NftablesFirewall;
@@ -55,14 +56,15 @@ impl ActiveFirewall {
         }
     }
 
+    /// Apply the firewall rules for the given `RuntimeSnapshot`.
     pub fn apply(
         &self,
-        snapshot: &RuntimeSnapshot,
+        state: &RuntimeState,
         dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
     ) -> Result<(), FirewallError> {
         match self {
-            Self::Nftables(firewall) => firewall.apply_with_dns(snapshot, dns_cache),
-            Self::Iptables(firewall) => firewall.apply_with_dns(snapshot, dns_cache),
+            Self::Nftables(firewall) => firewall.apply(state, dns_cache),
+            Self::Iptables(firewall) => firewall.apply(state, dns_cache),
         }
     }
 

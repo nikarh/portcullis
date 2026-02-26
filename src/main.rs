@@ -21,10 +21,12 @@ use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
 use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
-use crate::docker::{DockerClient, DockerError, DockerEventClient, DockerFirewallBackend};
+use crate::docker::{
+    DockerApi, DockerClient, DockerError, DockerEventClient, DockerFirewallBackend,
+};
 use crate::firewall::{ActiveFirewall, FirewallError};
 use crate::logging::{LogLevel, LoggingError};
-use crate::monitor::{DockerMonitor, MonitorError, RuntimeChangeTracker, RuntimeState};
+use crate::monitor::{DockerMonitor, MonitorError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirewallBackend {
@@ -51,7 +53,6 @@ struct Config {
     docker_socket: String,
     firewall_backend: FirewallBackend,
     log_level: LogLevel,
-    fail_closed: bool,
 }
 
 impl Default for Config {
@@ -60,7 +61,6 @@ impl Default for Config {
             docker_socket: "/var/run/docker.sock".to_string(),
             firewall_backend: FirewallBackend::Auto,
             log_level: LogLevel::Info,
-            fail_closed: false,
         }
     }
 }
@@ -121,9 +121,6 @@ fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
     if let Some(level) = args.opt_value_from_str::<_, String>("--log-level")? {
         config.log_level = LogLevel::from_str(&level)?;
     }
-    if args.contains("--fail-closed") {
-        config.fail_closed = true;
-    }
 
     let remaining = args.finish();
     if !remaining.is_empty() {
@@ -144,7 +141,6 @@ OPTIONS:
   --docker-socket      Path to Docker Unix socket (default: /var/run/docker.sock)
   --firewall-backend   Firewall implementation: auto, nftables, or iptables (default: auto)
   --log-level          Logging level (default: info)
-  --fail-closed        Force default-deny for all discovered containers, even without labels
   -h, --help           Show this help
 ";
     std::io::stdout().write_all(usage.as_bytes())
@@ -162,26 +158,28 @@ fn run(config: &Config) -> Result<(), MainError> {
         docker_socket = %config.docker_socket,
         firewall_backend = ?config.firewall_backend,
         log_level = ?config.log_level,
-        fail_closed = config.fail_closed,
         "portcullis prototype started"
     );
 
     let monitor_client = DockerClient::connect(&config.docker_socket)?;
-    let mut monitor = DockerMonitor::new(monitor_client);
-    let mut event_client = DockerEventClient::connect(&config.docker_socket)?;
 
     let selected_backend = match config.firewall_backend {
-        FirewallBackend::Auto => match monitor.firewall_backend()? {
+        FirewallBackend::Auto => match monitor_client.firewall_backend()? {
             DockerFirewallBackend::Nftables => FirewallBackend::Nftables,
             DockerFirewallBackend::Iptables => FirewallBackend::Iptables,
         },
         backend => backend,
     };
+
     info!(
         configured_backend = ?config.firewall_backend,
         selected_backend = ?selected_backend,
         "selected firewall backend"
     );
+
+    let mut monitor = DockerMonitor::new(monitor_client);
+    let mut event_client = DockerEventClient::connect(&config.docker_socket)?;
+    info!("connected to docker socket");
 
     let firewall = match selected_backend {
         FirewallBackend::Auto => unreachable!("auto backend must be resolved before execution"),
@@ -203,18 +201,11 @@ fn run(config: &Config) -> Result<(), MainError> {
     let mut tracker = RuntimeChangeTracker::new();
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.collect_state()?;
-    info!("docker event stream connected");
 
-    apply_runtime_state(
-        &runtime_state,
-        &firewall,
-        &mut tracker,
-        &mut dns_cache,
-        config.fail_closed,
-        true,
-    )?;
+    trace!(?runtime_state, "applying firewall rules");
+    firewall.apply(&runtime_state, &mut dns_cache)?;
+    info!("firewall rules applied");
 
-    info!("subscribed to docker container events");
     loop {
         if terminate.load(Ordering::Relaxed) {
             info!("termination signal received; cleanup will start now");
@@ -247,15 +238,11 @@ fn run(config: &Config) -> Result<(), MainError> {
                         trace!("docker event produced no policy state changes");
                     }
                     Ok(true) => {
-                        if let Err(error) = apply_runtime_state(
-                            &runtime_state,
-                            &firewall,
-                            &mut tracker,
-                            &mut dns_cache,
-                            config.fail_closed,
-                            false,
-                        ) {
-                            error!(%error, "firewall refresh failed; continuing");
+                        trace!(?runtime_state, "runtime snapshot for firewall apply");
+                        if let Err(error) = firewall.apply(&runtime_state, &mut dns_cache) {
+                            error!(%error, "firewall apply failed; continuing");
+                        } else {
+                            info!("firewall rules applied");
                         }
                     }
                     Err(error) => {
@@ -289,40 +276,6 @@ fn run(config: &Config) -> Result<(), MainError> {
     Ok(())
 }
 
-fn apply_runtime_state(
-    runtime_state: &RuntimeState,
-    firewall: &ActiveFirewall,
-    tracker: &mut RuntimeChangeTracker,
-    dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
-    fail_closed: bool,
-    force_apply: bool,
-) -> Result<(), MainError> {
-    let mut snapshot = runtime_state.snapshot();
-    if fail_closed {
-        enforce_fail_closed_defaults(&mut snapshot);
-    }
-    let changes = tracker.detect_and_log(&snapshot);
-    debug!(change_count = changes.len(), "runtime changes computed");
-    trace!(?snapshot, "runtime snapshot for firewall apply");
-    if !force_apply && changes.is_empty() {
-        debug!("skipping firewall apply because no runtime changes were detected");
-        return Ok(());
-    }
-    firewall.apply(&snapshot, dns_cache)?;
-    info!("firewall rules applied");
-    Ok(())
-}
-
-fn enforce_fail_closed_defaults(snapshot: &mut crate::model::RuntimeSnapshot) {
-    for container in &mut snapshot.containers {
-        if !container.policy.enabled {
-            container.policy.enabled = true;
-            container.policy.egress.clear();
-            container.policy.icc_allow.clear();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +290,6 @@ mod tests {
                 docker_socket: "/var/run/docker.sock".to_string(),
                 firewall_backend: FirewallBackend::Auto,
                 log_level: LogLevel::Info,
-                fail_closed: false,
             })
         );
     }
@@ -351,7 +303,6 @@ mod tests {
             "nftables".into(),
             "--log-level".into(),
             "debug".into(),
-            "--fail-closed".into(),
         ]);
         let config = parse_config(args).ok();
         assert_eq!(
@@ -360,7 +311,6 @@ mod tests {
                 docker_socket: "/tmp/docker.sock".to_string(),
                 firewall_backend: FirewallBackend::Nftables,
                 log_level: LogLevel::Debug,
-                fail_closed: true,
             })
         );
     }

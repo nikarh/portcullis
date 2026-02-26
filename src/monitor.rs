@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -13,9 +13,7 @@ use crate::docker::{
     DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind, DockerFirewallBackend,
 };
 use crate::labels::{LabelParseError, parse_policy};
-use crate::model::{
-    ContainerId, ContainerSnapshot, NetworkAttachment, NetworkId, NetworkSnapshot, RuntimeSnapshot,
-};
+use crate::model::{Container, ContainerId, NetworkAttachment, NetworkId, RuntimeSnapshot};
 
 #[derive(Debug, Error)]
 pub enum MonitorError {
@@ -28,8 +26,12 @@ pub enum MonitorError {
     },
     #[error("missing subnet for network id: {0}")]
     MissingNetworkSubnet(String),
+    #[error("missing gateway for network id: {0}")]
+    MissingNetworkGateway(String),
     #[error("invalid subnet in network id {network_id}: {subnet}")]
     InvalidNetworkSubnet { network_id: String, subnet: String },
+    #[error("invalid gateway in network id {network_id}: {gateway}")]
+    InvalidNetworkGateway { network_id: String, gateway: String },
     #[error("invalid network label {label} on network {network_id}: {value}")]
     InvalidNetworkLabel {
         network_id: String,
@@ -41,15 +43,15 @@ pub enum MonitorError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NetworkRuntimeData {
+struct Network {
     pub name: String,
     pub subnet: IpNet,
-    pub gateway: Option<IpAddr>,
-    pub enforced: bool,
+    pub gateway: IpAddr,
 }
 
-impl NetworkRuntimeData {
+impl Network {
     fn try_new(network: &DockerNetworkInspect) -> Result<Option<Self>, MonitorError> {
+        // Ignore non-bridge networks
         if !network.driver.is_bridge() {
             debug!(
                 network_id = %network.id,
@@ -60,29 +62,36 @@ impl NetworkRuntimeData {
             return Ok(None);
         }
 
-        let subnet = network_primary_subnet(network)?;
-        let gateway = network_primary_gateway(network)?;
-        let enforce_network_policy = is_portcullis_network_enforced(network)?;
+        // Ignore non-portcullis networks
+        if !is_portcullis_network_enforced(&network)? {
+            debug!(
+                network_id = %network.id,
+                network_name = %network.name,
+                "ignoring non-portcullis network"
+            );
+            return Ok(None);
+        }
+
+        let (subnet, gateway) = network_primary_config(&network)?;
 
         Ok(Some(Self {
             name: network.name.clone(),
             subnet,
             gateway,
-            enforced: enforce_network_policy,
         }))
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeState {
-    containers: BTreeMap<ContainerId, ContainerSnapshot>,
-    networks: HashMap<NetworkId, NetworkRuntimeData>,
+    containers: HashMap<ContainerId, Container>,
+    networks: HashMap<NetworkId, Network>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeStateAction {
     CreateContainer {
-        snapshot: Box<ContainerSnapshot>,
+        container: Box<Container>,
     },
     RenameContainer {
         container_id: ContainerId,
@@ -99,8 +108,7 @@ pub enum RuntimeStateAction {
         network_id: NetworkId,
         network_name: String,
         subnet: IpNet,
-        gateway: Option<IpAddr>,
-        enforced: bool,
+        gateway: IpAddr,
     },
     RemoveNetwork {
         network_id: NetworkId,
@@ -108,40 +116,6 @@ pub enum RuntimeStateAction {
 }
 
 impl RuntimeState {
-    #[must_use]
-    pub fn snapshot(&self) -> RuntimeSnapshot {
-        let mut enforced_network_subnets = BTreeSet::new();
-        for network in self.networks.values() {
-            if network.enforced {
-                enforced_network_subnets.insert(network.subnet);
-            }
-        }
-        RuntimeSnapshot {
-            containers: self.containers.values().cloned().collect(),
-            networks: self
-                .networks
-                .iter()
-                .map(|(id, data)| {
-                    (
-                        id.clone(),
-                        NetworkSnapshot {
-                            id: id.clone(),
-                            name: data.name.clone(),
-                            subnet: data.subnet,
-                            gateway: data.gateway,
-                            enforced: data.enforced,
-                        },
-                    )
-                })
-                .collect(),
-            enforced_network_subnets: enforced_network_subnets.into_iter().collect(),
-        }
-    }
-
-    fn remove_container(&mut self, container_id: &ContainerId) -> bool {
-        self.containers.remove(container_id).is_some()
-    }
-
     fn remove_network(&mut self, network_id: &NetworkId) -> bool {
         let mut changed = self.networks.remove(network_id).is_some();
         for container in self.containers.values_mut() {
@@ -158,11 +132,13 @@ impl RuntimeState {
 
     pub fn apply_action(&mut self, action: RuntimeStateAction) -> bool {
         match action {
-            RuntimeStateAction::CreateContainer { snapshot } => {
+            RuntimeStateAction::CreateContainer {
+                container: snapshot,
+            } => {
                 let container_id = snapshot.id.clone();
-                let changed = self.containers.get(&container_id) != Some(&snapshot);
                 self.containers.insert(container_id, *snapshot);
-                changed
+
+                true
             }
             RuntimeStateAction::RenameContainer { container_id, name } => {
                 if let Some(container) = self.containers.get_mut(&container_id) {
@@ -171,9 +147,10 @@ impl RuntimeState {
                 }
                 false
             }
-            RuntimeStateAction::RemoveContainer { container_id } => {
-                self.remove_container(&container_id)
-            }
+            RuntimeStateAction::RemoveContainer { container_id } => self
+                .containers
+                .remove(&container_id)
+                .is_some_and(|c| !c.attachments.is_empty()),
             RuntimeStateAction::RemoveContainerAttachment {
                 container_id,
                 network_id,
@@ -192,17 +169,15 @@ impl RuntimeState {
                 network_name,
                 subnet,
                 gateway,
-                enforced,
             } => {
-                let next = NetworkRuntimeData {
+                let next = Network {
                     name: network_name,
                     subnet,
                     gateway,
-                    enforced,
                 };
-                let changed = self.networks.get(&network_id).cloned() != Some(next.clone());
                 self.networks.insert(network_id, next);
-                changed
+
+                true
             }
             RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
         }
@@ -221,30 +196,15 @@ where
         Self { api }
     }
 
-    #[cfg(test)]
-    pub fn snapshot(&mut self) -> Result<RuntimeSnapshot, MonitorError> {
-        let state = self.collect_state()?;
-        let snapshot = state.snapshot();
-        info!(
-            container_count = snapshot.containers.len(),
-            "docker runtime snapshot collected"
-        );
-        trace!(?snapshot, "full docker runtime snapshot");
-        Ok(snapshot)
-    }
-
-    pub fn firewall_backend(&mut self) -> Result<DockerFirewallBackend, MonitorError> {
-        self.api.firewall_backend().map_err(Into::into)
-    }
-
     pub fn collect_state(&mut self) -> Result<RuntimeState, MonitorError> {
         debug!("collecting docker runtime state");
+
         let networks = self.api.list_networks()?;
         let containers = self.api.list_containers()?;
 
         let mut state = RuntimeState::default();
         for network in networks {
-            if let Some(data) = NetworkRuntimeData::try_new(&network)? {
+            if let Some(data) = Network::try_new(&network)? {
                 state.networks.insert(network.id.into(), data);
             }
         }
@@ -261,50 +221,36 @@ where
         event: DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         match event.kind {
-            DockerEventKind::Container => Self::resolve_container_event_action(event),
-            DockerEventKind::Network => self.resolve_network_event_action(state, &event),
-        }
-    }
-
-    fn resolve_container_event_action(
-        event: DockerEvent,
-    ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        match event.action {
-            DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
-                container_id: event.id.as_str().into(),
-            })),
-            DockerEventAction::Create => Self::create_container_action(event),
-            DockerEventAction::Rename => {
-                let Some(name) = event.name else {
-                    return Ok(None);
-                };
-
-                Ok(Some(RuntimeStateAction::RenameContainer {
+            DockerEventKind::Container => match event.action {
+                DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
                     container_id: event.id.into(),
-                    name: normalize_container_name(name),
-                }))
-            }
-            _ => Ok(None),
-        }
-    }
+                })),
+                DockerEventAction::Create => Self::create_container_action(event),
+                DockerEventAction::Rename => {
+                    let Some(name) = event.name else {
+                        return Ok(None);
+                    };
 
-    fn resolve_network_event_action(
-        &mut self,
-        state: &RuntimeState,
-        event: &DockerEvent,
-    ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        match event.action {
-            DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveNetwork {
-                network_id: event.id.as_str().into(),
-            })),
-            DockerEventAction::Create | DockerEventAction::Update => {
-                self.inspect_network_action(&event.id)
-            }
-            DockerEventAction::Connect => self.resolve_network_connect_action(state, event),
-            DockerEventAction::Disconnect => {
-                Ok(Self::resolve_network_disconnect_action(state, event))
-            }
-            _ => Ok(None),
+                    Ok(Some(RuntimeStateAction::RenameContainer {
+                        container_id: event.id.into(),
+                        name,
+                    }))
+                }
+                _ => Ok(None),
+            },
+            DockerEventKind::Network => match event.action {
+                DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveNetwork {
+                    network_id: event.id.into(),
+                })),
+                DockerEventAction::Create | DockerEventAction::Update => {
+                    self.inspect_network_action(&event.id)
+                }
+                DockerEventAction::Connect => self.resolve_network_connect_action(state, &event),
+                DockerEventAction::Disconnect => {
+                    Ok(Self::resolve_network_disconnect_action(state, &event))
+                }
+                _ => Ok(None),
+            },
         }
     }
 
@@ -312,16 +258,11 @@ where
         &mut self,
         state: &RuntimeState,
         inspect: DockerContainerInspect,
-    ) -> Result<ContainerSnapshot, MonitorError> {
+    ) -> Result<Container, MonitorError> {
         let policy = parse_policy(&inspect.config.labels)?;
         let runtime_dns_servers = runtime_dns_servers(inspect.host_config.as_ref());
 
         let mut attachments = Vec::new();
-        let mut network_cache: HashMap<NetworkId, Option<NetworkRuntimeData>> = state
-            .networks
-            .iter()
-            .map(|(network_id, data)| (network_id.clone(), Some(data.clone())))
-            .collect();
 
         for (network_name, endpoint) in container_inspect_network_endpoints(&inspect) {
             let Some(address) = endpoint.ip_address else {
@@ -334,11 +275,11 @@ where
                     network_name: network_name.to_string(),
                 })?
                 .into();
-            let network_data = if let Some(value) = network_cache.get(&network_id) {
+            let network_data = if let Some(value) = state.networks.get(&network_id) {
                 value.clone()
             } else {
                 let value = match self.api.inspect_network(network_id.as_str()) {
-                    Ok(network) => NetworkRuntimeData::try_new(&network)?,
+                    Ok(network) => Network::try_new(&network)?,
                     Err(error) if is_not_found(&error) => None,
                     Err(error) => return Err(error.into()),
                 };
@@ -360,9 +301,9 @@ where
             });
         }
 
-        Ok(ContainerSnapshot {
+        Ok(Container {
             id: inspect.id.into(),
-            name: normalize_container_name(inspect.name),
+            name: inspect.name.trim_start_matches('/').to_string(),
             attachments,
             runtime_dns_servers,
             policy,
@@ -375,11 +316,12 @@ where
         container_id: &str,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         debug!(%container_id, "resolving container runtime state action");
+
         match self.api.inspect_container(container_id) {
             Ok(inspect) => {
                 let snapshot = self.build_container_snapshot_from_inspect(state, inspect)?;
                 Ok(Some(RuntimeStateAction::CreateContainer {
-                    snapshot: Box::new(snapshot),
+                    container: Box::new(snapshot),
                 }))
             }
             Err(error) if is_not_found(&error) => Ok(Some(RuntimeStateAction::RemoveContainer {
@@ -399,9 +341,9 @@ where
         };
 
         Ok(Some(RuntimeStateAction::CreateContainer {
-            snapshot: Box::new(ContainerSnapshot {
+            container: Box::new(Container {
                 id: event.id.into(),
-                name: normalize_container_name(name),
+                name: name.trim_start_matches('/').to_string(),
                 attachments: Vec::new(),
                 runtime_dns_servers: HashSet::new(),
                 policy,
@@ -465,13 +407,12 @@ where
         debug!(%network_id, "resolving network runtime state action");
         match self.api.inspect_network(network_id) {
             Ok(network) => {
-                if let Some(data) = NetworkRuntimeData::try_new(&network)? {
+                if let Some(data) = Network::try_new(&network)? {
                     Ok(Some(RuntimeStateAction::UpsertNetwork {
                         network_id: network_id.into(),
                         network_name: network.name.clone(),
                         subnet: data.subnet,
                         gateway: data.gateway,
-                        enforced: data.enforced,
                     }))
                 } else {
                     Ok(Some(RuntimeStateAction::RemoveNetwork {
@@ -489,7 +430,7 @@ where
     fn build_container_snapshot_from_summary(
         state: &RuntimeState,
         summary: &DockerContainerSummary,
-    ) -> Result<ContainerSnapshot, MonitorError> {
+    ) -> Result<Container, MonitorError> {
         let policy = parse_policy(&summary.labels)?;
         let runtime_dns_servers = runtime_dns_servers(summary.host_config.as_ref());
 
@@ -512,7 +453,7 @@ where
             });
         }
 
-        Ok(ContainerSnapshot {
+        Ok(Container {
             id: summary.id.clone().into(),
             name: container_summary_name(summary),
             attachments,
@@ -526,41 +467,34 @@ fn is_not_found(error: &DockerError) -> bool {
     matches!(error, DockerError::ApiHttpStatus { status: 404, .. })
 }
 
-fn network_primary_subnet(network: &DockerNetworkInspect) -> Result<IpNet, MonitorError> {
-    let subnet = network
+fn network_primary_config(network: &DockerNetworkInspect) -> Result<(IpNet, IpAddr), MonitorError> {
+    let config = network
         .ipam
         .as_ref()
         .and_then(|ipam| ipam.config.as_ref())
-        .and_then(|configs| configs.iter().find_map(|config| config.subnet.clone()))
-        .ok_or_else(|| MonitorError::MissingNetworkSubnet(network.id.clone()))?;
+        .and_then(|configs| configs.iter().next());
 
-    subnet
+    let subnet = config
+        .and_then(|c| c.subnet.as_deref())
+        .ok_or_else(|| MonitorError::MissingNetworkSubnet(network.id.clone()))?;
+    let subnet = subnet
         .parse::<IpNet>()
         .map_err(|_| MonitorError::InvalidNetworkSubnet {
             network_id: network.id.clone(),
-            subnet,
-        })
-}
-
-fn network_primary_gateway(network: &DockerNetworkInspect) -> Result<Option<IpAddr>, MonitorError> {
-    let gateway = network
-        .ipam
-        .as_ref()
-        .and_then(|ipam| ipam.config.as_ref())
-        .and_then(|configs| configs.iter().find_map(|config| config.gateway.clone()));
-
-    let Some(value) = gateway else {
-        return Ok(None);
-    };
-
-    let value = value
-        .parse::<IpAddr>()
-        .map_err(|_| MonitorError::InvalidNetworkSubnet {
-            network_id: network.id.clone(),
-            subnet: value,
+            subnet: subnet.to_string(),
         })?;
 
-    Ok(Some(value))
+    let gateway = config
+        .and_then(|c| c.gateway.as_deref())
+        .ok_or_else(|| MonitorError::MissingNetworkGateway(network.id.clone()))?;
+    let gateway = gateway
+        .parse::<IpAddr>()
+        .map_err(|_| MonitorError::InvalidNetworkGateway {
+            network_id: network.id.clone(),
+            gateway: gateway.to_string(),
+        })?;
+
+    Ok((subnet, gateway))
 }
 
 fn is_portcullis_network_enforced(network: &DockerNetworkInspect) -> Result<bool, MonitorError> {
@@ -626,174 +560,14 @@ fn container_summary_network_endpoints(
 }
 
 fn container_summary_name(summary: &DockerContainerSummary) -> String {
-    normalize_container_name(
-        summary
-            .names
-            .as_ref()
-            .and_then(|values| values.first())
-            .cloned()
-            .unwrap_or_else(|| summary.id.clone()),
-    )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeChange {
-    ContainerAdded {
-        id: String,
-        name: String,
-    },
-    ContainerRemoved {
-        id: String,
-        name: String,
-    },
-    AttachmentAdded {
-        container_id: String,
-        network_id: String,
-        ip_address: IpAddr,
-    },
-    AttachmentRemoved {
-        container_id: String,
-        network_id: String,
-        ip_address: IpAddr,
-    },
-    PolicyChanged {
-        container_id: String,
-    },
-}
-
-#[derive(Debug, Default)]
-pub struct RuntimeChangeTracker {
-    previous: Option<RuntimeSnapshot>,
-}
-
-impl RuntimeChangeTracker {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { previous: None }
-    }
-
-    pub fn detect_and_log(&mut self, current: &RuntimeSnapshot) -> Vec<RuntimeChange> {
-        let changes = detect_runtime_changes(self.previous.as_ref(), current);
-
-        if changes.is_empty() {
-            debug!("docker change tracker: no runtime changes detected");
-        } else {
-            info!(
-                change_count = changes.len(),
-                "docker runtime changes detected"
-            );
-        }
-
-        trace!(?changes, "docker runtime changes");
-        self.previous = Some(current.clone());
-        changes
-    }
-}
-
-#[must_use]
-fn detect_runtime_changes(
-    previous: Option<&RuntimeSnapshot>,
-    current: &RuntimeSnapshot,
-) -> Vec<RuntimeChange> {
-    let mut changes = Vec::new();
-
-    let Some(previous_snapshot) = previous else {
-        for container in &current.containers {
-            changes.push(RuntimeChange::ContainerAdded {
-                id: container.id.to_string(),
-                name: container.name.clone(),
-            });
-        }
-        return changes;
-    };
-
-    let previous_by_id: HashMap<&str, &ContainerSnapshot> = previous_snapshot
-        .containers
-        .iter()
-        .map(|container| (container.id.as_str(), container))
-        .collect();
-    let current_by_id: HashMap<&str, &ContainerSnapshot> = current
-        .containers
-        .iter()
-        .map(|container| (container.id.as_str(), container))
-        .collect();
-
-    for (container_id, container) in &current_by_id {
-        if let Some(previous_container) = previous_by_id.get(container_id) {
-            detect_attachment_changes(&mut changes, previous_container, container);
-            if previous_container.policy != container.policy {
-                changes.push(RuntimeChange::PolicyChanged {
-                    container_id: (*container_id).to_string(),
-                });
-            }
-        } else {
-            changes.push(RuntimeChange::ContainerAdded {
-                id: container.id.to_string(),
-                name: container.name.clone(),
-            });
-        }
-    }
-
-    for (container_id, container) in &previous_by_id {
-        if !current_by_id.contains_key(container_id) {
-            changes.push(RuntimeChange::ContainerRemoved {
-                id: container.id.to_string(),
-                name: container.name.clone(),
-            });
-        }
-    }
-
-    changes
-}
-
-fn detect_attachment_changes(
-    changes: &mut Vec<RuntimeChange>,
-    previous: &ContainerSnapshot,
-    current: &ContainerSnapshot,
-) {
-    let previous_keys: BTreeMap<String, &NetworkAttachment> = previous
-        .attachments
-        .iter()
-        .map(|attachment| (attachment_key(attachment), attachment))
-        .collect();
-    let current_keys: BTreeMap<String, &NetworkAttachment> = current
-        .attachments
-        .iter()
-        .map(|attachment| (attachment_key(attachment), attachment))
-        .collect();
-
-    for (key, attachment) in &current_keys {
-        if !previous_keys.contains_key(key) {
-            changes.push(RuntimeChange::AttachmentAdded {
-                container_id: current.id.to_string(),
-                network_id: attachment.network_id.to_string(),
-                ip_address: attachment.ip_address,
-            });
-        }
-    }
-
-    for (key, attachment) in &previous_keys {
-        if !current_keys.contains_key(key) {
-            changes.push(RuntimeChange::AttachmentRemoved {
-                container_id: previous.id.to_string(),
-                network_id: attachment.network_id.to_string(),
-                ip_address: attachment.ip_address,
-            });
-        }
-    }
-}
-
-fn attachment_key(attachment: &NetworkAttachment) -> String {
-    format!("{}|{}", attachment.network_id, attachment.ip_address)
-}
-
-fn normalize_container_name(value: String) -> String {
-    let trimmed = value.trim_start_matches('/');
-    if trimmed.is_empty() {
-        value
-    } else {
-        trimmed.to_string()
-    }
+    summary
+        .names
+        .as_ref()
+        .and_then(|values| values.first())
+        .cloned()
+        .unwrap_or_else(|| summary.id.clone())
+        .trim_start_matches('/')
+        .to_string()
 }
 
 #[cfg(test)]
@@ -1245,7 +1019,7 @@ mod tests {
             enforced: true,
         });
         state.apply_action(RuntimeStateAction::CreateContainer {
-            snapshot: Box::new(ContainerSnapshot {
+            container: Box::new(Container {
                 id: "abc".into(),
                 name: "web".to_string(),
                 attachments: Vec::new(),
@@ -1284,7 +1058,7 @@ mod tests {
         let mut monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
         state.apply_action(RuntimeStateAction::CreateContainer {
-            snapshot: Box::new(ContainerSnapshot {
+            container: Box::new(Container {
                 id: "abc".into(),
                 name: "web".to_string(),
                 attachments: vec![NetworkAttachment {
@@ -1505,7 +1279,7 @@ mod tests {
         };
 
         RuntimeSnapshot {
-            containers: vec![ContainerSnapshot {
+            containers: vec![Container {
                 id: container_id.into(),
                 name: name.to_string(),
                 attachments: vec![NetworkAttachment {

@@ -10,6 +10,7 @@ use tracing::{info, trace};
 
 use crate::dns::{DnsProxyCache, UpstreamResolver};
 use crate::model::{DnsTarget, EgressTarget, IccMode, NetworkId, Protocol, RuntimeSnapshot};
+use crate::monitor::RuntimeState;
 use commands::{CommandBuffer, IpsetCommand, IptablesCommand, Ipv4Destination};
 
 use super::FirewallError;
@@ -137,13 +138,12 @@ where
         Self { runner, use_ipset }
     }
 
-    pub fn apply_with_dns<Dns: UpstreamResolver>(
+    pub fn apply<Dns: UpstreamResolver>(
         &self,
-        snapshot: &RuntimeSnapshot,
+        state: &RuntimeState,
         resolver: &mut DnsProxyCache<Dns>,
     ) -> Result<(), FirewallError> {
-        let commands =
-            build_apply_commands_with_dns(snapshot, resolver, self.use_ipset, CHAIN_NAME)?;
+        let commands = build_apply_commands_with_dns(state, resolver, self.use_ipset, CHAIN_NAME)?;
 
         self.runner.run_ipset_restore(&commands.ipset)?;
         self.runner.run_iptables_restore(&commands.iptables)?;
@@ -633,8 +633,7 @@ mod tests {
     use super::*;
     use crate::dns::{DnsError, DnsProxyCache, UpstreamResolver};
     use crate::model::{
-        ContainerPolicy, ContainerSnapshot, EgressRule, NetworkAttachment, NetworkSnapshot,
-        PortSpec,
+        Container, ContainerPolicy, EgressRule, NetworkAttachment, NetworkSnapshot, PortSpec,
     };
 
     struct MockResolver;
@@ -666,7 +665,7 @@ mod tests {
         };
 
         RuntimeSnapshot {
-            containers: vec![ContainerSnapshot {
+            containers: vec![Container {
                 id: "abc".into(),
                 name: "web".to_string(),
                 attachments: vec![NetworkAttachment {
@@ -738,7 +737,7 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
-        snapshot.containers.push(ContainerSnapshot {
+        snapshot.containers.push(Container {
             id: "peer".into(),
             name: "/peer".to_string(),
             attachments: vec![NetworkAttachment {
