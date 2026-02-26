@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::ops::Deref;
@@ -170,6 +171,18 @@ pub struct Network {
     pub gateway: Option<IpAddr>,
 }
 
+impl Network {
+    #[must_use]
+    pub fn new(id: NetworkId, name: String, subnet: IpNet, gateway: Option<IpAddr>) -> Self {
+        Self {
+            id,
+            name,
+            subnet,
+            gateway,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Container {
     pub name: String,
@@ -180,13 +193,18 @@ pub struct Container {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeState {
-    pub containers: HashMap<ContainerId, Container>,
-    pub networks: HashMap<NetworkId, Network>,
-    container_lookup: HashMap<String, ContainerId>,
+    containers: HashMap<ContainerId, Container>,
+    networks: HashMap<NetworkId, Network>,
+
+    containers_by_name: HashMap<String, ContainerId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeStateAction {
+    Initialize {
+        containers: HashMap<ContainerId, Container>,
+        networks: HashMap<NetworkId, Network>,
+    },
     CreateContainer {
         id: ContainerId,
         container: Box<Container>,
@@ -214,36 +232,19 @@ pub enum RuntimeStateAction {
 }
 
 impl RuntimeState {
-    fn rebuild_container_lookup(&mut self) {
-        self.container_lookup.clear();
-
-        let mut ids: Vec<_> = self.containers.keys().cloned().collect();
-        ids.sort_unstable();
-
-        for id in ids {
-            let Some(container) = self.containers.get(&id) else {
-                continue;
-            };
-
-            self.container_lookup
-                .insert(id.as_str().to_string(), id.clone());
-            self.container_lookup
-                .insert(container.name.clone(), id.clone());
-            for attachment in &container.attachments {
-                for alias in &attachment.aliases {
-                    self.container_lookup.insert(alias.clone(), id.clone());
-                }
-            }
-        }
-    }
-
-    pub fn refresh_indexes(&mut self) {
-        self.rebuild_container_lookup();
+    #[must_use]
+    pub fn containers(&self) -> &HashMap<ContainerId, Container> {
+        &self.containers
     }
 
     #[must_use]
-    pub fn resolve_container_id(&self, key: &str) -> Option<&ContainerId> {
-        self.container_lookup.get(key)
+    pub fn networks(&self) -> &HashMap<NetworkId, Network> {
+        &self.networks
+    }
+
+    #[must_use]
+    pub fn container_id(&self, container_name: &str) -> Option<&ContainerId> {
+        self.containers_by_name.get(container_name)
     }
 
     fn remove_network(&mut self, network_id: &NetworkId) -> bool {
@@ -253,6 +254,7 @@ impl RuntimeState {
             container
                 .attachments
                 .retain(|attachment| &attachment.network_id != network_id);
+
             if container.attachments.len() != previous_len {
                 changed = true;
             }
@@ -262,41 +264,63 @@ impl RuntimeState {
 
     pub fn apply_action(&mut self, action: RuntimeStateAction) -> bool {
         match action {
-            RuntimeStateAction::CreateContainer { id, container } => {
-                self.containers.insert(id, *container);
-                self.rebuild_container_lookup();
+            RuntimeStateAction::Initialize {
+                containers,
+                networks,
+            } => {
+                self.containers = containers;
+                self.networks = networks;
+                self.containers_by_name.clear();
+
+                for (id, container) in &self.containers {
+                    self.containers_by_name
+                        .insert(container.name.clone(), id.clone());
+                }
+
                 true
             }
-            RuntimeStateAction::RenameContainer { container_id, name } => {
-                if let Some(container) = self.containers.get_mut(&container_id) {
-                    container.name = name;
-                    self.rebuild_container_lookup();
-                    return true;
+            RuntimeStateAction::CreateContainer { id, container } => {
+                if let Some(previous) = self.containers.get(&id).cloned() {
+                    self.containers_by_name.remove(&previous.name);
                 }
-                false
+
+                let has_networks = !container.attachments.is_empty();
+
+                self.containers_by_name
+                    .insert(container.name.clone(), id.clone());
+                self.containers.insert(id.clone(), *container);
+
+                has_networks
+            }
+            RuntimeStateAction::RenameContainer { container_id, name } => {
+                let Some(container) = self.containers.get_mut(&container_id) else {
+                    return false;
+                };
+                if container.name == name {
+                    return false;
+                }
+                let previous_name = std::mem::replace(&mut container.name, name);
+
+                self.containers_by_name.remove(previous_name.as_str());
+                self.containers_by_name
+                    .insert(container.name.clone(), container_id);
+                true
             }
             RuntimeStateAction::RemoveContainer { container_id } => {
-                let removed = self.containers.remove(&container_id);
-                if let Some(container) = removed {
-                    self.rebuild_container_lookup();
+                if let Some(container) = self.containers.remove(&container_id) {
+                    self.containers_by_name.remove(container.name.as_str());
                     return !container.attachments.is_empty();
                 }
-                false
+                true
             }
             RuntimeStateAction::RemoveContainerAttachment {
                 container_id,
                 network_id,
             } => {
                 if let Some(container) = self.containers.get_mut(&container_id) {
-                    let previous_len = container.attachments.len();
-                    container
-                        .attachments
-                        .retain(|attachment| attachment.network_id != network_id);
-                    let changed = container.attachments.len() != previous_len;
-                    if changed {
-                        self.rebuild_container_lookup();
-                    }
-                    return changed;
+                    let len = container.attachments.len();
+                    container.attachments.retain(|a| a.network_id != network_id);
+                    return len != container.attachments.len();
                 }
                 false
             }
@@ -308,22 +332,11 @@ impl RuntimeState {
             } => {
                 self.networks.insert(
                     network_id.clone(),
-                    Network {
-                        id: network_id,
-                        name: network_name,
-                        subnet,
-                        gateway,
-                    },
+                    Network::new(network_id, network_name, subnet, gateway),
                 );
                 true
             }
-            RuntimeStateAction::RemoveNetwork { network_id } => {
-                let changed = self.remove_network(&network_id);
-                if changed {
-                    self.rebuild_container_lookup();
-                }
-                changed
-            }
+            RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
         }
     }
 

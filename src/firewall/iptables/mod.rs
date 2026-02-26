@@ -209,7 +209,7 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
         .iptables
         .push(IptablesCommand::FlushChain { chain: chain_name });
 
-    for container in state.containers.values() {
+    for container in state.containers().values() {
         let policy = &container.policy;
 
         for attachment in &container.attachments {
@@ -309,7 +309,7 @@ fn append_icc_drop_commands<'a>(
     source_network_id: &NetworkId,
     state: &RuntimeState,
 ) {
-    let Some(network) = state.networks.get(source_network_id) else {
+    let Some(network) = state.networks().get(source_network_id) else {
         return;
     };
     let ipnet::IpNet::V4(destination_subnet) = network.subnet else {
@@ -330,7 +330,7 @@ fn append_icc_allow_commands<'a>(
     source_network_id: &NetworkId,
     state: &RuntimeState,
 ) {
-    for container in state.containers.values() {
+    for container in state.containers().values() {
         for attachment in &container.attachments {
             if attachment.network_id != *source_network_id {
                 continue;
@@ -461,7 +461,7 @@ fn append_default_drop_command<'a>(
 
 fn network_gateway(state: &RuntimeState, network_id: &NetworkId) -> Option<IpAddr> {
     state
-        .networks
+        .networks()
         .get(network_id)
         .and_then(|network| network.gateway)
 }
@@ -549,11 +549,10 @@ fn append_icc_allow_list_commands<'a>(
     state: &RuntimeState,
 ) {
     for rule in rules {
-        let Some(target_container_id) = state.resolve_container_id(rule.target_container.as_str())
+        let Some(target_container) = state
+            .container_id(rule.target_container.as_str())
+            .and_then(|id| state.containers().get(id))
         else {
-            continue;
-        };
-        let Some(target_container) = state.containers.get(target_container_id) else {
             continue;
         };
 
@@ -658,7 +657,8 @@ mod tests {
     use super::*;
     use crate::dns::{DnsError, DnsProxyCache, UpstreamResolver};
     use crate::model::{
-        Container, ContainerPolicy, EgressRule, Network, NetworkAttachment, PortSpec,
+        Container, ContainerId, ContainerPolicy, EgressRule, NetworkAttachment, PortSpec,
+        RuntimeStateAction,
     };
 
     struct MockResolver;
@@ -690,9 +690,15 @@ mod tests {
         };
 
         let mut state = RuntimeState::default();
-        state.containers.insert(
-            "abc".into(),
-            Container {
+        state.apply_action(RuntimeStateAction::UpsertNetwork {
+            network_id: "net0".into(),
+            network_name: "bridge".to_string(),
+            subnet,
+            gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
+        });
+        state.apply_action(RuntimeStateAction::CreateContainer {
+            id: "abc".into(),
+            container: Box::new(Container {
                 name: "web".to_string(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
@@ -712,19 +718,25 @@ mod tests {
                     icc_allow: Vec::new(),
                     dns_targets: vec![crate::model::DnsTarget::Docker],
                 },
-            },
-        );
-        state.networks.insert(
-            "net0".into(),
-            Network {
-                id: "net0".into(),
-                name: "bridge".to_string(),
-                subnet,
-                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-            },
-        );
-        state.refresh_indexes();
+            }),
+        });
+
         state
+    }
+
+    fn update_container(state: &mut RuntimeState, id: &str, apply: impl FnOnce(&mut Container)) {
+        let id = ContainerId::from(id);
+        let mut container = state
+            .containers()
+            .get(&id)
+            .cloned()
+            .expect("container fixture should exist");
+        apply(&mut container);
+
+        state.apply_action(RuntimeStateAction::CreateContainer {
+            id,
+            container: Box::new(container),
+        });
     }
 
     #[test]
@@ -758,17 +770,13 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("failed to parse peer ip: {error}"),
         };
-        let subnet: IpNet = match "172.18.0.0/16".parse() {
-            Ok(value) => value,
-            Err(error) => panic!("failed to parse subnet: {error}"),
-        };
         let second_subnet: IpNet = match "172.19.0.0/16".parse() {
             Ok(value) => value,
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
-        state.containers.insert(
-            "peer".into(),
-            Container {
+        state.apply_action(RuntimeStateAction::CreateContainer {
+            id: "peer".into(),
+            container: Box::new(Container {
                 name: "/peer".to_string(),
                 attachments: vec![
                     NetworkAttachment {
@@ -784,45 +792,24 @@ mod tests {
                 ],
                 runtime_dns_servers: HashSet::new(),
                 policy: crate::model::ContainerPolicy::default(),
-            },
-        );
-        state.networks.insert(
-            "net0".into(),
-            Network {
-                id: "net0".into(),
-                name: "bridge".to_string(),
-                subnet,
-                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-            },
-        );
-        state.networks.insert(
-            "net1".into(),
-            Network {
-                id: "net1".into(),
-                name: "bridge2".to_string(),
-                subnet: second_subnet,
-                gateway: Some("172.19.0.1".parse().expect("gateway fixture should parse")),
-            },
-        );
-        state.refresh_indexes();
-        state
-            .containers
-            .get_mut("abc")
-            .expect("abc fixture container should exist")
-            .policy
-            .icc_mode = IccMode::AllowListed;
-        state
-            .containers
-            .get_mut("abc")
-            .expect("abc fixture container should exist")
-            .policy
-            .icc_allow = vec![crate::model::IccAllowRule {
-            target_container: "db".into(),
-            ports: vec![PortSpec {
-                protocol: Protocol::Tcp,
-                port: 5432,
-            }],
-        }];
+            }),
+        });
+        state.apply_action(RuntimeStateAction::UpsertNetwork {
+            network_id: "net1".into(),
+            network_name: "bridge2".to_string(),
+            subnet: second_subnet,
+            gateway: Some("172.19.0.1".parse().expect("gateway fixture should parse")),
+        });
+        update_container(&mut state, "abc", |container| {
+            container.policy.icc_mode = IccMode::AllowListed;
+            container.policy.icc_allow = vec![crate::model::IccAllowRule {
+                target_container: "/peer".into(),
+                ports: vec![PortSpec {
+                    protocol: Protocol::Tcp,
+                    port: 5432,
+                }],
+            }];
+        });
 
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands = build_apply_commands_with_dns(&state, &mut resolver, false, CHAIN_NAME)
@@ -852,9 +839,9 @@ mod tests {
     #[test]
     fn build_commands_adds_icc_allow_for_same_network_container_ips() {
         let mut state = sample_state();
-        state.containers.insert(
-            "peer".into(),
-            Container {
+        state.apply_action(RuntimeStateAction::CreateContainer {
+            id: "peer".into(),
+            container: Box::new(Container {
                 name: "peer".to_string(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
@@ -863,9 +850,8 @@ mod tests {
                 }],
                 runtime_dns_servers: HashSet::new(),
                 policy: ContainerPolicy::default(),
-            },
-        );
-        state.refresh_indexes();
+            }),
+        });
 
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands = build_apply_commands_with_dns(&state, &mut resolver, false, CHAIN_NAME)
@@ -885,12 +871,9 @@ mod tests {
     #[test]
     fn build_commands_adds_icc_deny_as_subnet_drop() {
         let mut state = sample_state();
-        state
-            .containers
-            .get_mut("abc")
-            .expect("abc fixture container should exist")
-            .policy
-            .icc_mode = IccMode::Deny;
+        update_container(&mut state, "abc", |container| {
+            container.policy.icc_mode = IccMode::Deny;
+        });
 
         let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
         let commands = build_apply_commands_with_dns(&state, &mut resolver, false, CHAIN_NAME)

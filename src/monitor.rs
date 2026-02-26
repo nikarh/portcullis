@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -64,12 +64,12 @@ fn network_from_inspect(network: &DockerNetworkInspect) -> Result<Option<Network
 
     let (subnet, gateway) = network_primary_config(network)?;
 
-    Ok(Some(Network {
-        id: network.id.clone().into(),
-        name: network.name.clone(),
+    Ok(Some(Network::new(
+        network.id.clone().into(),
+        network.name.clone(),
         subnet,
         gateway,
-    }))
+    )))
 }
 
 pub struct DockerMonitor<A> {
@@ -90,17 +90,22 @@ where
         let networks = self.api.list_networks()?;
         let containers = self.api.list_containers()?;
 
-        let mut state = RuntimeState::default();
+        let mut networks_by_id = HashMap::new();
         for network in networks {
             if let Some(data) = network_from_inspect(&network)? {
-                state.networks.insert(data.id.clone(), data);
+                networks_by_id.insert(data.id.clone(), data);
             }
         }
+        let mut containers_by_id = HashMap::new();
         for summary in containers {
-            let container = Self::build_container_from_summary(&state, &summary)?;
-            state.containers.insert(summary.id.into(), container);
+            let container = Self::build_container_from_summary(&networks_by_id, &summary)?;
+            containers_by_id.insert(summary.id.into(), container);
         }
-        state.refresh_indexes();
+        let mut state = RuntimeState::default();
+        state.apply_action(RuntimeStateAction::Initialize {
+            containers: containers_by_id,
+            networks: networks_by_id,
+        });
         Ok(state)
     }
 
@@ -163,7 +168,7 @@ where
                     network_name: network_name.to_string(),
                 })?
                 .into();
-            if !state.networks.contains_key(&network_id) {
+            if !state.networks().contains_key(&network_id) {
                 warn!(
                     network_id = %network_id,
                     container_id = %inspect.id,
@@ -231,7 +236,7 @@ where
         event: &DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         if !state
-            .networks
+            .networks()
             .contains_key(&NetworkId::from(event.id.as_str()))
         {
             trace!(
@@ -253,7 +258,8 @@ where
         event: &DockerEvent,
     ) -> Option<RuntimeStateAction> {
         let container_id = event.attributes.get("container")?;
-        let container = state.containers.get(container_id.as_str())?;
+        let container_id = ContainerId::from(container_id.as_str());
+        let container = state.containers().get(&container_id)?;
         if !container
             .attachments
             .iter()
@@ -263,7 +269,7 @@ where
         }
 
         Some(RuntimeStateAction::RemoveContainerAttachment {
-            container_id: container_id.as_str().into(),
+            container_id,
             network_id: event.id.as_str().into(),
         })
     }
@@ -296,7 +302,7 @@ where
     }
 
     fn build_container_from_summary(
-        state: &RuntimeState,
+        managed_networks: &HashMap<NetworkId, Network>,
         summary: &DockerContainerSummary,
     ) -> Result<Container, MonitorError> {
         let policy = parse_policy(&summary.labels)?;
@@ -315,7 +321,7 @@ where
             // Ignore unregistered network.
             // NOTE: this can lead to problems if there are races in docker events and
             // the network appears after container attachment
-            if !state.networks.contains_key(&network_id) {
+            if !managed_networks.contains_key(&network_id) {
                 continue;
             }
             let aliases = endpoint.aliases.unwrap_or_default();
@@ -620,6 +626,29 @@ mod tests {
         }
     }
 
+    fn add_network(
+        state: &mut RuntimeState,
+        network_id: &str,
+        subnet: &str,
+        gateway: Option<&str>,
+    ) {
+        let subnet = subnet.parse().expect("subnet fixture should parse");
+        let gateway = gateway.map(|value| value.parse().expect("gateway fixture should parse"));
+        state.apply_action(RuntimeStateAction::UpsertNetwork {
+            network_id: network_id.into(),
+            network_name: network_id.to_string(),
+            subnet,
+            gateway,
+        });
+    }
+
+    fn add_container(state: &mut RuntimeState, id: &str, container: Container) {
+        state.apply_action(RuntimeStateAction::CreateContainer {
+            id: id.into(),
+            container: Box::new(container),
+        });
+    }
+
     #[test]
     fn collect_state_keeps_all_containers_and_only_managed_attachments() {
         let mut api = MockDockerApi::default();
@@ -660,12 +689,12 @@ mod tests {
             .collect_state()
             .expect("collect_state should succeed");
 
-        assert_eq!(state.networks.len(), 1);
-        assert!(state.networks.contains_key("net0"));
-        assert_eq!(state.containers.len(), 2);
+        assert_eq!(state.networks().len(), 1);
+        assert!(state.networks().contains_key("net0"));
+        assert_eq!(state.containers().len(), 2);
         assert_eq!(
             state
-                .containers
+                .containers()
                 .get("abc")
                 .expect("abc should be present")
                 .attachments
@@ -674,7 +703,7 @@ mod tests {
         );
         assert!(
             state
-                .containers
+                .containers()
                 .get("def")
                 .expect("def should be present")
                 .attachments
@@ -697,15 +726,7 @@ mod tests {
 
         let mut monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
-        state.networks.insert(
-            "net0".into(),
-            Network {
-                id: "net0".into(),
-                name: "managed".to_string(),
-                subnet: "172.20.0.0/16".parse().expect("valid subnet"),
-                gateway: Some("172.20.0.1".parse().expect("valid gateway")),
-            },
-        );
+        add_network(&mut state, "net0", "172.20.0.0/16", Some("172.20.0.1"));
 
         let action = monitor
             .resolve_event_action(&state, network_connect_event("net0", "abc"))
@@ -750,15 +771,7 @@ mod tests {
 
         let mut monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
-        state.networks.insert(
-            "net0".into(),
-            Network {
-                id: "net0".into(),
-                name: "managed".to_string(),
-                subnet: "172.20.0.0/16".parse().expect("valid subnet"),
-                gateway: Some("172.20.0.1".parse().expect("valid gateway")),
-            },
-        );
+        add_network(&mut state, "net0", "172.20.0.0/16", Some("172.20.0.1"));
 
         let action = monitor
             .resolve_event_action(&state, network_connect_event("net0", "abc"))
@@ -778,8 +791,9 @@ mod tests {
         let api = MockDockerApi::default();
         let mut monitor = DockerMonitor::new(api);
         let mut state = RuntimeState::default();
-        state.containers.insert(
-            "abc".into(),
+        add_container(
+            &mut state,
+            "abc",
             Container {
                 name: "web".to_string(),
                 attachments: vec![NetworkAttachment {
