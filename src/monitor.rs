@@ -84,7 +84,7 @@ where
         Self { api }
     }
 
-    pub fn collect_state(&mut self) -> Result<RuntimeState, MonitorError> {
+    pub fn initialize(&mut self) -> Result<RuntimeState, MonitorError> {
         debug!("collecting docker runtime state");
 
         let networks = self.api.list_networks()?;
@@ -685,9 +685,7 @@ mod tests {
         ));
 
         let mut monitor = DockerMonitor::new(api);
-        let state = monitor
-            .collect_state()
-            .expect("collect_state should succeed");
+        let state = monitor.initialize().expect("collect_state should succeed");
 
         assert_eq!(state.networks().len(), 1);
         assert!(state.networks().contains_key("net0"));
@@ -926,7 +924,7 @@ mod tests {
         ));
 
         let mut monitor = DockerMonitor::new(api);
-        let result = monitor.collect_state();
+        let result = monitor.initialize();
 
         assert!(matches!(
             result,

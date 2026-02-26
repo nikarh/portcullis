@@ -3,7 +3,7 @@ mod nftables;
 
 use thiserror::Error;
 
-use crate::dns::{DnsProxyCache, SystemUpstreamResolver};
+use crate::dns::PolicyDnsResolver;
 use crate::model::RuntimeState;
 
 pub use iptables::{CommandIptablesRunner, IptablesFirewall};
@@ -56,11 +56,10 @@ impl ActiveFirewall {
     }
 
     /// Apply firewall rules for the current runtime state.
-    pub fn apply(
-        &self,
-        state: &RuntimeState,
-        dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
-    ) -> Result<(), FirewallError> {
+    pub fn apply<Dns>(&self, state: &RuntimeState, dns_cache: &mut Dns) -> Result<(), FirewallError>
+    where
+        Dns: PolicyDnsResolver,
+    {
         match self {
             Self::Nftables(firewall) => firewall.apply(state, dns_cache),
             Self::Iptables(firewall) => firewall.apply(state, dns_cache),

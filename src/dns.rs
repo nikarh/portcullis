@@ -18,6 +18,10 @@ pub trait UpstreamResolver {
     fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError>;
 }
 
+pub trait PolicyDnsResolver {
+    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError>;
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SystemUpstreamResolver;
 
@@ -122,6 +126,37 @@ where
         }
     }
 
+    fn store_values(&mut self, host: &str, values: &Arc<[IpAddr]>, ttl: Duration) {
+        let expires_at = Instant::now() + ttl;
+        self.entries.insert(
+            host.to_string(),
+            CacheEntry {
+                values: Arc::clone(values),
+                expires_at,
+            },
+        );
+        self.touch_lru(host);
+        self.enforce_limit();
+    }
+
+    pub fn resolve_cached(&mut self, host: &str) -> Arc<[IpAddr]> {
+        let now = Instant::now();
+        self.purge_expired(now);
+        if let Some(entry) = self.entries.get(host)
+            && entry.expires_at > now
+        {
+            let values = Arc::clone(&entry.values);
+            self.touch_lru(host);
+            return values;
+        }
+        Arc::from(Vec::<IpAddr>::new().into_boxed_slice())
+    }
+
+    pub fn insert_with_ttl(&mut self, host: &str, values: Vec<IpAddr>, ttl: Duration) {
+        let addresses: Arc<[IpAddr]> = Arc::<[IpAddr]>::from(values.into_boxed_slice());
+        self.store_values(host, &addresses, ttl);
+    }
+
     pub fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
         let now = Instant::now();
         self.purge_expired(now);
@@ -144,17 +179,7 @@ where
         // 2) `Arc<[IpAddr]>` allocates once to store deduplicated addresses for cheap cache-hit cloning.
         // 3) Host key String is stored in HashMap and LRU deque.
         let addresses: Arc<[IpAddr]> = Arc::<[IpAddr]>::from(values.into_boxed_slice());
-        let expires_at = now + self.ttl;
-
-        self.entries.insert(
-            host.to_string(),
-            CacheEntry {
-                values: Arc::clone(&addresses),
-                expires_at,
-            },
-        );
-        self.touch_lru(host);
-        self.enforce_limit();
+        self.store_values(host, &addresses, self.ttl);
 
         trace!(
             %host,
@@ -165,6 +190,40 @@ where
         );
 
         Ok(addresses)
+    }
+}
+
+impl<R> PolicyDnsResolver for DnsProxyCache<R>
+where
+    R: UpstreamResolver,
+{
+    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
+        DnsProxyCache::resolve(self, host)
+    }
+}
+
+pub struct CacheOnlyDnsResolver<'a, R>
+where
+    R: UpstreamResolver,
+{
+    cache: &'a mut DnsProxyCache<R>,
+}
+
+impl<'a, R> CacheOnlyDnsResolver<'a, R>
+where
+    R: UpstreamResolver,
+{
+    pub const fn new(cache: &'a mut DnsProxyCache<R>) -> Self {
+        Self { cache }
+    }
+}
+
+impl<R> PolicyDnsResolver for CacheOnlyDnsResolver<'_, R>
+where
+    R: UpstreamResolver,
+{
+    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
+        Ok(self.cache.resolve_cached(host))
     }
 }
 

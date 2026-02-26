@@ -9,7 +9,7 @@ use std::process::{Command, Output, Stdio};
 use ipnet::Ipv4Net;
 use tracing::{info, trace};
 
-use crate::dns::{DnsProxyCache, UpstreamResolver};
+use crate::dns::PolicyDnsResolver;
 use crate::model::{
     DnsTarget, EgressTarget, IccAllowRule, IccMode, NetworkId, PortSpec, Protocol, RuntimeState,
 };
@@ -140,11 +140,10 @@ where
         Self { runner, use_ipset }
     }
 
-    pub fn apply<Dns: UpstreamResolver>(
-        &self,
-        state: &RuntimeState,
-        resolver: &mut DnsProxyCache<Dns>,
-    ) -> Result<(), FirewallError> {
+    pub fn apply<Dns>(&self, state: &RuntimeState, resolver: &mut Dns) -> Result<(), FirewallError>
+    where
+        Dns: PolicyDnsResolver,
+    {
         let commands = build_apply_commands_with_dns(state, resolver, self.use_ipset, CHAIN_NAME)?;
 
         self.runner.run_ipset_restore(&commands.ipset)?;
@@ -197,12 +196,15 @@ impl IptablesFirewall<CommandIptablesRunner> {
     }
 }
 
-fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
+fn build_apply_commands_with_dns<'a, Dns>(
     state: &RuntimeState,
-    resolver: &mut DnsProxyCache<Dns>,
+    resolver: &mut Dns,
     use_ipset: bool,
     chain_name: &'a str,
-) -> Result<CommandBuffer<'a>, FirewallError> {
+) -> Result<CommandBuffer<'a>, FirewallError>
+where
+    Dns: PolicyDnsResolver,
+{
     let mut commands = CommandBuffer::default();
 
     commands
@@ -372,7 +374,7 @@ fn append_ip_target_commands<'a>(
 fn append_hostname_target_commands<'a>(
     commands: &mut CommandBuffer<'a>,
     chain_name: &'a str,
-    resolver: &mut DnsProxyCache<impl UpstreamResolver>,
+    resolver: &mut impl PolicyDnsResolver,
     source_ipv4: Ipv4Addr,
     host: &str,
     ports: &[PortSpec],
