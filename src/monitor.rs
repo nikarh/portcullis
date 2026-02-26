@@ -100,6 +100,7 @@ where
             let container = Self::build_container_from_summary(&state, &summary)?;
             state.containers.insert(summary.id.into(), container);
         }
+        state.refresh_indexes();
         Ok(state)
     }
 
@@ -711,8 +712,8 @@ mod tests {
             .expect("connect action should resolve");
 
         match action {
-            Some(RuntimeStateAction::CreateContainer { container }) => {
-                assert_eq!(container.id.as_str(), "abc");
+            Some(RuntimeStateAction::CreateContainer { id, container }) => {
+                assert_eq!(id.as_str(), "abc");
                 assert_eq!(container.attachments.len(), 1);
             }
             _ => panic!("expected create container action"),
@@ -764,7 +765,7 @@ mod tests {
             .expect("connect action should resolve");
 
         match action {
-            Some(RuntimeStateAction::CreateContainer { container }) => {
+            Some(RuntimeStateAction::CreateContainer { container, .. }) => {
                 assert!(container.attachments.is_empty());
             }
             _ => panic!("expected create container action"),
@@ -780,7 +781,6 @@ mod tests {
         state.containers.insert(
             "abc".into(),
             Container {
-                id: "abc".into(),
                 name: "web".to_string(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),

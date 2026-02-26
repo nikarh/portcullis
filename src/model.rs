@@ -182,6 +182,7 @@ pub struct Container {
 pub struct RuntimeState {
     pub containers: HashMap<ContainerId, Container>,
     pub networks: HashMap<NetworkId, Network>,
+    container_lookup: HashMap<String, ContainerId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +214,38 @@ pub enum RuntimeStateAction {
 }
 
 impl RuntimeState {
+    fn rebuild_container_lookup(&mut self) {
+        self.container_lookup.clear();
+
+        let mut ids: Vec<_> = self.containers.keys().cloned().collect();
+        ids.sort_unstable();
+
+        for id in ids {
+            let Some(container) = self.containers.get(&id) else {
+                continue;
+            };
+
+            self.container_lookup
+                .insert(id.as_str().to_string(), id.clone());
+            self.container_lookup
+                .insert(container.name.clone(), id.clone());
+            for attachment in &container.attachments {
+                for alias in &attachment.aliases {
+                    self.container_lookup.insert(alias.clone(), id.clone());
+                }
+            }
+        }
+    }
+
+    pub fn refresh_indexes(&mut self) {
+        self.rebuild_container_lookup();
+    }
+
+    #[must_use]
+    pub fn resolve_container_id(&self, key: &str) -> Option<&ContainerId> {
+        self.container_lookup.get(key)
+    }
+
     fn remove_network(&mut self, network_id: &NetworkId) -> bool {
         let mut changed = self.networks.remove(network_id).is_some();
         for container in self.containers.values_mut() {
@@ -231,19 +264,25 @@ impl RuntimeState {
         match action {
             RuntimeStateAction::CreateContainer { id, container } => {
                 self.containers.insert(id, *container);
+                self.rebuild_container_lookup();
                 true
             }
             RuntimeStateAction::RenameContainer { container_id, name } => {
                 if let Some(container) = self.containers.get_mut(&container_id) {
                     container.name = name;
+                    self.rebuild_container_lookup();
                     return true;
                 }
                 false
             }
-            RuntimeStateAction::RemoveContainer { container_id } => self
-                .containers
-                .remove(&container_id)
-                .is_some_and(|container| !container.attachments.is_empty()),
+            RuntimeStateAction::RemoveContainer { container_id } => {
+                let removed = self.containers.remove(&container_id);
+                if let Some(container) = removed {
+                    self.rebuild_container_lookup();
+                    return !container.attachments.is_empty();
+                }
+                false
+            }
             RuntimeStateAction::RemoveContainerAttachment {
                 container_id,
                 network_id,
@@ -253,7 +292,11 @@ impl RuntimeState {
                     container
                         .attachments
                         .retain(|attachment| attachment.network_id != network_id);
-                    return container.attachments.len() != previous_len;
+                    let changed = container.attachments.len() != previous_len;
+                    if changed {
+                        self.rebuild_container_lookup();
+                    }
+                    return changed;
                 }
                 false
             }
@@ -274,7 +317,13 @@ impl RuntimeState {
                 );
                 true
             }
-            RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
+            RuntimeStateAction::RemoveNetwork { network_id } => {
+                let changed = self.remove_network(&network_id);
+                if changed {
+                    self.rebuild_container_lookup();
+                }
+                changed
+            }
         }
     }
 

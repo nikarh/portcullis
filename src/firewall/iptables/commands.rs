@@ -46,7 +46,12 @@ pub enum IptablesCommand<'a> {
         source: Ipv4Addr,
         protocol: Protocol,
     },
-    DropIcc {
+    DropIccSubnet {
+        chain: &'a str,
+        source: Ipv4Addr,
+        destination: ipnet::Ipv4Net,
+    },
+    AcceptIcc {
         chain: &'a str,
         source: Ipv4Addr,
         destination: Ipv4Addr,
@@ -147,11 +152,16 @@ impl fmt::Display for IptablesCommand<'_> {
                 "-A {chain} -s {source}/32 -p {} --dport 53 -j DROP",
                 protocol_name(*protocol)
             ),
-            Self::DropIcc {
+            Self::DropIccSubnet {
                 chain,
                 source,
                 destination,
-            } => write!(f, "-A {chain} -s {source}/32 -d {destination}/32 -j DROP"),
+            } => write!(f, "-A {chain} -s {source}/32 -d {destination} -j DROP"),
+            Self::AcceptIcc {
+                chain,
+                source,
+                destination,
+            } => write!(f, "-A {chain} -s {source}/32 -d {destination}/32 -j ACCEPT"),
             Self::DropSourceIp { chain, source } => {
                 write!(f, "-A {chain} -s {source}/32 -j DROP")
             }

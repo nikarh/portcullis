@@ -1,6 +1,6 @@
 mod commands;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
@@ -209,9 +209,6 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
         .iptables
         .push(IptablesCommand::FlushChain { chain: chain_name });
 
-    let managed_ipv4 = collect_managed_ipv4(state);
-    let container_targets = collect_container_targets(state);
-
     for container in state.containers.values() {
         let policy = &container.policy;
 
@@ -231,19 +228,40 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
             );
 
             match policy.icc_mode {
-                IccMode::Allow => {}
+                IccMode::Allow => {
+                    append_icc_allow_commands(
+                        &mut commands,
+                        chain_name,
+                        source_ipv4,
+                        &attachment.network_id,
+                        state,
+                    );
+                }
                 IccMode::Deny => {
-                    append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
+                    append_icc_drop_commands(
+                        &mut commands,
+                        chain_name,
+                        source_ipv4,
+                        &attachment.network_id,
+                        state,
+                    );
                 }
                 IccMode::AllowListed => {
                     append_icc_allow_list_commands(
                         &mut commands,
                         chain_name,
                         source_ipv4,
+                        &attachment.network_id,
                         &policy.icc_allow,
-                        &container_targets,
+                        state,
                     );
-                    append_icc_drop_commands(&mut commands, chain_name, source_ipv4, &managed_ipv4);
+                    append_icc_drop_commands(
+                        &mut commands,
+                        chain_name,
+                        source_ipv4,
+                        &attachment.network_id,
+                        state,
+                    );
                 }
             }
 
@@ -286,23 +304,55 @@ fn build_apply_commands_with_dns<'a, Dns: UpstreamResolver>(
 
 fn append_icc_drop_commands<'a>(
     commands: &mut CommandBuffer<'a>,
-
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
-    managed_ipv4: &[Ipv4Addr],
+    source_network_id: &NetworkId,
+    state: &RuntimeState,
 ) {
-    for destination in managed_ipv4 {
-        commands.iptables.push(IptablesCommand::DropIcc {
-            chain: chain_name,
-            source: source_ipv4,
-            destination: *destination,
-        });
+    let Some(network) = state.networks.get(source_network_id) else {
+        return;
+    };
+    let ipnet::IpNet::V4(destination_subnet) = network.subnet else {
+        return;
+    };
+
+    commands.iptables.push(IptablesCommand::DropIccSubnet {
+        chain: chain_name,
+        source: source_ipv4,
+        destination: destination_subnet,
+    });
+}
+
+fn append_icc_allow_commands<'a>(
+    commands: &mut CommandBuffer<'a>,
+    chain_name: &'a str,
+    source_ipv4: Ipv4Addr,
+    source_network_id: &NetworkId,
+    state: &RuntimeState,
+) {
+    for container in state.containers.values() {
+        for attachment in &container.attachments {
+            if attachment.network_id != *source_network_id {
+                continue;
+            }
+            let IpAddr::V4(destination) = attachment.ip_address else {
+                continue;
+            };
+            if destination == source_ipv4 {
+                continue;
+            }
+
+            commands.iptables.push(IptablesCommand::AcceptIcc {
+                chain: chain_name,
+                source: source_ipv4,
+                destination,
+            });
+        }
     }
 }
 
 fn append_ip_target_commands<'a>(
     commands: &mut CommandBuffer<'a>,
-
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
     destination: Ipv4Net,
@@ -321,7 +371,6 @@ fn append_ip_target_commands<'a>(
 
 fn append_hostname_target_commands<'a>(
     commands: &mut CommandBuffer<'a>,
-
     chain_name: &'a str,
     resolver: &mut DnsProxyCache<impl UpstreamResolver>,
     source_ipv4: Ipv4Addr,
@@ -401,7 +450,6 @@ fn detect_ipset_available() -> bool {
 
 fn append_default_drop_command<'a>(
     commands: &mut CommandBuffer<'a>,
-
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
 ) {
@@ -409,20 +457,6 @@ fn append_default_drop_command<'a>(
         chain: chain_name,
         source: source_ipv4,
     });
-}
-
-fn collect_managed_ipv4(state: &RuntimeState) -> Vec<Ipv4Addr> {
-    let mut values = BTreeSet::new();
-
-    for container in state.containers.values() {
-        for attachment in &container.attachments {
-            if let IpAddr::V4(value) = attachment.ip_address {
-                values.insert(value);
-            }
-        }
-    }
-
-    values.into_iter().collect()
 }
 
 fn network_gateway(state: &RuntimeState, network_id: &NetworkId) -> Option<IpAddr> {
@@ -434,7 +468,6 @@ fn network_gateway(state: &RuntimeState, network_id: &NetworkId) -> Option<IpAdd
 
 fn append_enforced_network_drop_commands<'a>(
     commands: &mut CommandBuffer<'a>,
-
     chain_name: &'a str,
     subnets: &[ipnet::IpNet],
 ) {
@@ -451,7 +484,6 @@ fn append_enforced_network_drop_commands<'a>(
 
 fn append_implicit_dns_allow_commands<'a>(
     commands: &mut CommandBuffer<'a>,
-
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
     gateway: Option<IpAddr>,
@@ -510,58 +542,41 @@ fn append_implicit_dns_allow_commands<'a>(
 
 fn append_icc_allow_list_commands<'a>(
     commands: &mut CommandBuffer<'a>,
-
     chain_name: &'a str,
     source_ipv4: Ipv4Addr,
+    source_network_id: &NetworkId,
     rules: &[IccAllowRule],
-
-    container_targets: &HashMap<String, Vec<Ipv4Addr>>,
+    state: &RuntimeState,
 ) {
     for rule in rules {
-        let Some(destinations) = container_targets.get(rule.target_container.as_str()) else {
+        let Some(target_container_id) = state.resolve_container_id(rule.target_container.as_str())
+        else {
             continue;
         };
-        for destination in destinations {
+        let Some(target_container) = state.containers.get(target_container_id) else {
+            continue;
+        };
+
+        for destination in target_container
+            .attachments
+            .iter()
+            .filter_map(|attachment| match attachment.ip_address {
+                IpAddr::V4(value) if attachment.network_id == *source_network_id => Some(value),
+                _ => None,
+            })
+            .filter(|destination| *destination != source_ipv4)
+        {
             for port in &rule.ports {
                 commands.iptables.push(IptablesCommand::AcceptIpPort {
                     chain: chain_name,
                     source: source_ipv4,
-                    destination: Ipv4Destination::Address(*destination),
+                    destination: Ipv4Destination::Address(destination),
                     protocol: port.protocol,
                     port: port.port,
                 });
             }
         }
     }
-}
-
-/// TODO: refactor, I dont understand what it does and why it creates seemingly identical BTreeSet per key
-fn collect_container_targets(state: &RuntimeState) -> HashMap<&str, BTreeSet<Ipv4Addr>> {
-    let mut by_key: HashMap<&str, BTreeSet<Ipv4Addr>> = HashMap::new();
-
-    for (id, container) in &state.containers {
-        let mut keys: Vec<&str> = vec![&id, &container.name];
-
-        for attachment in &container.attachments {
-            for alias in &attachment.aliases {
-                keys.push(alias);
-            }
-        }
-
-        for key in keys {
-            let entry = by_key.entry(key).or_default();
-            for attachment in &container.attachments {
-                if let IpAddr::V4(value) = attachment.ip_address {
-                    entry.insert(value);
-                }
-            }
-        }
-    }
-
-    by_key
-        .into_iter()
-        .map(|(key, values)| (key, values))
-        .collect()
 }
 
 fn docker_user_jump_target(line: &str) -> Option<&str> {
@@ -633,8 +648,8 @@ fn build_cleanup_restore_commands(filter_rules: &str) -> Vec<IptablesCommand<'st
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::collections::VecDeque;
-    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -674,42 +689,42 @@ mod tests {
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
 
-        RuntimeState {
-            containers: HashMap::from([(
-                "abc".into(),
-                Container {
-                    id: "abc".into(),
-                    name: "web".to_string(),
-                    attachments: vec![NetworkAttachment {
-                        network_id: "net0".into(),
-                        ip_address: source_ip,
-                        aliases: vec!["web".to_string(), "app".to_string()],
-                    }],
-                    runtime_dns_servers: HashSet::new(),
-                    policy: ContainerPolicy {
-                        icc_mode: IccMode::Allow,
-                        egress: vec![EgressRule {
-                            target: EgressTarget::Hostname("api.example.com".to_string()),
-                            ports: vec![PortSpec {
-                                protocol: Protocol::Tcp,
-                                port: 443,
-                            }],
+        let mut state = RuntimeState::default();
+        state.containers.insert(
+            "abc".into(),
+            Container {
+                name: "web".to_string(),
+                attachments: vec![NetworkAttachment {
+                    network_id: "net0".into(),
+                    ip_address: source_ip,
+                    aliases: vec!["web".to_string(), "app".to_string()],
+                }],
+                runtime_dns_servers: HashSet::new(),
+                policy: ContainerPolicy {
+                    icc_mode: IccMode::Allow,
+                    egress: vec![EgressRule {
+                        target: EgressTarget::Hostname("api.example.com".to_string()),
+                        ports: vec![PortSpec {
+                            protocol: Protocol::Tcp,
+                            port: 443,
                         }],
-                        icc_allow: Vec::new(),
-                        dns_targets: vec![crate::model::DnsTarget::Docker],
-                    },
+                    }],
+                    icc_allow: Vec::new(),
+                    dns_targets: vec![crate::model::DnsTarget::Docker],
                 },
-            )]),
-            networks: HashMap::from([(
-                "net0".into(),
-                Network {
-                    id: "net0".into(),
-                    name: "bridge".to_string(),
-                    subnet,
-                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                },
-            )]),
-        }
+            },
+        );
+        state.networks.insert(
+            "net0".into(),
+            Network {
+                id: "net0".into(),
+                name: "bridge".to_string(),
+                subnet,
+                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
+            },
+        );
+        state.refresh_indexes();
+        state
     }
 
     #[test]
@@ -747,16 +762,26 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
+        let second_subnet: IpNet = match "172.19.0.0/16".parse() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse subnet: {error}"),
+        };
         state.containers.insert(
             "peer".into(),
             Container {
-                id: "peer".into(),
                 name: "/peer".to_string(),
-                attachments: vec![NetworkAttachment {
-                    network_id: "net0".into(),
-                    ip_address: peer_ip,
-                    aliases: vec!["db".to_string()],
-                }],
+                attachments: vec![
+                    NetworkAttachment {
+                        network_id: "net0".into(),
+                        ip_address: peer_ip,
+                        aliases: vec!["db".to_string()],
+                    },
+                    NetworkAttachment {
+                        network_id: "net1".into(),
+                        ip_address: "172.19.0.10".parse().expect("peer ip should parse"),
+                        aliases: vec!["db".to_string()],
+                    },
+                ],
                 runtime_dns_servers: HashSet::new(),
                 policy: crate::model::ContainerPolicy::default(),
             },
@@ -770,6 +795,16 @@ mod tests {
                 gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
             },
         );
+        state.networks.insert(
+            "net1".into(),
+            Network {
+                id: "net1".into(),
+                name: "bridge2".to_string(),
+                subnet: second_subnet,
+                gateway: Some("172.19.0.1".parse().expect("gateway fixture should parse")),
+            },
+        );
+        state.refresh_indexes();
         state
             .containers
             .get_mut("abc")
@@ -799,6 +834,75 @@ mod tests {
                 .map(std::string::ToString::to_string)
                 .any(|line| {
                     line.contains("-d 172.18.0.10/32") && line.contains("--dport 5432")
+                })
+        );
+        assert!(
+            !commands
+                .iptables
+                .iter()
+                .map(std::string::ToString::to_string)
+                .any(|line| {
+                    line.contains("-d 172.19.")
+                        && line.contains("--dport 5432")
+                        && line.contains("ACCEPT")
+                })
+        );
+    }
+
+    #[test]
+    fn build_commands_adds_icc_allow_for_same_network_container_ips() {
+        let mut state = sample_state();
+        state.containers.insert(
+            "peer".into(),
+            Container {
+                name: "peer".to_string(),
+                attachments: vec![NetworkAttachment {
+                    network_id: "net0".into(),
+                    ip_address: "172.18.0.10".parse().expect("peer ip should parse"),
+                    aliases: vec!["peer".to_string()],
+                }],
+                runtime_dns_servers: HashSet::new(),
+                policy: ContainerPolicy::default(),
+            },
+        );
+        state.refresh_indexes();
+
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
+        let commands = build_apply_commands_with_dns(&state, &mut resolver, false, CHAIN_NAME)
+            .expect("expected command build to succeed");
+
+        assert!(
+            commands
+                .iptables
+                .iter()
+                .map(std::string::ToString::to_string)
+                .any(|line| {
+                    line == "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.10/32 -j ACCEPT"
+                })
+        );
+    }
+
+    #[test]
+    fn build_commands_adds_icc_deny_as_subnet_drop() {
+        let mut state = sample_state();
+        state
+            .containers
+            .get_mut("abc")
+            .expect("abc fixture container should exist")
+            .policy
+            .icc_mode = IccMode::Deny;
+
+        let mut resolver = DnsProxyCache::new(MockResolver, Duration::from_secs(300), 128);
+        let commands = build_apply_commands_with_dns(&state, &mut resolver, false, CHAIN_NAME)
+            .expect("expected command build to succeed");
+
+        assert!(
+            commands
+                .iptables
+                .iter()
+                .map(std::string::ToString::to_string)
+                .any(|line| {
+                    line == "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.0/16 -j DROP"
                 })
         );
     }

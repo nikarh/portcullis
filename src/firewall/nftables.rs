@@ -595,7 +595,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod common_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use crate::dns::{DnsError, DnsProxyCache, UpstreamResolver};
@@ -634,44 +634,42 @@ mod common_tests {
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
 
-        RuntimeState {
-            containers: HashMap::from([(
-                "abc".into(),
-                Container {
-                    id: "abc".into(),
-                    name: "web".to_string(),
-                    attachments: vec![NetworkAttachment {
-                        network_id: "net0".into(),
-                        ip_address: source_ip,
-                        aliases: vec!["web".to_string()],
-                    }],
-                    runtime_dns_servers: HashSet::new(),
-                    policy: ContainerPolicy {
-                        icc_mode: crate::model::IccMode::Allow,
-                        egress: vec![EgressRule {
-                            target: crate::model::EgressTarget::Hostname(
-                                "api.example.com".to_string(),
-                            ),
-                            ports: vec![PortSpec {
-                                protocol: Protocol::Tcp,
-                                port: 443,
-                            }],
+        let mut state = RuntimeState::default();
+        state.containers.insert(
+            "abc".into(),
+            Container {
+                name: "web".to_string(),
+                attachments: vec![NetworkAttachment {
+                    network_id: "net0".into(),
+                    ip_address: source_ip,
+                    aliases: vec!["web".to_string()],
+                }],
+                runtime_dns_servers: HashSet::new(),
+                policy: ContainerPolicy {
+                    icc_mode: crate::model::IccMode::Allow,
+                    egress: vec![EgressRule {
+                        target: crate::model::EgressTarget::Hostname("api.example.com".to_string()),
+                        ports: vec![PortSpec {
+                            protocol: Protocol::Tcp,
+                            port: 443,
                         }],
-                        icc_allow: Vec::new(),
-                        dns_targets: vec![crate::model::DnsTarget::Docker],
-                    },
+                    }],
+                    icc_allow: Vec::new(),
+                    dns_targets: vec![crate::model::DnsTarget::Docker],
                 },
-            )]),
-            networks: HashMap::from([(
-                "net0".into(),
-                Network {
-                    id: "net0".into(),
-                    name: "bridge".to_string(),
-                    subnet,
-                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                },
-            )]),
-        }
+            },
+        );
+        state.networks.insert(
+            "net0".into(),
+            Network {
+                id: "net0".into(),
+                name: "bridge".to_string(),
+                subnet,
+                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
+            },
+        );
+        state.refresh_indexes();
+        state
     }
 
     #[test]
@@ -714,7 +712,6 @@ mod common_tests {
         state.containers.insert(
             "peer".into(),
             Container {
-                id: "peer".into(),
                 name: "/peer".to_string(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
@@ -725,6 +722,7 @@ mod common_tests {
                 policy: crate::model::ContainerPolicy::default(),
             },
         );
+        state.refresh_indexes();
 
         state
             .containers
@@ -1122,7 +1120,7 @@ mod libnftables_tests {
 
 #[cfg(test)]
 mod firewall_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1213,42 +1211,42 @@ mod firewall_tests {
             Err(error) => panic!("failed to parse destination cidr in fixture: {error}"),
         };
 
-        RuntimeState {
-            containers: HashMap::from([(
-                "abc".into(),
-                Container {
-                    id: "abc".into(),
-                    name: "web".to_string(),
-                    attachments: vec![NetworkAttachment {
-                        network_id: "net0".into(),
-                        ip_address: attachment_ip,
-                        aliases: vec!["web".to_string()],
-                    }],
-                    runtime_dns_servers: HashSet::new(),
-                    policy: ContainerPolicy {
-                        icc_mode: IccMode::Deny,
-                        egress: vec![EgressRule {
-                            target: EgressTarget::IpCidr(dst_cidr),
-                            ports: vec![PortSpec {
-                                protocol: Protocol::Tcp,
-                                port: 443,
-                            }],
+        let mut state = RuntimeState::default();
+        state.containers.insert(
+            "abc".into(),
+            Container {
+                name: "web".to_string(),
+                attachments: vec![NetworkAttachment {
+                    network_id: "net0".into(),
+                    ip_address: attachment_ip,
+                    aliases: vec!["web".to_string()],
+                }],
+                runtime_dns_servers: HashSet::new(),
+                policy: ContainerPolicy {
+                    icc_mode: IccMode::Deny,
+                    egress: vec![EgressRule {
+                        target: EgressTarget::IpCidr(dst_cidr),
+                        ports: vec![PortSpec {
+                            protocol: Protocol::Tcp,
+                            port: 443,
                         }],
-                        icc_allow: Vec::new(),
-                        dns_targets: vec![crate::model::DnsTarget::Docker],
-                    },
+                    }],
+                    icc_allow: Vec::new(),
+                    dns_targets: vec![crate::model::DnsTarget::Docker],
                 },
-            )]),
-            networks: HashMap::from([(
-                "net0".into(),
-                Network {
-                    id: "net0".into(),
-                    name: "bridge".to_string(),
-                    subnet,
-                    gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
-                },
-            )]),
-        }
+            },
+        );
+        state.networks.insert(
+            "net0".into(),
+            Network {
+                id: "net0".into(),
+                name: "bridge".to_string(),
+                subnet,
+                gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
+            },
+        );
+        state.refresh_indexes();
+        state
     }
 
     #[test]
