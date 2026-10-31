@@ -152,13 +152,15 @@ pub struct Plan {
 
 impl Plan {
     /// Build the plan for `state`, resolving every distinct hostname exactly once.
-    pub fn build<R>(state: &RuntimeState, resolver: &mut R) -> Self
+    /// `host_resolvers` are the host's DNS servers, see [`crate::host_dns`].
+    pub fn build<R>(state: &RuntimeState, resolver: &mut R, host_resolvers: &[IpAddr]) -> Self
     where
         R: PolicyDnsResolver,
     {
         let mut planner = Planner {
             state,
             resolver,
+            host_resolvers,
             plan: Self::default(),
             seen_sources: HashSet::new(),
             host_index: HashMap::new(),
@@ -200,6 +202,7 @@ impl Plan {
 struct Planner<'s, 'r, R> {
     state: &'s RuntimeState,
     resolver: &'r mut R,
+    host_resolvers: &'s [IpAddr],
     plan: Plan,
     seen_sources: HashSet<IpAddr>,
     /// Hostname -> index into `plan.host_sets`.
@@ -290,9 +293,18 @@ where
         self.scratch.clear();
         for target in targets {
             match target {
-                DnsTarget::Docker => self.scratch.extend(gateway),
-                // Host resolvers are not label-driven anymore.
-                DnsTarget::Host => {}
+                // Docker's DNS server forwards from the container's address to the
+                // container's `--dns` servers, or to the host's when it has none.
+                DnsTarget::Docker => {
+                    self.scratch.extend(gateway);
+                    if container.runtime_dns_servers.is_empty() {
+                        self.scratch.extend_from_slice(self.host_resolvers);
+                    } else {
+                        self.scratch
+                            .extend(container.runtime_dns_servers.iter().copied());
+                    }
+                }
+                DnsTarget::Host => self.scratch.extend_from_slice(self.host_resolvers),
                 DnsTarget::Runtime => self
                     .scratch
                     .extend(container.runtime_dns_servers.iter().copied()),
@@ -448,7 +460,7 @@ mod tests {
 
     fn build(state: &RuntimeState) -> (Plan, MockResolver) {
         let mut resolver = MockResolver::default();
-        let plan = Plan::build(state, &mut resolver);
+        let plan = Plan::build(state, &mut resolver, &[]);
         (plan, resolver)
     }
 
@@ -498,6 +510,60 @@ mod tests {
             ]
         );
         assert_eq!(plan.enforced_subnets, vec![net("172.18.0.0/16")]);
+    }
+
+    fn dns_destinations(state: &RuntimeState, host_resolvers: &[IpAddr]) -> Vec<IpAddr> {
+        let plan = Plan::build(state, &mut MockResolver::default(), host_resolvers);
+        let mut destinations: Vec<_> = rules_of(&plan, "172.18.0.2")
+            .into_iter()
+            .filter_map(|rule| match rule {
+                Rule::AcceptDns {
+                    destination: Some(destination),
+                    protocol: Protocol::Udp,
+                } => Some(destination),
+                _ => None,
+            })
+            .collect();
+        destinations.sort_unstable();
+        destinations
+    }
+
+    fn with_dns(dns_targets: Vec<DnsTarget>, runtime_dns: &[&str]) -> RuntimeState {
+        let mut state = test_support::hostname_state();
+        let mut web = state.containers().get("abc").cloned().expect("web fixture");
+        web.policy.dns_targets = dns_targets;
+        web.runtime_dns_servers = runtime_dns.iter().map(|value| ip(value)).collect();
+        state.apply_action(crate::model::RuntimeStateAction::CreateContainer {
+            container: Box::new(web),
+        });
+        state
+    }
+
+    #[test]
+    fn docker_dns_allows_gateway_and_host_resolvers() {
+        let state = with_dns(vec![DnsTarget::Docker], &[]);
+        assert_eq!(
+            dns_destinations(&state, &[ip("9.9.9.9")]),
+            vec![ip("9.9.9.9"), ip("172.18.0.1")]
+        );
+    }
+
+    #[test]
+    fn docker_dns_follows_container_dns_servers_instead_of_the_hosts() {
+        let state = with_dns(vec![DnsTarget::Docker], &["1.1.1.1"]);
+        assert_eq!(
+            dns_destinations(&state, &[ip("9.9.9.9")]),
+            vec![ip("1.1.1.1"), ip("172.18.0.1")]
+        );
+    }
+
+    #[test]
+    fn host_dns_allows_host_resolvers_only() {
+        let state = with_dns(vec![DnsTarget::Host], &["1.1.1.1"]);
+        assert_eq!(
+            dns_destinations(&state, &[ip("9.9.9.9")]),
+            vec![ip("9.9.9.9")]
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@ mod plan;
 #[cfg(test)]
 mod test_support;
 
+use std::net::IpAddr;
+
 use thiserror::Error;
 
 use crate::dns::PolicyDnsResolver;
@@ -57,13 +59,18 @@ impl ActiveFirewall {
     }
 
     /// Apply firewall rules for the current runtime state.
-    pub fn apply<Dns>(&self, state: &RuntimeState, dns_cache: &mut Dns) -> Result<(), FirewallError>
+    pub fn apply<Dns>(
+        &self,
+        state: &RuntimeState,
+        dns_cache: &mut Dns,
+        host_resolvers: &[IpAddr],
+    ) -> Result<(), FirewallError>
     where
         Dns: PolicyDnsResolver,
     {
         match self {
-            Self::Nftables(firewall) => firewall.apply(state, dns_cache),
-            Self::Iptables(firewall) => firewall.apply(state, dns_cache),
+            Self::Nftables(firewall) => firewall.apply(state, dns_cache, host_resolvers),
+            Self::Iptables(firewall) => firewall.apply(state, dns_cache, host_resolvers),
         }
     }
 

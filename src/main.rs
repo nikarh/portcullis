@@ -4,6 +4,7 @@ mod dns;
 mod dns_proxy;
 mod docker;
 mod firewall;
+mod host_dns;
 mod labels;
 mod logging;
 mod model;
@@ -208,17 +209,19 @@ fn apply_firewall(
     state: &RuntimeState,
     dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
 ) -> Result<(), MainError> {
+    // Re-read on every update, so changes to the host's DNS configuration are picked up.
+    let host_resolvers = host_dns::host_resolvers();
     match mode {
         DnsMode::Lazy => {
             let mut resolver = CacheFallbackDnsResolver::new(dns_cache);
             firewall
-                .apply(state, &mut resolver)
+                .apply(state, &mut resolver, &host_resolvers)
                 .map_err(MainError::Firewall)
         }
         DnsMode::Proxy => {
             let mut resolver = CacheOnlyDnsResolver::new(dns_cache);
             firewall
-                .apply(state, &mut resolver)
+                .apply(state, &mut resolver, &host_resolvers)
                 .map_err(MainError::Firewall)
         }
     }

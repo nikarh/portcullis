@@ -116,11 +116,16 @@ where
         }
     }
 
-    pub fn apply<Dns>(&self, state: &RuntimeState, resolver: &mut Dns) -> Result<(), FirewallError>
+    pub fn apply<Dns>(
+        &self,
+        state: &RuntimeState,
+        resolver: &mut Dns,
+        host_resolvers: &[IpAddr],
+    ) -> Result<(), FirewallError>
     where
         Dns: PolicyDnsResolver,
     {
-        let plan = Plan::build(state, resolver);
+        let plan = Plan::build(state, resolver, host_resolvers);
         info!(
             source_count = plan.sources.len(),
             rule_count = plan.rule_count(),
@@ -529,7 +534,7 @@ mod tests {
     use crate::firewall::test_support::{self, MockResolver};
 
     fn render(state: &RuntimeState, use_ipset: bool) -> (String, String) {
-        let plan = Plan::build(state, &mut MockResolver::default());
+        let plan = Plan::build(state, &mut MockResolver::default(), &[]);
         let mut ipset = String::new();
         render_ipset_script(&plan, &mut ipset).expect("ipset script should render");
         let mut iptables = String::new();
@@ -641,6 +646,7 @@ mod tests {
         let plan = Plan::build(
             &test_support::hostname_state(),
             &mut MockResolver::default(),
+            &[],
         );
         let mut script = String::new();
         render_iptables_script(&plan, CHAIN_NAME, 3, false, &mut script)
@@ -730,13 +736,13 @@ mod tests {
         let firewall = IptablesFirewall::new(RecordingRunner::default(), true);
         let mut resolver = MockResolver::default();
         firewall
-            .apply(&test_support::hostname_state(), &mut resolver)
+            .apply(&test_support::hostname_state(), &mut resolver, &[])
             .expect("apply should succeed");
         firewall
-            .apply(&test_support::icc_state(), &mut resolver)
+            .apply(&test_support::icc_state(), &mut resolver, &[])
             .expect("apply should succeed");
         firewall
-            .apply(&test_support::icc_state(), &mut resolver)
+            .apply(&test_support::icc_state(), &mut resolver, &[])
             .expect("apply should succeed");
 
         let scripts = firewall.runner.ipset_scripts.lock().expect("lock");
@@ -768,10 +774,10 @@ mod tests {
         let firewall = IptablesFirewall::new(RecordingRunner::default(), false);
         let mut resolver = MockResolver::default();
         firewall
-            .apply(&test_support::icc_state(), &mut resolver)
+            .apply(&test_support::icc_state(), &mut resolver, &[])
             .expect("apply should succeed");
         firewall
-            .apply(&test_support::hostname_state(), &mut resolver)
+            .apply(&test_support::hostname_state(), &mut resolver, &[])
             .expect("apply should succeed");
 
         let scripts = firewall.runner.iptables_scripts.lock().expect("lock");
@@ -811,6 +817,7 @@ mod tests {
             .apply(
                 &test_support::unresolvable_state(),
                 &mut MockResolver::default(),
+                &[],
             )
             .expect("apply should succeed");
         assert_eq!(
@@ -826,6 +833,7 @@ mod tests {
             .apply(
                 &test_support::hostname_state(),
                 &mut MockResolver::default(),
+                &[],
             )
             .expect("apply should succeed");
         assert_eq!(firewall.runner.ipset_scripts.lock().expect("lock").len(), 1);

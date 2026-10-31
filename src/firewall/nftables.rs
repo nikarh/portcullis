@@ -36,11 +36,16 @@ where
         Self { runner }
     }
 
-    pub fn apply<Dns>(&self, state: &RuntimeState, resolver: &mut Dns) -> Result<(), FirewallError>
+    pub fn apply<Dns>(
+        &self,
+        state: &RuntimeState,
+        resolver: &mut Dns,
+        host_resolvers: &[IpAddr],
+    ) -> Result<(), FirewallError>
     where
         Dns: PolicyDnsResolver,
     {
-        let plan = Plan::build(state, resolver);
+        let plan = Plan::build(state, resolver, host_resolvers);
         info!(
             source_count = plan.sources.len(),
             rule_count = plan.rule_count(),
@@ -644,7 +649,7 @@ mod tests {
     use crate::firewall::test_support::{self, MockResolver};
 
     fn render(state: &RuntimeState) -> String {
-        let plan = Plan::build(state, &mut MockResolver::default());
+        let plan = Plan::build(state, &mut MockResolver::default(), &[]);
         let mut script = String::new();
         render_apply_script(&plan, &mut script).expect("script should render");
         script
@@ -793,6 +798,7 @@ add chain inet portcullis s0
             .apply(
                 &test_support::unresolvable_state(),
                 &mut MockResolver::default(),
+                &[],
             )
             .expect("apply should succeed");
         assert_eq!(firewall.runner.scripts.lock().expect("lock").len(), 1);
@@ -817,6 +823,7 @@ add chain inet portcullis s0
             .apply(
                 &test_support::hostname_state(),
                 &mut MockResolver::default(),
+                &[],
             )
             .expect("apply should succeed");
         let scripts = firewall.runner.scripts.lock().expect("lock");

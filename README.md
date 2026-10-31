@@ -77,7 +77,7 @@ Or by hand:
 docker network create --label portcullis.enable=true backend
 ```
 
-Every container attached to an enforced network is then restricted, whether or not it has Portcullis labels of its own. `portcullis.enable` only has an effect on networks; on a container it is ignored. A container without labels can talk to other containers on the same network and send DNS queries to the network's gateway, and nothing else. Labels on the container open up more.
+Every container attached to an enforced network is then restricted, whether or not it has Portcullis labels of its own. `portcullis.enable` only has an effect on networks; on a container it is ignored. A container without labels can talk to other containers on the same network and resolve names through Docker's DNS, and nothing else. Labels on the container open up more.
 
 Only bridge networks can be enforced. The default `bridge` network can't be, because it can't be given labels.
 
@@ -141,14 +141,17 @@ portcullis.dns.<name>=<target>
 
 | Target | Allows DNS to |
 |---|---|
-| `docker` | the gateway address of the container's network. This is the default when no `portcullis.dns.*` label is set. |
+| `docker` | Docker's DNS server, the default when no `portcullis.dns.*` label is set. See below. |
+| `host` | the host's DNS servers. |
 | `runtime` | the servers set with `docker run --dns` or Compose `dns:`. |
 | `ip:<address>` | that resolver, for example `ip:1.1.1.1`. |
 | `*` | any resolver. |
 
-Setting any `portcullis.dns.*` label replaces the default, so add `docker` explicitly if you still want it. Since DNS rules are checked before egress rules, an egress label like `ip:1.1.1.1,udp:53` has no effect; use `portcullis.dns.x=ip:1.1.1.1` instead.
+Containers normally resolve names through Docker's DNS server (`127.0.0.11`). It answers container and service names itself and forwards everything else to the container's `--dns` servers, or to the host's when the container has none. Docker sends those forwarded queries from the container's own address, so they go through the container's policy. The `docker` target allows them: the network's gateway, plus the container's `--dns` servers if it has any, otherwise the host's servers. The container can then also query those servers directly.
 
-Docker's own DNS server (`127.0.0.11`) runs inside the container. Names it can't answer itself it forwards to the upstream servers from the host's `resolv.conf`, or to the ones set with `--dns`, and those forwarded queries can leave from the container's address. They are then subject to these rules. If name resolution stops working on an enforced network, allow the upstream servers with `ip:` or `runtime`.
+The host's servers are the `nameserver` entries of the host's `/etc/resolv.conf`. If that file only points at systemd-resolved's local stub (`127.0.0.53`), they are read from `/run/systemd/resolve/resolv.conf` instead, the same way Docker does it. Loopback servers are left out, because Docker contacts them from the host and they aren't affected by the policy. The files are read again on every rule update.
+
+Setting any `portcullis.dns.*` label replaces the default, so add `docker` explicitly if you still want it. Since DNS rules are checked before egress rules, an egress label like `ip:1.1.1.1,udp:53` has no effect; use `portcullis.dns.x=ip:1.1.1.1` instead.
 
 ### Hostname rules
 
@@ -250,6 +253,7 @@ labels:
 - IPv6 is not supported, by design. Containers are matched by their IPv4 address only, so on a network with IPv6 enabled their IPv6 traffic is not restricted. Don't enable IPv6 on enforced networks.
 - Only the first subnet configured on a network is used.
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
+- DNS servers set daemon-wide with `dns` in Docker's `daemon.json` aren't visible to Portcullis, so the `docker` DNS target doesn't cover them. Allow them with `portcullis.dns.<name>=ip:<address>`.
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close. Replies to incoming connections are always allowed, so published ports keep working.
 - A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too.
 - If a hostname can't be resolved, Portcullis logs an error and its rules allow nothing until it resolves again. Everything else is applied as usual. Failed lookups are retried every 30 seconds.
