@@ -181,7 +181,22 @@ Some common setups:
 | Any resolver | any | `portcullis.dns.0=*` |
 | Container names only, no outside names | `dns:` set to any address | `portcullis.dns.0=none` |
 
-Names of other containers always resolve, because Docker's DNS answers them inside the container. Since DNS rules are checked before egress rules, an egress label like `ip:1.1.1.1,udp:53` has no effect; use `portcullis.dns.x=ip:1.1.1.1` instead.
+Since DNS rules are checked before egress rules, an egress label like `ip:1.1.1.1,udp:53` has no effect; use `portcullis.dns.x=ip:1.1.1.1` instead.
+
+#### What can and can't be controlled
+
+DNS labels control:
+
+- which resolvers a container may query directly: the host's, specific addresses, any, or none;
+- which resolvers Docker's DNS may forward to, for a container with its own DNS servers (`dns:`).
+
+They can't control:
+
+- lookups Docker's DNS forwards for a container without its own DNS servers. Docker 29 sends those from the host, where no container policy applies, so such a container can always resolve outside names. To restrict a container's name resolution, give it `dns:` servers and allow only those.
+- names of other containers and services. Docker's DNS answers them inside the container, so they always resolve.
+- which names are looked up. Rules allow or deny resolvers by address, not by domain: a container that may use a resolver can resolve any name through it.
+- DNS over TLS or HTTPS. That's ordinary traffic on ports 853 and 443, controlled by egress labels, not DNS labels.
+- DNS servers set daemon-wide with `dns` in Docker's `daemon.json`. Portcullis can't see them through Docker's API, so the `docker` target doesn't include them; allow them with `portcullis.dns.<name>=ip:<address>`.
 
 ### Hostname rules
 
@@ -283,7 +298,7 @@ labels:
 - IPv6 is not supported, by design. Containers are matched by their IPv4 address only, so on a network with IPv6 enabled their IPv6 traffic is not restricted. Don't enable IPv6 on enforced networks.
 - Only the first subnet configured on a network is used.
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
-- DNS servers set daemon-wide with `dns` in Docker's `daemon.json` aren't visible to Portcullis, so the `docker` DNS target doesn't cover them. Allow them with `portcullis.dns.<name>=ip:<address>`.
+- DNS policies can't restrict everything a container resolves; see [What can and can't be controlled](#what-can-and-cant-be-controlled).
 - Filtering traffic between containers needs connection tracking for bridged traffic. The kernel loads the `nf_conntrack_bridge` module for this the first time Portcullis installs its rules.
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close. Replies to incoming connections are always allowed, so published ports keep working.
 - A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too.
