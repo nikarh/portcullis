@@ -637,7 +637,8 @@ fn render_base_chain(out: &mut String, table: Table) -> fmt::Result {
 /// with that container's MAC; it then continues to the container's ICC rules, if any.
 /// Everything else IPv4 is denied, which stops containers from using addresses that aren't
 /// theirs; with a source queue, it is held first, in case it comes from a container whose
-/// rules aren't applied yet (see `source_hold`). Other frames (ARP, IPv6) pass.
+/// rules aren't applied yet (see `source_hold`). ARP and IPv6 pass; other frames, such as
+/// VLAN-tagged ones, are denied on enforced bridges.
 fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
     render_elements(
@@ -645,6 +646,19 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         format_args!("add rule {base} meta ibrname !="),
         plan.bridges.iter().map(|bridge| Quoted(&bridge.name)),
         " accept",
+    )?;
+    // A VLAN-tagged frame (even with VLAN ID 0, which receivers treat as untagged) would
+    // carry IPv4 past every check below, so enforced bridges only pass ARP and IPv6 besides
+    // IPv4. Other frames aren't IP, can't be reported by address, and are denied silently.
+    writeln!(out, "add rule {base} ether type {{ arp, ip6 }} accept")?;
+    render_elements(
+        out,
+        format_args!("add rule {base} meta ibrname"),
+        plan.bridges
+            .iter()
+            .filter(|bridge| !bridge.monitor)
+            .map(|bridge| Quoted(&bridge.name)),
+        format_args!(" ether type != ip {}", options.deny),
     )?;
     writeln!(out, "add rule {base} ether type != ip accept")?;
 
@@ -1350,6 +1364,8 @@ flush chain bridge portcullis icc0
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
                 "add rule bridge portcullis prerouting ct state established,related accept".into(),
                 "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept".into(),
+                "add rule bridge portcullis prerouting ether type { arp, ip6 } accept".into(),
+                "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type != ip drop".into(),
                 "add rule bridge portcullis prerouting ether type != ip accept".into(),
                 "add rule bridge portcullis prerouting ip saddr . ether saddr vmap { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }".into(),
                 decided("add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip", 'd', "source", "drop"),
