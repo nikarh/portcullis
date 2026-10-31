@@ -2,244 +2,266 @@
 
 [![CI](https://github.com/nikarh/portcullis/actions/workflows/ci.yml/badge.svg)](https://github.com/nikarh/portcullis/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/portcullis.svg)](https://crates.io/crates/portcullis)
-[![Docs.rs](https://docs.rs/portcullis/badge.svg)](https://docs.rs/portcullis)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE-APACHE)
 
-Host-level egress policy controller for Docker containers.
-
-Portcullis reads container labels, compiles egress allowlists, resolves hostname targets with a bounded TTL cache, and applies firewall policy using `nftables` or `iptables`.
+Portcullis limits what Docker containers can connect to, using labels on your networks and containers.
 
 ## Why
-Container workloads usually have broad outbound access by default. Portcullis enforces least-privilege egress so containers can only reach explicitly allowed destinations.
 
-## Current Status
-Prototype implementation in Rust.
+By default a container can open connections to any address on the internet and to every other container on its network. That is convenient until one of them is compromised or misbehaves, and then nothing stops it from talking to whatever it wants. Docker has no built-in way to say "this service may only reach `api.stripe.com` on port 443 and the database on 5432". Portcullis adds that: you mark a network as enforced, every container on it loses outbound access by default, and each container gets back the destinations its labels list. The policy lives next to the service definition in your Compose file, so it is reviewed and versioned with everything else.
 
-Implemented:
-- Docker container/network discovery from labels and runtime metadata.
-- Docker network support is currently limited to `bridge` driver networks.
-- Label-based egress policy parsing (`ip/cidr + ports`, `host + ports`).
-- ICC allowlist parsing (`container|name|alias + ports`) in `allow-listed` mode.
-- DNS resolution cache with TTL + max size + eviction.
-- Firewall backends:
-- `nftables` via `libnftables`
-- `nftables` via CLI runner
-- `iptables` adapter (uses `iptables` + `ipset`)
-- Runtime backend auto-selection from Docker info:
-- Docker reports `nftables` => use nftables (lib backend)
-- Docker reports `iptables` => use iptables backend
-- Long-running daemon mode:
-- Startup cleanup to recover from unclean previous exits.
-- Continuous Docker container+network event subscription over Docker Unix socket with incremental runtime-state updates for relevant events.
-- Graceful cleanup on shutdown (SIGINT/SIGTERM via signal handler).
-- Structured logging with `info` / `debug` / `trace` levels.
+## How it works
 
-## Architecture
+Portcullis is a daemon that runs on the Docker host. It watches the Docker API for containers and networks, turns their labels into firewall rules, and rebuilds the rules whenever something changes. Each rebuild replaces the whole ruleset in one atomic step, so there is never a moment with half-applied rules.
 
-### High-level flow
-```mermaid
-flowchart LR
-  A[Docker Runtime] --> B[Monitor]
-  B --> C[Policy Compiler]
-  C --> D[DNS Resolver + TTL Cache]
-  D --> E[Firewall Planner]
-  E --> F[nftables or iptables Adapter]
-  F --> G[Host Network Rules]
-```
+It has two firewall backends: nftables, and iptables (with ipset when it is installed). By default it uses the same one Docker uses. The two backends enforce the same policy, and the labels don't depend on which one runs.
 
-### Runtime components
-- `monitor`: Docker discovery via Docker Engine HTTP API over Unix socket (`/containers/json?all=1`, `/containers/{id}/json`, `/networks`, `/networks/{id}`, `/info`).
-- `labels`: policy parsing from `portcullis.*` labels.
-- `dns`: bounded hostname->IP cache (TTL + max-size eviction).
-- `firewall`: backend adapters for nftables and iptables.
-- iptables hook point: `DOCKER-USER` chain (Docker-compatible user policy chain).
-- nftables hook point: dedicated base chain on `forward` hook with priority `-1` (before Docker's default forward filter priority).
+Portcullis only removes access. Traffic that a policy allows still goes through Docker's own rules afterwards, so things Docker blocks (internal networks, isolation between networks) stay blocked.
 
-## How It Works
-1. On startup, detect firewall backend and run cleanup of managed rules/chains/tables.
-2. Collect container metadata and labels from Docker.
-3. Parse labels into normalized egress rules.
-4. Resolve hostname targets and cache resulting IPs.
-5. Generate backend-specific firewall operations.
-6. Apply default-deny egress plus explicit allow rules.
-7. Enter event loop, update only affected container/network runtime objects, then refresh policy.
-8. On shutdown, attempt cleanup of managed rules/chains/tables.
+## Usage
 
-## Quick Start
+### Requirements
 
-### Build
+- Linux, with Portcullis running as root (it needs to manage the firewall and read the Docker socket).
+- Docker with bridge networks.
+- `libnftables`, for both building and running.
+- For the iptables backend: `iptables-restore` and `iptables-save`. `ipset` is optional and makes hostname rules cheaper.
+
+### Building
+
+Building needs Rust, the libnftables development headers and clang (used to generate the libnftables bindings).
+
 ```bash
 cargo build --release
 ```
 
-### Run
+The binary is `target/release/portcullis`.
+
+### Running
+
 ```bash
-./target/release/portcullis \
-  --docker-socket /var/run/docker.sock \
-  --firewall-backend auto \
-  --log-level info
+sudo ./target/release/portcullis
 ```
 
-## CLI
-```text
-portcullis [--docker-socket <path>] [--firewall-backend <auto|nftables|iptables>] [--log-level <error|warn|info|debug|trace>] [--fail-closed]
-```
+Portcullis runs in the foreground until it gets SIGINT or SIGTERM. On startup and on shutdown it removes all firewall rules it owns.
 
-Options:
-- `--docker-socket`: Docker Unix socket path. Default: `/var/run/docker.sock`
-- `--firewall-backend`: `auto`, `nftables`, or `iptables`. Default: `auto`
-- `--log-level`: `error|warn|info|debug|trace`. Default: `info`
-- `--fail-closed`: force default-deny for all discovered containers, even without labels.
+| Option | Default | Description |
+|---|---|---|
+| `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
+| `--firewall-backend <auto\|nftables\|iptables>` | `auto` | `auto` picks the backend Docker itself uses. |
+| `--dns-mode <lazy\|proxy>` | `lazy` | How hostname rules get their addresses, see [Hostname rules](#hostname-rules). |
+| `--dns-proxy-bind <ip:port>` | `127.0.0.1:1053` | Where the DNS proxy listens in `proxy` mode. |
+| `--log-level <error\|warn\|info\|debug\|trace>` | `info` | `trace` logs every firewall script that gets applied. |
 
-## Labels
+### Enforcing a network
 
-Prefix: `portcullis.*`
+Nothing is restricted until you label a network:
 
-- Enable policy:
-```text
-portcullis.enable=true
-```
-
-- Static target:
-```text
-portcullis.egress.0=ip:1.1.1.1/32,tcp:443
-```
-
-- Hostname target:
-```text
-portcullis.egress.1=host:api.example.com,tcp:443
-```
-
-- ICC mode:
-```text
-portcullis.icc.mode=allow|deny|allow-listed
-```
-
-- ICC allowlist entry (used when `icc.mode=allow-listed`):
-```text
-portcullis.icc.allow.0=container:db,tcp:5432
-```
-
-- DNS policy entries (per container):
-```text
-portcullis.dns.0=docker
-portcullis.dns.1=host
-portcullis.dns.2=runtime
-portcullis.dns.3=ip:1.1.1.1
-portcullis.dns.4=*
-portcullis.dns.host.0=192.168.1.1
-portcullis.dns.host.1=8.8.8.8
-```
-
-DNS entry meanings:
-- `docker`: allow Docker internal resolver endpoint for that attachment (gateway-derived).
-- `host`: allow only IPs explicitly defined via `portcullis.dns.host.<n>=<ip>`.
-- `runtime`: allow DNS configured via container runtime (`docker run --dns` / Compose `dns`).
-- `ip:<addr>`: allow a specific resolver IP.
-- `*`: allow DNS to any destination (`udp/53` and `tcp/53`).
-
-Default when no `portcullis.dns.*` labels are set:
-- `docker` only, plus explicit drop of any other DNS destination.
-
-- Network-level default deny (set on Docker network):
 ```text
 portcullis.network.enforce=true
 ```
 
-When enabled on a Docker network, Portcullis adds a baseline deny for that network subnet.
-Only `bridge` driver networks are currently supported for network-level enforcement.
-Labeled container allow rules are still added and evaluated first.
+Docker only lets you set labels when a network is created. With Compose:
 
-Implicit behavior:
-- When policy is enabled for a container, Portcullis automatically allows DNS to that container's Docker network gateway on `udp/53` and `tcp/53`.
+```yaml
+networks:
+  backend:
+    labels:
+      - portcullis.network.enforce=true
+```
 
-ICC target lookup notes:
-- `container:<value>` is resolved from Docker runtime metadata, not DNS.
-- `<value>` can be container ID, container name, or network alias.
-- Lookup is scoped to the source container's networks, like Docker's embedded DNS: only targets on a shared network match, and only their addresses on that network are allowed.
+Or by hand:
 
-## Docker Compose Examples
+```bash
+docker network create --label portcullis.network.enforce=true backend
+```
 
-### HTTPS-only egress
+Every container attached to an enforced network is then restricted, whether or not it has Portcullis labels of its own. A container without labels can talk to other containers on the same network and send DNS queries to the network's gateway, and nothing else. Labels on the container open up more.
+
+Only bridge networks can be enforced. The default `bridge` network can't be, because it can't be given labels.
+
+### Allowing outbound connections
+
+Each allowed destination is one label:
+
+```text
+portcullis.egress.<name>=<target>,<protocol>:<port>[,<protocol>:<port>...]
+```
+
+`<name>` is any string that makes the label key unique, for example `0`, `1` or `stripe`. The target is one of:
+
+- `ip:<address>` or `ip:<cidr>`, for example `ip:1.1.1.1` or `ip:10.0.0.0/8`.
+- `host:<hostname>`, for example `host:api.stripe.com`. See [Hostname rules](#hostname-rules) for how the name is resolved.
+
+Ports are `tcp:<port>` or `udp:<port>`, at least one per label. There are no port ranges and no "any port" option.
+
+```yaml
+labels:
+  - portcullis.egress.stripe=host:api.stripe.com,tcp:443
+  - portcullis.egress.ntp=ip:162.159.200.1,udp:123
+  - portcullis.egress.internal=ip:10.20.0.0/16,tcp:80,tcp:443
+```
+
+Egress labels don't apply to DNS (port 53) or to containers on the same network. DNS is controlled by the [DNS labels](#dns), and containers on the same network by the [ICC mode](#traffic-between-containers). Both are checked first.
+
+### Traffic between containers
+
+ICC (inter-container communication) covers traffic from a container to other containers on the same enforced network. Set the mode with:
+
+```text
+portcullis.icc.mode=allow|deny|allow-listed
+```
+
+- `allow` (the default) lets the container reach every container on its networks.
+- `deny` blocks all of it.
+- `allow-listed` blocks all of it except the entries you list:
+
+```text
+portcullis.icc.allow.<name>=container:<target>,<protocol>:<port>[,<protocol>:<port>...]
+```
+
+The target is matched the way Docker's DNS resolves names from the source container:
+
+- It matches a container name or a network alias. Compose gives every container its service name as an alias, so `container:db` works for a service called `db`, even though the container itself is named something like `myproject-db-1`.
+- Only containers on a network the source container is also on can match, and only their addresses on that shared network are allowed.
+- If several containers match (a service scaled to more than one replica), all of them are allowed.
+
+Container IDs are not accepted, since they change every time a container is recreated.
+
+The mode only controls connections the container starts. Whether others can reach it is decided by their own labels.
+
+### DNS
+
+DNS queries (port 53, UDP and TCP) from a container are dropped unless their destination is allowed with:
+
+```text
+portcullis.dns.<name>=<target>
+```
+
+| Target | Allows DNS to |
+|---|---|
+| `docker` | the gateway address of the container's network. This is the default when no `portcullis.dns.*` label is set. |
+| `runtime` | the servers set with `docker run --dns` or Compose `dns:`. |
+| `ip:<address>` | that resolver, for example `ip:1.1.1.1`. |
+| `*` | any resolver. |
+
+Setting any `portcullis.dns.*` label replaces the default, so add `docker` explicitly if you still want it. Since DNS rules are checked before egress rules, an egress label like `ip:1.1.1.1,udp:53` has no effect; use `portcullis.dns.x=ip:1.1.1.1` instead.
+
+Docker's own DNS server (`127.0.0.11`) runs inside the container. Names it can't answer itself it forwards to the upstream servers from the host's `resolv.conf`, or to the ones set with `--dns`, and those forwarded queries can leave from the container's address. They are then subject to these rules. If name resolution stops working on an enforced network, allow the upstream servers with `ip:` or `runtime`.
+
+### Hostname rules
+
+An IP firewall can't match hostnames, so a `host:` rule is turned into the addresses the hostname resolves to. `--dns-mode` decides where those addresses come from.
+
+`lazy` (the default) needs no setup. Portcullis resolves each hostname itself, using the host's resolver, when it builds the rules, and re-resolves all of them every 30 seconds. Results are cached for 5 minutes. Portcullis and the container may not get the same answer, though. Services behind CDNs or DNS load balancing often return different addresses on each lookup, and then the container ends up connecting to an address the firewall doesn't allow.
+
+`proxy` fixes that by making Portcullis the container's DNS server. When a container looks up a hostname used in a policy, Portcullis resolves it, adds the addresses to the firewall, and only then sends the answer back. The container can only connect to addresses it got from that lookup, and those are always allowed. To use it:
+
+1. Bind the proxy to an address containers can reach, such as the gateway of an enforced network. The default `127.0.0.1:1053` is not reachable from containers.
+2. Point the containers' DNS at it.
+
+```bash
+portcullis --dns-mode proxy --dns-proxy-bind 172.30.0.1:53
+```
+
 ```yaml
 services:
   app:
-    image: ghcr.io/acme/app:latest
+    dns: [172.30.0.1]
+    networks: [backend]
     labels:
-      - "portcullis.enable=true"
-      - "portcullis.egress.0=ip:1.1.1.1/32,tcp:443"
+      - portcullis.egress.stripe=host:api.stripe.com,tcp:443
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+    labels:
+      - portcullis.network.enforce=true
 ```
 
-### Hostname allowlist + DNS
+The network has to exist before Portcullis starts, otherwise there is no gateway address to bind to.
+
+In proxy mode a hostname rule allows nothing until a container has looked the name up through the proxy. The proxy answers only A and AAAA queries; other record types get an empty answer.
+
+### Examples
+
+A service that may only call one external API:
+
 ```yaml
 services:
-  api-client:
-    image: ghcr.io/acme/client:latest
+  billing:
+    image: ghcr.io/acme/billing:latest
+    networks: [backend]
     labels:
-      - "portcullis.enable=true"
-      - "portcullis.egress.0=host:api.stripe.com,tcp:443"
-      - "portcullis.egress.1=ip:10.96.0.10/32,udp:53"
+      - portcullis.egress.stripe=host:api.stripe.com,tcp:443
+
+networks:
+  backend:
+    labels:
+      - portcullis.network.enforce=true
 ```
 
-### ICC deny mode
-```yaml
-services:
-  internal-service:
-    image: ghcr.io/acme/internal:latest
-    labels:
-      - "portcullis.enable=true"
-      - "portcullis.icc.mode=deny"
-      - "portcullis.egress.0=host:telemetry.acme.io,tcp:443"
-```
+An API that may reach its database and cache but nothing else on the network, and a database with no outbound access at all:
 
-### ICC allowlist by alias
 ```yaml
 services:
   api:
     image: ghcr.io/acme/api:latest
+    networks: [backend]
     labels:
-      - "portcullis.enable=true"
-      - "portcullis.icc.mode=allow-listed"
-      - "portcullis.icc.allow.0=container:db,tcp:5432"
-      - "portcullis.icc.allow.1=container:redis,tcp:6379"
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.db=container:db,tcp:5432
+      - portcullis.icc.allow.cache=container:redis,tcp:6379
+      - portcullis.egress.telemetry=host:telemetry.acme.io,tcp:443
 
   db:
     image: postgres:16
-    networks:
-      default:
-        aliases: [db]
+    networks: [backend]
+    labels:
+      - portcullis.icc.mode=deny
 
   redis:
     image: redis:7
-    networks:
-      default:
-        aliases: [redis]
+    networks: [backend]
+    labels:
+      - portcullis.icc.mode=deny
+
+networks:
+  backend:
+    labels:
+      - portcullis.network.enforce=true
 ```
 
-## Logging
-- `info`: operational lifecycle activity (startup cleanup, snapshot/apply, backend selection, event-triggered refresh)
-- `debug`: runtime change details
-- `trace`: exact firewall command arrays executed and full event/snapshot payloads
+`db` and `redis` can still answer the API's connections; the `deny` mode only stops them from opening their own.
 
-## DNS Cache Notes
-- Cache stores hostname -> `Arc<[IpAddr]>`.
-- TTL expiration and max-size eviction prevent unbounded growth.
-- Cache hits return cached addresses without re-resolving.
+A container that runs its own resolver against a public DNS server:
 
-## Limitations
-- Prototype quality, not fully production hardened.
-- Docker network handling currently supports only `bridge` driver networks; other drivers are ignored.
-- DNS path currently resolver-driven (not a full packet-level DNS proxy listener yet).
-- Both backends render the same rule plan, but the `iptables` backend manages IPv4 only.
+```yaml
+labels:
+  - portcullis.dns.0=docker
+  - portcullis.dns.1=ip:9.9.9.9
+```
+
+## Limitations and details
+
+- Only IPv4 is filtered. Containers are matched by their IPv4 address, so on a network with IPv6 enabled their IPv6 traffic is not restricted.
+- Only the first subnet configured on a network is used.
+- A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
+- Rules apply to new connections. Connections that were already open when a policy changed keep working until they close. Replies to incoming connections are always allowed, so published ports keep working.
+- A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too.
+- In `lazy` mode, if a hostname can't be resolved, rebuilding the rules fails. At startup Portcullis exits. Later, the previous rules stay in place until the next successful rebuild, changes to other containers wait as well, and a new container on an enforced network has no access at all until then.
+- Portcullis refuses to start if any container on the host, running or stopped, has an invalid Portcullis label, or a network has an invalid `portcullis.network.enforce` value. A container created with an invalid label while Portcullis is running is logged and gets no access at all.
+- Portcullis removes its rules when it starts and when it stops. Containers are unrestricted while it is not running, and if it crashes, the last rules stay in place until it is started again.
+- With the iptables backend and no `ipset`, every hostname rule becomes one firewall rule per resolved address.
 
 ## License
-Licensed under either of:
+
+Licensed under either of
+
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
-
-## Documentation
-Detailed technical docs are in:
-- `docs/PORTCULLIS.md`
