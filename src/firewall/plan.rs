@@ -110,14 +110,15 @@ pub struct Source {
 pub struct HostSetId(u64);
 
 impl HostSetId {
-    /// 64-bit FNV-1a of the hostname. Hostnames are deduplicated before hashing, so a
-    /// collision would require two distinct hostnames used in the same policy to share a
-    /// 64-bit hash, which is negligible for any realistic number of hostnames.
+    /// 64-bit FNV-1a of the container name and hostname. A collision would require two of
+    /// the sets in use to share a 64-bit hash, which is negligible for any realistic number
+    /// of containers and hostnames.
     #[must_use]
-    pub fn for_host(host: &str) -> Self {
+    pub fn for_host(container: &str, host: &str) -> Self {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in host.as_bytes() {
-            hash ^= u64::from(*byte);
+        // The separator can't appear in either name.
+        for byte in container.bytes().chain([0]).chain(host.bytes()) {
+            hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x1000_0000_01b3);
         }
         Self(hash)
@@ -146,10 +147,13 @@ impl fmt::Display for SetName {
 pub const SET_PREFIX_V4: &str = "pc_h4_";
 pub const SET_PREFIX_V6: &str = "pc_h6_";
 
-/// Known addresses of one hostname, shared by every rule that targets it.
+/// Known addresses of one hostname for one container, shared by every rule of the container
+/// that targets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostSet {
     pub id: HostSetId,
+    /// The container whose rules use the set.
+    pub container: ContainerName,
     /// The hostname, normalized.
     pub host: String,
     /// Addresses and how long each stays allowed.
@@ -192,7 +196,7 @@ pub struct Plan {
     pub sources: Vec<Source>,
     /// Rules of all sources, see [`Plan::rules`].
     rules: Vec<Rule>,
-    /// Hostname sets, one per distinct hostname.
+    /// Hostname sets, one per container and hostname.
     pub host_sets: Vec<HostSet>,
     /// Bridges of managed networks. Traffic entering from them with a source that isn't a
     /// managed address (and MAC) is denied.
@@ -281,8 +285,8 @@ struct Planner<'s, 'r, R> {
     host_resolvers: &'s [IpAddr],
     plan: Plan,
     seen_sources: HashSet<IpAddr>,
-    /// Hostname -> index into `plan.host_sets`.
-    host_index: HashMap<&'s str, usize>,
+    /// Container name and hostname -> index into `plan.host_sets`.
+    host_index: HashMap<(&'s str, &'s str), usize>,
     /// Built lazily, only when an allow-listed container exists.
     icc_targets: Option<IccTargets<'s>>,
     /// Reused buffer for DNS destinations.
@@ -329,7 +333,7 @@ where
                 }
                 EgressTarget::IpCidr(_) => continue,
                 EgressTarget::Hostname(host) => {
-                    let index = self.host_set(host);
+                    let index = self.host_set(&container.name, host);
                     if let Some(set) = self.plan.host_sets.get_mut(index) {
                         if source.is_ipv4() {
                             set.used_v4 = true;
@@ -485,35 +489,37 @@ where
         }
     }
 
-    /// Index of the set for `host`. A hostname that can't be resolved gets an empty set,
-    /// so its rules allow nothing while the rest of the policy still applies.
-    fn host_set(&mut self, host: &'s str) -> usize {
-        if let Some(index) = self.host_index.get(host) {
+    /// Index of the set for `host` in `container`'s rules. A hostname that can't be
+    /// resolved gets an empty set, so its rules allow nothing while the rest of the policy
+    /// still applies.
+    fn host_set(&mut self, container: &'s ContainerName, host: &'s str) -> usize {
+        if let Some(index) = self.host_index.get(&(container.as_str(), host)) {
             return *index;
         }
 
         let normalized = normalize(host);
-        let addresses = match self.resolver.addresses(&normalized) {
+        let addresses = match self.resolver.addresses(container, &normalized) {
             Ok(addresses) => addresses,
             Err(error) => {
                 error!(%host, %error, "failed to resolve hostname; its rules allow nothing until it resolves");
                 Vec::new()
             }
         };
-        if addresses.is_empty() {
+        if addresses.is_empty() && !self.plan.unresolved_hosts.contains(&normalized) {
             self.plan.unresolved_hosts.push(normalized.clone());
         }
         trace!(%host, ip_count = addresses.len(), ?addresses, "known hostname addresses");
 
         let index = self.plan.host_sets.len();
         self.plan.host_sets.push(HostSet {
-            id: HostSetId::for_host(&normalized),
+            id: HostSetId::for_host(container, &normalized),
+            container: container.clone(),
             host: normalized,
             addresses,
             used_v4: false,
             used_v6: false,
         });
-        self.host_index.insert(host, index);
+        self.host_index.insert((container.as_str(), host), index);
         index
     }
 }
@@ -745,18 +751,23 @@ mod tests {
     }
 
     #[test]
-    fn resolves_and_creates_each_hostname_set_once() {
+    fn creates_a_hostname_set_per_container() {
+        // What one container learns from DNS answers must not widen another's rules.
         let (plan, resolver) = build(&test_support::shared_hostname_state());
-        assert_eq!(resolver.calls, 1);
-        assert_eq!(plan.host_sets.len(), 1);
+        assert_eq!(resolver.calls, 2);
+        assert_eq!(plan.host_sets.len(), 2);
         assert_eq!(plan.sources.len(), 2);
-        for source in &plan.sources {
+        for (index, source) in plan.sources.iter().enumerate() {
+            let set = plan.host_set(index).expect("host set");
+            assert_eq!(set.container, source.container);
+            assert_eq!(set.host, test_support::HOST);
             assert!(plan.egress_rules(source).contains(&Rule::AcceptPort {
-                destination: Destination::HostSet(0),
+                destination: Destination::HostSet(index),
                 protocol: Protocol::Tcp,
                 port: 443,
             }));
         }
+        assert_ne!(plan.host_sets[0].id, plan.host_sets[1].id);
     }
 
     #[test]

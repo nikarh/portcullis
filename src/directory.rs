@@ -142,13 +142,13 @@ impl Directory {
             .unwrap_or_default()
     }
 
-    /// Hostname sets of the current rules for any of `names`.
+    /// Hostname sets of `container`'s current rules for any of `names`.
     #[must_use]
-    pub fn host_sets_for(&self, names: &[String]) -> Vec<HostSet> {
+    pub fn host_sets_for(&self, container: &str, names: &[String]) -> Vec<HostSet> {
         self.read()
             .host_sets
             .iter()
-            .filter(|set| names.contains(&set.host))
+            .filter(|set| set.container.as_str() == container && names.contains(&set.host))
             .cloned()
             .collect()
     }
@@ -274,11 +274,17 @@ mod tests {
         );
         let directory = Directory::default();
         directory.update(&plan);
-        let sets = directory.host_sets_for(&[test_support::HOST.to_string()]);
+        let sets = directory.host_sets_for("web", &[test_support::HOST.to_string()]);
         assert_eq!(sets.len(), 1);
         assert!(
             directory
-                .host_sets_for(&["other.test".to_string()])
+                .host_sets_for("web", &["other.test".to_string()])
+                .is_empty()
+        );
+        // Another container's sets.
+        assert!(
+            directory
+                .host_sets_for("db", &[test_support::HOST.to_string()])
                 .is_empty()
         );
     }

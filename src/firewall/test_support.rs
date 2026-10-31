@@ -26,7 +26,11 @@ pub struct MockResolver {
 pub const HOLD: Duration = Duration::from_secs(3600);
 
 impl HostResolver for MockResolver {
-    fn addresses(&mut self, host: &str) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
+    fn addresses(
+        &mut self,
+        _container: &str,
+        host: &str,
+    ) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
         self.calls += 1;
         if host == HOST {
             return Ok(vec![(ip("1.1.1.1"), HOLD), (ip("2606:4700::1111"), HOLD)]);

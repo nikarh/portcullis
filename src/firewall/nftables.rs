@@ -1655,9 +1655,9 @@ flush chain bridge portcullis icc0
     }
 
     #[test]
-    fn renders_hostname_sets_with_timeouts_once_per_host() {
+    fn renders_hostname_sets_with_timeouts_once_per_container_and_host() {
         let script = render(&test_support::shared_hostname_state());
-        assert_eq!(script.matches("add set inet portcullis pc_h4_").count(), 1);
+        assert_eq!(script.matches("add set inet portcullis pc_h4_").count(), 2);
         assert!(script.contains("{ type ipv4_addr; flags timeout; }"));
         assert!(script.contains(" { 1.1.1.1 timeout 3600s }\n"));
         assert_eq!(script.matches("ip daddr @pc_h4_").count(), 2);

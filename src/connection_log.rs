@@ -152,12 +152,13 @@ fn rule_domain(
     source: IpAddr,
     destination: IpAddr,
 ) -> Option<String> {
+    let container = directory.source(source)?.container;
     let rule_hosts = directory.rule_hosts(source);
     let hosts = hosts.lock().unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
     rule_hosts
         .into_iter()
-        .find(|host| hosts.allows(host, destination, now))
+        .find(|host| hosts.allows(&container, host, destination, now))
 }
 
 /// A packet whose source address isn't the sender's: name the sender by its MAC, if known,
@@ -295,6 +296,7 @@ mod tests {
 
         // An address of a hostname the container has no rule for isn't attributed to it.
         hosts.lock().expect("lock").observe(
+            "web",
             "rule.test",
             ip("198.51.100.5"),
             Duration::from_secs(60),
@@ -320,6 +322,7 @@ mod tests {
             Duration::from_secs(3600),
         )));
         hosts.lock().expect("lock").observe(
+            "web",
             test_support::HOST,
             ip("198.51.100.5"),
             Duration::from_secs(60),

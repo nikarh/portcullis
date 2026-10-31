@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, select, unbounded};
 use pico_args::Arguments;
@@ -340,6 +340,7 @@ impl Applier {
         let state = &*state;
         let result = {
             let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+            hosts.prune(Instant::now());
             self.firewall
                 .apply(state, &mut *hosts, &host_resolvers, self.monitor_all)
         };

@@ -149,18 +149,27 @@ fn allow_addresses(
     if answer.addresses.is_empty() {
         return;
     }
+    // Only the receiving container's rules learn from its answers.
+    let Some(owner) = directory.source(answer.container) else {
+        return;
+    };
     let now = Instant::now();
     let mut names = Vec::with_capacity(1 + answer.aliases.len());
     names.push(answer.name.clone());
     names.extend(answer.aliases.iter().cloned());
 
-    for set in directory.host_sets_for(&names) {
+    for set in directory.host_sets_for(&owner.container, &names) {
         let allowed: Vec<_> = {
             let mut hosts = hosts.lock().unwrap_or_else(PoisonError::into_inner);
             answer
                 .addresses
                 .iter()
-                .map(|(address, ttl)| (*address, hosts.observe(&set.host, *address, *ttl, now)))
+                .map(|(address, ttl)| {
+                    (
+                        *address,
+                        hosts.observe(&owner.container, &set.host, *address, *ttl, now),
+                    )
+                })
                 .collect()
         };
         debug!(host = %set.host, ?allowed, "allowing addresses from a DNS answer");
