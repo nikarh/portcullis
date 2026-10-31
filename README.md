@@ -56,10 +56,10 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. On startup an
 
 ### Enforcing a network
 
-Nothing is restricted until you label a network:
+Nothing is restricted until you enable Portcullis on a network with a network label:
 
 ```text
-portcullis.network.enforce=true
+portcullis.enable=true
 ```
 
 Docker only lets you set labels when a network is created. With Compose:
@@ -68,16 +68,16 @@ Docker only lets you set labels when a network is created. With Compose:
 networks:
   backend:
     labels:
-      - portcullis.network.enforce=true
+      - portcullis.enable=true
 ```
 
 Or by hand:
 
 ```bash
-docker network create --label portcullis.network.enforce=true backend
+docker network create --label portcullis.enable=true backend
 ```
 
-Every container attached to an enforced network is then restricted, whether or not it has Portcullis labels of its own. A container without labels can talk to other containers on the same network and send DNS queries to the network's gateway, and nothing else. Labels on the container open up more.
+Every container attached to an enforced network is then restricted, whether or not it has Portcullis labels of its own. `portcullis.enable` only has an effect on networks; on a container it is ignored. A container without labels can talk to other containers on the same network and send DNS queries to the network's gateway, and nothing else. Labels on the container open up more.
 
 Only bridge networks can be enforced. The default `bridge` network can't be, because it can't be given labels.
 
@@ -179,7 +179,7 @@ networks:
       config:
         - subnet: 172.30.0.0/24
     labels:
-      - portcullis.network.enforce=true
+      - portcullis.enable=true
 ```
 
 The network has to exist before Portcullis starts, otherwise there is no gateway address to bind to.
@@ -201,7 +201,7 @@ services:
 networks:
   backend:
     labels:
-      - portcullis.network.enforce=true
+      - portcullis.enable=true
 ```
 
 An API that may reach its database and cache but nothing else on the network, and a database with no outbound access at all:
@@ -232,7 +232,7 @@ services:
 networks:
   backend:
     labels:
-      - portcullis.network.enforce=true
+      - portcullis.enable=true
 ```
 
 `db` and `redis` can still answer the API's connections; the `deny` mode only stops them from opening their own.
@@ -253,7 +253,7 @@ labels:
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close. Replies to incoming connections are always allowed, so published ports keep working.
 - A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too.
 - If a hostname can't be resolved, Portcullis logs an error and its rules allow nothing until it resolves again. Everything else is applied as usual. Failed lookups are retried every 30 seconds.
-- Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.network.enforce` value enforces the network. An enforced network without a usable subnet is logged and not enforced.
+- Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.enable` value on a network enforces it. An enforced network without a usable subnet is logged and not enforced.
 - Portcullis removes its rules when it starts and when it stops. Containers are unrestricted while it is not running, and if it crashes, the last rules stay in place until it is started again.
 - With the iptables backend and no `ipset`, every hostname rule becomes one firewall rule per resolved address.
 

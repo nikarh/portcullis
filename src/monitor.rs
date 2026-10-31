@@ -56,7 +56,7 @@ fn network_from_inspect(network: &DockerNetworkInspect) -> Option<Network> {
     }
 
     // Ignore non-portcullis networks
-    if !is_portcullis_network_enforced(network) {
+    if !is_portcullis_enabled(network) {
         debug!(
             network_id = %network.id,
             network_name = %network.name,
@@ -387,8 +387,8 @@ fn network_primary_config(
 
 /// Whether the network opted in. An invalid value is logged and treated as enforced, so a
 /// typo restricts containers instead of silently leaving them open.
-fn is_portcullis_network_enforced(network: &DockerNetworkInspect) -> bool {
-    const LABEL_KEY: &str = "portcullis.network.enforce";
+fn is_portcullis_enabled(network: &DockerNetworkInspect) -> bool {
+    const LABEL_KEY: &str = "portcullis.enable";
     let Some(value) = network
         .labels
         .as_ref()
@@ -542,9 +542,8 @@ mod tests {
         driver: DockerNetworkDriver,
         enforce_label: Option<&str>,
     ) -> DockerNetworkInspect {
-        let labels = enforce_label.map(|value| {
-            IndexMap::from([("portcullis.network.enforce".to_string(), value.to_string())])
-        });
+        let labels = enforce_label
+            .map(|value| IndexMap::from([("portcullis.enable".to_string(), value.to_string())]));
 
         DockerNetworkInspect {
             id: id.to_string(),

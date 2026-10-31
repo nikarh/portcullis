@@ -315,7 +315,6 @@ mod tests {
     #[test]
     fn parse_policy_parses_ip_and_host_rules() {
         let parsed = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
             ("portcullis.icc.mode", "deny"),
             ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443,udp:53"),
             ("portcullis.egress.1", "host:api.example.com,tcp:443"),
@@ -347,11 +346,8 @@ mod tests {
 
     #[test]
     fn parse_policy_defaults_icc_mode_to_allow() {
-        let parsed = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.egress.0", "ip:10.0.0.0/8,tcp:443"),
-        ]))
-        .expect("parser should not fail");
+        let parsed = parse_strict(&labels(&[("portcullis.egress.0", "ip:10.0.0.0/8,tcp:443")]))
+            .expect("parser should not fail");
 
         assert_eq!(parsed.icc_mode, IccMode::Allow);
         assert!(parsed.icc_allow.is_empty());
@@ -359,22 +355,16 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_invalid_icc_mode() {
-        let error = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.icc.mode", "nope"),
-        ]))
-        .expect_err("invalid icc mode should be rejected");
+        let error = parse_strict(&labels(&[("portcullis.icc.mode", "nope")]))
+            .expect_err("invalid icc mode should be rejected");
 
         assert_eq!(error, LabelParseError::InvalidIccMode("nope".to_string()));
     }
 
     #[test]
     fn parse_policy_rejects_invalid_cidr() {
-        let error = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.egress.0", "ip:not-a-cidr,tcp:443"),
-        ]))
-        .expect_err("invalid cidr should be rejected");
+        let error = parse_strict(&labels(&[("portcullis.egress.0", "ip:not-a-cidr,tcp:443")]))
+            .expect_err("invalid cidr should be rejected");
 
         assert_eq!(
             error,
@@ -387,11 +377,8 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_missing_ports() {
-        let error = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.egress.0", "ip:1.1.1.1/32"),
-        ]))
-        .expect_err("missing ports should be rejected");
+        let error = parse_strict(&labels(&[("portcullis.egress.0", "ip:1.1.1.1/32")]))
+            .expect_err("missing ports should be rejected");
 
         assert_eq!(
             error,
@@ -401,10 +388,10 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_invalid_port_definition() {
-        let error = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.egress.0", "ip:1.1.1.1/32,sctp:443"),
-        ]))
+        let error = parse_strict(&labels(&[(
+            "portcullis.egress.0",
+            "ip:1.1.1.1/32,sctp:443",
+        )]))
         .expect_err("invalid port should be rejected");
 
         assert_eq!(
@@ -418,11 +405,8 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_zero_port() {
-        let error = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:0"),
-        ]))
-        .expect_err("port zero should be rejected");
+        let error = parse_strict(&labels(&[("portcullis.egress.0", "ip:1.1.1.1/32,tcp:0")]))
+            .expect_err("port zero should be rejected");
 
         assert_eq!(
             error,
@@ -436,7 +420,6 @@ mod tests {
     #[test]
     fn parse_policy_parses_icc_allow_rule() {
         let parsed = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
             ("portcullis.icc.mode", "allow-listed"),
             ("portcullis.icc.allow.0", "container:redis,tcp:6379"),
         ]))
@@ -453,7 +436,6 @@ mod tests {
     #[test]
     fn parse_policy_parses_dns_targets() {
         let parsed = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
             ("portcullis.dns.0", "docker"),
             ("portcullis.dns.1", "host"),
             ("portcullis.dns.2", "runtime"),
@@ -475,21 +457,18 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_invalid_dns_target() {
-        let error = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.dns.0", "bad"),
-        ]))
-        .expect_err("invalid dns target should be rejected");
+        let error = parse_strict(&labels(&[("portcullis.dns.0", "bad")]))
+            .expect_err("invalid dns target should be rejected");
 
         assert!(matches!(error, LabelParseError::InvalidDnsTarget(_, _)));
     }
 
     #[test]
     fn parse_policy_rejects_invalid_icc_allow_target() {
-        let error = parse_strict(&labels(&[
-            ("portcullis.enable", "true"),
-            ("portcullis.icc.allow.0", "host:redis,tcp:6379"),
-        ]))
+        let error = parse_strict(&labels(&[(
+            "portcullis.icc.allow.0",
+            "host:redis,tcp:6379",
+        )]))
         .expect_err("invalid icc allow target should be rejected");
 
         assert!(matches!(
