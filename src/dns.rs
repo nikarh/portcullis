@@ -28,7 +28,7 @@ pub struct SystemUpstreamResolver;
 impl UpstreamResolver for SystemUpstreamResolver {
     fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         trace!(%host, "performing system DNS lookup");
-        let ips: Vec<_> = (host, 0)
+        let mut ips: Vec<_> = (host, 0)
             .to_socket_addrs()
             .map_err(|error| DnsError::LookupFailed {
                 host: host.to_string(),
@@ -36,6 +36,9 @@ impl UpstreamResolver for SystemUpstreamResolver {
             })?
             .map(|address| address.ip())
             .collect();
+        // Same canonical form as the DNS runtime, so unchanged results compare equal.
+        ips.sort_unstable();
+        ips.dedup();
 
         trace!(%host, result_count = ips.len(), ?ips, "system DNS lookup result");
         Ok(ips)

@@ -355,6 +355,8 @@ fn run(config: &Config) -> Result<(), MainError> {
     let mut runtime_state = monitor.initialize()?;
     apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache)?;
     info!("firewall rules applied");
+    // Whether the installed rules reflect the current state and DNS cache.
+    let mut rules_current = true;
 
     let (docker_tx, docker_rx) = unbounded::<DockerWorkerEvent>();
     let (docker_stop_tx, docker_stop_rx) = unbounded::<()>();
@@ -416,12 +418,14 @@ fn run(config: &Config) -> Result<(), MainError> {
                                 trace!("docker event produced no policy state changes");
                             }
                             Ok(true) => {
-                                if let Err(error) = apply_firewall(
+                                let result = apply_firewall(
                                     &firewall,
                                     config.dns_mode,
                                     &runtime_state,
                                     &mut dns_cache,
-                                ) {
+                                );
+                                rules_current = result.is_ok();
+                                if let Err(error) = result {
                                     error!(%error, "firewall apply failed; continuing");
                                 } else {
                                     refresh_dns_tracking(&dns_runtime, &runtime_state, config.dns_mode);
@@ -441,12 +445,14 @@ fn run(config: &Config) -> Result<(), MainError> {
                                 match monitor.initialize() {
                                     Ok(state) => {
                                         runtime_state = state;
-                                        if let Err(error) = apply_firewall(
+                                        let result = apply_firewall(
                                             &firewall,
                                             config.dns_mode,
                                             &runtime_state,
                                             &mut dns_cache,
-                                        ) {
+                                        );
+                                        rules_current = result.is_ok();
+                                        if let Err(error) = result {
                                             error!(%error, "firewall apply failed after reconnect; continuing");
                                         } else {
                                             refresh_dns_tracking(&dns_runtime, &runtime_state, config.dns_mode);
@@ -470,9 +476,18 @@ fn run(config: &Config) -> Result<(), MainError> {
                     continue;
                 };
                 debug!(host = %event.host, ip_count = event.addresses.len(), "received DNS resolution event");
+                let cached = dns_cache.resolve_cached(&event.host);
+                let unchanged = rules_current && !cached.is_empty() && *cached == *event.addresses;
                 dns_cache.insert_with_ttl(&event.host, event.addresses.clone(), event.ttl);
-                let apply_result =
-                    apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache);
+                let apply_result = if unchanged {
+                    trace!(host = %event.host, "DNS addresses unchanged; rules already current");
+                    Ok(())
+                } else {
+                    let result =
+                        apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache);
+                    rules_current = result.is_ok();
+                    result
+                };
                 if let Some(ack) = event.ack {
                     let _ = ack.send(if apply_result.is_ok() {
                         DnsApplyAck::Applied
