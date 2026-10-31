@@ -7,17 +7,79 @@ use std::sync::Mutex;
 use tracing::{info, trace};
 
 use super::FirewallError;
-use super::plan::{DNS_PORT, Destination, HostSet, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6};
+use super::plan::{
+    DNS_PORT, Destination, HostSet, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
+};
 use crate::dns::PolicyDnsResolver;
 use crate::model::RuntimeState;
 
-pub const TABLE_FAMILY: &str = "inet";
-pub const TABLE_NAME: &str = "portcullis";
-pub const CHAIN_NAME: &str = "egress";
+/// Name of both managed tables.
+const TABLE_NAME: &str = "portcullis";
+/// Priority of both base chains: before Docker's filter chains.
 const FORWARD_HOOK_PRIORITY: i32 = -1;
-/// `add rule {TABLE_FAMILY} {TABLE_NAME}`, spelled out to avoid formatting the same
-/// constants for every rule.
-const RULE_PREFIX: &str = "add rule inet portcullis";
+
+/// The managed tables: `inet` sees traffic routed out of a container's network, `bridge`
+/// sees traffic between containers on the same network, which a bridge switches without
+/// passing the IP hooks (unless `br_netfilter` is loaded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Table {
+    Inet,
+    Bridge,
+}
+
+impl fmt::Display for Table {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inet => write!(f, "inet {TABLE_NAME}"),
+            Self::Bridge => write!(f, "bridge {TABLE_NAME}"),
+        }
+    }
+}
+
+/// A chain, displayed as `<family> <table> <chain>`.
+#[derive(Debug, Clone, Copy)]
+enum Chain {
+    /// The base chain of a table.
+    Base(Table),
+    /// Egress rules of the n-th source, in the inet table.
+    Egress(usize),
+    /// ICC rules of the n-th source, in the bridge table.
+    Icc(usize),
+}
+
+impl Chain {
+    const fn table(self) -> Table {
+        match self {
+            Self::Base(table) => table,
+            Self::Egress(_) => Table::Inet,
+            Self::Icc(_) => Table::Bridge,
+        }
+    }
+}
+
+impl fmt::Display for Chain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ", self.table())?;
+        match self {
+            Self::Base(_) => f.write_str("forward"),
+            Self::Egress(index) => write!(f, "egress{index}"),
+            Self::Icc(index) => write!(f, "icc{index}"),
+        }
+    }
+}
+
+/// The chain name alone, as used in jump targets.
+struct ChainName(Chain);
+
+impl fmt::Display for ChainName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Chain::Base(_) => f.write_str("forward"),
+            Chain::Egress(index) => write!(f, "egress{index}"),
+            Chain::Icc(index) => write!(f, "icc{index}"),
+        }
+    }
+}
 
 pub trait NftRunner {
     /// Run an nft script as a single atomic transaction.
@@ -75,37 +137,33 @@ impl NftablesFirewall<LibNftablesRunner> {
     }
 }
 
-/// Remove the managed table. The `add` makes the `delete` succeed whether or not the table
+/// Remove the managed tables. The `add` makes the `delete` succeed whether or not a table
 /// exists, so neither cleanup nor apply depend on prior state or on matching error strings.
 fn render_table_reset(out: &mut String) -> fmt::Result {
-    writeln!(out, "add table {TABLE_FAMILY} {TABLE_NAME}")?;
-    writeln!(out, "delete table {TABLE_FAMILY} {TABLE_NAME}")
+    for table in [Table::Inet, Table::Bridge] {
+        writeln!(out, "add table {table}")?;
+        writeln!(out, "delete table {table}")?;
+    }
+    Ok(())
 }
 
 /// Render the full apply script.
 ///
-/// Layout: the base chain lets established traffic through, then dispatches each managed
-/// source address through a verdict map to its own chain, then drops unmanaged sources of
-/// enforced subnets. A packet costs one hash lookup plus the rules of its own source,
-/// regardless of how many containers are managed.
+/// Each table has a base chain that lets established traffic through and dispatches each
+/// managed source address through a verdict map to its own chain. A packet costs one hash
+/// lookup plus the rules of its own source, regardless of how many containers are managed.
+/// The inet base chain then drops unmanaged sources of enforced subnets.
 ///
-/// The table is deleted and recreated inside the same transaction, so the swap is atomic
-/// and chains and sets no longer needed disappear together with the old table.
+/// Both tables are deleted and recreated inside the same transaction, so the swap is
+/// atomic and chains and sets no longer needed disappear together with the old tables.
 fn render_apply_script(plan: &Plan, out: &mut String) -> fmt::Result {
     render_table_reset(out)?;
-    writeln!(out, "add table {TABLE_FAMILY} {TABLE_NAME}")?;
-    writeln!(
-        out,
-        "add chain {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority {FORWARD_HOOK_PRIORITY}; policy accept; }}"
-    )?;
-    for index in 0..plan.sources.len() {
-        writeln!(
-            out,
-            "add chain {TABLE_FAMILY} {TABLE_NAME} {}",
-            SourceChain(index)
-        )?;
-    }
 
+    // Routed traffic.
+    render_base_chain(out, Table::Inet)?;
+    for (index, _) in plan.sources.iter().enumerate() {
+        writeln!(out, "add chain {}", Chain::Egress(index))?;
+    }
     for set in &plan.host_sets {
         if set.used_v4 {
             render_set(out, set, SET_PREFIX_V4, "ipv4_addr", set.v4())?;
@@ -114,47 +172,87 @@ fn render_apply_script(plan: &Plan, out: &mut String) -> fmt::Result {
             render_set(out, set, SET_PREFIX_V6, "ipv6_addr", set.v6())?;
         }
     }
-
-    // Policy applies to new connections only; replies and established flows skip it.
-    writeln!(
-        out,
-        "{RULE_PREFIX} {CHAIN_NAME} ct state established,related accept"
-    )?;
-    for (family, is_family) in [
-        ("ip", IpAddr::is_ipv4 as fn(&IpAddr) -> bool),
-        ("ip6", IpAddr::is_ipv6),
-    ] {
-        let sources = plan
-            .sources
-            .iter()
-            .enumerate()
-            .filter(|(_, source)| is_family(&source.address))
-            .map(|(index, source)| Goto(source.address, SourceChain(index)));
-        render_elements(
-            out,
-            format_args!("{RULE_PREFIX} {CHAIN_NAME} {family} saddr vmap"),
-            sources,
-            "",
-        )?;
-
+    render_dispatch(out, plan, Table::Inet, |_| true, Chain::Egress)?;
+    let base = Chain::Base(Table::Inet);
+    for (family, is_family) in FAMILIES {
         let subnets = plan
             .enforced_subnets
             .iter()
             .filter(|subnet| is_family(&subnet.addr()));
         render_elements(
             out,
-            format_args!("{RULE_PREFIX} {CHAIN_NAME} {family} saddr"),
+            format_args!("add rule {base} {family} saddr"),
             subnets,
             " drop",
         )?;
     }
-
     for (index, source) in plan.sources.iter().enumerate() {
-        let chain = SourceChain(index);
-        for rule in plan.rules(source) {
+        let chain = Chain::Egress(index);
+        for rule in plan.egress_rules(source) {
             render_rule(plan, source.address, chain, rule, out)?;
         }
-        writeln!(out, "{RULE_PREFIX} {chain} drop")?;
+        writeln!(out, "add rule {chain} drop")?;
+    }
+
+    // Traffic between containers on the same network.
+    let restricted = |source: &Source| !plan.icc_rules(source).is_empty();
+    render_base_chain(out, Table::Bridge)?;
+    for (index, _) in plan
+        .sources
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| restricted(source))
+    {
+        writeln!(out, "add chain {}", Chain::Icc(index))?;
+    }
+    render_dispatch(out, plan, Table::Bridge, restricted, Chain::Icc)?;
+    for (index, source) in plan.sources.iter().enumerate() {
+        let chain = Chain::Icc(index);
+        for rule in plan.icc_rules(source) {
+            render_rule(plan, source.address, chain, rule, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// nftables keyword of an address family, and whether an address belongs to it.
+type Family = (&'static str, fn(&IpAddr) -> bool);
+
+const FAMILIES: [Family; 2] = [("ip", IpAddr::is_ipv4), ("ip6", IpAddr::is_ipv6)];
+
+fn render_base_chain(out: &mut String, table: Table) -> fmt::Result {
+    let base = Chain::Base(table);
+    writeln!(out, "add table {table}")?;
+    writeln!(
+        out,
+        "add chain {base} {{ type filter hook forward priority {FORWARD_HOOK_PRIORITY}; policy accept; }}"
+    )?;
+    // Policy applies to new connections only; replies and established flows skip it.
+    writeln!(out, "add rule {base} ct state established,related accept")
+}
+
+/// Dispatch the selected sources from the base chain of `table` to their chains.
+fn render_dispatch(
+    out: &mut String,
+    plan: &Plan,
+    table: Table,
+    selected: impl Fn(&Source) -> bool,
+    chain: fn(usize) -> Chain,
+) -> fmt::Result {
+    let base = Chain::Base(table);
+    for (family, is_family) in FAMILIES {
+        let entries = plan
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| is_family(&source.address) && selected(source))
+            .map(|(index, source)| Goto(source.address, chain(index)));
+        render_elements(
+            out,
+            format_args!("add rule {base} {family} saddr vmap"),
+            entries,
+            "",
+        )?;
     }
     Ok(())
 }
@@ -191,34 +289,22 @@ fn render_set(
     addresses: impl Iterator<Item = IpAddr>,
 ) -> fmt::Result {
     let name = set.id.name(prefix);
-    writeln!(
-        out,
-        "add set {TABLE_FAMILY} {TABLE_NAME} {name} {{ type {type_name}; }}"
-    )?;
+    let table = Table::Inet;
+    writeln!(out, "add set {table} {name} {{ type {type_name}; }}")?;
     render_elements(
         out,
-        format_args!("add element {TABLE_FAMILY} {TABLE_NAME} {name}"),
+        format_args!("add element {table} {name}"),
         addresses,
         "",
     )
 }
 
 /// Verdict map entry dispatching a source address to its chain.
-struct Goto(IpAddr, SourceChain);
+struct Goto(IpAddr, Chain);
 
 impl fmt::Display for Goto {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} : goto {}", self.0, self.1)
-    }
-}
-
-/// Name of the chain holding the rules of the n-th managed source address.
-#[derive(Debug, Clone, Copy)]
-struct SourceChain(usize);
-
-impl fmt::Display for SourceChain {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "s{}", self.0)
+        write!(f, "{} : goto {}", self.0, ChainName(self.1))
     }
 }
 
@@ -232,7 +318,7 @@ const fn family(address: IpAddr) -> &'static str {
 fn render_rule(
     plan: &Plan,
     source: IpAddr,
-    chain: SourceChain,
+    chain: Chain,
     rule: &Rule,
     out: &mut String,
 ) -> fmt::Result {
@@ -242,7 +328,7 @@ fn render_rule(
             destination,
             protocol,
         } => {
-            write!(out, "{RULE_PREFIX} {chain} ")?;
+            write!(out, "add rule {chain} ")?;
             if let Some(destination) = destination {
                 write!(out, "{f} daddr {destination} ")?;
             }
@@ -250,14 +336,14 @@ fn render_rule(
         }
         Rule::DropDns { protocol } => writeln!(
             out,
-            "{RULE_PREFIX} {chain} {} dport {DNS_PORT} drop",
+            "add rule {chain} {} dport {DNS_PORT} drop",
             protocol.as_str()
         ),
         Rule::AcceptNet(destination) => {
-            writeln!(out, "{RULE_PREFIX} {chain} {f} daddr {destination} accept")
+            writeln!(out, "add rule {chain} {f} daddr {destination} accept")
         }
         Rule::DropNet(destination) => {
-            writeln!(out, "{RULE_PREFIX} {chain} {f} daddr {destination} drop")
+            writeln!(out, "add rule {chain} {f} daddr {destination} drop")
         }
         Rule::AcceptPort {
             destination,
@@ -268,11 +354,11 @@ fn render_rule(
             match destination {
                 Destination::Net(destination) => writeln!(
                     out,
-                    "{RULE_PREFIX} {chain} {f} daddr {destination} {protocol} dport {port} accept"
+                    "add rule {chain} {f} daddr {destination} {protocol} dport {port} accept"
                 ),
                 Destination::Addr(destination) => writeln!(
                     out,
-                    "{RULE_PREFIX} {chain} {f} daddr {destination} {protocol} dport {port} accept"
+                    "add rule {chain} {f} daddr {destination} {protocol} dport {port} accept"
                 ),
                 Destination::HostSet(index) => {
                     let Some(set) = plan.host_set(index) else {
@@ -285,7 +371,7 @@ fn render_rule(
                     };
                     writeln!(
                         out,
-                        "{RULE_PREFIX} {chain} {f} daddr @{} {protocol} dport {port} accept",
+                        "add rule {chain} {f} daddr @{} {protocol} dport {port} accept",
                         set.id.name(prefix)
                     )
                 }
@@ -663,55 +749,60 @@ mod tests {
         script.lines().any(|line| line == expected)
     }
 
-    /// Name of the chain the base chain dispatches `source` to.
-    fn chain_of(script: &str, source: &str) -> String {
+    /// Name of the chain the base chain of `table` ("inet" or "bridge") dispatches
+    /// `source` to.
+    fn chain_of(script: &str, table: &str, source: &str) -> String {
+        let prefix = format!("add rule {table} portcullis forward ");
         let needle = format!(" {source} : goto ");
-        let rest = script
-            .split_once(needle.as_str())
-            .unwrap_or_else(|| panic!("no dispatch for {source} in:\n{script}"))
-            .1;
-        rest.split([',', ' '])
+        script
+            .lines()
+            .filter(|line| line.starts_with(prefix.as_str()) && line.contains("vmap"))
+            .find_map(|line| line.split_once(needle.as_str()))
+            .unwrap_or_else(|| panic!("no {table} dispatch for {source} in:\n{script}"))
+            .1
+            .split([',', ' '])
             .next()
             .unwrap_or_default()
             .to_string()
     }
 
-    fn assert_rules(script: &str, source: &str, expected: &[&str]) {
-        let chain = chain_of(script, source);
+    fn assert_rules(script: &str, table: &str, source: &str, expected: &[&str]) {
+        let chain = chain_of(script, table, source);
         for rule in expected {
-            let line = format!("add rule inet portcullis {chain} {rule}");
+            let line = format!("add rule {table} portcullis {chain} {rule}");
             assert!(has_line(script, &line), "missing {line} in:\n{script}");
         }
     }
 
     #[test]
-    fn rule_prefix_matches_table_constants() {
-        assert_eq!(RULE_PREFIX, format!("add rule {TABLE_FAMILY} {TABLE_NAME}"));
-    }
-
-    #[test]
     fn renders_layout() {
         let script = render(&test_support::hostname_state());
-        assert_eq!(chain_of(&script, "172.18.0.2"), "s0");
+        assert_eq!(chain_of(&script, "inet", "172.18.0.2"), "egress0");
+        assert_eq!(chain_of(&script, "bridge", "172.18.0.2"), "icc0");
         let expected_head = "\
 add table inet portcullis
 delete table inet portcullis
+add table bridge portcullis
+delete table bridge portcullis
 add table inet portcullis
-add chain inet portcullis egress { type filter hook forward priority -1; policy accept; }
-add chain inet portcullis s0
+add chain inet portcullis forward { type filter hook forward priority -1; policy accept; }
+add rule inet portcullis forward ct state established,related accept
+add chain inet portcullis egress0
 ";
         assert!(
             script.starts_with(expected_head),
             "unexpected head:\n{script}"
         );
         for expected in [
-            "add rule inet portcullis egress ct state established,related accept",
-            "add rule inet portcullis egress ip saddr vmap { 172.18.0.2 : goto s0 }",
-            "add rule inet portcullis egress ip saddr { 172.18.0.0/16 } drop",
+            "add rule inet portcullis forward ip saddr vmap { 172.18.0.2 : goto egress0 }",
+            "add rule inet portcullis forward ip saddr { 172.18.0.0/16 } drop",
+            "add rule inet portcullis egress0 drop",
+            "add chain bridge portcullis forward { type filter hook forward priority -1; policy accept; }",
+            "add rule bridge portcullis forward ct state established,related accept",
+            "add rule bridge portcullis forward ip saddr vmap { 172.18.0.2 : goto icc0 }",
         ] {
             assert!(has_line(&script, expected), "missing line: {expected}");
         }
-        assert!(script.ends_with("add rule inet portcullis s0 drop\n"));
         // nothing for families without sources
         assert!(!script.contains("ip6 saddr"));
     }
@@ -738,25 +829,32 @@ add chain inet portcullis s0
         assert!(!script.contains("pc_h4_"));
         assert!(has_line(
             &script,
-            "add rule inet portcullis egress ip6 saddr vmap { fd00::2 : goto s0 }"
+            "add rule inet portcullis forward ip6 saddr vmap { fd00::2 : goto egress0 }"
         ));
-        assert!(script.contains("add rule inet portcullis s0 ip6 daddr @pc_h6_"));
+        assert!(script.contains("add rule inet portcullis egress0 ip6 daddr @pc_h6_"));
         assert_rules(
             &script,
+            "inet",
             "fd00::2",
-            &[
-                "ip6 daddr 2001:db8::/32 tcp dport 443 accept",
-                "ip6 daddr fd00::/64 drop",
-            ],
+            &["ip6 daddr 2001:db8::/32 tcp dport 443 accept"],
         );
+        assert_rules(&script, "bridge", "fd00::2", &["ip6 daddr fd00::/64 drop"]);
     }
 
     #[test]
     fn renders_icc_modes() {
         let script = render(&test_support::icc_state());
-        assert_rules(&script, "172.18.0.3", &["ip daddr 172.18.0.0/16 accept"]);
+        // allow: no bridge rules at all
+        assert!(!script.contains("172.18.0.3 : goto icc"));
         assert_rules(
             &script,
+            "inet",
+            "172.18.0.3",
+            &["ip daddr 172.18.0.0/16 accept"],
+        );
+        assert_rules(
+            &script,
+            "bridge",
             "172.18.0.2",
             &[
                 "ip daddr 172.18.0.10 tcp dport 5432 accept",
@@ -771,6 +869,7 @@ add chain inet portcullis s0
         let script = render(&test_support::hostname_state());
         assert_rules(
             &script,
+            "inet",
             "172.18.0.2",
             &[
                 "ip daddr 9.9.9.9 udp dport 53 accept",
@@ -790,6 +889,7 @@ add chain inet portcullis s0
         assert!(script.contains("ip daddr @pc_h4_"));
         assert_rules(
             &script,
+            "inet",
             "172.18.0.2",
             &["ip daddr 8.8.8.0/24 tcp dport 853 accept"],
         );
@@ -841,7 +941,9 @@ add chain inet portcullis s0
         let scripts = firewall.runner.scripts.lock().expect("lock");
         assert_eq!(
             scripts.as_slice(),
-            ["add table inet portcullis\ndelete table inet portcullis\n"]
+            [
+                "add table inet portcullis\ndelete table inet portcullis\nadd table bridge portcullis\ndelete table bridge portcullis\n"
+            ]
         );
     }
 }

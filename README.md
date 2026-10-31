@@ -15,7 +15,7 @@ By default a container can open connections to any address on the internet and t
 
 Portcullis is a daemon that runs on the Docker host. It watches the Docker API for containers and networks, turns their labels into firewall rules, and rebuilds the rules whenever something changes. Each rebuild replaces the whole ruleset in one atomic step, so there is never a moment with half-applied rules.
 
-The rules are nftables rules, kept in Portcullis's own tables. They work next to Docker's rules whether Docker itself uses iptables or nftables.
+The rules are nftables rules, kept in two tables of its own: an `inet` table for traffic leaving a container's network, and a `bridge` table for traffic between containers on the same network. A Linux bridge passes that traffic directly between containers, without the IP-level hooks Docker's own rules use, so only the bridge table can see it. Both work next to Docker's rules whether Docker itself uses iptables or nftables.
 
 Portcullis only removes access. Traffic that a policy allows still goes through Docker's own rules afterwards, so things Docker blocks (internal networks, isolation between networks) stay blocked.
 
@@ -265,6 +265,7 @@ labels:
 - Only the first subnet configured on a network is used.
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
 - DNS servers set daemon-wide with `dns` in Docker's `daemon.json` aren't visible to Portcullis, so the `docker` DNS target doesn't cover them. Allow them with `portcullis.dns.<name>=ip:<address>`.
+- Filtering traffic between containers needs connection tracking for bridged traffic. The kernel loads the `nf_conntrack_bridge` module for this the first time Portcullis installs its rules.
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close. Replies to incoming connections are always allowed, so published ports keep working.
 - A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too.
 - If a hostname can't be resolved, Portcullis logs an error and its rules allow nothing until it resolves again. Everything else is applied as usual. Failed lookups are retried every 30 seconds.

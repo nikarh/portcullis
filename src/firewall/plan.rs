@@ -5,11 +5,12 @@
 //! firewall backends only render this plan, so policy semantics live in one place and a
 //! future backend (such as eBPF) only needs a renderer.
 //!
-//! Evaluation model shared by both backends, for traffic forwarded from a container:
+//! Evaluation model, for traffic from a container:
 //! 1. packets of established or related connections pass;
-//! 2. a packet whose source is a managed address is dispatched to that source's rules,
-//!    evaluated in order, first match wins, ending with an implicit drop;
-//! 3. any other packet from an enforced subnet is dropped;
+//! 2. a packet whose source is a managed address is checked against that source's rules,
+//!    first match wins: ICC rules for traffic to containers on the same network (bridged),
+//!    egress rules for everything else (routed), which end with an implicit deny;
+//! 3. any other routed packet from an enforced subnet is denied;
 //! 4. everything else passes.
 //!
 //! "Pass" and "accept" only mean that this policy doesn't drop the packet; Docker's own
@@ -69,8 +70,10 @@ pub enum Rule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub address: IpAddr,
-    /// Range into [`Plan::rules`].
-    rules: Range<usize>,
+    /// Range into [`Plan::rules`] of rules for traffic leaving the network.
+    egress: Range<usize>,
+    /// Range into [`Plan::rules`] of rules for traffic to containers on the same network.
+    icc: Range<usize>,
 }
 
 /// Stable identifier of a hostname set, derived from the hostname.
@@ -182,10 +185,18 @@ impl Plan {
         planner.plan
     }
 
-    /// Rules of `source`, in evaluation order. A source's rules end with an implicit drop.
+    /// Rules for traffic of `source` leaving its network (routed traffic), in evaluation
+    /// order. They end with an implicit deny.
     #[must_use]
-    pub fn rules(&self, source: &Source) -> &[Rule] {
-        self.rules.get(source.rules.clone()).unwrap_or_default()
+    pub fn egress_rules(&self, source: &Source) -> &[Rule] {
+        self.rules.get(source.egress.clone()).unwrap_or_default()
+    }
+
+    /// Rules for traffic of `source` to containers on the same network (bridged traffic),
+    /// in evaluation order. Traffic no rule matches is allowed; empty means unrestricted.
+    #[must_use]
+    pub fn icc_rules(&self, source: &Source) -> &[Rule] {
+        self.rules.get(source.icc.clone()).unwrap_or_default()
     }
 
     #[must_use]
@@ -225,24 +236,21 @@ where
             return;
         }
 
-        let start = self.plan.rules.len();
         let policy = &container.policy;
-        let network = self.state.networks().get(&attachment.network_id);
+        let subnet = self
+            .state
+            .networks()
+            .get(&attachment.network_id)
+            .map(|network| network.subnet)
+            .filter(|subnet| same_family(source, subnet.addr()));
 
-        self.plan_dns(source, &policy.dns_targets, container);
-
-        if let Some(network) = network.filter(|network| same_family(source, network.subnet.addr()))
-        {
-            let subnet = network.subnet;
-            match policy.icc_mode {
-                IccMode::Allow => self.plan.rules.push(Rule::AcceptNet(subnet)),
-                IccMode::Deny => self.plan.rules.push(Rule::DropNet(subnet)),
-                IccMode::AllowListed => {
-                    self.plan_icc_allow_list(source, attachment, &policy.icc_allow);
-                    self.plan.rules.push(Rule::DropNet(subnet));
-                }
-            }
+        let egress_start = self.plan.rules.len();
+        // Traffic within the network is up to the ICC rules. It only reaches the routed
+        // path at all when br_netfilter is loaded; don't let the egress deny catch it there.
+        if let Some(subnet) = subnet {
+            self.plan.rules.push(Rule::AcceptNet(subnet));
         }
+        self.plan_dns(source, &policy.dns_targets, container);
 
         for rule in &policy.egress {
             let destination = match &rule.target {
@@ -271,9 +279,25 @@ where
                 }));
         }
 
+        let egress = egress_start..self.plan.rules.len();
+
+        let icc_start = self.plan.rules.len();
+        if let Some(subnet) = subnet {
+            match policy.icc_mode {
+                IccMode::Allow => {}
+                IccMode::Deny => self.plan.rules.push(Rule::DropNet(subnet)),
+                IccMode::AllowListed => {
+                    self.plan_icc_allow_list(source, attachment, &policy.icc_allow);
+                    self.plan.rules.push(Rule::DropNet(subnet));
+                }
+            }
+        }
+        let icc = icc_start..self.plan.rules.len();
+
         self.plan.sources.push(Source {
             address: source,
-            rules: start..self.plan.rules.len(),
+            egress,
+            icc,
         });
     }
 
@@ -452,14 +476,20 @@ mod tests {
         (plan, resolver)
     }
 
-    fn rules_of(plan: &Plan, source: &str) -> Vec<Rule> {
-        let source = ip(source);
-        let source = plan
-            .sources
+    fn source<'p>(plan: &'p Plan, address: &str) -> &'p Source {
+        let address = ip(address);
+        plan.sources
             .iter()
-            .find(|candidate| candidate.address == source)
-            .expect("source should be planned");
-        plan.rules(source).to_vec()
+            .find(|candidate| candidate.address == address)
+            .expect("source should be planned")
+    }
+
+    fn rules_of(plan: &Plan, address: &str) -> Vec<Rule> {
+        plan.egress_rules(source(plan, address)).to_vec()
+    }
+
+    fn icc_of(plan: &Plan, address: &str) -> Vec<Rule> {
+        plan.icc_rules(source(plan, address)).to_vec()
     }
 
     #[test]
@@ -470,6 +500,7 @@ mod tests {
         assert_eq!(
             rules_of(&plan, "172.18.0.2"),
             vec![
+                Rule::AcceptNet(net("172.18.0.0/16")),
                 Rule::AcceptDns {
                     destination: Some(resolver),
                     protocol: Protocol::Udp
@@ -484,7 +515,6 @@ mod tests {
                 Rule::DropDns {
                     protocol: Protocol::Tcp
                 },
-                Rule::DropNet(net("172.18.0.0/16")),
                 Rule::AcceptPort {
                     destination: Destination::HostSet(0),
                     protocol: Protocol::Tcp,
@@ -496,6 +526,10 @@ mod tests {
                     port: 853
                 },
             ]
+        );
+        assert_eq!(
+            icc_of(&plan, "172.18.0.2"),
+            vec![Rule::DropNet(net("172.18.0.0/16"))]
         );
         assert_eq!(plan.enforced_subnets, vec![net("172.18.0.0/16")]);
     }
@@ -581,7 +615,7 @@ mod tests {
         assert_eq!(plan.host_sets.len(), 1);
         assert_eq!(plan.sources.len(), 2);
         for source in &plan.sources {
-            assert!(plan.rules(source).contains(&Rule::AcceptPort {
+            assert!(plan.egress_rules(source).contains(&Rule::AcceptPort {
                 destination: Destination::HostSet(0),
                 protocol: Protocol::Tcp,
                 port: 443,
@@ -603,15 +637,15 @@ mod tests {
     }
 
     #[test]
-    fn icc_allow_accepts_own_subnet() {
+    fn icc_allow_has_no_icc_rules() {
         let (plan, _) = build(&test_support::icc_state());
-        assert!(rules_of(&plan, "172.18.0.3").contains(&Rule::AcceptNet(net("172.18.0.0/16"))));
+        assert!(icc_of(&plan, "172.18.0.3").is_empty());
     }
 
     #[test]
     fn icc_allow_list_resolves_alias_on_source_network_only() {
         let (plan, _) = build(&test_support::icc_state());
-        let accepted: Vec<_> = rules_of(&plan, "172.18.0.2")
+        let accepted: Vec<_> = icc_of(&plan, "172.18.0.2")
             .into_iter()
             .filter_map(|rule| match rule {
                 Rule::AcceptPort {
@@ -639,7 +673,7 @@ mod tests {
 
             let (plan, _) = build(&state);
             assert_eq!(
-                rules_of(&plan, "172.18.0.2").contains(&Rule::AcceptPort {
+                icc_of(&plan, "172.18.0.2").contains(&Rule::AcceptPort {
                     destination: Destination::Addr(ip("172.18.0.10")),
                     protocol: Protocol::Tcp,
                     port: 5432,
