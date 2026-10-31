@@ -985,7 +985,7 @@ mod tests {
             "abc",
             "/web",
             &[
-                ("portcullis.egress.good", "ip:1.1.1.1/32,tcp:443"),
+                ("portcullis.egress.good", "ip:1.1.1.1,tcp:443"),
                 ("portcullis.egress.bad", "ip:nope,tcp:443"),
             ],
             &[("managed", "net0", "172.20.0.2")],

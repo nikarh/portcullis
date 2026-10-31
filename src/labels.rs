@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use indexmap::IndexMap;
@@ -140,7 +141,9 @@ fn parse_target(key: &str, part: &str) -> Result<EgressTarget, LabelParseError> 
 
     match kind {
         "ip" => {
+            // A plain address means just that address.
             let cidr = IpNet::from_str(value)
+                .or_else(|_| IpAddr::from_str(value).map(IpNet::from))
                 .map_err(|_| LabelParseError::InvalidCidr(key.to_string(), value.to_string()))?;
             Ok(EgressTarget::IpCidr(cidr))
         }
@@ -259,6 +262,23 @@ mod tests {
         assert_eq!(policy.icc_allow.len(), 1);
         assert_eq!(policy.icc_mode, IccMode::Allow);
         assert_eq!(policy.dns_targets, vec![DnsTarget::Docker]);
+    }
+
+    #[test]
+    fn egress_ip_accepts_plain_addresses() {
+        let policy = parse_strict(&labels(&[
+            ("portcullis.egress.v4", "ip:1.1.1.1,tcp:443"),
+            ("portcullis.egress.v6", "ip:2001:db8::1,tcp:443"),
+        ]))
+        .expect("plain addresses should parse");
+        let targets: Vec<_> = policy.egress.into_iter().map(|rule| rule.target).collect();
+        assert_eq!(
+            targets,
+            vec![
+                EgressTarget::IpCidr("1.1.1.1/32".parse().expect("cidr")),
+                EgressTarget::IpCidr("2001:db8::1/128".parse().expect("cidr")),
+            ]
+        );
     }
 
     #[test]
