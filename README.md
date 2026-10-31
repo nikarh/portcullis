@@ -247,7 +247,7 @@ labels:
 
 ## Limitations and details
 
-- Only IPv4 is filtered. Containers are matched by their IPv4 address, so on a network with IPv6 enabled their IPv6 traffic is not restricted.
+- IPv6 is not supported, by design. Containers are matched by their IPv4 address only, so on a network with IPv6 enabled their IPv6 traffic is not restricted. Don't enable IPv6 on enforced networks.
 - Only the first subnet configured on a network is used.
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close. Replies to incoming connections are always allowed, so published ports keep working.
