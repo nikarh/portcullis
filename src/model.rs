@@ -128,6 +128,16 @@ pub enum Protocol {
     Udp,
 }
 
+impl Protocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortSpec {
     pub protocol: Protocol,

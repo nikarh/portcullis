@@ -1,5 +1,8 @@
 mod iptables;
 mod nftables;
+mod plan;
+#[cfg(test)]
+mod test_support;
 
 use thiserror::Error;
 
