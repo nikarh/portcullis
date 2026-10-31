@@ -1,8 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Write as _};
 use std::net::IpAddr;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use tracing::{info, trace};
@@ -12,7 +13,7 @@ use super::plan::{
     DNS_PORT, Destination, HostSet, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
 };
 use crate::dns::HostResolver;
-use crate::model::RuntimeState;
+use crate::model::{ContainerName, RuntimeState};
 
 /// Name of both managed tables.
 const TABLE_NAME: &str = "portcullis";
@@ -121,6 +122,9 @@ pub struct Options {
     pub log_allowed: LogAllowed,
     /// NFQUEUE number DNS answers to managed containers are held in for inspection.
     pub dns_queue: Option<u16>,
+    /// NFQUEUE number packets from not yet known sources on enforced networks are held in
+    /// until the next rule update, instead of being denied. See `source_hold`.
+    pub source_queue: Option<u16>,
 }
 
 impl Default for Options {
@@ -130,9 +134,14 @@ impl Default for Options {
             log_group: 1,
             log_allowed: LogAllowed::Monitor,
             dns_queue: None,
+            source_queue: None,
         }
     }
 }
+
+/// Packet mark of held packets whose source stayed unknown: they are denied when they come
+/// back.
+pub const HOLD_EXPIRED_MARK: u32 = 0x7063_0001;
 
 /// Which allowed connections are reported.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -167,6 +176,19 @@ const LOG_SNAPLEN_DNS: u16 = 512;
 pub struct NftablesFirewall<R = LibNftablesRunner> {
     runner: R,
     options: Options,
+    /// What the last successful update installed; `None` before the first one and after a
+    /// cleanup, when the tables may hold leftovers of another run.
+    installed: Mutex<Option<Installed>>,
+}
+
+/// Chains and sets an update created besides the fixed base chains and log sets, as
+/// `<family> <table> <name>`. The next update deletes the ones it doesn't need anymore.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Installed {
+    chains: BTreeSet<String>,
+    sets: BTreeSet<String>,
+    /// The container of each managed address.
+    sources: BTreeMap<IpAddr, ContainerName>,
 }
 
 impl<R> NftablesFirewall<R>
@@ -174,7 +196,11 @@ where
     R: NftRunner,
 {
     pub const fn new(runner: R, options: Options) -> Self {
-        Self { runner, options }
+        Self {
+            runner,
+            options,
+            installed: Mutex::new(None),
+        }
     }
 
     /// Apply rules for `state`. Returns the plan that was applied.
@@ -197,9 +223,15 @@ where
             "applying nftables changes"
         );
 
+        let mut installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut script = String::with_capacity(plan.rule_count() * 96);
-        render_apply_script(&plan, self.options, &mut script)?;
+        let now_installed =
+            render_apply_script(&plan, self.options, installed.as_ref(), &mut script)?;
         self.runner.run_script(script)?;
+        *installed = Some(now_installed);
         Ok(plan)
     }
 
@@ -241,6 +273,10 @@ where
         let mut script = String::new();
         render_table_reset(&mut script)?;
         self.runner.run_script(script)?;
+        *self
+            .installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         info!("nftables cleanup completed");
         Ok(())
     }
@@ -339,7 +375,8 @@ const LOGGED_SET_V6: &str = "logged6";
 const LOGGED_TIMEOUT: &str = "60s";
 const LOGGED_SIZE: u32 = 65_536;
 
-fn render_logged_sets(out: &mut String, table: Table) -> fmt::Result {
+/// Create the sets of reported flows; with `flush`, forget the flows reported so far.
+fn render_logged_sets(out: &mut String, table: Table, flush: bool) -> fmt::Result {
     let families: &[(&str, &str)] = match table {
         Table::Inet => &[(LOGGED_SET_V4, "ipv4_addr"), (LOGGED_SET_V6, "ipv6_addr")],
         Table::Bridge => &[(LOGGED_SET_V4, "ipv4_addr")],
@@ -349,6 +386,9 @@ fn render_logged_sets(out: &mut String, table: Table) -> fmt::Result {
             out,
             "add set {table} {name} {{ type {address} . {address} . inet_proto . inet_service; flags dynamic,timeout; timeout {LOGGED_TIMEOUT}; size {LOGGED_SIZE}; }}"
         )?;
+        if flush {
+            writeln!(out, "flush set {table} {name}")?;
+        }
     }
     Ok(())
 }
@@ -387,53 +427,73 @@ fn set_literal<T: fmt::Display>(elements: impl Iterator<Item = T>) -> Option<Str
     Some(literal)
 }
 
-/// Render the full apply script.
+/// Render the script of a rule update.
 ///
 /// Each table has a base chain that lets established traffic through and dispatches each
 /// managed source address through a verdict map to its own chain. A packet costs one hash
 /// lookup plus the rules of its own source, regardless of how many containers are managed.
 ///
-/// Both tables are deleted and recreated inside the same transaction, so the swap is
-/// atomic and chains and sets no longer needed disappear together with the old tables.
-fn render_apply_script(plan: &Plan, options: Options, out: &mut String) -> fmt::Result {
-    render_table_reset(out)?;
-    let bridges = || plan.bridges.iter().map(|bridge| Quoted(&bridge.name));
-    let enforced_bridges = || {
-        plan.bridges
+/// The tables, base chains and log sets are created once and kept: an update flushes and
+/// refills chains and sets, and deletes those of the previous update it doesn't need, in
+/// one atomic transaction. Deleting a base chain would unregister its hook, and the kernel
+/// drops every packet held in a queue from that hook: DNS answers being inspected, and
+/// packets of new containers waiting for their rules. Only the first update, without
+/// `previous`, starts from empty tables, removing whatever a previous run left behind.
+fn render_apply_script(
+    plan: &Plan,
+    options: Options,
+    previous: Option<&Installed>,
+    out: &mut String,
+) -> Result<Installed, fmt::Error> {
+    let empty = Installed::default();
+    let previous = if let Some(previous) = previous {
+        previous
+    } else {
+        render_table_reset(out)?;
+        &empty
+    };
+    // Flows are remembered by address: when an address goes to another container, or to
+    // none, its flows must be reported again.
+    let sources: BTreeMap<IpAddr, ContainerName> = plan
+        .sources
+        .iter()
+        .map(|source| (source.address, source.container.clone()))
+        .collect();
+    let reassigned = previous
+        .sources
+        .iter()
+        .any(|(address, container)| sources.get(address) != Some(container));
+    for table in [Table::Inet, Table::Bridge] {
+        writeln!(out, "add table {table}")?;
+        render_base_chain(out, table)?;
+        render_logged_sets(out, table, reassigned)?;
+        writeln!(out, "flush chain {}", Chain::Base(table))?;
+    }
+
+    let mut installed = render_objects(out, plan, options, previous)?;
+    installed.sources = sources;
+    let ipv4_sources = || {
+        plan.sources
             .iter()
-            .filter(|bridge| !bridge.monitor)
-            .map(|bridge| Quoted(&bridge.name))
+            .enumerate()
+            .filter(|(_, source)| source.address.is_ipv4())
     };
 
     // Routed traffic.
     let base = Chain::Base(Table::Inet);
-    writeln!(out, "add table {}", Table::Inet)?;
-    render_base_chain(out, Table::Inet)?;
-    render_logged_sets(out, Table::Inet)?;
     if let Some(queue) = options.dns_queue {
         // Hold DNS answers to managed containers until the addresses they contain are
         // allowed. `bypass` lets them through when Portcullis isn't listening.
         render_elements(
             out,
             format_args!("add rule {base} oifname"),
-            bridges(),
+            plan.bridges.iter().map(|bridge| Quoted(&bridge.name)),
             format_args!(
                 " meta l4proto {{ tcp, udp }} th sport {DNS_PORT} ct direction reply queue num {queue} bypass"
             ),
         )?;
     }
     writeln!(out, "add rule {base} ct state established,related accept")?;
-    for (index, _) in plan.sources.iter().enumerate() {
-        writeln!(out, "add chain {}", Chain::Egress(index))?;
-    }
-    for set in &plan.host_sets {
-        if set.used_v4 {
-            render_set(out, set, SET_PREFIX_V4, "ipv4_addr", set.v4())?;
-        }
-        if set.used_v6 {
-            render_set(out, set, SET_PREFIX_V6, "ipv6_addr", set.v6())?;
-        }
-    }
     for (family, is_family) in FAMILIES {
         let entries = plan
             .sources
@@ -453,7 +513,10 @@ fn render_apply_script(plan: &Plan, options: Options, out: &mut String) -> fmt::
     render_elements(
         out,
         format_args!("add rule {base} iifname"),
-        enforced_bridges(),
+        plan.bridges
+            .iter()
+            .filter(|bridge| !bridge.monitor)
+            .map(|bridge| Quoted(&bridge.name)),
         format_args!(" {}", options.deny),
     )?;
     for (index, source) in plan.sources.iter().enumerate() {
@@ -470,26 +533,11 @@ fn render_apply_script(plan: &Plan, options: Options, out: &mut String) -> fmt::
 
     // Everything entering a managed network's bridge from a container: source checks and
     // traffic between containers on the same network.
-    writeln!(out, "add table {}", Table::Bridge)?;
-    render_base_chain(out, Table::Bridge)?;
-    render_logged_sets(out, Table::Bridge)?;
     writeln!(
         out,
         "add rule {} ct state established,related accept",
         Chain::Base(Table::Bridge)
     )?;
-    // Containers are only managed by their IPv4 address; see the IPv6 limitation.
-    let ipv4_sources = || {
-        plan.sources
-            .iter()
-            .enumerate()
-            .filter(|(_, source)| source.address.is_ipv4())
-    };
-    for (index, source) in ipv4_sources() {
-        if icc_chain_needed(plan, source, options) {
-            writeln!(out, "add chain {}", Chain::Icc(index))?;
-        }
-    }
     if !plan.bridges.is_empty() {
         render_bridge_dispatch(out, plan, options)?;
     }
@@ -501,7 +549,63 @@ fn render_apply_script(plan: &Plan, options: Options, out: &mut String) -> fmt::
             }
         }
     }
-    Ok(())
+    Ok(installed)
+}
+
+/// Create or flush the chains and sets of `plan`, and remove those of `previous` it doesn't
+/// need. Returns what is installed afterwards.
+fn render_objects(
+    out: &mut String,
+    plan: &Plan,
+    options: Options,
+    previous: &Installed,
+) -> Result<Installed, fmt::Error> {
+    let mut installed = Installed::default();
+    // Containers are only managed by their IPv4 address on the bridge; see the IPv6
+    // limitation.
+    let ipv4_sources = || {
+        plan.sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| source.address.is_ipv4())
+    };
+    let chains = plan
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, _)| Chain::Egress(index))
+        .chain(
+            ipv4_sources()
+                .filter(|(_, source)| icc_chain_needed(plan, source, options))
+                .map(|(index, _)| Chain::Icc(index)),
+        );
+    for chain in chains {
+        writeln!(out, "add chain {chain}")?;
+        writeln!(out, "flush chain {chain}")?;
+        installed.chains.insert(chain.to_string());
+    }
+    for set in &plan.host_sets {
+        if set.used_v4 {
+            installed
+                .sets
+                .insert(render_set(out, set, SET_PREFIX_V4, "ipv4_addr", set.v4())?);
+        }
+        if set.used_v6 {
+            installed
+                .sets
+                .insert(render_set(out, set, SET_PREFIX_V6, "ipv6_addr", set.v6())?);
+        }
+    }
+    // Nothing references them anymore: the chains that did were flushed above.
+    for chain in previous.chains.difference(&installed.chains) {
+        writeln!(out, "flush chain {chain}")?;
+        writeln!(out, "delete chain {chain}")?;
+    }
+    for set in previous.sets.difference(&installed.sets) {
+        writeln!(out, "delete set {set}")?;
+    }
+
+    Ok(installed)
 }
 
 /// Whether `source` needs its own ICC chain: anything beyond "allow everything" without
@@ -532,7 +636,8 @@ fn render_base_chain(out: &mut String, table: Table) -> fmt::Result {
 /// IPv4 frame passes only when its source address belongs to a managed container and comes
 /// with that container's MAC; it then continues to the container's ICC rules, if any.
 /// Everything else IPv4 is denied, which stops containers from using addresses that aren't
-/// theirs. Other frames (ARP, IPv6) pass.
+/// theirs; with a source queue, it is held first, in case it comes from a container whose
+/// rules aren't applied yet (see `source_hold`). Other frames (ARP, IPv6) pass.
 fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
     render_elements(
@@ -578,21 +683,48 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
             .map(|(index, source)| Dispatch(source.address, verdict(index, source))),
         "",
     )?;
-    for monitor in [true, false] {
-        let bridges = plan
-            .bridges
-            .iter()
-            .filter(|bridge| bridge.monitor == monitor)
-            .map(|bridge| Quoted(&bridge.name));
-        if let Some(bridges) = set_literal(bridges) {
-            decide(
-                out,
-                format_args!("add rule {base} meta ibrname {bridges} ether type ip"),
-                Outcome::deny(options, monitor, "source"),
-            )?;
-        }
+    let bridges = |monitor: bool| {
+        set_literal(
+            plan.bridges
+                .iter()
+                .filter(move |bridge| bridge.monitor == monitor)
+                .map(|bridge| Quoted(&bridge.name)),
+        )
+    };
+    if let Some(monitored) = bridges(true) {
+        decide(
+            out,
+            format_args!("add rule {base} meta ibrname {monitored} ether type ip"),
+            Outcome::deny(options, true, "source"),
+        )?;
     }
-    Ok(())
+    let Some(enforced) = bridges(false) else {
+        return Ok(());
+    };
+    let deny = Outcome::deny(options, false, "source");
+    let Some(queue) = options.source_queue else {
+        return decide(
+            out,
+            format_args!("add rule {base} meta ibrname {enforced} ether type ip"),
+            deny,
+        );
+    };
+    // Held before, and the source stayed unknown.
+    decide(
+        out,
+        format_args!(
+            "add rule {base} meta ibrname {enforced} ether type ip meta mark {HOLD_EXPIRED_MARK:#x}"
+        ),
+        deny,
+    )?;
+    // A source no container has (yet): most likely a container that just started, or that
+    // got the address of a removed one, and that Portcullis hasn't applied rules for. Hold
+    // the packet until the next update; spoofed sources stay unknown and are denied above
+    // once the hold expires.
+    writeln!(
+        out,
+        "add rule {base} meta ibrname {enforced} ether type ip queue num {queue}"
+    )
 }
 
 /// Write `{head} { e1, e2, ... }{tail}` and a newline; writes nothing without elements.
@@ -617,26 +749,25 @@ fn render_elements<T: fmt::Display>(
     Ok(())
 }
 
-/// Sets have per-element timeouts: addresses expire when nothing renews them.
+/// Sets have per-element timeouts: addresses expire when nothing renews them. Returns the
+/// set's qualified name.
 fn render_set(
     out: &mut String,
     set: &HostSet,
     prefix: &'static str,
     type_name: &str,
     addresses: impl Iterator<Item = (IpAddr, Duration)>,
-) -> fmt::Result {
-    let name = set.id.name(prefix);
-    let table = Table::Inet;
-    writeln!(
-        out,
-        "add set {table} {name} {{ type {type_name}; flags timeout; }}"
-    )?;
+) -> Result<String, fmt::Error> {
+    let name = format!("{} {}", Table::Inet, set.id.name(prefix));
+    writeln!(out, "add set {name} {{ type {type_name}; flags timeout; }}")?;
+    writeln!(out, "flush set {name}")?;
     render_elements(
         out,
-        format_args!("add element {table} {name}"),
+        format_args!("add element {name}"),
         addresses.map(|(address, timeout)| Timed(address, timeout)),
         "",
-    )
+    )?;
+    Ok(name)
 }
 
 /// A set element with a timeout, at least one second.
@@ -1130,8 +1261,6 @@ mod libnftables_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::firewall::test_support::{self, MockResolver};
 
@@ -1140,6 +1269,7 @@ mod tests {
         log_group: 7,
         log_allowed: LogAllowed::Never,
         dns_queue: None,
+        source_queue: None,
     };
 
     fn render_with(state: &RuntimeState, options: Options, monitor_all: bool) -> String {
@@ -1150,7 +1280,8 @@ mod tests {
             monitor_all,
         );
         let mut script = String::new();
-        render_apply_script(&plan, options, &mut script).expect("script should render");
+        render_apply_script(&plan, options, Some(&Installed::default()), &mut script)
+            .expect("script should render");
         script
     }
 
@@ -1193,15 +1324,18 @@ mod tests {
         let script = render(&test_support::hostname_state());
         let expected_head = "\
 add table inet portcullis
-delete table inet portcullis
-add table bridge portcullis
-delete table bridge portcullis
-add table inet portcullis
 add chain inet portcullis forward { type filter hook forward priority -1; policy accept; }
 add set inet portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set inet portcullis logged6 { type ipv6_addr . ipv6_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
-add rule inet portcullis forward ct state established,related accept
+flush chain inet portcullis forward
+add table bridge portcullis
+add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }
+add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
+flush chain bridge portcullis prerouting
 add chain inet portcullis egress0
+flush chain inet portcullis egress0
+add chain bridge portcullis icc0
+flush chain bridge portcullis icc0
 ";
         assert!(
             script.starts_with(expected_head),
@@ -1214,7 +1348,6 @@ add chain inet portcullis egress0
                 // Reported by the bridge table already.
                 "add rule inet portcullis forward iifname { \"br-net0\" } drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
-                "add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }".into(),
                 "add rule bridge portcullis prerouting ct state established,related accept".into(),
                 "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept".into(),
                 "add rule bridge portcullis prerouting ether type != ip accept".into(),
@@ -1226,6 +1359,142 @@ add chain inet portcullis egress0
         );
         // nothing for families without sources
         assert!(!script.contains("ip6 saddr"));
+    }
+
+    #[test]
+    fn holds_unknown_sources_of_enforced_networks() {
+        let options = Options {
+            source_queue: Some(9),
+            ..OPTIONS
+        };
+        let script = render_with(&test_support::hostname_state(), options, false);
+        let head =
+            "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip";
+        let expected = [
+            "add rule bridge portcullis prerouting ip saddr . ether saddr vmap { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }".to_string(),
+            decided(&format!("{head} meta mark 0x70630001"), 'd', "source", "drop"),
+            format!("{head} queue num 9"),
+        ]
+        .join("\n");
+        assert!(script.contains(&format!("{expected}\n")), "{script}");
+        // No bypass: without Portcullis, such packets aren't let through.
+        assert!(!script.contains("bypass"), "{script}");
+
+        // Monitor mode lets them through, reported.
+        let monitored = render_with(&test_support::hostname_state(), options, true);
+        assert!(!monitored.contains("queue num 9"), "{monitored}");
+    }
+
+    /// The chains a script creates or keeps, without the base chains.
+    fn chains(script: &str) -> BTreeSet<&str> {
+        script
+            .lines()
+            .filter_map(|line| line.strip_prefix("add chain "))
+            .filter(|chain| !chain.contains('{'))
+            .collect()
+    }
+
+    #[test]
+    fn updates_rules_without_recreating_tables() {
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
+        let mut resolver = MockResolver::default();
+        for state in [
+            test_support::icc_state(),
+            test_support::hostname_state(),
+            test_support::icc_state(),
+        ] {
+            firewall
+                .apply(&state, &mut resolver, &[], false)
+                .expect("apply");
+        }
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        let [first, second, third] = scripts.as_slice() else {
+            panic!("expected three scripts");
+        };
+        // The first update clears what another run may have left.
+        assert!(first.starts_with("add table inet portcullis\ndelete table inet portcullis\n"));
+        for script in [second, third] {
+            // Deleting a table or base chain would drop every packet held in its queues.
+            assert!(!script.contains("delete table"), "{script}");
+            assert!(!script.contains("delete chain inet portcullis forward"));
+            assert!(!script.contains("delete chain bridge portcullis prerouting"));
+        }
+
+        // What the previous update created and this one doesn't need is removed; the rest
+        // is flushed and refilled.
+        let removed: Vec<_> = chains(first).difference(&chains(second)).copied().collect();
+        assert!(!removed.is_empty());
+        for chain in removed {
+            assert!(
+                second.contains(&format!("flush chain {chain}\ndelete chain {chain}\n")),
+                "{chain} not removed:\n{second}"
+            );
+        }
+        for chain in chains(second) {
+            assert!(
+                !second.contains(&format!("delete chain {chain}\n")),
+                "{second}"
+            );
+        }
+        assert!(!second.contains("delete set"), "{second}");
+
+        // Same for host sets.
+        let set = second
+            .lines()
+            .filter_map(|line| line.strip_prefix("add set "))
+            .filter_map(|rest| rest.split(" {").next())
+            .find(|name| name.contains("pc_h4_"))
+            .expect("host set");
+        assert!(third.contains(&format!("delete set {set}\n")), "{third}");
+    }
+
+    #[test]
+    fn forgets_reported_flows_of_reassigned_addresses() {
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
+        let mut resolver = MockResolver::default();
+        let mut apply = |state: &RuntimeState| {
+            firewall
+                .apply(state, &mut resolver, &[], false)
+                .expect("apply");
+        };
+        let state = test_support::icc_state();
+        apply(&state);
+        apply(&state);
+        // web's address goes to another container.
+        let mut reassigned = test_support::icc_state();
+        reassigned.apply_action(crate::model::RuntimeStateAction::RemoveContainer {
+            container_id: "abc".to_string().into(),
+        });
+        test_support::add_container(
+            &mut reassigned,
+            "new",
+            "web-2",
+            &[("net0", "172.18.0.2", &[])],
+            crate::model::ContainerPolicy::default(),
+        );
+        apply(&reassigned);
+        // A container is added: nothing to forget.
+        let mut added = reassigned.clone();
+        test_support::add_container(
+            &mut added,
+            "more",
+            "more",
+            &[("net0", "172.18.0.20", &[])],
+            crate::model::ContainerPolicy::default(),
+        );
+        apply(&added);
+
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        let flushes = |script: &String| {
+            ["inet", "bridge"]
+                .map(|table| script.contains(&format!("flush set {table} portcullis logged4\n")))
+        };
+        let flushed: Vec<_> = scripts.iter().skip(1).map(flushes).collect();
+        assert_eq!(
+            flushed,
+            [[false, false], [true, true], [false, false]],
+            "{scripts:#?}"
+        );
     }
 
     #[test]
