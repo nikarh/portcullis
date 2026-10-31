@@ -229,12 +229,7 @@ where
         let policy = &container.policy;
         let network = self.state.networks().get(&attachment.network_id);
 
-        self.plan_dns(
-            source,
-            network.and_then(|network| network.gateway),
-            &policy.dns_targets,
-            container,
-        );
+        self.plan_dns(source, &policy.dns_targets, container);
 
         if let Some(network) = network.filter(|network| same_family(source, network.subnet.addr()))
         {
@@ -282,13 +277,9 @@ where
         });
     }
 
-    fn plan_dns(
-        &mut self,
-        source: IpAddr,
-        gateway: Option<IpAddr>,
-        targets: &[DnsTarget],
-        container: &Container,
-    ) {
+    /// DNS rules. They only cover DNS leaving the container's network; Docker's DNS server
+    /// itself runs inside the container's network namespace and is never filtered.
+    fn plan_dns(&mut self, source: IpAddr, targets: &[DnsTarget], container: &Container) {
         let mut allow_any = false;
         self.scratch.clear();
         for target in targets {
@@ -296,7 +287,6 @@ where
                 // Docker's DNS server forwards from the container's address to the
                 // container's `--dns` servers, or to the host's when it has none.
                 DnsTarget::Docker => {
-                    self.scratch.extend(gateway);
                     if container.runtime_dns_servers.is_empty() {
                         self.scratch.extend_from_slice(self.host_resolvers);
                     } else {
@@ -305,11 +295,9 @@ where
                     }
                 }
                 DnsTarget::Host => self.scratch.extend_from_slice(self.host_resolvers),
-                DnsTarget::Runtime => self
-                    .scratch
-                    .extend(container.runtime_dns_servers.iter().copied()),
                 DnsTarget::Ip(address) => self.scratch.push(*address),
                 DnsTarget::Any => allow_any = true,
+                DnsTarget::None => {}
             }
         }
 
@@ -460,7 +448,7 @@ mod tests {
 
     fn build(state: &RuntimeState) -> (Plan, MockResolver) {
         let mut resolver = MockResolver::default();
-        let plan = Plan::build(state, &mut resolver, &[]);
+        let plan = Plan::build(state, &mut resolver, &test_support::host_resolvers());
         (plan, resolver)
     }
 
@@ -477,17 +465,17 @@ mod tests {
     #[test]
     fn plans_rules_in_evaluation_order() {
         let (plan, _) = build(&test_support::hostname_state());
-        let gateway = ip("172.18.0.1");
+        let resolver = ip("9.9.9.9");
 
         assert_eq!(
             rules_of(&plan, "172.18.0.2"),
             vec![
                 Rule::AcceptDns {
-                    destination: Some(gateway),
+                    destination: Some(resolver),
                     protocol: Protocol::Udp
                 },
                 Rule::AcceptDns {
-                    destination: Some(gateway),
+                    destination: Some(resolver),
                     protocol: Protocol::Tcp
                 },
                 Rule::DropDns {
@@ -540,11 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn docker_dns_allows_gateway_and_host_resolvers() {
+    fn docker_dns_allows_host_resolvers() {
         let state = with_dns(vec![DnsTarget::Docker], &[]);
         assert_eq!(
             dns_destinations(&state, &[ip("9.9.9.9")]),
-            vec![ip("9.9.9.9"), ip("172.18.0.1")]
+            vec![ip("9.9.9.9")]
         );
     }
 
@@ -553,8 +541,14 @@ mod tests {
         let state = with_dns(vec![DnsTarget::Docker], &["1.1.1.1"]);
         assert_eq!(
             dns_destinations(&state, &[ip("9.9.9.9")]),
-            vec![ip("1.1.1.1"), ip("172.18.0.1")]
+            vec![ip("1.1.1.1")]
         );
+    }
+
+    #[test]
+    fn none_dns_allows_nothing() {
+        let state = with_dns(vec![DnsTarget::None], &["1.1.1.1"]);
+        assert!(dns_destinations(&state, &[ip("9.9.9.9")]).is_empty());
     }
 
     #[test]

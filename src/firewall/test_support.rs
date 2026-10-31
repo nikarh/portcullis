@@ -35,6 +35,11 @@ impl PolicyDnsResolver for MockResolver {
     }
 }
 
+/// The host's DNS servers in tests.
+pub fn host_resolvers() -> [IpAddr; 1] {
+    [ip("9.9.9.9")]
+}
+
 pub fn ip(value: &str) -> IpAddr {
     value.parse().expect("ip fixture should parse")
 }

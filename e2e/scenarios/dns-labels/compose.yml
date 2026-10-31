@@ -1,23 +1,44 @@
+# The VM's host resolver is QEMU's (10.0.2.3); the outside resolver is 198.51.100.2.
 services:
-  by-ip:
+  only-ip:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.dns.0=ip:198.51.100.2
+  only-host:
     image: portcullis-e2e-tester
     pull_policy: never
     networks: [net]
     labels:
-      - portcullis.dns.0=ip:198.51.100.2
+      - portcullis.dns.0=host
+  host-and-ip:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.dns.0=host
+      - portcullis.dns.1=ip:198.51.100.2
   any:
     image: portcullis-e2e-tester
     pull_policy: never
     networks: [net]
     labels:
       - portcullis.dns.0=*
-  runtime:
+  none:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.dns.0=none
+  none-with-dns:
     image: portcullis-e2e-tester
     pull_policy: never
     networks: [net]
     dns: [198.51.100.2]
     labels:
-      - portcullis.dns.0=runtime
+      - portcullis.dns.0=none
 
 networks:
   net:

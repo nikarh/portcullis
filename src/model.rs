@@ -171,11 +171,15 @@ pub enum IccMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsTarget {
+    /// Whatever Docker's DNS server forwards this container's queries to: its `--dns`
+    /// servers, or the host's when it has none.
     Docker,
+    /// The host's DNS servers.
     Host,
-    Runtime,
     Ip(IpAddr),
     Any,
+    /// Nothing; only names Docker's DNS answers itself (containers, services) resolve.
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

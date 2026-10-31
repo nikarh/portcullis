@@ -131,7 +131,12 @@ The mode only controls connections the container starts. Whether others can reac
 
 ### DNS
 
-DNS queries (port 53, UDP and TCP) from a container are dropped unless their destination is allowed with:
+Containers normally resolve names through Docker's DNS server (`127.0.0.11`). It runs inside the container, answers container and service names itself, and forwards everything else:
+
+- If the container has its own DNS servers (`docker run --dns`, Compose `dns:`), Docker forwards to them from the container's address. These queries go through the container's policy.
+- Otherwise Docker forwards to the host's DNS servers from the host itself (Docker 29; older versions forwarded from the container's address). Portcullis can't see these queries, so such a container can always resolve outside names through Docker's DNS.
+
+Besides that, any DNS query a container sends itself (port 53, UDP and TCP) is dropped unless its destination is allowed with:
 
 ```text
 portcullis.dns.<name>=<target>
@@ -139,17 +144,25 @@ portcullis.dns.<name>=<target>
 
 | Target | Allows DNS to |
 |---|---|
-| `docker` | Docker's DNS server, the default when no `portcullis.dns.*` label is set. See below. |
+| `docker` | the servers Docker's DNS forwards to for this container: its own DNS servers if it has any, otherwise the host's. This is the default when no `portcullis.dns.*` label is set. |
 | `host` | the host's DNS servers. |
-| `runtime` | the servers set with `docker run --dns` or Compose `dns:`. |
 | `ip:<address>` | that resolver, for example `ip:1.1.1.1`. |
 | `*` | any resolver. |
+| `none` | nothing. |
 
-Containers normally resolve names through Docker's DNS server (`127.0.0.11`). It answers container and service names itself and forwards everything else to the container's `--dns` servers, or to the host's when the container has none. Docker sends those forwarded queries from the container's own address, so they go through the container's policy. The `docker` target allows them: the network's gateway, plus the container's `--dns` servers if it has any, otherwise the host's servers. The container can then also query those servers directly.
+Setting any `portcullis.dns.*` label replaces the default. The host's DNS servers are the `nameserver` entries of the host's `/etc/resolv.conf`, or of `/run/systemd/resolve/resolv.conf` when the former only points at systemd-resolved's local stub; loopback addresses are left out. They are read again on every rule update.
 
-The host's servers are the `nameserver` entries of the host's `/etc/resolv.conf`. If that file only points at systemd-resolved's local stub (`127.0.0.53`), they are read from `/run/systemd/resolve/resolv.conf` instead, the same way Docker does it. Loopback servers are left out, because Docker contacts them from the host and they aren't affected by the policy. The files are read again on every rule update.
+Some common setups:
 
-Setting any `portcullis.dns.*` label replaces the default, so add `docker` explicitly if you still want it. Since DNS rules are checked before egress rules, an egress label like `ip:1.1.1.1,udp:53` has no effect; use `portcullis.dns.x=ip:1.1.1.1` instead.
+| Goal | Container DNS servers | Labels |
+|---|---|---|
+| Resolve through the host's DNS only | not set | none needed (add `portcullis.dns.0=host` to also allow direct queries to the host's servers) |
+| Only `1.1.1.1` | `dns: [1.1.1.1]` | `portcullis.dns.0=ip:1.1.1.1` |
+| The host's DNS and `1.1.1.1` | not set | `portcullis.dns.0=host`, `portcullis.dns.1=ip:1.1.1.1` |
+| Any resolver | any | `portcullis.dns.0=*` |
+| Container names only, no outside names | `dns:` set to any address | `portcullis.dns.0=none` |
+
+Names of other containers always resolve, because Docker's DNS answers them inside the container. Since DNS rules are checked before egress rules, an egress label like `ip:1.1.1.1,udp:53` has no effect; use `portcullis.dns.x=ip:1.1.1.1` instead.
 
 ### Hostname rules
 

@@ -649,7 +649,11 @@ mod tests {
     use crate::firewall::test_support::{self, MockResolver};
 
     fn render(state: &RuntimeState) -> String {
-        let plan = Plan::build(state, &mut MockResolver::default(), &[]);
+        let plan = Plan::build(
+            state,
+            &mut MockResolver::default(),
+            &test_support::host_resolvers(),
+        );
         let mut script = String::new();
         render_apply_script(&plan, &mut script).expect("script should render");
         script
@@ -769,8 +773,8 @@ add chain inet portcullis s0
             &script,
             "172.18.0.2",
             &[
-                "ip daddr 172.18.0.1 udp dport 53 accept",
-                "ip daddr 172.18.0.1 tcp dport 53 accept",
+                "ip daddr 9.9.9.9 udp dport 53 accept",
+                "ip daddr 9.9.9.9 tcp dport 53 accept",
                 "udp dport 53 drop",
                 "tcp dport 53 drop",
                 "ip daddr 8.8.8.0/24 tcp dport 853 accept",

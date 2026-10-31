@@ -91,8 +91,8 @@ fn parse_dns_target(key: &str, value: &str) -> Result<DnsTarget, LabelParseError
     match value {
         "docker" => Ok(DnsTarget::Docker),
         "host" => Ok(DnsTarget::Host),
-        "runtime" => Ok(DnsTarget::Runtime),
         "*" => Ok(DnsTarget::Any),
+        "none" => Ok(DnsTarget::None),
         _ => {
             if let Some(ip) = value.strip_prefix("ip:")
                 && let Ok(parsed) = ip.parse()
@@ -438,7 +438,7 @@ mod tests {
         let parsed = parse_strict(&labels(&[
             ("portcullis.dns.0", "docker"),
             ("portcullis.dns.1", "host"),
-            ("portcullis.dns.2", "runtime"),
+            ("portcullis.dns.2", "none"),
             ("portcullis.dns.3", "ip:1.1.1.1"),
             ("portcullis.dns.4", "*"),
         ]))
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(parsed.dns_targets.len(), 5);
         assert_eq!(parsed.dns_targets[0], DnsTarget::Docker);
         assert_eq!(parsed.dns_targets[1], DnsTarget::Host);
-        assert_eq!(parsed.dns_targets[2], DnsTarget::Runtime);
+        assert_eq!(parsed.dns_targets[2], DnsTarget::None);
         assert_eq!(
             parsed.dns_targets[3],
             DnsTarget::Ip("1.1.1.1".parse().expect("ip should parse"))
