@@ -11,7 +11,7 @@ categories = ["network-programming", "virtualization"]
 
 [dependencies]
 crossbeam-channel = "0.5.15"
-ctrlc = "3.5.2"
+ctrlc = { version = "3.5.2", features = ["termination"] }
 hickory-proto = "0.25.2"
 indexmap = { version = "2.12.0", features = ["serde"] }
 ipnet = "2.11"
