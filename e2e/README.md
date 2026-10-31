@@ -16,13 +16,14 @@ The host needs `qemu-system-x86_64`, `genisoimage` (or `mkisofs`), `ssh`, `rsync
 
 ## How it works
 
-`suite.sh` runs inside the VM as root. It starts Portcullis, runs every scenario, stops Portcullis with SIGTERM and checks that no rules are left behind. A last pass runs Portcullis in DNS proxy mode.
+`suite.sh` runs inside the VM as root. It starts Portcullis, runs every scenario, stops Portcullis with SIGTERM and checks that no rules are left behind. Then it repeats two scenarios with `--deny-action drop`, and runs one scenario in DNS proxy mode.
 
 Outbound targets live in a network namespace routed from the Docker host (`outside.sh`), so traffic to them is forwarded and filtered like traffic to the internet. It serves TCP 80, 443 and 8080 and UDP 9000 on `198.51.100.2` to `.5`, and a DNS server on `198.51.100.2` that resolves `api.test` to `.3` and `other.test` to `.4`. The Docker host resolves the same names through `/etc/hosts`.
 
-Each scenario in `scenarios/<name>/` is a Compose project on a network with `portcullis.enable=true`, plus a `test.sh` with checks:
+Each scenario in `scenarios/<name>/` is a Compose project on a network with `portcullis.enable=true`, plus a `test.sh` with checks. No check waits for a timeout to pass:
 
-- `allowed <description> <probe>` retries the probe for up to 10 seconds, since rules are applied asynchronously after a container starts.
-- `blocked <description> <probe>` runs the probe once. Call `wait_managed <address>` first, which waits until Portcullis installed rules for that container, so a blocked check can't pass just because rules aren't there yet.
+- `wait_managed <address>...` blocks until Portcullis's event stream (`--events-socket`) reports rules in place for those containers. Call it before checking anything a container's rules decide.
+- `allowed <description> <probe>` passes only when the probe shows the peer's answer.
+- `blocked <description> <probe>` passes only when the probe shows the rejection Portcullis sends ("Host is unreachable", or SERVFAIL from Docker's DNS server). In drop mode it passes when a kernel packet trace (`nft monitor trace`) shows one of Portcullis's chains dropping the probe.
 
-The checks of a scenario run in parallel. Probes (`tcp`, `udp`, `dns`, `resolve`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname, and a probe only succeeds when it gets that answer.
+Probes (`tcp`, `udp`, `dns`, `resolve`, `from_outside`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname. The checks of a scenario run in parallel; a failed check prints the probe's output.

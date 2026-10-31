@@ -75,6 +75,7 @@ packages:
   - curl
   - dnsmasq-base
   - dnsutils
+  - inotify-tools
   - iptables
   - libnftables-dev
   - nftables

@@ -32,6 +32,9 @@ fi
 # Remove anything a previous, interrupted run may have left behind.
 remove_leftovers() {
   nft delete table inet portcullis 2>/dev/null
+  nft delete table bridge portcullis 2>/dev/null
+  nft delete table inet pc_trace 2>/dev/null
+  nft delete table bridge pc_trace 2>/dev/null
   return 0
 }
 
@@ -56,7 +59,8 @@ teardown() {
 
 assert_cleaned_up() {
   local leftovers=()
-  nft list table inet portcullis >/dev/null 2>&1 && leftovers+=("nftables table")
+  nft list table inet portcullis >/dev/null 2>&1 && leftovers+=("inet table")
+  nft list table bridge portcullis >/dev/null 2>&1 && leftovers+=("bridge table")
   if ((${#leftovers[@]})); then
     fail "rules removed on shutdown (left behind: ${leftovers[*]})"
   else
@@ -74,6 +78,17 @@ if start_portcullis; then
   stop_portcullis
   assert_cleaned_up
 fi
+
+log "deny action drop"
+DENY_ACTION=drop
+if start_portcullis; then
+  for scenario in egress icc; do
+    run_scenario "${scenario}"
+  done
+  stop_portcullis
+  assert_cleaned_up
+fi
+DENY_ACTION=reject
 
 log "DNS proxy mode"
 if start_portcullis --dns-mode proxy --dns-proxy-bind 198.51.100.1:53; then
