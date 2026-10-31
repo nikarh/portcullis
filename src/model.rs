@@ -237,8 +237,6 @@ pub struct Container {
 pub struct RuntimeState {
     containers: HashMap<ContainerId, Container>,
     networks: HashMap<NetworkId, Network>,
-
-    containers_by_name: HashMap<ContainerName, ContainerId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,11 +281,6 @@ impl RuntimeState {
         &self.networks
     }
 
-    #[must_use]
-    pub fn container_id(&self, container_name: &str) -> Option<&ContainerId> {
-        self.containers_by_name.get(container_name)
-    }
-
     fn remove_network(&mut self, network_id: &NetworkId) -> bool {
         let mut changed = self.networks.remove(network_id).is_some();
         for container in self.containers.values_mut() {
@@ -311,25 +304,11 @@ impl RuntimeState {
             } => {
                 self.containers = containers;
                 self.networks = networks;
-                self.containers_by_name.clear();
-
-                for (id, container) in &self.containers {
-                    self.containers_by_name
-                        .insert(container.name.clone(), id.clone());
-                }
-
                 true
             }
             RuntimeStateAction::CreateContainer { container } => {
                 let has_networks = !container.attachments.is_empty();
-
-                let id = container.id.clone();
-                let name = container.name.clone();
-                if let Some(previous) = self.containers.insert(id.clone(), *container) {
-                    self.containers_by_name.remove(&previous.name);
-                }
-                self.containers_by_name.insert(name, id);
-
+                self.containers.insert(container.id.clone(), *container);
                 has_networks
             }
             RuntimeStateAction::RenameContainer { container_id, name } => {
@@ -339,17 +318,11 @@ impl RuntimeState {
                 if container.name.as_str() == name {
                     return false;
                 }
-                let previous_name =
-                    std::mem::replace(&mut container.name, ContainerName::from(name));
-
-                self.containers_by_name.remove(previous_name.as_str());
-                self.containers_by_name
-                    .insert(container.name.clone(), container_id);
+                container.name = ContainerName::from(name);
                 true
             }
             RuntimeStateAction::RemoveContainer { container_id } => {
                 if let Some(container) = self.containers.remove(&container_id) {
-                    self.containers_by_name.remove(container.name.as_str());
                     return !container.attachments.is_empty();
                 }
                 true
@@ -379,13 +352,5 @@ impl RuntimeState {
             }
             RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
         }
-    }
-
-    #[must_use]
-    pub fn network_subnets(&self) -> Vec<IpNet> {
-        self.networks
-            .values()
-            .map(|network| network.subnet)
-            .collect()
     }
 }
