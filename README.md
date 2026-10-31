@@ -253,7 +253,7 @@ labels:
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close. Replies to incoming connections are always allowed, so published ports keep working.
 - A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too.
 - If a hostname can't be resolved, Portcullis logs an error and its rules allow nothing until it resolves again. Everything else is applied as usual. Failed lookups are retried every 30 seconds.
-- Portcullis refuses to start if any container on the host, running or stopped, has an invalid Portcullis label, or a network has an invalid `portcullis.network.enforce` value. A container created with an invalid label while Portcullis is running is logged and gets no access at all.
+- Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.network.enforce` value enforces the network. An enforced network without a usable subnet is logged and not enforced.
 - Portcullis removes its rules when it starts and when it stops. Containers are unrestricted while it is not running, and if it crashes, the last rules stay in place until it is started again.
 - With the iptables backend and no `ipset`, every hostname rule becomes one firewall rule per resolved address.
 

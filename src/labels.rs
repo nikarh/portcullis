@@ -35,36 +35,55 @@ pub enum LabelParseError {
     InvalidDnsTarget(String, String),
 }
 
-pub fn parse_policy(labels: &IndexMap<String, String>) -> Result<ContainerPolicy, LabelParseError> {
+/// Parse a container's policy from its labels.
+///
+/// Invalid labels are returned as errors and otherwise skipped, so one typo doesn't take
+/// the rest of the policy down with it. Skipping a label never grants access: egress, ICC
+/// allow and DNS labels only add access, and an invalid ICC mode falls back to `deny`.
+pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<LabelParseError>) {
+    let mut errors = Vec::new();
     let icc_mode = match labels.get(ICC_MODE_LABEL) {
         None => IccMode::Allow,
-        Some(mode) => parse_icc_mode(mode)?,
+        Some(mode) => parse_icc_mode(mode).unwrap_or_else(|error| {
+            errors.push(error);
+            IccMode::Deny
+        }),
     };
 
     let mut egress = Vec::new();
     let mut icc_allow = Vec::new();
     let mut dns_targets = Vec::with_capacity(1);
+    let mut has_dns_labels = false;
 
     for (key, value) in labels {
-        if key.starts_with(EGRESS_PREFIX) {
-            egress.push(parse_egress_value(key, value)?);
+        let result = if key.starts_with(EGRESS_PREFIX) {
+            parse_egress_value(key, value).map(|rule| egress.push(rule))
         } else if key.starts_with(ICC_ALLOW_PREFIX) {
-            icc_allow.push(parse_icc_allow_value(key, value)?);
+            parse_icc_allow_value(key, value).map(|rule| icc_allow.push(rule))
         } else if key.starts_with(DNS_PREFIX) {
-            dns_targets.push(parse_dns_target(key, value)?);
+            has_dns_labels = true;
+            parse_dns_target(key, value).map(|target| dns_targets.push(target))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            errors.push(error);
         }
     }
 
-    if dns_targets.is_empty() {
+    // Only fall back to the default when no DNS label was written at all: if every DNS
+    // label is invalid, the container gets no DNS rather than the default.
+    if !has_dns_labels {
         dns_targets.push(DnsTarget::Docker);
     }
 
-    Ok(ContainerPolicy {
+    let policy = ContainerPolicy {
         icc_mode,
         egress,
         icc_allow,
         dns_targets,
-    })
+    };
+    (policy, errors)
 }
 
 fn parse_dns_target(key: &str, value: &str) -> Result<DnsTarget, LabelParseError> {
@@ -220,6 +239,42 @@ fn split_once_colon<'a>(key: &str, part: &'a str) -> Result<(&'a str, &'a str), 
 mod tests {
     use super::*;
 
+    /// The policy, or the first label error.
+    fn parse_strict(labels: &IndexMap<String, String>) -> Result<ContainerPolicy, LabelParseError> {
+        let (policy, errors) = parse_policy(labels);
+        errors.into_iter().next().map_or(Ok(policy), Err)
+    }
+
+    #[test]
+    fn invalid_labels_are_skipped_and_reported() {
+        let (policy, errors) = parse_policy(&labels(&[
+            ("portcullis.egress.good", "ip:1.1.1.1/32,tcp:443"),
+            ("portcullis.egress.bad", "ip:not-an-ip,tcp:443"),
+            ("portcullis.icc.allow.bad", "db,tcp:5432"),
+            ("portcullis.icc.allow.good", "container:db,tcp:5432"),
+        ]));
+
+        assert_eq!(errors.len(), 2);
+        assert_eq!(policy.egress.len(), 1);
+        assert_eq!(policy.icc_allow.len(), 1);
+        assert_eq!(policy.icc_mode, IccMode::Allow);
+        assert_eq!(policy.dns_targets, vec![DnsTarget::Docker]);
+    }
+
+    #[test]
+    fn invalid_icc_mode_falls_back_to_deny() {
+        let (policy, errors) = parse_policy(&labels(&[("portcullis.icc.mode", "allowlisted")]));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(policy.icc_mode, IccMode::Deny);
+    }
+
+    #[test]
+    fn invalid_dns_labels_do_not_restore_the_default() {
+        let (policy, errors) = parse_policy(&labels(&[("portcullis.dns.0", "bogus")]));
+        assert_eq!(errors.len(), 1);
+        assert!(policy.dns_targets.is_empty());
+    }
+
     use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol};
 
     fn labels(pairs: &[(&str, &str)]) -> IndexMap<String, String> {
@@ -231,7 +286,7 @@ mod tests {
 
     #[test]
     fn parse_policy_parses_rules_without_enable_label() {
-        let parsed = parse_policy(&labels(&[("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443")]))
+        let parsed = parse_strict(&labels(&[("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443")]))
             .expect("parser should not fail");
         assert_eq!(parsed.icc_mode, IccMode::Allow);
         assert_eq!(parsed.egress.len(), 1);
@@ -239,7 +294,7 @@ mod tests {
 
     #[test]
     fn parse_policy_parses_ip_and_host_rules() {
-        let parsed = parse_policy(&labels(&[
+        let parsed = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.icc.mode", "deny"),
             ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:443,udp:53"),
@@ -272,7 +327,7 @@ mod tests {
 
     #[test]
     fn parse_policy_defaults_icc_mode_to_allow() {
-        let parsed = parse_policy(&labels(&[
+        let parsed = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.egress.0", "ip:10.0.0.0/8,tcp:443"),
         ]))
@@ -284,7 +339,7 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_invalid_icc_mode() {
-        let error = parse_policy(&labels(&[
+        let error = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.icc.mode", "nope"),
         ]))
@@ -295,7 +350,7 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_invalid_cidr() {
-        let error = parse_policy(&labels(&[
+        let error = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.egress.0", "ip:not-a-cidr,tcp:443"),
         ]))
@@ -312,7 +367,7 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_missing_ports() {
-        let error = parse_policy(&labels(&[
+        let error = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.egress.0", "ip:1.1.1.1/32"),
         ]))
@@ -326,7 +381,7 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_invalid_port_definition() {
-        let error = parse_policy(&labels(&[
+        let error = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.egress.0", "ip:1.1.1.1/32,sctp:443"),
         ]))
@@ -343,7 +398,7 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_zero_port() {
-        let error = parse_policy(&labels(&[
+        let error = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.egress.0", "ip:1.1.1.1/32,tcp:0"),
         ]))
@@ -360,7 +415,7 @@ mod tests {
 
     #[test]
     fn parse_policy_parses_icc_allow_rule() {
-        let parsed = parse_policy(&labels(&[
+        let parsed = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.icc.mode", "allow-listed"),
             ("portcullis.icc.allow.0", "container:redis,tcp:6379"),
@@ -377,7 +432,7 @@ mod tests {
 
     #[test]
     fn parse_policy_parses_dns_targets() {
-        let parsed = parse_policy(&labels(&[
+        let parsed = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.dns.0", "docker"),
             ("portcullis.dns.1", "host"),
@@ -400,7 +455,7 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_invalid_dns_target() {
-        let error = parse_policy(&labels(&[
+        let error = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.dns.0", "bad"),
         ]))
@@ -411,7 +466,7 @@ mod tests {
 
     #[test]
     fn parse_policy_rejects_invalid_icc_allow_target() {
-        let error = parse_policy(&labels(&[
+        let error = parse_strict(&labels(&[
             ("portcullis.enable", "true"),
             ("portcullis.icc.allow.0", "host:redis,tcp:6379"),
         ]))
