@@ -2,18 +2,21 @@ use std::fmt::{self, Write as _};
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, PoisonError};
 
 use ipnet::IpNet;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use super::FirewallError;
-use super::plan::{DNS_PORT, Destination, Plan, Rule, SET_PREFIX_V4};
+use super::plan::{DNS_PORT, Destination, HostSetId, Plan, Rule, SET_PREFIX_V4};
 use crate::dns::PolicyDnsResolver;
 use crate::model::RuntimeState;
 
 const CHAIN_NAME: &str = "PORTCULLIS_EGRESS";
 const STAGING_CHAIN_NAME: &str = "PORTCULLIS_EGRESS_NEXT";
 const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
+/// Prefix of the scratch sets used to refill hostname sets atomically.
+const TEMP_SET_PREFIX_V4: &str = "pc_t4_";
 
 pub trait IptablesRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<(), FirewallError>;
@@ -22,6 +25,8 @@ pub trait IptablesRunner {
     /// Run `ipset restore` with the given script.
     fn run_ipset_restore(&self, script: &str) -> Result<(), FirewallError>;
     fn read_iptables_save_filter(&self) -> Result<String, FirewallError>;
+    /// Names of all existing ipsets, one per line (`ipset list -n`).
+    fn list_ipsets(&self) -> Result<String, FirewallError>;
 }
 
 pub struct CommandIptablesRunner;
@@ -78,11 +83,20 @@ impl IptablesRunner for CommandIptablesRunner {
         let output = ensure_success(output)?;
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
+
+    fn list_ipsets(&self) -> Result<String, FirewallError> {
+        trace!(program = "ipset", args = ?["list", "-n"], "listing ipsets");
+        let output = Command::new("ipset").args(["list", "-n"]).output()?;
+        let output = ensure_success(output)?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 }
 
 pub struct IptablesFirewall<R> {
     runner: R,
     use_ipset: bool,
+    /// Sorted ids of hostname ipsets this process may have created and not destroyed yet.
+    known_sets: Mutex<Vec<HostSetId>>,
 }
 
 impl<R> IptablesFirewall<R>
@@ -90,7 +104,11 @@ where
     R: IptablesRunner,
 {
     pub const fn new(runner: R, use_ipset: bool) -> Self {
-        Self { runner, use_ipset }
+        Self {
+            runner,
+            use_ipset,
+            known_sets: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn apply<Dns>(&self, state: &RuntimeState, resolver: &mut Dns) -> Result<(), FirewallError>
@@ -105,18 +123,72 @@ where
             "applying iptables changes"
         );
 
-        // One buffer reused for both scripts.
+        // One buffer reused for every script.
         let mut script = String::with_capacity(plan.rules.len() * 64);
+        let mut current_sets = Vec::new();
         if self.use_ipset {
+            current_sets.extend(
+                plan.host_sets
+                    .iter()
+                    .filter(|set| set.used_v4)
+                    .map(|set| set.id),
+            );
+            current_sets.sort_unstable();
+
             render_ipset_script(&plan, &mut script)?;
             if !script.is_empty() {
                 self.runner.run_ipset_restore(&script)?;
             }
             script.clear();
+
+            // Track the sets before the rules apply, so they are destroyed later even if
+            // applying the rules fails.
+            let mut known = self
+                .known_sets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            known.extend_from_slice(&current_sets);
+            known.sort_unstable();
+            known.dedup();
         }
 
         render_iptables_script(&plan, CHAIN_NAME, self.use_ipset, &mut script)?;
-        self.runner.run_iptables_restore(&script)
+        self.runner.run_iptables_restore(&script)?;
+
+        if self.use_ipset {
+            script.clear();
+            self.destroy_stale_sets(&current_sets, &mut script)?;
+        }
+        Ok(())
+    }
+
+    /// Destroy known sets that are not part of `current` (sorted). Must run after the rules
+    /// referencing them were replaced, otherwise the kernel refuses to destroy them.
+    fn destroy_stale_sets(
+        &self,
+        current: &[HostSetId],
+        script: &mut String,
+    ) -> Result<(), FirewallError> {
+        let mut known = self
+            .known_sets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for id in known.iter().filter(|id| current.binary_search(id).is_err()) {
+            writeln!(script, "destroy {}", id.name(SET_PREFIX_V4))?;
+        }
+        if script.is_empty() {
+            return Ok(());
+        }
+
+        match self.runner.run_ipset_restore(script) {
+            Ok(()) => {
+                known.clear();
+                known.extend_from_slice(current);
+            }
+            // Keep tracking them so the next apply or cleanup retries.
+            Err(error) => warn!(%error, "failed to destroy stale ipsets; will retry"),
+        }
+        Ok(())
     }
 
     pub fn initialize(&self) -> Result<(), FirewallError> {
@@ -148,6 +220,20 @@ where
             self.runner.run_iptables_restore(&script)?;
         }
 
+        if self.use_ipset {
+            // Covers sets left behind by previous processes as well.
+            let sets = self.runner.list_ipsets()?;
+            script.clear();
+            render_ipset_cleanup_script(&sets, &mut script)?;
+            if !script.is_empty() {
+                self.runner.run_ipset_restore(&script)?;
+            }
+            self.known_sets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        }
+
         info!("iptables cleanup completed");
         Ok(())
     }
@@ -175,14 +261,33 @@ fn detect_ipset_available() -> bool {
 
 /// Render the `ipset restore` script creating and populating one set per hostname that is
 /// referenced by an IPv4 rule.
+///
+/// Each set is filled in a scratch set and swapped in, so live rules never observe a
+/// partially filled set.
 fn render_ipset_script(plan: &Plan, out: &mut String) -> fmt::Result {
     for set in plan.host_sets.iter().filter(|set| set.used_v4) {
         let name = set.id.name(SET_PREFIX_V4);
+        let temp = set.id.name(TEMP_SET_PREFIX_V4);
         writeln!(out, "create {name} hash:ip -exist")?;
-        writeln!(out, "flush {name}")?;
+        writeln!(out, "create {temp} hash:ip -exist")?;
+        writeln!(out, "flush {temp}")?;
         for address in set.v4() {
-            writeln!(out, "add {name} {address} -exist")?;
+            writeln!(out, "add {temp} {address} -exist")?;
         }
+        writeln!(out, "swap {temp} {name}")?;
+        writeln!(out, "destroy {temp}")?;
+    }
+    Ok(())
+}
+
+/// Render the script destroying every managed set listed in `ipset list -n` output.
+fn render_ipset_cleanup_script(sets: &str, out: &mut String) -> fmt::Result {
+    for name in sets
+        .lines()
+        .map(str::trim)
+        .filter(|name| name.starts_with(SET_PREFIX_V4) || name.starts_with(TEMP_SET_PREFIX_V4))
+    {
+        writeln!(out, "destroy {name}")?;
     }
     Ok(())
 }
@@ -384,7 +489,7 @@ mod tests {
     fn renders_hostname_rules_with_ipset_once_per_host() {
         let (ipset, script) = render(&test_support::shared_hostname_state(), true);
         assert_eq!(ipset.matches("create pc_h4_").count(), 1);
-        assert_eq!(ipset.matches("add pc_h4_").count(), 1);
+        assert_eq!(ipset.matches("swap pc_t4_").count(), 1);
         assert_eq!(script.matches("--match-set pc_h4_").count(), 2);
     }
 
@@ -433,6 +538,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         save_filter_output: String,
+        ipset_list_output: String,
         iptables_scripts: Mutex<Vec<String>>,
         ipset_scripts: Mutex<Vec<String>>,
     }
@@ -461,6 +567,71 @@ mod tests {
         fn read_iptables_save_filter(&self) -> Result<String, FirewallError> {
             Ok(self.save_filter_output.clone())
         }
+
+        fn list_ipsets(&self) -> Result<String, FirewallError> {
+            Ok(self.ipset_list_output.clone())
+        }
+    }
+
+    #[test]
+    fn refills_ipset_atomically_via_swap() {
+        let (ipset, _) = render(&test_support::hostname_state(), true);
+        let lines: Vec<&str> = ipset.lines().collect();
+        let [
+            create,
+            create_temp,
+            flush_temp,
+            add_temp,
+            swap,
+            destroy_temp,
+        ] = lines.as_slice()
+        else {
+            panic!("unexpected ipset script: {ipset}");
+        };
+        assert!(create.starts_with("create pc_h4_"));
+        assert!(create_temp.starts_with("create pc_t4_"));
+        assert!(flush_temp.starts_with("flush pc_t4_"));
+        assert!(add_temp.starts_with("add pc_t4_") && add_temp.contains(" 1.1.1.1 "));
+        assert!(swap.starts_with("swap pc_t4_") && swap.contains(" pc_h4_"));
+        assert!(destroy_temp.starts_with("destroy pc_t4_"));
+    }
+
+    #[test]
+    fn apply_destroys_sets_no_longer_referenced() {
+        let firewall = IptablesFirewall::new(RecordingRunner::default(), true);
+        let mut resolver = MockResolver::default();
+        firewall
+            .apply(&test_support::hostname_state(), &mut resolver)
+            .expect("apply should succeed");
+        firewall
+            .apply(&test_support::icc_state(), &mut resolver)
+            .expect("apply should succeed");
+        firewall
+            .apply(&test_support::icc_state(), &mut resolver)
+            .expect("apply should succeed");
+
+        let scripts = firewall.runner.ipset_scripts.lock().expect("lock");
+        // fill on first apply, destroy after the second, nothing on the third
+        assert_eq!(scripts.len(), 2);
+        let destroy = scripts.get(1).expect("destroy script");
+        assert!(destroy.starts_with("destroy pc_h4_"));
+        assert_eq!(destroy.lines().count(), 1);
+    }
+
+    #[test]
+    fn cleanup_destroys_managed_ipsets() {
+        let runner = RecordingRunner {
+            ipset_list_output: "pc_h4_0000000000000001\nunrelated\npc_t4_0000000000000002\n"
+                .to_string(),
+            ..RecordingRunner::default()
+        };
+        let firewall = IptablesFirewall::new(runner, true);
+        firewall.cleanup().expect("cleanup should succeed");
+        let scripts = firewall.runner.ipset_scripts.lock().expect("lock");
+        assert_eq!(
+            scripts.as_slice(),
+            ["destroy pc_h4_0000000000000001\ndestroy pc_t4_0000000000000002\n"]
+        );
     }
 
     #[test]
