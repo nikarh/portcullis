@@ -15,6 +15,8 @@ use crate::model::RuntimeState;
 const CHAIN_NAME: &str = "PORTCULLIS_EGRESS";
 const STAGING_CHAIN_NAME: &str = "PORTCULLIS_EGRESS_NEXT";
 const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
+/// Prefix of per-source chains, followed by an index.
+const SOURCE_CHAIN_PREFIX: &str = "PORTCULLIS_S";
 /// Prefix of the scratch sets used to refill hostname sets atomically.
 const TEMP_SET_PREFIX_V4: &str = "pc_t4_";
 
@@ -97,6 +99,8 @@ pub struct IptablesFirewall<R> {
     use_ipset: bool,
     /// Sorted ids of hostname ipsets this process may have created and not destroyed yet.
     known_sets: Mutex<Vec<HostSetId>>,
+    /// Number of per-source chains currently installed.
+    source_chains: Mutex<usize>,
 }
 
 impl<R> IptablesFirewall<R>
@@ -108,6 +112,7 @@ where
             runner,
             use_ipset,
             known_sets: Mutex::new(Vec::new()),
+            source_chains: Mutex::new(0),
         }
     }
 
@@ -117,14 +122,15 @@ where
     {
         let plan = Plan::build(state, resolver)?;
         info!(
-            rule_count = plan.rules.len(),
+            source_count = plan.sources.len(),
+            rule_count = plan.rule_count(),
             host_set_count = plan.host_sets.len(),
             container_count = state.containers().len(),
             "applying iptables changes"
         );
 
         // One buffer reused for every script.
-        let mut script = String::with_capacity(plan.rules.len() * 64);
+        let mut script = String::with_capacity(plan.rule_count() * 64);
         let mut current_sets = Vec::new();
         if self.use_ipset {
             current_sets.extend(
@@ -152,8 +158,25 @@ where
             known.dedup();
         }
 
-        render_iptables_script(&plan, CHAIN_NAME, self.use_ipset, &mut script)?;
-        self.runner.run_iptables_restore(&script)?;
+        {
+            let mut source_chains = self
+                .source_chains
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            render_iptables_script(
+                &plan,
+                CHAIN_NAME,
+                *source_chains,
+                self.use_ipset,
+                &mut script,
+            )?;
+            self.runner.run_iptables_restore(&script)?;
+            *source_chains = plan
+                .sources
+                .iter()
+                .filter(|source| source.address.is_ipv4())
+                .count();
+        }
 
         if self.use_ipset {
             script.clear();
@@ -219,6 +242,10 @@ where
         if !script.is_empty() {
             self.runner.run_iptables_restore(&script)?;
         }
+        *self
+            .source_chains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 0;
 
         if self.use_ipset {
             // Covers sets left behind by previous processes as well.
@@ -294,69 +321,115 @@ fn render_ipset_cleanup_script(sets: &str, out: &mut String) -> fmt::Result {
 
 /// Render the `iptables-restore --noflush` script replacing the contents of `chain`.
 ///
-/// Allowed traffic `RETURN`s to `DOCKER-USER` instead of being accepted, so Docker's own
-/// rules (network isolation, internal networks, ICC settings) still apply: the policy can
-/// only take access away, never grant it. This matches nftables, where `accept` in our
-/// base chain doesn't skip Docker's chains.
+/// Layout: `chain` lets established traffic through, then dispatches each managed source
+/// address with `-g` (goto) to its own chain, then drops unmanaged sources of enforced
+/// subnets. A packet is evaluated against a single compare per source plus the rules of its
+/// own source only, instead of every rule of every container.
 ///
-/// The iptables backend only manages IPv4; IPv6 rules of the plan are skipped.
+/// Allowed traffic `RETURN`s instead of being accepted. Since source chains are entered with
+/// goto, that returns straight to `DOCKER-USER`, so Docker's own rules (network isolation,
+/// internal networks, ICC settings) still apply: the policy can only take access away, never
+/// grant it. This matches nftables, where `accept` in our base chain doesn't skip Docker's
+/// chains.
+///
+/// Source chains are numbered per apply. `existing_source_chains` chains from the previous
+/// apply are reused, and the surplus is deleted in the same atomic transaction.
+///
+/// The iptables backend only manages IPv4; IPv6 parts of the plan are skipped.
 fn render_iptables_script(
     plan: &Plan,
     chain: &str,
+    existing_source_chains: usize,
     use_ipset: bool,
     out: &mut String,
 ) -> fmt::Result {
+    let sources = || {
+        plan.sources
+            .iter()
+            .filter(|source| source.address.is_ipv4())
+            .enumerate()
+            .map(|(index, source)| (SourceChain(index), source))
+    };
+
     out.push_str("*filter\n");
+    // Declaring a chain creates it, or flushes it if it already exists.
+    for (source_chain, _) in sources() {
+        writeln!(out, ":{source_chain} - [0:0]")?;
+    }
+
     writeln!(out, "-F {chain}")?;
     // Policy applies to new connections only; replies and established flows skip it.
     writeln!(
         out,
         "-A {chain} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
     )?;
-    for rule in &plan.rules {
-        render_rule(plan, rule, chain, use_ipset, out)?;
+    for (source_chain, source) in sources() {
+        writeln!(out, "-A {chain} -s {}/32 -g {source_chain}", source.address)?;
     }
+    for subnet in &plan.enforced_subnets {
+        if let IpNet::V4(subnet) = subnet {
+            writeln!(out, "-A {chain} -s {subnet} -j DROP")?;
+        }
+    }
+
+    for (source_chain, source) in sources() {
+        for rule in plan.rules(source) {
+            render_rule(plan, rule, source_chain, use_ipset, out)?;
+        }
+        writeln!(out, "-A {source_chain} -j DROP")?;
+    }
+
+    let source_chain_count = sources().count();
+    for index in source_chain_count..existing_source_chains {
+        let source_chain = SourceChain(index);
+        writeln!(out, "-F {source_chain}")?;
+        writeln!(out, "-X {source_chain}")?;
+    }
+
     out.push_str("COMMIT\n");
     Ok(())
+}
+
+/// Name of the chain holding the rules of the n-th managed source address.
+#[derive(Debug, Clone, Copy)]
+struct SourceChain(usize);
+
+impl fmt::Display for SourceChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{SOURCE_CHAIN_PREFIX}{}", self.0)
+    }
 }
 
 fn render_rule(
     plan: &Plan,
     rule: &Rule,
-    chain: &str,
+    chain: SourceChain,
     use_ipset: bool,
     out: &mut String,
 ) -> fmt::Result {
     match *rule {
         Rule::AcceptDns {
-            source: IpAddr::V4(source),
             destination,
             protocol,
         } => {
-            write!(out, "-A {chain} -s {source}/32 ")?;
+            write!(out, "-A {chain} ")?;
             if let Some(IpAddr::V4(destination)) = destination {
                 write!(out, "-d {destination}/32 ")?;
             }
             writeln!(out, "-p {} --dport {DNS_PORT} -j RETURN", protocol.as_str())
         }
-        Rule::DropDns {
-            source: IpAddr::V4(source),
-            protocol,
-        } => writeln!(
+        Rule::DropDns { protocol } => writeln!(
             out,
-            "-A {chain} -s {source}/32 -p {} --dport {DNS_PORT} -j DROP",
+            "-A {chain} -p {} --dport {DNS_PORT} -j DROP",
             protocol.as_str()
         ),
-        Rule::AcceptNet {
-            source: IpAddr::V4(source),
-            destination: IpNet::V4(destination),
-        } => writeln!(out, "-A {chain} -s {source}/32 -d {destination} -j RETURN"),
-        Rule::DropNet {
-            source: IpAddr::V4(source),
-            destination: IpNet::V4(destination),
-        } => writeln!(out, "-A {chain} -s {source}/32 -d {destination} -j DROP"),
+        Rule::AcceptNet(IpNet::V4(destination)) => {
+            writeln!(out, "-A {chain} -d {destination} -j RETURN")
+        }
+        Rule::DropNet(IpNet::V4(destination)) => {
+            writeln!(out, "-A {chain} -d {destination} -j DROP")
+        }
         Rule::AcceptPort {
-            source: IpAddr::V4(source),
             destination,
             protocol,
             port,
@@ -365,11 +438,11 @@ fn render_rule(
             match destination {
                 Destination::Net(IpNet::V4(destination)) => writeln!(
                     out,
-                    "-A {chain} -s {source}/32 -d {destination} -p {protocol} --dport {port} -j RETURN"
+                    "-A {chain} -d {destination} -p {protocol} --dport {port} -j RETURN"
                 ),
                 Destination::Addr(IpAddr::V4(destination)) => writeln!(
                     out,
-                    "-A {chain} -s {source}/32 -d {destination}/32 -p {protocol} --dport {port} -j RETURN"
+                    "-A {chain} -d {destination}/32 -p {protocol} --dport {port} -j RETURN"
                 ),
                 Destination::HostSet(index) => {
                     let Some(set) = plan.host_set(index) else {
@@ -378,14 +451,14 @@ fn render_rule(
                     if use_ipset {
                         writeln!(
                             out,
-                            "-A {chain} -s {source}/32 -m set --match-set {} dst -p {protocol} --dport {port} -j RETURN",
+                            "-A {chain} -m set --match-set {} dst -p {protocol} --dport {port} -j RETURN",
                             set.id.name(SET_PREFIX_V4)
                         )
                     } else {
                         for destination in set.v4() {
                             writeln!(
                                 out,
-                                "-A {chain} -s {source}/32 -d {destination}/32 -p {protocol} --dport {port} -j RETURN"
+                                "-A {chain} -d {destination}/32 -p {protocol} --dport {port} -j RETURN"
                             )?;
                         }
                         Ok(())
@@ -394,14 +467,7 @@ fn render_rule(
                 Destination::Net(IpNet::V6(_)) | Destination::Addr(IpAddr::V6(_)) => Ok(()),
             }
         }
-        Rule::DropSource {
-            source: IpAddr::V4(source),
-        } => writeln!(out, "-A {chain} -s {source}/32 -j DROP"),
-        Rule::DropSourceNet {
-            subnet: IpNet::V4(subnet),
-        } => writeln!(out, "-A {chain} -s {subnet} -j DROP"),
-        // IPv6 is not managed by the iptables backend.
-        _ => Ok(()),
+        Rule::AcceptNet(IpNet::V6(_)) | Rule::DropNet(IpNet::V6(_)) => Ok(()),
     }
 }
 
@@ -416,49 +482,40 @@ fn docker_user_jump_target(line: &str) -> Option<&str> {
     None
 }
 
+fn is_managed_chain(chain: &str) -> bool {
+    chain == CHAIN_NAME || chain == STAGING_CHAIN_NAME || chain.starts_with(SOURCE_CHAIN_PREFIX)
+}
+
 /// Render the cleanup script from `iptables-save -t filter` output. Leaves `out` empty when
 /// there is nothing to clean up.
 fn render_cleanup_script(filter_rules: &str, out: &mut String) -> fmt::Result {
-    let mut has_egress_chain = false;
-    let mut has_staging_chain = false;
-    let mut egress_jump_count = 0usize;
-    let mut staging_jump_count = 0usize;
+    let chains = || {
+        filter_rules
+            .lines()
+            .filter_map(|line| line.strip_prefix(':')?.split_whitespace().next())
+            .filter(|chain| is_managed_chain(chain))
+    };
+    let jumps = || {
+        filter_rules
+            .lines()
+            .filter_map(docker_user_jump_target)
+            .filter(|chain| is_managed_chain(chain))
+    };
 
-    for line in filter_rules.lines() {
-        if let Some(chain) = line.strip_prefix(':') {
-            match chain.split_whitespace().next() {
-                Some(CHAIN_NAME) => has_egress_chain = true,
-                Some(STAGING_CHAIN_NAME) => has_staging_chain = true,
-                _ => {}
-            }
-            continue;
-        }
-        match docker_user_jump_target(line) {
-            Some(CHAIN_NAME) => egress_jump_count += 1,
-            Some(STAGING_CHAIN_NAME) => staging_jump_count += 1,
-            _ => {}
-        }
-    }
-
-    if !has_egress_chain && !has_staging_chain && egress_jump_count + staging_jump_count == 0 {
+    if chains().next().is_none() && jumps().next().is_none() {
         return Ok(());
     }
 
     out.push_str("*filter\n");
-    for _ in 0..egress_jump_count {
-        writeln!(out, "-D {DOCKER_USER_CHAIN} -j {CHAIN_NAME}")?;
+    for target in jumps() {
+        writeln!(out, "-D {DOCKER_USER_CHAIN} -j {target}")?;
     }
-    for _ in 0..staging_jump_count {
-        writeln!(out, "-D {DOCKER_USER_CHAIN} -j {STAGING_CHAIN_NAME}")?;
+    // Flush everything first: chains may reference each other.
+    for chain in chains() {
+        writeln!(out, "-F {chain}")?;
     }
-    for (present, chain) in [
-        (has_egress_chain, CHAIN_NAME),
-        (has_staging_chain, STAGING_CHAIN_NAME),
-    ] {
-        if present {
-            writeln!(out, "-F {chain}")?;
-            writeln!(out, "-X {chain}")?;
-        }
+    for chain in chains() {
+        writeln!(out, "-X {chain}")?;
     }
     out.push_str("COMMIT\n");
     Ok(())
@@ -476,7 +533,7 @@ mod tests {
         let mut ipset = String::new();
         render_ipset_script(&plan, &mut ipset).expect("ipset script should render");
         let mut iptables = String::new();
-        render_iptables_script(&plan, CHAIN_NAME, use_ipset, &mut iptables)
+        render_iptables_script(&plan, CHAIN_NAME, 0, use_ipset, &mut iptables)
             .expect("iptables script should render");
         (ipset, iptables)
     }
@@ -485,13 +542,57 @@ mod tests {
         script.lines().any(|line| line == expected)
     }
 
+    /// Name of the chain the main chain dispatches `source` to.
+    fn chain_of(script: &str, source: &str) -> String {
+        let prefix = format!("-A PORTCULLIS_EGRESS -s {source}/32 -g ");
+        script
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("no dispatch for {source} in:\n{script}"))
+            .to_string()
+    }
+
+    fn assert_rules(script: &str, source: &str, expected: &[&str]) {
+        let chain = chain_of(script, source);
+        for rule in expected {
+            let line = format!("-A {chain} {rule}");
+            assert!(has_line(script, &line), "missing {line} in:\n{script}");
+        }
+    }
+
+    #[test]
+    fn renders_layout() {
+        let (_, script) = render(&test_support::hostname_state(), true);
+        let chain = chain_of(&script, "172.18.0.2");
+        let lines: Vec<&str> = script.lines().collect();
+        assert_eq!(
+            lines.get(..6),
+            Some(
+                [
+                    "*filter",
+                    &format!(":{chain} - [0:0]"),
+                    "-F PORTCULLIS_EGRESS",
+                    "-A PORTCULLIS_EGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN",
+                    &format!("-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -g {chain}"),
+                    "-A PORTCULLIS_EGRESS -s 172.18.0.0/16 -j DROP",
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            lines.get(lines.len() - 2..),
+            Some([format!("-A {chain} -j DROP").as_str(), "COMMIT"].as_slice())
+        );
+    }
+
     #[test]
     fn renders_hostname_rules_without_ipset() {
         let (_, script) = render(&test_support::hostname_state(), false);
-        assert!(has_line(
+        assert_rules(
             &script,
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 1.1.1.1/32 -p tcp --dport 443 -j RETURN"
-        ));
+            "172.18.0.2",
+            &["-d 1.1.1.1/32 -p tcp --dport 443 -j RETURN"],
+        );
         assert!(!script.contains("--match-set"));
     }
 
@@ -506,39 +607,56 @@ mod tests {
     #[test]
     fn renders_icc_modes() {
         let (_, script) = render(&test_support::icc_state(), false);
-        // allow: subnet accept
-        assert!(has_line(
+        assert_rules(&script, "172.18.0.3", &["-d 172.18.0.0/16 -j RETURN"]);
+        assert_rules(
             &script,
-            "-A PORTCULLIS_EGRESS -s 172.18.0.3/32 -d 172.18.0.0/16 -j RETURN"
-        ));
-        // allow-listed: alias target on the same network, then subnet drop
-        assert!(has_line(
-            &script,
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.10/32 -p tcp --dport 5432 -j RETURN"
-        ));
-        assert!(has_line(
-            &script,
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.0/16 -j DROP"
-        ));
-        assert!(!script.contains("-d 172.19.0.10/32 -p tcp --dport 5432"));
+            "172.18.0.2",
+            &[
+                "-d 172.18.0.10/32 -p tcp --dport 5432 -j RETURN",
+                "-d 172.18.0.0/16 -j DROP",
+            ],
+        );
+        assert!(!script.contains("-d 172.19.0.10/32"));
     }
 
     #[test]
-    fn renders_dns_and_baseline_rules() {
+    fn renders_dns_rules() {
         let (_, script) = render(&test_support::hostname_state(), false);
-        for expected in [
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p udp --dport 53 -j RETURN",
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p tcp --dport 53 -j RETURN",
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -p udp --dport 53 -j DROP",
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -j DROP",
-            "-A PORTCULLIS_EGRESS -s 172.18.0.0/16 -j DROP",
-        ] {
-            assert!(has_line(&script, expected), "missing line: {expected}");
-        }
-        assert!(script.starts_with(
-            "*filter\n-F PORTCULLIS_EGRESS\n-A PORTCULLIS_EGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n"
-        ));
-        assert!(script.ends_with("COMMIT\n"));
+        assert_rules(
+            &script,
+            "172.18.0.2",
+            &[
+                "-d 172.18.0.1/32 -p udp --dport 53 -j RETURN",
+                "-d 172.18.0.1/32 -p tcp --dport 53 -j RETURN",
+                "-p udp --dport 53 -j DROP",
+                "-p tcp --dport 53 -j DROP",
+                "-d 8.8.8.0/24 -p tcp --dport 853 -j RETURN",
+                "-j DROP",
+            ],
+        );
+    }
+
+    #[test]
+    fn deletes_surplus_source_chains() {
+        let plan = Plan::build(
+            &test_support::hostname_state(),
+            &mut MockResolver::default(),
+        )
+        .expect("plan should build");
+        let mut script = String::new();
+        render_iptables_script(&plan, CHAIN_NAME, 3, false, &mut script)
+            .expect("script should render");
+        let tail: Vec<&str> = script.lines().rev().take(5).collect();
+        assert_eq!(
+            tail,
+            [
+                "COMMIT",
+                "-X PORTCULLIS_S2",
+                "-F PORTCULLIS_S2",
+                "-X PORTCULLIS_S1",
+                "-F PORTCULLIS_S1",
+            ]
+        );
     }
 
     #[test]
@@ -647,6 +765,26 @@ mod tests {
     }
 
     #[test]
+    fn apply_deletes_source_chains_of_previous_apply() {
+        let firewall = IptablesFirewall::new(RecordingRunner::default(), false);
+        let mut resolver = MockResolver::default();
+        firewall
+            .apply(&test_support::icc_state(), &mut resolver)
+            .expect("apply should succeed");
+        firewall
+            .apply(&test_support::hostname_state(), &mut resolver)
+            .expect("apply should succeed");
+
+        let scripts = firewall.runner.iptables_scripts.lock().expect("lock");
+        let second = scripts.get(1).expect("second apply");
+        assert!(!scripts.first().expect("first apply").contains("-X "));
+        for index in 1..4 {
+            assert!(has_line(second, &format!("-X PORTCULLIS_S{index}")));
+        }
+        assert!(!has_line(second, "-X PORTCULLIS_S0"));
+    }
+
+    #[test]
     fn apply_runs_ipset_before_iptables() {
         let firewall = IptablesFirewall::new(RecordingRunner::default(), true);
         firewall
@@ -673,6 +811,8 @@ mod tests {
 :PORTCULLIS_EGRESS_NEXT - [0:0]
 -A DOCKER-USER -j PORTCULLIS_EGRESS
 -A DOCKER-USER -j PORTCULLIS_EGRESS_NEXT
+:PORTCULLIS_S0 - [0:0]
+-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -g PORTCULLIS_S0
 COMMIT
 "
             .to_string(),
@@ -689,9 +829,11 @@ COMMIT
 -D DOCKER-USER -j PORTCULLIS_EGRESS
 -D DOCKER-USER -j PORTCULLIS_EGRESS_NEXT
 -F PORTCULLIS_EGRESS
--X PORTCULLIS_EGRESS
 -F PORTCULLIS_EGRESS_NEXT
+-F PORTCULLIS_S0
+-X PORTCULLIS_EGRESS
 -X PORTCULLIS_EGRESS_NEXT
+-X PORTCULLIS_S0
 COMMIT
 "]
         );

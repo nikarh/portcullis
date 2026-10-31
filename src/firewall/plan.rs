@@ -1,12 +1,24 @@
 //! Backend-agnostic firewall plan.
 //!
-//! The planner turns [`RuntimeState`] into an ordered list of typed [`Rule`]s plus the
-//! hostname address sets they reference. Both the iptables and the nftables backends only
-//! render this plan, so policy semantics live in exactly one place and cannot drift apart.
+//! The planner turns [`RuntimeState`] into one ordered rule list per managed source address,
+//! the hostname address sets those rules reference, and the enforced network subnets. Both
+//! the iptables and the nftables backends only render this plan, so policy semantics live in
+//! exactly one place and cannot drift apart.
+//!
+//! Evaluation model shared by both backends, for traffic forwarded from a container:
+//! 1. packets of established or related connections pass;
+//! 2. a packet whose source is a managed address is dispatched to that source's rules,
+//!    evaluated in order, first match wins, ending with an implicit drop;
+//! 3. any other packet from an enforced subnet is dropped;
+//! 4. everything else passes.
+//!
+//! "Pass" and "accept" only mean that this policy doesn't drop the packet; Docker's own
+//! rules still apply afterwards.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
+use std::ops::Range;
 use std::sync::Arc;
 
 use ipnet::IpNet;
@@ -31,35 +43,35 @@ pub enum Destination {
     HostSet(usize),
 }
 
-/// A single firewall rule. Rules are evaluated in order, first match wins.
-///
-/// Every address in a rule has the same family as its `source`; the planner never emits
-/// mixed-family rules.
+/// A rule of one source. Every address in a rule has the same family as the source; the
+/// planner never emits mixed-family rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
-    /// Allow DNS from `source` to `destination`, or to any destination when `None`.
+    /// Allow DNS to `destination`, or to any destination when `None`.
     AcceptDns {
-        source: IpAddr,
         destination: Option<IpAddr>,
         protocol: Protocol,
     },
-    /// Drop any other DNS from `source`.
-    DropDns { source: IpAddr, protocol: Protocol },
-    /// Allow all traffic from `source` to `destination` (ICC allow).
-    AcceptNet { source: IpAddr, destination: IpNet },
-    /// Drop all traffic from `source` to `destination` (ICC deny).
-    DropNet { source: IpAddr, destination: IpNet },
-    /// Allow traffic from `source` to `destination` on a single port.
+    /// Drop any other DNS.
+    DropDns { protocol: Protocol },
+    /// Allow all traffic to a subnet (ICC allow).
+    AcceptNet(IpNet),
+    /// Drop all traffic to a subnet (ICC deny).
+    DropNet(IpNet),
+    /// Allow traffic to `destination` on a single port.
     AcceptPort {
-        source: IpAddr,
         destination: Destination,
         protocol: Protocol,
         port: u16,
     },
-    /// Default deny for a policy-managed source address.
-    DropSource { source: IpAddr },
-    /// Baseline deny for an enforced network subnet.
-    DropSourceNet { subnet: IpNet },
+}
+
+/// A managed source address and its rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub address: IpAddr,
+    /// Range into [`Plan::rules`].
+    rules: Range<usize>,
 }
 
 /// Stable identifier of a hostname set, derived from the hostname.
@@ -129,9 +141,14 @@ impl HostSet {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Plan {
-    pub rules: Vec<Rule>,
+    /// Managed source addresses, each listed once.
+    pub sources: Vec<Source>,
+    /// Rules of all sources, see [`Plan::rules`].
+    rules: Vec<Rule>,
     /// Hostname sets, one per distinct hostname.
     pub host_sets: Vec<HostSet>,
+    /// Subnets of enforced networks; unmanaged sources in them are dropped.
+    pub enforced_subnets: Vec<IpNet>,
 }
 
 impl Plan {
@@ -144,6 +161,7 @@ impl Plan {
             state,
             resolver,
             plan: Self::default(),
+            seen_sources: HashSet::new(),
             host_index: HashMap::new(),
             icc_targets: None,
             scratch: Vec::new(),
@@ -155,16 +173,23 @@ impl Plan {
             }
         }
 
-        planner.plan.rules.extend(
-            state
-                .networks()
-                .values()
-                .map(|network| Rule::DropSourceNet {
-                    subnet: network.subnet,
-                }),
-        );
+        planner
+            .plan
+            .enforced_subnets
+            .extend(state.networks().values().map(|network| network.subnet));
 
         Ok(planner.plan)
+    }
+
+    /// Rules of `source`, in evaluation order. A source's rules end with an implicit drop.
+    #[must_use]
+    pub fn rules(&self, source: &Source) -> &[Rule] {
+        self.rules.get(source.rules.clone()).unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
     }
 
     #[must_use]
@@ -177,6 +202,7 @@ struct Planner<'s, 'r, R> {
     state: &'s RuntimeState,
     resolver: &'r mut R,
     plan: Plan,
+    seen_sources: HashSet<IpAddr>,
     /// Hostname -> index into `plan.host_sets`.
     host_index: HashMap<&'s str, usize>,
     /// Built lazily, only when an allow-listed container exists.
@@ -195,6 +221,13 @@ where
         attachment: &'s NetworkAttachment,
     ) -> Result<(), FirewallError> {
         let source = attachment.ip_address;
+        // An address can only belong to one container at a time. Should stale state ever
+        // contain it twice, the first owner wins, as it would in a linear rule list.
+        if !self.seen_sources.insert(source) {
+            return Ok(());
+        }
+
+        let start = self.plan.rules.len();
         let policy = &container.policy;
         let network = self.state.networks().get(&attachment.network_id);
 
@@ -209,20 +242,11 @@ where
         {
             let subnet = network.subnet;
             match policy.icc_mode {
-                IccMode::Allow => self.plan.rules.push(Rule::AcceptNet {
-                    source,
-                    destination: subnet,
-                }),
-                IccMode::Deny => self.plan.rules.push(Rule::DropNet {
-                    source,
-                    destination: subnet,
-                }),
+                IccMode::Allow => self.plan.rules.push(Rule::AcceptNet(subnet)),
+                IccMode::Deny => self.plan.rules.push(Rule::DropNet(subnet)),
                 IccMode::AllowListed => {
                     self.plan_icc_allow_list(source, attachment, &policy.icc_allow);
-                    self.plan.rules.push(Rule::DropNet {
-                        source,
-                        destination: subnet,
-                    });
+                    self.plan.rules.push(Rule::DropNet(subnet));
                 }
             }
         }
@@ -248,14 +272,16 @@ where
             self.plan
                 .rules
                 .extend(rule.ports.iter().map(|port| Rule::AcceptPort {
-                    source,
                     destination,
                     protocol: port.protocol,
                     port: port.port,
                 }));
         }
 
-        self.plan.rules.push(Rule::DropSource { source });
+        self.plan.sources.push(Source {
+            address: source,
+            rules: start..self.plan.rules.len(),
+        });
         Ok(())
     }
 
@@ -285,7 +311,6 @@ where
             self.plan
                 .rules
                 .extend(DNS_PROTOCOLS.map(|protocol| Rule::AcceptDns {
-                    source,
                     destination: None,
                     protocol,
                 }));
@@ -298,7 +323,6 @@ where
                 self.plan
                     .rules
                     .extend(DNS_PROTOCOLS.map(|protocol| Rule::AcceptDns {
-                        source,
                         destination: Some(*destination),
                         protocol,
                     }));
@@ -307,7 +331,7 @@ where
 
         self.plan
             .rules
-            .extend(DNS_PROTOCOLS.map(|protocol| Rule::DropDns { source, protocol }));
+            .extend(DNS_PROTOCOLS.map(|protocol| Rule::DropDns { protocol }));
     }
 
     fn plan_icc_allow_list(
@@ -335,7 +359,6 @@ where
                 self.plan
                     .rules
                     .extend(rule.ports.iter().map(|port| Rule::AcceptPort {
-                        source,
                         destination: Destination::Addr(destination),
                         protocol: port.protocol,
                         port: port.port,
@@ -381,8 +404,8 @@ struct IccTarget<'s> {
 ///
 /// A target matches by container name or network alias, restricted to the source
 /// attachment's network, the way Docker's embedded DNS resolves names. Container IDs are
-/// deliberately not matched: they change on every recreate, so they can't be used in labels. A single sorted vector of borrowed keys: one allocation, binary
-/// search lookups.
+/// deliberately not matched: they change on every recreate, so they can't be used in labels.
+/// A single sorted vector of borrowed keys: one allocation, binary search lookups.
 struct IccTargets<'s> {
     entries: Vec<IccTarget<'s>>,
 }
@@ -433,75 +456,66 @@ mod tests {
         (plan, resolver)
     }
 
-    fn rules_from(plan: &Plan, source: &str) -> Vec<Rule> {
+    fn rules_of(plan: &Plan, source: &str) -> Vec<Rule> {
         let source = ip(source);
-        plan.rules
+        let source = plan
+            .sources
             .iter()
-            .copied()
-            .filter(|rule| match *rule {
-                Rule::AcceptDns { source: s, .. }
-                | Rule::DropDns { source: s, .. }
-                | Rule::AcceptNet { source: s, .. }
-                | Rule::DropNet { source: s, .. }
-                | Rule::AcceptPort { source: s, .. }
-                | Rule::DropSource { source: s } => s == source,
-                Rule::DropSourceNet { .. } => false,
-            })
-            .collect()
+            .find(|candidate| candidate.address == source)
+            .expect("source should be planned");
+        plan.rules(source).to_vec()
     }
 
     #[test]
     fn plans_rules_in_evaluation_order() {
         let (plan, _) = build(&test_support::hostname_state());
-        let source = ip("172.18.0.2");
         let gateway = ip("172.18.0.1");
 
         assert_eq!(
-            rules_from(&plan, "172.18.0.2"),
+            rules_of(&plan, "172.18.0.2"),
             vec![
                 Rule::AcceptDns {
-                    source,
                     destination: Some(gateway),
                     protocol: Protocol::Udp
                 },
                 Rule::AcceptDns {
-                    source,
                     destination: Some(gateway),
                     protocol: Protocol::Tcp
                 },
                 Rule::DropDns {
-                    source,
                     protocol: Protocol::Udp
                 },
                 Rule::DropDns {
-                    source,
                     protocol: Protocol::Tcp
                 },
-                Rule::DropNet {
-                    source,
-                    destination: net("172.18.0.0/16")
-                },
+                Rule::DropNet(net("172.18.0.0/16")),
                 Rule::AcceptPort {
-                    source,
                     destination: Destination::HostSet(0),
                     protocol: Protocol::Tcp,
                     port: 443
                 },
                 Rule::AcceptPort {
-                    source,
                     destination: Destination::Net(net("8.8.8.0/24")),
                     protocol: Protocol::Tcp,
                     port: 853
                 },
-                Rule::DropSource { source },
             ]
         );
-        assert_eq!(
-            plan.rules.last(),
-            Some(&Rule::DropSourceNet {
-                subnet: net("172.18.0.0/16")
-            })
+        assert_eq!(plan.enforced_subnets, vec![net("172.18.0.0/16")]);
+    }
+
+    #[test]
+    fn plans_each_source_once() {
+        let mut state = test_support::hostname_state();
+        test_support::add_container(
+            &mut state,
+            "stale",
+            "stale",
+            &[("net0", "172.18.0.2", &[])],
+            test_support::policy(IccMode::Allow, Vec::new()),
         );
+        let (plan, _) = build(&state);
+        assert_eq!(plan.sources.len(), 1);
     }
 
     #[test]
@@ -509,19 +523,14 @@ mod tests {
         let (plan, resolver) = build(&test_support::shared_hostname_state());
         assert_eq!(resolver.calls, 1);
         assert_eq!(plan.host_sets.len(), 1);
-        assert_eq!(
-            plan.rules
-                .iter()
-                .filter(|rule| matches!(
-                    rule,
-                    Rule::AcceptPort {
-                        destination: Destination::HostSet(0),
-                        ..
-                    }
-                ))
-                .count(),
-            2
-        );
+        assert_eq!(plan.sources.len(), 2);
+        for source in &plan.sources {
+            assert!(plan.rules(source).contains(&Rule::AcceptPort {
+                destination: Destination::HostSet(0),
+                protocol: Protocol::Tcp,
+                port: 443,
+            }));
+        }
     }
 
     #[test]
@@ -540,16 +549,13 @@ mod tests {
     #[test]
     fn icc_allow_accepts_own_subnet() {
         let (plan, _) = build(&test_support::icc_state());
-        assert!(rules_from(&plan, "172.18.0.3").contains(&Rule::AcceptNet {
-            source: ip("172.18.0.3"),
-            destination: net("172.18.0.0/16"),
-        }));
+        assert!(rules_of(&plan, "172.18.0.3").contains(&Rule::AcceptNet(net("172.18.0.0/16"))));
     }
 
     #[test]
     fn icc_allow_list_resolves_alias_on_source_network_only() {
         let (plan, _) = build(&test_support::icc_state());
-        let accepted: Vec<_> = rules_from(&plan, "172.18.0.2")
+        let accepted: Vec<_> = rules_of(&plan, "172.18.0.2")
             .into_iter()
             .filter_map(|rule| match rule {
                 Rule::AcceptPort {
@@ -577,8 +583,7 @@ mod tests {
 
             let (plan, _) = build(&state);
             assert_eq!(
-                plan.rules.contains(&Rule::AcceptPort {
-                    source: ip("172.18.0.2"),
+                rules_of(&plan, "172.18.0.2").contains(&Rule::AcceptPort {
                     destination: Destination::Addr(ip("172.18.0.10")),
                     protocol: Protocol::Tcp,
                     port: 5432,
@@ -592,16 +597,15 @@ mod tests {
     #[test]
     fn never_mixes_address_families() {
         let (plan, _) = build(&test_support::ipv6_state());
-        assert!(!plan.rules.iter().any(|rule| matches!(
+        let rules = rules_of(&plan, "fd00::2");
+        assert!(!rules.iter().any(|rule| matches!(
             rule,
             Rule::AcceptDns {
-                source: IpAddr::V6(_),
                 destination: Some(IpAddr::V4(_)),
                 ..
             }
         )));
-        assert!(plan.rules.contains(&Rule::AcceptPort {
-            source: ip("fd00::2"),
+        assert!(rules.contains(&Rule::AcceptPort {
             destination: Destination::Net(net("2001:db8::/32")),
             protocol: Protocol::Tcp,
             port: 443,
