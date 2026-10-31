@@ -3,6 +3,7 @@
 mod dns;
 mod dns_proxy;
 mod docker;
+mod events;
 mod firewall;
 mod host_dns;
 mod labels;
@@ -14,6 +15,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
@@ -30,6 +32,7 @@ use crate::dns_proxy::{
     DnsApplyAck, DnsResolvedEvent, DnsRuntimeHandle, DnsRuntimeMode, spawn_dns_runtime,
 };
 use crate::docker::{DockerClient, DockerError, DockerEvent, DockerEventClient};
+use crate::events::EventSink;
 use crate::firewall::{DenyAction, FirewallError, NftablesFirewall};
 use crate::logging::{LogLevel, LoggingError};
 use crate::model::{EgressTarget, RuntimeState};
@@ -56,6 +59,7 @@ impl FromStr for DnsMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
     docker_socket: String,
+    events_socket: Option<PathBuf>,
     deny_action: DenyAction,
     dns_mode: DnsMode,
     dns_proxy_bind: SocketAddr,
@@ -66,6 +70,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             docker_socket: "/var/run/docker.sock".to_string(),
+            events_socket: None,
             deny_action: DenyAction::Reject,
             dns_mode: DnsMode::Lazy,
             dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 1053)),
@@ -96,6 +101,8 @@ enum MainError {
     Firewall(#[from] FirewallError),
     #[error("failed to install signal handler: {0}")]
     SignalHandler(String),
+    #[error("failed to open the events socket: {0}")]
+    EventsSocket(std::io::Error),
     #[error("failed to start DNS runtime: {0}")]
     DnsRuntimeStart(String),
 }
@@ -136,6 +143,7 @@ fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
     if let Some(socket) = args.opt_value_from_str::<_, String>("--docker-socket")? {
         config.docker_socket = socket;
     }
+    config.events_socket = args.opt_value_from_str::<_, PathBuf>("--events-socket")?;
     if let Some(action) = args.opt_value_from_str::<_, String>("--deny-action")? {
         config.deny_action = match action.as_str() {
             "reject" => DenyAction::Reject,
@@ -168,10 +176,11 @@ fn print_help() -> Result<(), std::io::Error> {
 portcullis prototype
 
 USAGE:
-  portcullis [--docker-socket <path>] [--deny-action <reject|drop>] [--dns-mode <lazy|proxy>] [--dns-proxy-bind <host:port>] [--log-level <error|warn|info|debug|trace>]
+  portcullis [--docker-socket <path>] [--events-socket <path>] [--deny-action <reject|drop>] [--dns-mode <lazy|proxy>] [--dns-proxy-bind <host:port>] [--log-level <error|warn|info|debug|trace>]
 
 OPTIONS:
   --docker-socket      Path to Docker Unix socket (default: /var/run/docker.sock)
+  --events-socket      Serve a JSON event stream on this Unix socket (mode 0600; off by default)
   --deny-action        Reject denied traffic with an ICMP error, or drop it silently
                        (default: reject)
   --dns-mode           DNS behavior mode: lazy or proxy (default: lazy)
@@ -191,21 +200,29 @@ fn apply_firewall(
     mode: DnsMode,
     state: &RuntimeState,
     dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
+    events: &mut EventSink,
 ) -> Result<(), MainError> {
     // Re-read on every update, so changes to the host's DNS configuration are picked up.
     let host_resolvers = host_dns::host_resolvers();
-    match mode {
+    let result = match mode {
         DnsMode::Lazy => {
             let mut resolver = CacheFallbackDnsResolver::new(dns_cache);
-            firewall
-                .apply(state, &mut resolver, &host_resolvers)
-                .map_err(MainError::Firewall)
+            firewall.apply(state, &mut resolver, &host_resolvers)
         }
         DnsMode::Proxy => {
             let mut resolver = CacheOnlyDnsResolver::new(dns_cache);
-            firewall
-                .apply(state, &mut resolver, &host_resolvers)
-                .map_err(MainError::Firewall)
+            firewall.apply(state, &mut resolver, &host_resolvers)
+        }
+    };
+    match result {
+        Ok(plan) => {
+            let sources: Vec<_> = plan.sources.iter().map(|source| source.address).collect();
+            events.applied(&sources, &plan.unresolved_hosts);
+            Ok(())
+        }
+        Err(error) => {
+            events.apply_failed(&error.to_string());
+            Err(MainError::Firewall(error))
         }
     }
 }
@@ -315,9 +332,19 @@ fn run(config: &Config) -> Result<(), MainError> {
     info!("performing startup firewall cleanup");
     firewall.cleanup()?;
 
+    let mut events = match &config.events_socket {
+        Some(path) => EventSink::bind(path).map_err(MainError::EventsSocket)?,
+        None => EventSink::default(),
+    };
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.initialize()?;
-    apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache)?;
+    apply_firewall(
+        &firewall,
+        config.dns_mode,
+        &runtime_state,
+        &mut dns_cache,
+        &mut events,
+    )?;
     info!("firewall rules applied");
     // Whether the installed rules reflect the current state and DNS cache.
     let mut rules_current = true;
@@ -382,12 +409,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                                 trace!("docker event produced no policy state changes");
                             }
                             Ok(true) => {
-                                let result = apply_firewall(
-                                    &firewall,
-                                    config.dns_mode,
-                                    &runtime_state,
-                                    &mut dns_cache,
-                                );
+                                let result = apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache, &mut events);
                                 rules_current = result.is_ok();
                                 if let Err(error) = result {
                                     error!(%error, "firewall apply failed; continuing");
@@ -409,12 +431,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                                 match monitor.initialize() {
                                     Ok(state) => {
                                         runtime_state = state;
-                                        let result = apply_firewall(
-                                            &firewall,
-                                            config.dns_mode,
-                                            &runtime_state,
-                                            &mut dns_cache,
-                                        );
+                                        let result = apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache, &mut events);
                                         rules_current = result.is_ok();
                                         if let Err(error) = result {
                                             error!(%error, "firewall apply failed after reconnect; continuing");
@@ -448,7 +465,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                     Ok(())
                 } else {
                     let result =
-                        apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache);
+                        apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache, &mut events);
                     rules_current = result.is_ok();
                     result
                 };
@@ -493,6 +510,7 @@ mod tests {
             config,
             Some(Config {
                 docker_socket: "/var/run/docker.sock".to_string(),
+                events_socket: None,
                 deny_action: DenyAction::Reject,
                 dns_mode: DnsMode::Lazy,
                 dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 1053)),
@@ -506,6 +524,8 @@ mod tests {
         let args = Arguments::from_vec(vec![
             "--docker-socket".into(),
             "/tmp/docker.sock".into(),
+            "--events-socket".into(),
+            "/run/portcullis.sock".into(),
             "--deny-action".into(),
             "drop".into(),
             "--dns-mode".into(),
@@ -520,6 +540,7 @@ mod tests {
             config,
             Some(Config {
                 docker_socket: "/tmp/docker.sock".to_string(),
+                events_socket: Some(PathBuf::from("/run/portcullis.sock")),
                 deny_action: DenyAction::Drop,
                 dns_mode: DnsMode::Proxy,
                 dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 5300)),

@@ -48,10 +48,28 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. On startup an
 | Option | Default | Description |
 |---|---|---|
 | `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
+| `--events-socket <path>` | off | Serve a stream of events on a Unix socket, see [Events](#events). |
 | `--deny-action <reject\|drop>` | `reject` | `reject` answers denied traffic with an ICMP "administratively prohibited" error, so applications fail immediately with "Host is unreachable". `drop` discards it silently, and applications wait for their own timeout. |
 | `--dns-mode <lazy\|proxy>` | `lazy` | How hostname rules get their addresses, see [Hostname rules](#hostname-rules). |
 | `--dns-proxy-bind <ip:port>` | `127.0.0.1:1053` | Where the DNS proxy listens in `proxy` mode. |
 | `--log-level <error\|warn\|info\|debug\|trace>` | `info` | `trace` logs every firewall script that gets applied. |
+
+### Events
+
+With `--events-socket <path>`, Portcullis serves a read-only stream of JSON lines on a Unix socket, for health checks, monitoring or tests that need to know when rules are in place. The socket is created with mode `0600`, so only its owner (normally root) can connect; change it with `chmod`/`chown` after startup if another user needs access. Without the option, no socket is created.
+
+A client first receives the current state, then one line per rule update:
+
+```json
+{"event":"applied","generation":12,"sources":["172.18.0.2","172.18.0.3"],"unresolved_hosts":[]}
+{"event":"apply_failed","error":"..."}
+```
+
+`sources` are the container addresses rules are in place for. `unresolved_hosts` are hostnames from `host:` rules that couldn't be resolved and currently allow nothing. After `apply_failed`, the previous rules stay in place.
+
+```bash
+sudo socat - UNIX-CONNECT:/run/portcullis.sock
+```
 
 ### Enforcing a network
 

@@ -123,12 +123,13 @@ where
         Self { runner, deny }
     }
 
+    /// Apply rules for `state`. Returns the plan that was applied.
     pub fn apply<Dns>(
         &self,
         state: &RuntimeState,
         resolver: &mut Dns,
         host_resolvers: &[IpAddr],
-    ) -> Result<(), FirewallError>
+    ) -> Result<Plan, FirewallError>
     where
         Dns: PolicyDnsResolver,
     {
@@ -143,7 +144,8 @@ where
 
         let mut script = String::with_capacity(plan.rule_count() * 64);
         render_apply_script(&plan, self.deny, &mut script)?;
-        self.runner.run_script(script)
+        self.runner.run_script(script)?;
+        Ok(plan)
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {

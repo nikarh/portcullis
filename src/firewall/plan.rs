@@ -151,6 +151,8 @@ pub struct Plan {
     pub host_sets: Vec<HostSet>,
     /// Subnets of enforced networks; unmanaged sources in them are dropped.
     pub enforced_subnets: Vec<IpNet>,
+    /// Hostnames that could not be resolved; their sets are empty.
+    pub unresolved_hosts: Vec<String>,
 }
 
 impl Plan {
@@ -401,6 +403,7 @@ where
             Ok(addresses) => addresses,
             Err(error) => {
                 error!(%host, %error, "failed to resolve hostname; its rules allow nothing until it resolves");
+                self.plan.unresolved_hosts.push(host.to_string());
                 Arc::from([])
             }
         };
@@ -713,6 +716,7 @@ mod tests {
     #[test]
     fn unresolvable_hostname_allows_nothing_but_keeps_the_rest() {
         let (plan, _) = build(&test_support::unresolvable_state());
+        assert_eq!(plan.unresolved_hosts, vec![test_support::UNRESOLVABLE_HOST]);
         let set = plan.host_set(0).expect("host set");
         assert!(set.addresses.is_empty());
         assert!(set.used_v4);
