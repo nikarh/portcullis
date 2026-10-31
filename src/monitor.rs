@@ -98,8 +98,8 @@ where
         }
         let mut containers_by_id = HashMap::new();
         for summary in containers {
-            let container = Self::build_container_from_summary(&networks_by_id, &summary)?;
-            containers_by_id.insert(summary.id.into(), container);
+            let container = Self::build_container_from_summary(&networks_by_id, summary)?;
+            containers_by_id.insert(container.id.clone(), container);
         }
         let mut state = RuntimeState::default();
         state.apply_action(RuntimeStateAction::Initialize {
@@ -139,9 +139,9 @@ where
                 DockerEventAction::Create | DockerEventAction::Update => {
                     self.inspect_network_action(&event.id)
                 }
-                DockerEventAction::Connect => self.resolve_network_connect_action(state, &event),
+                DockerEventAction::Connect => self.resolve_network_connect_action(state, event),
                 DockerEventAction::Disconnect => {
-                    Ok(Self::resolve_network_disconnect_action(state, &event))
+                    Ok(Self::resolve_network_disconnect_action(state, event))
                 }
                 _ => Ok(None),
             },
@@ -183,10 +183,13 @@ where
             });
         }
 
+        let id = ContainerId::from(inspect.id);
+
         Ok((
-            inspect.id.into(),
+            id.clone(),
             Box::new(Container {
-                name: inspect.name.trim_start_matches('/').to_string(),
+                id,
+                name: inspect.name.trim_start_matches('/').to_string().into(),
                 attachments,
                 runtime_dns_servers,
                 policy,
@@ -219,10 +222,12 @@ where
             return Ok(None);
         };
 
+        let id = ContainerId::from(event.id);
         Ok(Some(RuntimeStateAction::CreateContainer {
-            id: event.id.into(),
+            id: id.clone(),
             container: Box::new(Container {
-                name: name.trim_start_matches('/').to_string(),
+                id,
+                name: name.trim_start_matches('/').to_string().into(),
                 attachments: Vec::new(),
                 runtime_dns_servers: HashSet::new(),
                 policy,
@@ -233,14 +238,13 @@ where
     fn resolve_network_connect_action(
         &mut self,
         state: &RuntimeState,
-        event: &DockerEvent,
+        event: DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        if !state
-            .networks()
-            .contains_key(&NetworkId::from(event.id.as_str()))
-        {
+        let network_id = NetworkId::from(event.id);
+
+        if !state.networks().contains_key(&network_id) {
             trace!(
-                network_id = %event.id,
+                network_id = %network_id,
                 "network connect ignored for unmanaged network"
             );
             return Ok(None);
@@ -255,22 +259,24 @@ where
 
     fn resolve_network_disconnect_action(
         state: &RuntimeState,
-        event: &DockerEvent,
+        mut event: DockerEvent,
     ) -> Option<RuntimeStateAction> {
-        let container_id = event.attributes.get("container")?;
-        let container_id = ContainerId::from(container_id.as_str());
+        let container_id = event.attributes.swap_remove("container")?;
+        let container_id = ContainerId::from(container_id);
         let container = state.containers().get(&container_id)?;
+        let network_id = NetworkId::from(event.id);
+
         if !container
             .attachments
             .iter()
-            .any(|attachment| attachment.network_id == NetworkId::from(event.id.as_str()))
+            .any(|attachment| attachment.network_id == network_id)
         {
             return None;
         }
 
         Some(RuntimeStateAction::RemoveContainerAttachment {
             container_id,
-            network_id: event.id.as_str().into(),
+            network_id,
         })
     }
 
@@ -303,13 +309,13 @@ where
 
     fn build_container_from_summary(
         managed_networks: &HashMap<NetworkId, Network>,
-        summary: &DockerContainerSummary,
+        summary: DockerContainerSummary,
     ) -> Result<Container, MonitorError> {
         let policy = parse_policy(&summary.labels)?;
         let runtime_dns_servers = runtime_dns_servers(summary.host_config.as_ref());
 
         let mut attachments = Vec::new();
-        for (_, endpoint) in container_summary_network_endpoints(summary) {
+        for (_, endpoint) in container_summary_network_endpoints(&summary) {
             let Some(ip_address) = endpoint.ip_address else {
                 continue;
             };
@@ -333,8 +339,10 @@ where
             });
         }
 
+        let name = container_summary_name(&summary).into();
         Ok(Container {
-            name: container_summary_name(summary),
+            id: summary.id.into(),
+            name,
             attachments,
             runtime_dns_servers,
             policy,
@@ -644,7 +652,7 @@ mod tests {
 
     fn add_container(state: &mut RuntimeState, id: &str, container: Container) {
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: id.into(),
+            id: id.to_string().into(),
             container: Box::new(container),
         });
     }
@@ -793,7 +801,8 @@ mod tests {
             &mut state,
             "abc",
             Container {
-                name: "web".to_string(),
+                id: "abc".to_string().into(),
+                name: "web".to_string().into(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: "172.20.0.2".parse().expect("valid ip"),

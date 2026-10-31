@@ -4,11 +4,12 @@ use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use ipnet::IpNet;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ContainerId(String);
+pub struct ContainerId(Arc<String>);
 
 impl ContainerId {
     #[must_use]
@@ -25,13 +26,7 @@ impl fmt::Display for ContainerId {
 
 impl From<String> for ContainerId {
     fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for ContainerId {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
+        Self(Arc::new(value))
     }
 }
 
@@ -42,6 +37,42 @@ impl Borrow<str> for ContainerId {
 }
 
 impl Deref for ContainerId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ContainerName(Arc<String>);
+
+impl ContainerName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ContainerName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<String> for ContainerName {
+    fn from(value: String) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl Borrow<str> for ContainerName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for ContainerName {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -117,7 +148,7 @@ pub struct EgressRule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IccAllowRule {
-    pub target_container: ContainerId,
+    pub target_container: ContainerName,
     pub ports: Vec<PortSpec>,
 }
 
@@ -185,7 +216,8 @@ impl Network {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Container {
-    pub name: String,
+    pub id: ContainerId,
+    pub name: ContainerName,
     pub attachments: Vec<NetworkAttachment>,
     pub runtime_dns_servers: HashSet<IpAddr>,
     pub policy: ContainerPolicy,
@@ -196,7 +228,7 @@ pub struct RuntimeState {
     containers: HashMap<ContainerId, Container>,
     networks: HashMap<NetworkId, Network>,
 
-    containers_by_name: HashMap<String, ContainerId>,
+    containers_by_name: HashMap<ContainerName, ContainerId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,10 +328,11 @@ impl RuntimeState {
                 let Some(container) = self.containers.get_mut(&container_id) else {
                     return false;
                 };
-                if container.name == name {
+                if container.name.as_str() == name {
                     return false;
                 }
-                let previous_name = std::mem::replace(&mut container.name, name);
+                let previous_name =
+                    std::mem::replace(&mut container.name, ContainerName::from(name));
 
                 self.containers_by_name.remove(previous_name.as_str());
                 self.containers_by_name

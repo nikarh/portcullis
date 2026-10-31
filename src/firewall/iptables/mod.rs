@@ -699,9 +699,10 @@ mod tests {
             gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
         });
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "abc".into(),
+            id: "abc".to_string().into(),
             container: Box::new(Container {
-                name: "web".to_string(),
+                id: "abc".to_string().into(),
+                name: "web".to_string().into(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: source_ip,
@@ -727,7 +728,7 @@ mod tests {
     }
 
     fn update_container(state: &mut RuntimeState, id: &str, apply: impl FnOnce(&mut Container)) {
-        let id = ContainerId::from(id);
+        let id = ContainerId::from(id.to_string());
         let mut container = state
             .containers()
             .get(&id)
@@ -777,9 +778,10 @@ mod tests {
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "peer".into(),
+            id: "peer".to_string().into(),
             container: Box::new(Container {
-                name: "/peer".to_string(),
+                id: "peer".to_string().into(),
+                name: "/peer".to_string().into(),
                 attachments: vec![
                     NetworkAttachment {
                         network_id: "net0".into(),
@@ -805,7 +807,7 @@ mod tests {
         update_container(&mut state, "abc", |container| {
             container.policy.icc_mode = IccMode::AllowListed;
             container.policy.icc_allow = vec![crate::model::IccAllowRule {
-                target_container: "/peer".into(),
+                target_container: "/peer".to_string().into(),
                 ports: vec![PortSpec {
                     protocol: Protocol::Tcp,
                     port: 5432,
@@ -842,9 +844,10 @@ mod tests {
     fn build_commands_adds_icc_allow_for_same_network_container_ips() {
         let mut state = sample_state();
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "peer".into(),
+            id: "peer".to_string().into(),
             container: Box::new(Container {
-                name: "peer".to_string(),
+                id: "peer".to_string().into(),
+                name: "peer".to_string().into(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: "172.18.0.10".parse().expect("peer ip should parse"),

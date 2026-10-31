@@ -200,7 +200,7 @@ fn parse_icc_allow_value(key: &str, value: &str) -> Result<IccAllowRule, LabelPa
 
     let ports = parse_ports(key, port_parts)?;
     Ok(IccAllowRule {
-        target_container: target.into(),
+        target_container: target.to_string().into(),
         ports,
     })
 }
@@ -262,7 +262,10 @@ mod tests {
             EgressTarget::Hostname("api.example.com".to_string())
         );
         assert_eq!(parsed.icc_allow.len(), 1);
-        assert_eq!(parsed.icc_allow[0].target_container, "db".into());
+        assert_eq!(
+            parsed.icc_allow[0].target_container,
+            "db".to_string().into()
+        );
         assert_eq!(parsed.icc_allow[0].ports[0].port, 5432);
         assert_eq!(parsed.dns_targets, vec![DnsTarget::Docker]);
     }
@@ -366,7 +369,10 @@ mod tests {
 
         assert_eq!(parsed.icc_mode, IccMode::AllowListed);
         assert_eq!(parsed.icc_allow.len(), 1);
-        assert_eq!(parsed.icc_allow[0].target_container, "redis".into());
+        assert_eq!(
+            parsed.icc_allow[0].target_container,
+            "redis".to_string().into()
+        );
     }
 
     #[test]

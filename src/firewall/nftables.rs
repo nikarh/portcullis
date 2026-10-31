@@ -355,7 +355,7 @@ fn collect_container_targets(snapshot: &RuntimeState) -> HashMap<String, Vec<IpA
     let mut by_key: HashMap<String, BTreeSet<IpAddr>> = HashMap::new();
 
     for (id, container) in snapshot.containers() {
-        let mut keys = vec![id.to_string(), container.name.clone()];
+        let mut keys = vec![id.to_string(), container.name.to_string()];
         for attachment in &container.attachments {
             for alias in &attachment.aliases {
                 keys.push(alias.clone());
@@ -642,9 +642,10 @@ mod common_tests {
             gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
         });
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "abc".into(),
+            id: "abc".to_string().into(),
             container: Box::new(Container {
-                name: "web".to_string(),
+                id: "abc".to_string().into(),
+                name: "web".to_string().into(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: source_ip,
@@ -669,7 +670,7 @@ mod common_tests {
     }
 
     fn update_container(state: &mut RuntimeState, id: &str, apply: impl FnOnce(&mut Container)) {
-        let id = ContainerId::from(id);
+        let id = ContainerId::from(id.to_string());
         let mut container = state
             .containers()
             .get(&id)
@@ -718,9 +719,10 @@ mod common_tests {
             Err(error) => panic!("failed to parse peer ip: {error}"),
         };
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "peer".into(),
+            id: "peer".to_string().into(),
             container: Box::new(Container {
-                name: "/peer".to_string(),
+                id: "peer".to_string().into(),
+                name: "/peer".to_string().into(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: peer_ip,
@@ -734,7 +736,7 @@ mod common_tests {
         update_container(&mut state, "abc", |container| {
             container.policy.icc_mode = crate::model::IccMode::AllowListed;
             container.policy.icc_allow = vec![crate::model::IccAllowRule {
-                target_container: "peer".into(),
+                target_container: "peer".to_string().into(),
                 ports: vec![PortSpec {
                     protocol: Protocol::Tcp,
                     port: 5432,
@@ -1218,9 +1220,10 @@ mod firewall_tests {
             gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
         });
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "abc".into(),
+            id: "abc".to_string().into(),
             container: Box::new(Container {
-                name: "web".to_string(),
+                id: "abc".to_string().into(),
+                name: "web".to_string().into(),
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: attachment_ip,
