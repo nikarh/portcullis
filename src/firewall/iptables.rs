@@ -308,6 +308,11 @@ fn render_iptables_script(
 ) -> fmt::Result {
     out.push_str("*filter\n");
     writeln!(out, "-F {chain}")?;
+    // Policy applies to new connections only; replies and established flows skip it.
+    writeln!(
+        out,
+        "-A {chain} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
+    )?;
     for rule in &plan.rules {
         render_rule(plan, rule, chain, use_ipset, out)?;
     }
@@ -530,7 +535,9 @@ mod tests {
         ] {
             assert!(has_line(&script, expected), "missing line: {expected}");
         }
-        assert!(script.starts_with("*filter\n-F PORTCULLIS_EGRESS\n"));
+        assert!(script.starts_with(
+            "*filter\n-F PORTCULLIS_EGRESS\n-A PORTCULLIS_EGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n"
+        ));
         assert!(script.ends_with("COMMIT\n"));
     }
 

@@ -87,6 +87,8 @@ fn render_apply_script(plan: &Plan, out: &mut String) -> fmt::Result {
         out,
         "add chain {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority {FORWARD_HOOK_PRIORITY}; policy accept; }}"
     )?;
+    // Policy applies to new connections only; replies and established flows skip it.
+    writeln!(out, "{PREFIX} ct state established,related accept")?;
 
     for set in &plan.host_sets {
         if set.used_v4 {
@@ -607,6 +609,7 @@ add table inet portcullis
 delete table inet portcullis
 add table inet portcullis
 add chain inet portcullis egress { type filter hook forward priority -1; policy accept; }
+add rule inet portcullis egress ct state established,related accept
 "
         ));
     }
