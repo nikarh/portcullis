@@ -16,7 +16,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
-use tracing::debug;
+use tracing::warn;
 
 use crate::model::{BridgePort, RuntimeState};
 
@@ -168,9 +168,12 @@ pub fn container_ports(state: &RuntimeState) -> io::Result<HashMap<IpAddr, Bridg
         };
         let namespace = match socket.namespace_id(Path::new(sandbox)) {
             Ok(Some(namespace)) => namespace,
-            Ok(None) => continue,
+            Ok(None) => {
+                warn!(container = %container.name, "the container's network namespace has no ID here; checking its traffic by address and MAC only");
+                continue;
+            }
             Err(error) => {
-                debug!(container = %container.name, %error, "can't identify the container's network namespace");
+                warn!(container = %container.name, %error, "can't identify the container's network namespace; checking its traffic by address and MAC only");
                 continue;
             }
         };
@@ -181,15 +184,22 @@ pub fn container_ports(state: &RuntimeState) -> io::Result<HashMap<IpAddr, Bridg
             let Some(bridge) = links.iter().find(|link| link.name == network.bridge) else {
                 continue;
             };
-            if let Some(port) = links.iter().find(|link| {
+            let port = links.iter().find(|link| {
                 link.master == Some(bridge.index) && link.peer_namespace == Some(namespace)
-            }) {
+            });
+            if let Some(port) = port {
                 ports.insert(
                     attachment.ip_address,
                     BridgePort {
                         name: port.name.clone(),
                         index: port.index,
                     },
+                );
+            } else {
+                warn!(
+                    container = %container.name,
+                    bridge = %network.bridge,
+                    "can't find the container's port on the bridge; checking its traffic by address and MAC only"
                 );
             }
         }
