@@ -168,6 +168,10 @@ where
                     Ok(inspect) => {
                         container.runtime_dns_servers =
                             runtime_dns_servers(inspect.host_config.as_ref());
+                        container.sandbox = inspect
+                            .network_settings
+                            .and_then(|settings| settings.sandbox_key)
+                            .filter(|key| !key.is_empty());
                     }
                     Err(error) => {
                         debug!(container = %container.name, %error, "failed to inspect container");
@@ -262,12 +266,18 @@ where
             });
         }
 
+        let sandbox = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.sandbox_key.clone())
+            .filter(|key| !key.is_empty());
         Ok(Box::new(Container {
             id: inspect.id.into(),
             name: inspect.name.trim_start_matches('/').to_string().into(),
             attachments,
             runtime_dns_servers,
             policy,
+            sandbox,
         }))
     }
 
@@ -307,6 +317,7 @@ where
                 attachments: Vec::new(),
                 runtime_dns_servers: HashSet::new(),
                 policy,
+                sandbox: None,
             }),
         })
     }
@@ -418,6 +429,7 @@ where
             attachments,
             runtime_dns_servers,
             policy,
+            sandbox: None,
         }
     }
 }
@@ -700,6 +712,7 @@ mod tests {
             host_config: None,
             network_settings: Some(DockerNetworkSettings {
                 networks: Some(network_map),
+                sandbox_key: Some("/var/run/docker/netns/abc".to_string()),
             }),
         }
     }
@@ -893,6 +906,7 @@ mod tests {
                 }],
                 runtime_dns_servers: HashSet::new(),
                 policy: crate::model::ContainerPolicy::default(),
+                sandbox: None,
             },
         );
 

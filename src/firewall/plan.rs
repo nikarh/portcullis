@@ -28,8 +28,8 @@ use tracing::{error, trace};
 
 use crate::dns::{HostResolver, normalize};
 use crate::model::{
-    Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule, IccMode, MacAddress,
-    NetworkAttachment, Protocol, RuntimeState,
+    BridgePort, Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule, IccMode,
+    MacAddress, NetworkAttachment, Protocol, RuntimeState,
 };
 
 pub const DNS_PORT: u16 = 53;
@@ -96,6 +96,9 @@ pub struct Source {
     /// The container's MAC address on the network the address belongs to. Packets from the
     /// address are only accepted with this MAC, so containers can't borrow others' addresses.
     pub mac: Option<MacAddress>,
+    /// The container's port on the network's bridge. Packets from the address are only
+    /// accepted from this port, so not even a copied MAC passes.
+    pub port: Option<BridgePort>,
     /// Range into [`Plan::rules`] of rules for traffic leaving the network.
     egress: Range<usize>,
     /// Range into [`Plan::rules`] of rules for traffic to containers on the same network.
@@ -383,6 +386,7 @@ where
                 .unwrap_or_default(),
             monitor: self.monitor_all || network.is_some_and(|network| network.monitor),
             mac: attachment.mac_address,
+            port: self.state.port(source).cloned(),
             egress,
             icc,
         });

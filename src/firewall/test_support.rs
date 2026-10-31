@@ -109,6 +109,7 @@ pub fn add_container(
                 .collect(),
             runtime_dns_servers: HashSet::new(),
             policy,
+            sandbox: None,
         }),
     });
 }

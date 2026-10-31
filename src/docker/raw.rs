@@ -67,6 +67,8 @@ pub struct DockerHostConfig {
 pub struct DockerNetworkSettings {
     #[serde(rename = "Networks")]
     pub networks: Option<BTreeMap<String, DockerEndpoint>>,
+    #[serde(rename = "SandboxKey", default)]
+    pub sandbox_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

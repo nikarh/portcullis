@@ -24,6 +24,8 @@ pub struct SourceInfo {
     pub container: String,
     pub network: String,
     pub mac: Option<MacAddress>,
+    /// Interface index of the container's bridge port, where known.
+    pub port: Option<u32>,
     /// The container's network is in monitor mode.
     pub monitor: bool,
 }
@@ -55,6 +57,7 @@ impl Directory {
                 container: source.container.to_string(),
                 network: source.network.clone(),
                 mac: source.mac,
+                port: source.port.as_ref().map(|port| port.index),
                 monitor: source.monitor,
             };
             if let Some(mac) = source.mac {

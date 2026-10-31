@@ -13,6 +13,7 @@ mod logging;
 mod model;
 mod monitor;
 mod nfnetlink;
+mod rtnetlink;
 mod source_hold;
 mod tools;
 
@@ -29,7 +30,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, select, unbounded};
 use pico_args::Arguments;
 use thiserror::Error;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
@@ -337,6 +338,11 @@ impl Applier {
         // Re-read on every update, so changes to the host's DNS configuration are picked up.
         let host_resolvers = host_dns::host_resolvers();
         state.set_daemon_dns(host_dns::docker_daemon_dns());
+        let ports = rtnetlink::container_ports(state).unwrap_or_else(|error| {
+            warn!(%error, "can't find containers' bridge ports; checking their traffic by address and MAC only");
+            HashMap::new()
+        });
+        state.set_ports(ports);
         let state = &*state;
         let result = {
             let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);

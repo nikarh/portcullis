@@ -17,10 +17,10 @@ use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_NETFILTER};
 
 use crate::model::MacAddress;
 
-const NLMSG_HDRLEN: usize = 16;
+pub(crate) const NLMSG_HDRLEN: usize = 16;
 const NFGENMSG_LEN: usize = 4;
-const NLMSG_ERROR: u16 = 2;
-const NLM_F_REQUEST: u16 = 1;
+pub(crate) const NLMSG_ERROR: u16 = 2;
+pub(crate) const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
@@ -58,6 +58,7 @@ const NFQNL_COPY_PACKET: u8 = 2;
 const NFQA_PACKET_HDR: u16 = 1;
 const NFQA_VERDICT_HDR: u16 = 2;
 const NFQA_MARK: u16 = 3;
+const NFQA_IFINDEX_PHYSINDEV: u16 = 7;
 const NFQA_HWADDR: u16 = 9;
 const NFQA_PAYLOAD: u16 = 10;
 
@@ -118,6 +119,8 @@ pub struct LoggedPacket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedPacket {
     pub id: u32,
+    /// For packets queued from the bridge table: the bridge port the frame came in on.
+    pub physindev: Option<u32>,
     /// Source MAC address of the frame, when the kernel knows it.
     pub hwaddr: Option<MacAddress>,
     /// The packet, starting at the IP header.
@@ -321,11 +324,13 @@ fn parse_queued(buffer: &[u8]) -> Vec<QueuedPacket> {
         .filter(|message| message.message_type == (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_PACKET)
         .filter_map(|message| {
             let mut id = None;
+            let mut physindev = None;
             let mut hwaddr = None;
             let mut payload = Vec::new();
             for (kind, value) in attributes(message.body.get(NFGENMSG_LEN..)?) {
                 match kind {
                     NFQA_PACKET_HDR => id = be_u32(value),
+                    NFQA_IFINDEX_PHYSINDEV => physindev = be_u32(value),
                     NFQA_HWADDR => hwaddr = hardware_address(value),
                     NFQA_PAYLOAD => payload = value.to_vec(),
                     _ => {}
@@ -333,6 +338,7 @@ fn parse_queued(buffer: &[u8]) -> Vec<QueuedPacket> {
             }
             Some(QueuedPacket {
                 id: id?,
+                physindev,
                 hwaddr,
                 payload,
             })
@@ -356,7 +362,7 @@ fn be_u32(value: &[u8]) -> Option<u32> {
 }
 
 /// The error code of an `NLMSG_ERROR` message; 0 is an acknowledgement.
-fn ack_error(body: &[u8]) -> i32 {
+pub(crate) fn ack_error(body: &[u8]) -> i32 {
     body.get(..4)
         .and_then(|bytes| bytes.try_into().ok())
         .map_or(-libc_eproto(), i32::from_ne_bytes)
@@ -366,7 +372,7 @@ const fn libc_eproto() -> i32 {
     71
 }
 
-const fn align4(length: usize) -> usize {
+pub(crate) const fn align4(length: usize) -> usize {
     (length + 3) & !3
 }
 
@@ -391,7 +397,7 @@ fn encode(
     message
 }
 
-fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
+pub(crate) fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
     let length = 4 + value.len();
     let mut attribute = Vec::with_capacity(align4(length));
     attribute.extend_from_slice(&u16::try_from(length).unwrap_or(u16::MAX).to_ne_bytes());
@@ -401,13 +407,13 @@ fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
     attribute
 }
 
-struct Message<'a> {
-    message_type: u16,
-    sequence: u32,
-    body: &'a [u8],
+pub(crate) struct Message<'a> {
+    pub message_type: u16,
+    pub sequence: u32,
+    pub body: &'a [u8],
 }
 
-fn messages(mut buffer: &[u8]) -> impl Iterator<Item = Message<'_>> {
+pub(crate) fn messages(mut buffer: &[u8]) -> impl Iterator<Item = Message<'_>> {
     std::iter::from_fn(move || {
         let header = buffer.get(..NLMSG_HDRLEN)?;
         let length = u32::from_ne_bytes(header.get(..4)?.try_into().ok()?) as usize;
@@ -423,7 +429,7 @@ fn messages(mut buffer: &[u8]) -> impl Iterator<Item = Message<'_>> {
     })
 }
 
-fn attributes(mut buffer: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+pub(crate) fn attributes(mut buffer: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     std::iter::from_fn(move || {
         let length = usize::from(u16::from_ne_bytes(buffer.get(..2)?.try_into().ok()?));
         let kind = u16::from_ne_bytes(buffer.get(2..4)?.try_into().ok()?) & NLA_TYPE_MASK;
@@ -613,6 +619,7 @@ pub mod tests {
         let mut header = 42_u32.to_be_bytes().to_vec();
         header.extend_from_slice(&[0x08, 0x00, 2]);
         let mut attributes = attribute(NFQA_PACKET_HDR, &header);
+        attributes.extend(attribute(NFQA_IFINDEX_PHYSINDEV, &5_u32.to_be_bytes()));
         attributes.extend(attribute(
             NFQA_HWADDR,
             &[0, 6, 0, 0, 2, 0x42, 0xac, 0x12, 0, 2, 0, 0],
@@ -630,6 +637,7 @@ pub mod tests {
             parse_queued(&buffer),
             vec![QueuedPacket {
                 id: 42,
+                physindev: Some(5),
                 hwaddr: Some(MacAddress::new([2, 0x42, 0xac, 0x12, 0, 2])),
                 payload: b"packet".to_vec()
             }]

@@ -1,12 +1,12 @@
 //! Holds packets from sources the rules don't know yet, instead of denying them.
 //!
 //! A container can start sending before Portcullis has seen it start and applied rules for
-//! it. Those first packets come from an address and MAC the rules don't know, which looks
+//! it. Those first packets come from an address, MAC and bridge port the rules don't know, which looks
 //! the same as a spoofed source. Docker also hands the address of a removed container to
 //! the next one at once, with a new MAC. The bridge table queues them (NFQUEUE) instead of denying them, and
 //! this module holds them:
 //!
-//! - once a rule update makes the source (address and MAC) known, a packet is replayed (`NF_REPEAT`): the
+//! - once a rule update makes the source (address, MAC and port) known, a packet is replayed (`NF_REPEAT`): the
 //!   kernel runs it through the rules again, now with the container's own chain, and it is
 //!   allowed or denied as if the rules had been there from the start;
 //! - if the source is still unknown after a grace period, the packet is replayed with a
@@ -39,6 +39,7 @@ struct Held {
     /// `None` when the packet couldn't be parsed.
     source: Option<IpAddr>,
     mac: Option<MacAddress>,
+    port: Option<u32>,
     deadline: Instant,
 }
 
@@ -81,6 +82,7 @@ pub fn spawn(queue: u16, grace: Duration, directory: Arc<Directory>) -> io::Resu
                     source:
                         Ipv4Packet::parse(&packet.payload).map(|parsed| IpAddr::V4(parsed.source)),
                     mac: packet.hwaddr,
+                    port: packet.physindev,
                     deadline: now + grace,
                 }));
             // The rules may already know the source.
@@ -102,11 +104,15 @@ pub fn spawn(queue: u16, grace: Duration, directory: Arc<Directory>) -> io::Resu
             }
             let verdicts = {
                 let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
-                release(&mut pending, Instant::now(), |source, mac| {
-                    // The rules check the MAC only when Docker reported one.
-                    directory
-                        .source(source)
-                        .is_some_and(|info| info.mac.is_none() || info.mac == mac)
+                release(&mut pending, Instant::now(), |held| {
+                    // The rules check the MAC only when Docker reported one, and the port
+                    // only where Portcullis found it.
+                    held.source
+                        .and_then(|source| directory.source(source))
+                        .is_some_and(|info| {
+                            (info.mac.is_none() || info.mac == held.mac)
+                                && (info.port.is_none() || info.port == held.port)
+                        })
                 })
             };
             for (id, verdict) in verdicts {
@@ -126,11 +132,11 @@ pub fn spawn(queue: u16, grace: Duration, directory: Arc<Directory>) -> io::Resu
 fn release(
     pending: &mut Vec<Held>,
     now: Instant,
-    known: impl Fn(IpAddr, Option<MacAddress>) -> bool,
+    known: impl Fn(&Held) -> bool,
 ) -> Vec<(u32, QueueVerdict)> {
     let mut verdicts = Vec::new();
     pending.retain(|held| {
-        let verdict = if held.source.is_some_and(|source| known(source, held.mac)) {
+        let verdict = if known(held) {
             QueueVerdict::Repeat { mark: None }
         } else if held.source.is_none() || now >= held.deadline {
             QueueVerdict::Repeat {
@@ -162,16 +168,20 @@ mod tests {
                 id: 1,
                 source: Some(ip("172.18.0.2")),
                 mac: None,
+                port: None,
                 deadline,
             },
             Held {
                 id: 2,
                 source: Some(ip("172.18.0.3")),
                 mac: None,
+                port: None,
                 deadline,
             },
         ];
-        let verdicts = release(&mut pending, now, |source, _| source == ip("172.18.0.2"));
+        let verdicts = release(&mut pending, now, |held| {
+            held.source == Some(ip("172.18.0.2"))
+        });
         assert_eq!(verdicts, vec![(1, QueueVerdict::Repeat { mark: None })]);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.first().map(|held| held.id), Some(2));
@@ -185,19 +195,21 @@ mod tests {
                 id: 1,
                 source: Some(ip("10.99.0.5")),
                 mac: None,
+                port: None,
                 deadline: now,
             },
             Held {
                 id: 2,
                 source: None,
                 mac: None,
+                port: None,
                 deadline: now + Duration::from_secs(3),
             },
         ];
         let expired = QueueVerdict::Repeat {
             mark: Some(HOLD_EXPIRED_MARK),
         };
-        let verdicts = release(&mut pending, now, |_, _| false);
+        let verdicts = release(&mut pending, now, |_| false);
         assert_eq!(verdicts, vec![(1, expired), (2, expired)]);
         assert!(pending.is_empty());
     }

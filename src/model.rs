@@ -281,6 +281,15 @@ pub struct Container {
     pub attachments: Vec<NetworkAttachment>,
     pub runtime_dns_servers: HashSet<IpAddr>,
     pub policy: ContainerPolicy,
+    /// The container's network namespace, as a file (Docker's `SandboxKey`), while it runs.
+    pub sandbox: Option<String>,
+}
+
+/// A container's port on a bridge: the host side of its veth pair.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BridgePort {
+    pub name: String,
+    pub index: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -289,6 +298,8 @@ pub struct RuntimeState {
     networks: HashMap<NetworkId, Network>,
     /// DNS servers set daemon-wide in Docker's `daemon.json`.
     daemon_dns: Vec<IpAddr>,
+    /// Bridge port of each container address, where known.
+    ports: HashMap<IpAddr, BridgePort>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +349,16 @@ impl RuntimeState {
 
     pub fn set_daemon_dns(&mut self, servers: Vec<IpAddr>) {
         self.daemon_dns = servers;
+    }
+
+    /// The bridge port the container with `address` sends from, where known.
+    #[must_use]
+    pub fn port(&self, address: IpAddr) -> Option<&BridgePort> {
+        self.ports.get(&address)
+    }
+
+    pub fn set_ports(&mut self, ports: HashMap<IpAddr, BridgePort>) {
+        self.ports = ports;
     }
 
     fn remove_network(&mut self, network_id: &NetworkId) -> bool {

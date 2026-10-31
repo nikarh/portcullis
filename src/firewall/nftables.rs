@@ -682,41 +682,7 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
     )?;
     writeln!(out, "add rule {base} ether type != ip accept")?;
 
-    let verdict = |index: usize, source: &Source| {
-        if icc_chain_needed(plan, source, options) {
-            Verdict::Goto(Chain::Icc(index))
-        } else {
-            Verdict::Accept
-        }
-    };
-    let ipv4 = || {
-        plan.sources
-            .iter()
-            .enumerate()
-            .filter(|(_, source)| source.address.is_ipv4())
-    };
-    render_elements(
-        out,
-        format_args!("add rule {base} ip saddr . ether saddr vmap"),
-        ipv4().filter_map(|(index, source)| {
-            let mac = source.mac?;
-            Some(Dispatch(
-                format_args!("{} . {mac}", source.address).to_string(),
-                verdict(index, source),
-            ))
-        }),
-        "",
-    )?;
-    // Docker always reports a MAC for bridge endpoints; without one, only the address is
-    // checked.
-    render_elements(
-        out,
-        format_args!("add rule {base} ip saddr vmap"),
-        ipv4()
-            .filter(|(_, source)| source.mac.is_none())
-            .map(|(index, source)| Dispatch(source.address, verdict(index, source))),
-        "",
-    )?;
+    render_known_sources(out, plan, options, base)?;
     let bridges = |monitor: bool| {
         set_literal(
             plan.bridges
@@ -758,6 +724,69 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
     writeln!(
         out,
         "add rule {base} meta ibrname {enforced} ether type ip queue num {queue}"
+    )
+}
+
+/// Send frames from managed containers' own address, MAC and port to their ICC rules.
+fn render_known_sources(
+    out: &mut String,
+    plan: &Plan,
+    options: Options,
+    base: Chain,
+) -> fmt::Result {
+    let verdict = |index: usize, source: &Source| {
+        if icc_chain_needed(plan, source, options) {
+            Verdict::Goto(Chain::Icc(index))
+        } else {
+            Verdict::Accept
+        }
+    };
+    let ipv4 = || {
+        plan.sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| source.address.is_ipv4())
+    };
+    // A container's address and MAC, from its own port on the bridge. A raw socket is
+    // enough to send with another container's address and MAC, but not from its port.
+    render_elements(
+        out,
+        format_args!("add rule {base} iifname . ip saddr . ether saddr vmap"),
+        ipv4().filter_map(|(index, source)| {
+            let mac = source.mac?;
+            let port = source.port.as_ref()?;
+            Some(Dispatch(
+                format_args!("{} . {} . {mac}", Quoted(&port.name), source.address).to_string(),
+                verdict(index, source),
+            ))
+        }),
+        "",
+    )?;
+    // Where the port isn't known, only the address and MAC.
+    render_elements(
+        out,
+        format_args!("add rule {base} ip saddr . ether saddr vmap"),
+        ipv4().filter_map(|(index, source)| {
+            let mac = source.mac?;
+            if source.port.is_some() {
+                return None;
+            }
+            Some(Dispatch(
+                format_args!("{} . {mac}", source.address).to_string(),
+                verdict(index, source),
+            ))
+        }),
+        "",
+    )?;
+    // Docker always reports a MAC for bridge endpoints; without one, only the address is
+    // checked.
+    render_elements(
+        out,
+        format_args!("add rule {base} ip saddr vmap"),
+        ipv4()
+            .filter(|(_, source)| source.mac.is_none())
+            .map(|(index, source)| Dispatch(source.address, verdict(index, source))),
+        "",
     )
 }
 
@@ -1545,6 +1574,43 @@ flush chain bridge portcullis icc0
             flushed,
             [[false, false], [true, true], [false, false]],
             "{scripts:#?}"
+        );
+    }
+
+    #[test]
+    fn binds_sources_to_their_bridge_port() {
+        let mut state = test_support::icc_state();
+        state.set_ports(
+            [(
+                test_support::ip("172.18.0.2"),
+                crate::model::BridgePort {
+                    name: "veth0a1b2c3".to_string(),
+                    index: 9,
+                },
+            )]
+            .into(),
+        );
+        let script = render(&state);
+        let line = |prefix: &str| {
+            script
+                .lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_default()
+                .to_string()
+        };
+        // web's address and MAC only count from its own port...
+        assert!(
+            line("add rule bridge portcullis prerouting iifname . ip saddr . ether saddr vmap")
+                .contains("\"veth0a1b2c3\" . 172.18.0.2 . 02:42:ac:12:00:02 : goto icc"),
+            "{script}"
+        );
+        // ...and not without it; containers whose port isn't known are checked by address
+        // and MAC.
+        let by_mac = line("add rule bridge portcullis prerouting ip saddr . ether saddr vmap");
+        assert!(!by_mac.contains("172.18.0.2 "), "{script}");
+        assert!(
+            by_mac.contains("172.18.0.3 . 02:42:ac:12:00:03"),
+            "{script}"
         );
     }
 
