@@ -10,7 +10,8 @@
 //! 2. a packet whose source is a managed address is checked against that source's rules,
 //!    first match wins: ICC rules for traffic to containers on the same network (bridged),
 //!    egress rules for everything else (routed), which end with an implicit deny;
-//! 3. any other routed packet from an enforced subnet is denied;
+//! 3. any other packet entering from an enforced network's bridge is denied: unknown or
+//!    spoofed source addresses, and managed addresses sent with another container's MAC;
 //! 4. everything else passes.
 //!
 //! "Pass" and "accept" only mean that this policy doesn't drop the packet; Docker's own
@@ -27,8 +28,8 @@ use tracing::{error, trace};
 
 use crate::dns::PolicyDnsResolver;
 use crate::model::{
-    Container, DnsTarget, EgressTarget, IccAllowRule, IccMode, NetworkAttachment, Protocol,
-    RuntimeState,
+    Container, DnsTarget, EgressTarget, IccAllowRule, IccMode, MacAddress, NetworkAttachment,
+    Protocol, RuntimeState,
 };
 
 pub const DNS_PORT: u16 = 53;
@@ -70,6 +71,9 @@ pub enum Rule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub address: IpAddr,
+    /// The container's MAC address on the network the address belongs to. Packets from the
+    /// address are only accepted with this MAC, so containers can't borrow others' addresses.
+    pub mac: Option<MacAddress>,
     /// Range into [`Plan::rules`] of rules for traffic leaving the network.
     egress: Range<usize>,
     /// Range into [`Plan::rules`] of rules for traffic to containers on the same network.
@@ -149,8 +153,9 @@ pub struct Plan {
     rules: Vec<Rule>,
     /// Hostname sets, one per distinct hostname.
     pub host_sets: Vec<HostSet>,
-    /// Subnets of enforced networks; unmanaged sources in them are dropped.
-    pub enforced_subnets: Vec<IpNet>,
+    /// Bridge interfaces of enforced networks. Traffic entering from them with a source
+    /// that isn't a managed address (and MAC) is denied.
+    pub enforced_bridges: Vec<String>,
     /// Hostnames that could not be resolved; their sets are empty.
     pub unresolved_hosts: Vec<String>,
 }
@@ -179,10 +184,13 @@ impl Plan {
             }
         }
 
-        planner
-            .plan
-            .enforced_subnets
-            .extend(state.networks().values().map(|network| network.subnet));
+        planner.plan.enforced_bridges.extend(
+            state
+                .networks()
+                .values()
+                .map(|network| network.bridge.clone()),
+        );
+        planner.plan.enforced_bridges.sort_unstable();
 
         planner.plan
     }
@@ -303,6 +311,7 @@ where
 
         self.plan.sources.push(Source {
             address: source,
+            mac: attachment.mac_address,
             egress,
             icc,
         });
@@ -542,7 +551,7 @@ mod tests {
                 Rule::DenyNet(net("172.18.0.0/16"))
             ]
         );
-        assert_eq!(plan.enforced_subnets, vec![net("172.18.0.0/16")]);
+        assert_eq!(plan.enforced_bridges, vec!["br-net0".to_string()]);
     }
 
     fn dns_destinations(state: &RuntimeState, host_resolvers: &[IpAddr]) -> Vec<IpAddr> {
@@ -731,6 +740,6 @@ mod tests {
             protocol: Protocol::Tcp,
             port: 853,
         }));
-        assert_eq!(plan.enforced_subnets, vec![net("172.18.0.0/16")]);
+        assert_eq!(plan.enforced_bridges, vec!["br-net0".to_string()]);
     }
 }

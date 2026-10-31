@@ -13,8 +13,8 @@ use crate::docker::raw::{
 use crate::docker::{DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind};
 use crate::labels::parse_policy;
 use crate::model::{
-    Container, ContainerId, ContainerPolicy, Network, NetworkAttachment, NetworkId, RuntimeState,
-    RuntimeStateAction,
+    Container, ContainerId, ContainerPolicy, MacAddress, Network, NetworkAttachment, NetworkId,
+    RuntimeState, RuntimeStateAction,
 };
 
 #[derive(Debug, Error)]
@@ -71,12 +71,29 @@ fn network_from_inspect(network: &DockerNetworkInspect) -> Option<Network> {
         }
     };
 
-    Some(Network::new(
-        network.id.clone().into(),
-        network.name.clone(),
+    Some(Network {
+        id: network.id.clone().into(),
+        name: network.name.clone(),
         subnet,
         gateway,
-    ))
+        bridge: bridge_name(network),
+    })
+}
+
+/// The host interface of a bridge network: set with the `com.docker.network.bridge.name`
+/// option, or `br-` followed by the first 12 characters of the network id.
+fn bridge_name(network: &DockerNetworkInspect) -> String {
+    network
+        .options
+        .as_ref()
+        .and_then(|options| options.get("com.docker.network.bridge.name"))
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("br-{}", network.id.get(..12).unwrap_or(&network.id)))
+}
+
+fn parse_mac(value: Option<&str>) -> Option<MacAddress> {
+    value.filter(|value| !value.is_empty())?.parse().ok()
 }
 
 pub struct DockerMonitor<A> {
@@ -186,6 +203,7 @@ where
             attachments.push(NetworkAttachment {
                 network_id,
                 ip_address: address,
+                mac_address: parse_mac(endpoint.mac_address.as_deref()),
                 aliases: endpoint.aliases.unwrap_or_default(),
             });
         }
@@ -286,13 +304,8 @@ where
         debug!(%network_id, "resolving network runtime state action");
         match self.api.inspect_network(network_id) {
             Ok(network) => {
-                if let Some(data) = network_from_inspect(&network) {
-                    Ok(Some(RuntimeStateAction::UpsertNetwork {
-                        network_id: network_id.into(),
-                        network_name: data.name,
-                        subnet: data.subnet,
-                        gateway: data.gateway,
-                    }))
+                if let Some(network) = network_from_inspect(&network) {
+                    Ok(Some(RuntimeStateAction::UpsertNetwork { network }))
                 } else {
                     Ok(Some(RuntimeStateAction::RemoveNetwork {
                         network_id: network_id.into(),
@@ -329,12 +342,11 @@ where
             if !managed_networks.contains_key(&network_id) {
                 continue;
             }
-            let aliases = endpoint.aliases.unwrap_or_default();
-
             attachments.push(NetworkAttachment {
                 network_id,
                 ip_address,
-                aliases,
+                mac_address: parse_mac(endpoint.mac_address.as_deref()),
+                aliases: endpoint.aliases.unwrap_or_default(),
             });
         }
 
@@ -554,6 +566,7 @@ mod tests {
                 }]),
             }),
             labels,
+            options: None,
         }
     }
 
@@ -571,6 +584,7 @@ mod tests {
                     network_id: Some((*network_id).to_string()),
                     ip_address: Some(ip.parse().expect("summary fixture ip should parse")),
                     aliases: Some(vec![name.trim_start_matches('/').to_string()]),
+                    mac_address: None,
                 },
             );
         }
@@ -603,6 +617,7 @@ mod tests {
                     network_id: Some((*network_id).to_string()),
                     ip_address: Some(ip.parse().expect("inspect fixture ip should parse")),
                     aliases: Some(vec![name.to_string()]),
+                    mac_address: None,
                 },
             );
         }
@@ -642,10 +657,13 @@ mod tests {
         let subnet = subnet.parse().expect("subnet fixture should parse");
         let gateway = gateway.map(|value| value.parse().expect("gateway fixture should parse"));
         state.apply_action(RuntimeStateAction::UpsertNetwork {
-            network_id: network_id.into(),
-            network_name: network_id.to_string(),
-            subnet,
-            gateway,
+            network: Network {
+                id: network_id.into(),
+                name: network_id.to_string(),
+                subnet,
+                gateway,
+                bridge: format!("br-{network_id}"),
+            },
         });
     }
 
@@ -803,6 +821,7 @@ mod tests {
                 attachments: vec![NetworkAttachment {
                     network_id: "net0".into(),
                     ip_address: "172.20.0.2".parse().expect("valid ip"),
+                    mac_address: None,
                     aliases: Vec::new(),
                 }],
                 runtime_dns_servers: HashSet::new(),
@@ -909,7 +928,7 @@ mod tests {
 
         assert!(matches!(
             managed,
-            Some(RuntimeStateAction::UpsertNetwork { network_id, .. }) if network_id == "net0".into()
+            Some(RuntimeStateAction::UpsertNetwork { network }) if network.id == "net0".into()
         ));
         assert!(matches!(
             unmanaged,

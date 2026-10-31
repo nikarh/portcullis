@@ -199,20 +199,28 @@ fn render_apply_script(plan: &Plan, deny: DenyAction, out: &mut String) -> fmt::
             render_set(out, set, SET_PREFIX_V6, "ipv6_addr", set.v6())?;
         }
     }
-    render_dispatch(out, plan, Table::Inet, |_| true, Chain::Egress)?;
     let base = Chain::Base(Table::Inet);
     for (family, is_family) in FAMILIES {
-        let subnets = plan
-            .enforced_subnets
+        let entries = plan
+            .sources
             .iter()
-            .filter(|subnet| is_family(&subnet.addr()));
+            .enumerate()
+            .filter(|(_, source)| is_family(&source.address))
+            .map(|(index, source)| Dispatch(source.address, Verdict::Goto(Chain::Egress(index))));
         render_elements(
             out,
-            format_args!("add rule {base} {family} saddr"),
-            subnets,
-            format_args!(" {deny}"),
+            format_args!("add rule {base} {family} saddr vmap"),
+            entries,
+            "",
         )?;
     }
+    // Anything else coming out of an enforced network: unknown or spoofed sources.
+    render_elements(
+        out,
+        format_args!("add rule {base} iifname"),
+        plan.enforced_bridges.iter().map(|bridge| Quoted(bridge)),
+        format_args!(" {deny}"),
+    )?;
     for (index, source) in plan.sources.iter().enumerate() {
         let chain = Chain::Egress(index);
         for rule in plan.egress_rules(source) {
@@ -221,19 +229,25 @@ fn render_apply_script(plan: &Plan, deny: DenyAction, out: &mut String) -> fmt::
         writeln!(out, "add rule {chain} {deny}")?;
     }
 
-    // Traffic between containers on the same network.
-    let restricted = |source: &Source| !plan.icc_rules(source).is_empty();
+    // Everything entering an enforced network's bridge from a container: source checks and
+    // traffic between containers on the same network.
     render_base_chain(out, Table::Bridge)?;
-    for (index, _) in plan
-        .sources
-        .iter()
-        .enumerate()
-        .filter(|(_, source)| restricted(source))
-    {
-        writeln!(out, "add chain {}", Chain::Icc(index))?;
+    // Containers are only managed by their IPv4 address; see the IPv6 limitation.
+    let ipv4_sources = || {
+        plan.sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| source.address.is_ipv4())
+    };
+    for (index, source) in ipv4_sources() {
+        if !plan.icc_rules(source).is_empty() {
+            writeln!(out, "add chain {}", Chain::Icc(index))?;
+        }
     }
-    render_dispatch(out, plan, Table::Bridge, restricted, Chain::Icc)?;
-    for (index, source) in plan.sources.iter().enumerate() {
+    if !plan.enforced_bridges.is_empty() {
+        render_bridge_dispatch(out, plan, deny)?;
+    }
+    for (index, source) in ipv4_sources() {
         let chain = Chain::Icc(index);
         for rule in plan.icc_rules(source) {
             render_rule(plan, source.address, chain, rule, deny, out)?;
@@ -259,30 +273,57 @@ fn render_base_chain(out: &mut String, table: Table) -> fmt::Result {
     writeln!(out, "add rule {base} ct state established,related accept")
 }
 
-/// Dispatch the selected sources from the base chain of `table` to their chains.
-fn render_dispatch(
-    out: &mut String,
-    plan: &Plan,
-    table: Table,
-    selected: impl Fn(&Source) -> bool,
-    chain: fn(usize) -> Chain,
-) -> fmt::Result {
-    let base = Chain::Base(table);
-    for (family, is_family) in FAMILIES {
-        let entries = plan
-            .sources
+/// Bridge base chain: only frames entering an enforced network's bridge are checked. An
+/// IPv4 frame passes only when its source address belongs to a managed container and comes
+/// with that container's MAC; it then continues to the container's ICC rules, if any.
+/// Everything else IPv4 is denied, which stops containers from using addresses that aren't
+/// theirs. Other frames (ARP, IPv6) pass.
+fn render_bridge_dispatch(out: &mut String, plan: &Plan, deny: DenyAction) -> fmt::Result {
+    let base = Chain::Base(Table::Bridge);
+    render_elements(
+        out,
+        format_args!("add rule {base} meta ibrname !="),
+        plan.enforced_bridges.iter().map(|bridge| Quoted(bridge)),
+        " accept",
+    )?;
+    writeln!(out, "add rule {base} ether type != ip accept")?;
+
+    let verdict = |index: usize, source: &Source| {
+        if plan.icc_rules(source).is_empty() {
+            Verdict::Accept
+        } else {
+            Verdict::Goto(Chain::Icc(index))
+        }
+    };
+    let ipv4 = || {
+        plan.sources
             .iter()
             .enumerate()
-            .filter(|(_, source)| is_family(&source.address) && selected(source))
-            .map(|(index, source)| Goto(source.address, chain(index)));
-        render_elements(
-            out,
-            format_args!("add rule {base} {family} saddr vmap"),
-            entries,
-            "",
-        )?;
-    }
-    Ok(())
+            .filter(|(_, source)| source.address.is_ipv4())
+    };
+    render_elements(
+        out,
+        format_args!("add rule {base} ip saddr . ether saddr vmap"),
+        ipv4().filter_map(|(index, source)| {
+            let mac = source.mac?;
+            Some(Dispatch(
+                format_args!("{} . {mac}", source.address).to_string(),
+                verdict(index, source),
+            ))
+        }),
+        "",
+    )?;
+    // Docker always reports a MAC for bridge endpoints; without one, only the address is
+    // checked.
+    render_elements(
+        out,
+        format_args!("add rule {base} ip saddr vmap"),
+        ipv4()
+            .filter(|(_, source)| source.mac.is_none())
+            .map(|(index, source)| Dispatch(source.address, verdict(index, source))),
+        "",
+    )?;
+    writeln!(out, "add rule {base} ether type ip {deny}")
 }
 
 /// Write `{head} { e1, e2, ... }{tail}` and a newline; writes nothing without elements.
@@ -325,12 +366,31 @@ fn render_set(
     )
 }
 
-/// Verdict map entry dispatching a source address to its chain.
-struct Goto(IpAddr, Chain);
+/// Verdict map entry: `<key> : <verdict>`.
+struct Dispatch<K>(K, Verdict);
 
-impl fmt::Display for Goto {
+impl<K: fmt::Display> fmt::Display for Dispatch<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} : goto {}", self.0, ChainName(self.1))
+        write!(f, "{} : ", self.0)?;
+        match self.1 {
+            Verdict::Accept => f.write_str("accept"),
+            Verdict::Goto(chain) => write!(f, "goto {}", ChainName(chain)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Verdict {
+    Accept,
+    Goto(Chain),
+}
+
+/// A string in double quotes, as nft expects interface names.
+struct Quoted<'a>(&'a str);
+
+impl fmt::Display for Quoted<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{}\"", self.0)
     }
 }
 
@@ -785,16 +845,15 @@ mod tests {
             "forward"
         };
         let prefix = format!("add rule {table} portcullis {base} ");
-        let needle = format!(" {source} : goto ");
         script
             .lines()
             .filter(|line| line.starts_with(prefix.as_str()) && line.contains("vmap"))
-            .find_map(|line| line.split_once(needle.as_str()))
+            .flat_map(|line| line.split(['{', '}', ',']))
+            .map(str::trim)
+            .find(|element| element.split(' ').next() == Some(source))
+            .and_then(|element| element.split_once(": goto "))
             .unwrap_or_else(|| panic!("no {table} dispatch for {source} in:\n{script}"))
             .1
-            .split([',', ' '])
-            .next()
-            .unwrap_or_default()
             .to_string()
     }
 
@@ -811,6 +870,7 @@ mod tests {
         let script = render(&test_support::hostname_state());
         assert_eq!(chain_of(&script, "inet", "172.18.0.2"), "egress0");
         assert_eq!(chain_of(&script, "bridge", "172.18.0.2"), "icc0");
+        assert!(script.contains("{ 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }"));
         let expected_head = "\
 add table inet portcullis
 delete table inet portcullis
@@ -827,11 +887,13 @@ add chain inet portcullis egress0
         );
         for expected in [
             "add rule inet portcullis forward ip saddr vmap { 172.18.0.2 : goto egress0 }",
-            "add rule inet portcullis forward ip saddr { 172.18.0.0/16 } drop",
+            "add rule inet portcullis forward iifname { \"br-net0\" } drop",
+            "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept",
+            "add rule bridge portcullis prerouting ether type != ip accept",
+            "add rule bridge portcullis prerouting ether type ip drop",
             "add rule inet portcullis egress0 drop",
             "add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }",
             "add rule bridge portcullis prerouting ct state established,related accept",
-            "add rule bridge portcullis prerouting ip saddr vmap { 172.18.0.2 : goto icc0 }",
             "add rule bridge portcullis icc0 ip daddr 172.18.0.1/32 accept",
             "add rule bridge portcullis icc0 ip daddr 172.18.0.0/16 drop",
         ] {
@@ -852,7 +914,8 @@ add chain inet portcullis egress0
         render_apply_script(&plan, DenyAction::Reject, &mut script).expect("script should render");
         assert!(!script.contains(" drop"));
         for expected in [
-            "add rule inet portcullis forward ip saddr { 172.18.0.0/16 } reject with icmpx admin-prohibited",
+            "add rule inet portcullis forward iifname { \"br-net0\" } reject with icmpx admin-prohibited",
+            "add rule bridge portcullis prerouting ether type ip reject with icmpx admin-prohibited",
             "add rule inet portcullis egress0 udp dport 53 reject with icmpx admin-prohibited",
             "add rule inet portcullis egress0 reject with icmpx admin-prohibited",
             "add rule bridge portcullis icc0 ip daddr 172.18.0.0/16 reject with icmpx admin-prohibited",
@@ -892,14 +955,15 @@ add chain inet portcullis egress0
             "fd00::2",
             &["ip6 daddr 2001:db8::/32 tcp dport 443 accept"],
         );
-        assert_rules(&script, "bridge", "fd00::2", &["ip6 daddr fd00::/64 drop"]);
+        // IPv6 sources only get egress rules.
+        assert!(!script.contains("bridge portcullis icc"));
     }
 
     #[test]
     fn renders_icc_modes() {
         let script = render(&test_support::icc_state());
-        // allow: no bridge rules at all
-        assert!(!script.contains("172.18.0.3 : goto icc"));
+        // allow: source checked, no ICC rules
+        assert!(script.contains("172.18.0.3 . 02:42:ac:12:00:03 : accept"));
         assert_rules(
             &script,
             "inet",

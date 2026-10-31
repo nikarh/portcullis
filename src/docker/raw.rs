@@ -33,6 +33,8 @@ pub struct DockerContainerSummaryEndpoint {
     pub ip_address: Option<IpAddr>,
     #[serde(rename = "Aliases")]
     pub aliases: Option<Vec<String>>,
+    #[serde(rename = "MacAddress", default)]
+    pub mac_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +78,8 @@ pub struct DockerEndpoint {
     pub ip_address: Option<IpAddr>,
     #[serde(rename = "Aliases")]
     pub aliases: Option<Vec<String>>,
+    #[serde(rename = "MacAddress", default)]
+    pub mac_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +94,8 @@ pub struct DockerNetworkInspect {
     pub ipam: Option<DockerIpam>,
     #[serde(rename = "Labels")]
     pub labels: Option<IndexMap<String, String>>,
+    #[serde(rename = "Options", default)]
+    pub options: Option<IndexMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

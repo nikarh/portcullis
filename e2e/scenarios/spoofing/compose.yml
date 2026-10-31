@@ -1,0 +1,18 @@
+# A container that can change its own addresses tries to borrow someone else's policy.
+services:
+  spoofer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    cap_add: [NET_ADMIN]
+    networks: [net]
+  victim:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.web=ip:198.51.100.3,tcp:80
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

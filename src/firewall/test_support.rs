@@ -9,7 +9,7 @@ use ipnet::IpNet;
 use crate::dns::{DnsError, PolicyDnsResolver};
 use crate::model::{
     Container, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
-    NetworkAttachment, PortSpec, Protocol, RuntimeState, RuntimeStateAction,
+    MacAddress, Network, NetworkAttachment, PortSpec, Protocol, RuntimeState, RuntimeStateAction,
 };
 
 pub const HOST: &str = "api.example.com";
@@ -57,11 +57,25 @@ pub const fn tcp(port: u16) -> PortSpec {
 
 pub fn add_network(state: &mut RuntimeState, id: &str, subnet: &str, gateway: &str) {
     state.apply_action(RuntimeStateAction::UpsertNetwork {
-        network_id: id.into(),
-        network_name: id.to_string(),
-        subnet: net(subnet),
-        gateway: Some(ip(gateway)),
+        network: Network {
+            id: id.into(),
+            name: id.to_string(),
+            subnet: net(subnet),
+            gateway: Some(ip(gateway)),
+            bridge: format!("br-{id}"),
+        },
     });
+}
+
+/// The MAC Docker derives from an IPv4 address: 02:42 followed by the address.
+pub fn mac_of(address: &str) -> Option<MacAddress> {
+    match ip(address) {
+        IpAddr::V4(address) => {
+            let [a, b, c, d] = address.octets();
+            Some(MacAddress::new([0x02, 0x42, a, b, c, d]))
+        }
+        IpAddr::V6(_) => None,
+    }
 }
 
 /// Add a container with `(network_id, ip, aliases)` attachments.
@@ -81,6 +95,7 @@ pub fn add_container(
                 .map(|(network_id, address, aliases)| NetworkAttachment {
                     network_id: (*network_id).into(),
                     ip_address: ip(address),
+                    mac_address: mac_of(address),
                     aliases: aliases.iter().map(ToString::to_string).collect(),
                 })
                 .collect(),

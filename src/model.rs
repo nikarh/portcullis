@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::ops::Deref;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use ipnet::IpNet;
@@ -205,6 +206,8 @@ impl Default for ContainerPolicy {
 pub struct NetworkAttachment {
     pub network_id: NetworkId,
     pub ip_address: IpAddr,
+    /// The container's MAC address on this network, when Docker reports one.
+    pub mac_address: Option<MacAddress>,
     pub aliases: Vec<String>,
 }
 
@@ -214,17 +217,52 @@ pub struct Network {
     pub name: String,
     pub subnet: IpNet,
     pub gateway: Option<IpAddr>,
+    /// Name of the network's bridge interface on the host.
+    pub bridge: String,
 }
 
-impl Network {
+/// An Ethernet MAC address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MacAddress([u8; 6]);
+
+impl MacAddress {
+    #[cfg(test)]
     #[must_use]
-    pub fn new(id: NetworkId, name: String, subnet: IpNet, gateway: Option<IpAddr>) -> Self {
-        Self {
-            id,
-            name,
-            subnet,
-            gateway,
+    pub const fn new(octets: [u8; 6]) -> Self {
+        Self(octets)
+    }
+}
+
+impl FromStr for MacAddress {
+    type Err = ();
+
+    /// Parses `aa:bb:cc:dd:ee:ff`.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut octets = [0; 6];
+        let mut parts = value.split(':');
+        for octet in &mut octets {
+            let part = parts.next().ok_or(())?;
+            if part.len() != 2 {
+                return Err(());
+            }
+            *octet = u8::from_str_radix(part, 16).map_err(|_| ())?;
         }
+        if parts.next().is_some() {
+            return Err(());
+        }
+        Ok(Self(octets))
+    }
+}
+
+impl fmt::Display for MacAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, octet) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(":")?;
+            }
+            write!(f, "{octet:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -264,10 +302,7 @@ pub enum RuntimeStateAction {
         network_id: NetworkId,
     },
     UpsertNetwork {
-        network_id: NetworkId,
-        network_name: String,
-        subnet: IpNet,
-        gateway: Option<IpAddr>,
+        network: Network,
     },
     RemoveNetwork {
         network_id: NetworkId,
@@ -342,19 +377,32 @@ impl RuntimeState {
                 }
                 false
             }
-            RuntimeStateAction::UpsertNetwork {
-                network_id,
-                network_name,
-                subnet,
-                gateway,
-            } => {
-                self.networks.insert(
-                    network_id.clone(),
-                    Network::new(network_id, network_name, subnet, gateway),
-                );
+            RuntimeStateAction::UpsertNetwork { network } => {
+                self.networks.insert(network.id.clone(), network);
                 true
             }
             RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_formats_mac_addresses() {
+        let mac: MacAddress = "02:42:AC:12:00:0a".parse().expect("mac");
+        assert_eq!(mac, MacAddress::new([0x02, 0x42, 0xac, 0x12, 0x00, 0x0a]));
+        assert_eq!(mac.to_string(), "02:42:ac:12:00:0a");
+        for invalid in [
+            "",
+            "02:42:ac:12:00",
+            "02:42:ac:12:00:0a:00",
+            "2:42:ac:12:00:0a",
+            "zz:42:ac:12:00:0a",
+        ] {
+            assert!(invalid.parse::<MacAddress>().is_err(), "{invalid}");
         }
     }
 }

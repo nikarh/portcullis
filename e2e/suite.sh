@@ -17,6 +17,7 @@ SCENARIOS=(
   published-port
   invalid-labels
   restart
+  spoofing
 )
 
 # E2E_SCENARIOS="icc egress" runs only those.

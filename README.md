@@ -296,6 +296,7 @@ labels:
 ## Limitations and details
 
 - IPv6 is not supported, by design. Portcullis uses a network's IPv4 subnet and matches containers by their IPv4 address only, so on a network with IPv6 enabled their IPv6 traffic is not restricted. Don't enable IPv6 on enforced networks.
+- Containers can't use addresses that aren't theirs: traffic entering an enforced network's bridge is only accepted from a known container address together with that container's MAC address, and is denied otherwise. A container with the `NET_ADMIN` capability that copies both the address and the MAC of another container on the same network can still pass as it, although both containers then fight over the MAC and their traffic breaks.
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
 - DNS policies can't restrict everything a container resolves; see [What can and can't be controlled](#what-can-and-cant-be-controlled).
 - Filtering traffic between containers needs connection tracking for bridged traffic. The kernel loads the `nf_conntrack_bridge` module for this the first time Portcullis installs its rules.
