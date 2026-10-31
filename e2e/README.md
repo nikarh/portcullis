@@ -28,6 +28,8 @@ Each scenario in `scenarios/<name>/` is a Compose project on a network with `por
 - `event <description> <filters> <probe>` subscribes to the event stream, runs the probe, and passes when an event matches every filter (`key=value` or `key~text`, see `expect-event.py`).
 - `wait_for_line <file> <pattern>` waits (through inotify) until a line of the file matches, for alerts.
 
+The `bypass` scenario checks what a container can try with Docker's default capabilities to get around its rules: `craft` (`images/tester/craft.py`, using scapy) sends hand-made frames through a raw socket, with borrowed addresses and MACs, VLAN tags, overlapping fragments, broadcast and multicast destinations, and reports whether anything answered. Such probes can't always see a rejection (it goes to the borrowed address), so `unanswered` checks pass when the probe heard nothing back within its listening time (4 seconds), next to `allowed` checks that show the same probes do get answers where the rules allow them. A second DNS server on `198.51.100.4` lies about `api.test` (it says `198.51.100.5`).
+
 To check what happens before Portcullis has applied rules for a container, the `fast-start` scenario stops Portcullis with SIGSTOP, starts a container that sends right away, and resumes Portcullis with SIGCONT.
 
 Probes (`tcp`, `udp`, `dns`, `resolve`, `from_outside`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname. The checks of a scenario run in parallel; a failed check prints the probe's output.

@@ -15,7 +15,7 @@ By default a container can open connections to any address on the internet and t
 
 Portcullis is a daemon that runs on the Docker host. It watches the Docker API for containers and networks, turns their labels into firewall rules, and updates the rules whenever something changes. Each update happens in one atomic step, so there is never a moment with half-applied rules.
 
-The rules are nftables rules, kept in two tables of its own: an `inet` table for traffic leaving a container's network, and a `bridge` table for traffic between containers on the same network. A Linux bridge passes that traffic directly between containers, without the IP-level hooks Docker's own rules use, so only the bridge table can see it. Both work next to Docker's rules whether Docker itself uses iptables or nftables.
+The rules are nftables rules, kept in two tables of its own: an `inet` table for traffic leaving a container's network or addressed to the Docker host, and a `bridge` table for traffic between containers on the same network. A Linux bridge passes that traffic directly between containers, without the IP-level hooks Docker's own rules use, so only the bridge table can see it. Both work next to Docker's rules whether Docker itself uses iptables or nftables.
 
 A container can start sending before Portcullis has seen it start. Its first packets then come from an address the rules don't know yet. Portcullis doesn't deny them: the firewall holds them until the container's rules are in place and then runs them through those rules, so they are allowed or denied as if the rules had been there all along. TCP and UDP are only delayed, not lost. Packets whose source is still unknown after 2 seconds are denied as spoofed (see [Limitations and details](#limitations-and-details)).
 
@@ -177,6 +177,15 @@ labels:
   - portcullis.egress.internal=ip:10.20.0.0/16,tcp:80,tcp:443
 ```
 
+The Docker host counts as a destination too. Traffic to any of its addresses (the network's gateway, its other interfaces) follows the egress labels, so a container can't reach services on the host, or other containers' published ports through the host, unless a label allows it:
+
+```yaml
+labels:
+  - portcullis.egress.host-proxy=ip:172.18.0.1,tcp:3128
+```
+
+The gateway's address depends on the network's subnet; give the network a fixed subnet in Compose (`ipam`) to know it in advance.
+
 Egress labels don't apply to DNS (port 53) or to containers on the same network. DNS is controlled by the [DNS labels](#dns), and containers on the same network by the [ICC mode](#traffic-between-containers). Both are checked first.
 
 ### Traffic between containers
@@ -202,6 +211,8 @@ The target is matched the way Docker's DNS resolves names from the source contai
 - If several containers match (a service scaled to more than one replica), all of them are allowed.
 
 Container IDs are not accepted, since they change every time a container is recreated.
+
+With `deny` and `allow-listed`, broadcast (`255.255.255.255`) and multicast (`224.0.0.0/4`) traffic is blocked too, since the bridge delivers it to every container on the network.
 
 The mode only controls connections the container starts. Whether others can reach it is decided by their own labels.
 
@@ -269,12 +280,25 @@ in `/etc/docker/daemon.json`, then restart Docker. For containers without it, Po
 
 An IP firewall can't match hostnames, so a `host:` rule allows the addresses the hostname resolves to. Portcullis learns them in two ways:
 
-- It inspects DNS answers to managed containers. The firewall holds each answer until Portcullis has added its addresses to the matching `host:` rules (a CNAME the name resolved through also counts), then releases it unchanged. The container can connect to exactly the addresses it was told, including ones that change with every lookup (CDNs, DNS load balancing). Queries still go to the resolver the container uses; Portcullis never answers or changes them.
+- It inspects DNS answers to managed containers. The firewall holds each answer until Portcullis has added its addresses to the matching `host:` rules of the container that received it (a CNAME the name resolved through also counts), then releases it unchanged. An answer only counts for that container: a container that may ask a resolver of its choice can't make another container's `host:` rules allow whatever that resolver claims. The container can connect to exactly the addresses it was told, including ones that change with every lookup (CDNs, DNS load balancing). Queries still go to the resolver the container uses; Portcullis never answers or changes them.
 - When a hostname has no known addresses, Portcullis resolves it itself through the host's resolver. That covers containers that resolved it before Portcullis started, and containers whose lookups it can't see.
 
 An address stays allowed for its DNS TTL, but at least `--hostname-hold` (an hour by default) after it was last seen, because applications often keep using an address longer than its TTL.
 
 If Portcullis stops reading them (after a crash, for example; a clean shutdown removes all rules), held answers are released anyway, so DNS keeps working.
+
+### Containers trying to get around the rules
+
+Portcullis assumes a container may be compromised and actively try to get past its rules. With Docker's default capabilities, a container can send any frame it likes through a raw socket (`NET_RAW`). Portcullis makes sure that doesn't get it anywhere its labels don't allow:
+
+- Each container's traffic is only accepted with its own address and MAC, and from its own port on the bridge (the host side of its network interface). Borrowing another container's address, MAC or both doesn't borrow its rules. Portcullis finds each container's port by asking the kernel about the container's network namespace; it never runs anything inside the container.
+- Enforced bridges only carry ARP, IPv4 and IPv6. Frames that wrap IP in something else, such as a VLAN tag, are denied, since the receiving container's kernel could unwrap them past the rules.
+- Broadcast and multicast count as traffic to other containers.
+- Traffic to the Docker host follows the egress labels.
+- Fragmented packets are put back together before the rules look at them, so fragments can't hide or rewrite ports.
+- Packets from an unknown source are held for at most 2 seconds and then denied. Flooding that queue makes the kernel drop them, it never lets them through.
+
+These are covered by the `bypass` end-to-end test scenario. What a firewall can't prevent is listed under [Limitations and details](#limitations-and-details).
 
 ### Examples
 
@@ -338,7 +362,8 @@ labels:
 ## Limitations and details
 
 - IPv6 is not supported, by design. Portcullis uses a network's IPv4 subnet and matches containers by their IPv4 address only, so on a network with IPv6 enabled their IPv6 traffic is not restricted. Don't enable IPv6 on enforced networks.
-- Containers can't use addresses that aren't theirs: traffic entering an enforced network's bridge is only accepted from a known container address together with that container's MAC address. Anything else is held for up to 2 seconds, in case it comes from a container that just started, and then denied. A container with the `NET_ADMIN` capability that copies both the address and the MAC of another container on the same network can still pass as it, although both containers then fight over the MAC and their traffic breaks. Closing this would mean tying each address to the container's own port on the bridge, but Docker's API doesn't say which host-side interface belongs to which container, and finding out would mean looking inside every container's network namespace. Don't give `NET_ADMIN` to containers you don't trust on networks with containers whose policy they could borrow.
+- Containers can't use addresses that aren't theirs: traffic entering an enforced network's bridge is only accepted with a known container's address and MAC, from that container's port on the bridge. Anything else is held for up to 2 seconds, in case it comes from a container that just started, and then denied. If Portcullis can't find a container's port (it logs a warning), that container's traffic is only checked by address and MAC, which another container with a raw socket can copy.
+- `NET_RAW` (which Docker grants by default) and `NET_ADMIN` let a container do things on its network that no firewall rule can stop, even though Portcullis keeps them from getting past its rules. With a raw socket, a container can answer ARP for its neighbours' addresses and so receive traffic other containers on the same network meant for each other or for the gateway, or flood the network. With `NET_ADMIN` it can also change its own interfaces and routes. Drop `NET_RAW` from containers that don't need it (`cap_drop: [NET_RAW]` in Compose; `ping` is about the only common tool that needs it), and don't give `NET_ADMIN` to containers you don't trust.
 - A network is enforced once Portcullis has seen it created, which usually takes milliseconds. Until then, its traffic isn't filtered at all. Containers that start on a brand-new network can get packets out in that window, for example when `docker compose up` creates the network and starts its containers right away. To close it, create enforced networks ahead of time (`docker network create`, or an `external` network in Compose) and start containers on them afterwards. Packets of containers that start on an already enforced network are held until their rules are in place, so nothing gets through there.
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
 - DNS policies can't restrict everything a container resolves; see [What can and can't be controlled](#what-can-and-cant-be-controlled).
