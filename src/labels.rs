@@ -191,6 +191,8 @@ fn parse_icc_allow_value(key: &str, value: &str) -> Result<IccAllowRule, LabelPa
     };
 
     let (kind, target) = split_once_colon(key, target_part)?;
+    // Docker reports names as `/name`; accept both spellings.
+    let target = target.trim_start_matches('/');
     if kind != "container" || target.is_empty() {
         return Err(LabelParseError::InvalidContainerTarget(
             key.to_string(),
@@ -369,6 +371,21 @@ mod tests {
 
         assert_eq!(parsed.icc_mode, IccMode::AllowListed);
         assert_eq!(parsed.icc_allow.len(), 1);
+        assert_eq!(
+            parsed.icc_allow[0].target_container,
+            "redis".to_string().into()
+        );
+    }
+
+    #[test]
+    fn parse_policy_strips_docker_name_slash_from_icc_target() {
+        let parsed = parse_policy(&labels(&[
+            ("portcullis.enable", "true"),
+            ("portcullis.icc.mode", "allow-listed"),
+            ("portcullis.icc.allow.0", "container:/redis,tcp:6379"),
+        ]))
+        .expect("parser should not fail");
+
         assert_eq!(
             parsed.icc_allow[0].target_container,
             "redis".to_string().into()
