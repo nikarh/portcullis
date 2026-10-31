@@ -379,9 +379,9 @@ struct IccTarget<'s> {
 
 /// Network-scoped lookup of ICC allow-list targets.
 ///
-/// A target matches the same way Docker's embedded DNS resolves it from the source
-/// container: by container ID, container name or network alias, restricted to the source
-/// attachment's network. A single sorted vector of borrowed keys: one allocation, binary
+/// A target matches by container name or network alias, restricted to the source
+/// attachment's network, the way Docker's embedded DNS resolves names. Container IDs are
+/// deliberately not matched: they change on every recreate, so they can't be used in labels. A single sorted vector of borrowed keys: one allocation, binary
 /// search lookups.
 struct IccTargets<'s> {
     entries: Vec<IccTarget<'s>>,
@@ -394,8 +394,7 @@ impl<'s> IccTargets<'s> {
             for attachment in &container.attachments {
                 let network_id = attachment.network_id.as_str();
                 let address = attachment.ip_address;
-                let keys = [container.id.as_str(), container.name.as_str()]
-                    .into_iter()
+                let keys = std::iter::once(container.name.as_str())
                     .chain(attachment.aliases.iter().map(String::as_str));
                 entries.extend(keys.map(|key| IccTarget {
                     network_id,
@@ -565,8 +564,8 @@ mod tests {
     }
 
     #[test]
-    fn icc_allow_list_matches_container_id_and_name() {
-        for key in ["peer", "project-db-1"] {
+    fn icc_allow_list_matches_container_name_but_not_id() {
+        for (key, matches) in [("project-db-1", true), ("peer", false)] {
             let mut state = test_support::icc_state();
             let mut web = state.containers().get("abc").cloned().expect("web fixture");
             if let Some(rule) = web.policy.icc_allow.first_mut() {
@@ -577,14 +576,15 @@ mod tests {
             });
 
             let (plan, _) = build(&state);
-            assert!(
+            assert_eq!(
                 plan.rules.contains(&Rule::AcceptPort {
                     source: ip("172.18.0.2"),
                     destination: Destination::Addr(ip("172.18.0.10")),
                     protocol: Protocol::Tcp,
                     port: 5432,
                 }),
-                "target {key} should resolve"
+                matches,
+                "target {key}"
             );
         }
     }
