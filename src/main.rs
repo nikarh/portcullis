@@ -13,6 +13,7 @@ mod logging;
 mod model;
 mod monitor;
 mod nfnetlink;
+mod source_hold;
 mod tools;
 
 use std::collections::{HashMap, HashSet};
@@ -41,11 +42,16 @@ use crate::firewall::{DenyAction, FirewallError, LogAllowed, NftablesFirewall, O
 use crate::logging::{LogFormat, LogLevel, LoggingError};
 use crate::model::RuntimeState;
 use crate::monitor::{DockerMonitor, MonitorError};
+use crate::source_hold::SourceHold;
 
 /// NFLOG group the firewall rules log decisions to.
 const NFLOG_GROUP: u16 = 4242;
 /// NFQUEUE number DNS answers are held in for inspection.
 const DNS_QUEUE: u16 = 4242;
+/// NFQUEUE number packets of not yet known containers are held in.
+const SOURCE_QUEUE: u16 = 4243;
+/// How long such packets are held before they are denied.
+const SOURCE_HOLD_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -104,6 +110,8 @@ enum MainError {
     ConnectionLog(std::io::Error),
     #[error("failed to listen for DNS answers (NFQUEUE): {0}")]
     DnsInspection(std::io::Error),
+    #[error("failed to listen for packets of new containers (NFQUEUE): {0}")]
+    SourceHold(std::io::Error),
     #[error("{0}")]
     Tool(std::io::Error),
 }
@@ -313,6 +321,7 @@ struct Managed {
 
 /// Applies rules and reports what changed.
 struct Applier {
+    source_hold: SourceHold,
     firewall: Arc<NftablesFirewall>,
     hosts: SharedHosts,
     directory: Arc<Directory>,
@@ -343,6 +352,7 @@ impl Applier {
                     plan.sources.iter().map(|source| source.address).collect(),
                     plan.unresolved_hosts.clone(),
                 );
+                self.source_hold.rules_applied();
                 info!("firewall rules applied");
                 Ok(())
             }
@@ -455,6 +465,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         log_group: NFLOG_GROUP,
         log_allowed: config.log_allowed,
         dns_queue: Some(DNS_QUEUE),
+        source_queue: Some(SOURCE_QUEUE),
     })?);
 
     info!("performing startup firewall cleanup");
@@ -482,7 +493,11 @@ fn run(config: &Config) -> Result<(), MainError> {
     )
     .map_err(MainError::DnsInspection)?;
 
+    let source_hold = source_hold::spawn(SOURCE_QUEUE, SOURCE_HOLD_GRACE, Arc::clone(&directory))
+        .map_err(MainError::SourceHold)?;
+
     let mut applier = Applier {
+        source_hold,
         firewall: Arc::clone(&firewall),
         hosts,
         directory,

@@ -78,9 +78,10 @@ resolve() {
 }
 
 # spoof_tcp <service> <source> <address> <port>: connect from an extra source address
-# the container adds to its own interface (needs NET_ADMIN).
+# the container adds to its own interface (needs NET_ADMIN). Portcullis holds packets of
+# unknown sources for 2 seconds before denying them.
 spoof_tcp() {
-  in_svc "$1" sh -c "ip addr add $2/32 dev eth0 2>/dev/null; nc -v -w 3 -s $2 $3 $4 </dev/null" 2>&1
+  in_svc "$1" sh -c "ip addr add $2/32 dev eth0 2>/dev/null; nc -v -w 5 -s $2 $3 $4 </dev/null" 2>&1
 }
 
 # from_outside <address> <port>: connect from the outside network.
@@ -91,10 +92,10 @@ from_outside() {
 # answered <probe> <output>
 answered() {
   case "$1" in
-    tcp | spoof_tcp | from_outside) grep -q 'succeeded' <<<"$2" ;;
-    udp) grep -v 'socat\[' <<<"$2" | grep -q . ;;
+    tcp | spoof_tcp | from_outside | fast_tcp) grep -q 'succeeded' <<<"$2" ;;
+    udp | fast_udp) grep -v 'socat\[' <<<"$2" | grep -q . ;;
     dns) grep -Eq '^[0-9a-f.:]+$' <<<"$2" ;;
-    resolve) grep -A1 '^Name:' <<<"$2" | grep -q '^Address' ;;
+    resolve | fast_dns) grep -A1 '^Name:' <<<"$2" | grep -q '^Address' ;;
     *) return 1 ;;
   esac
 }

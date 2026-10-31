@@ -26,7 +26,7 @@ use crate::directory::Directory;
 use crate::dns::normalize;
 use crate::events::{Dns, Event, EventBus};
 use crate::firewall::{LogAllowed, NftablesFirewall};
-use crate::nfnetlink::{Ipv4Packet, NfqueueSocket, PROTOCOL_TCP};
+use crate::nfnetlink::{Ipv4Packet, NfqueueSocket, PROTOCOL_TCP, QueueVerdict};
 
 /// Start inspecting DNS answers held in NFQUEUE `queue`. Answers are reported as events
 /// where allowed connections are (`log_allowed`).
@@ -59,7 +59,7 @@ pub fn spawn(
                     }
                 }
                 // Answers are always released; inspection never blocks DNS.
-                if let Err(error) = socket.verdict(packet.id, true) {
+                if let Err(error) = socket.verdict(packet.id, QueueVerdict::Accept) {
                     warn!(%error, "failed to release a DNS answer");
                 }
             }

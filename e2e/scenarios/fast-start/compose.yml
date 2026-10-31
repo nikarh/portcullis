@@ -1,0 +1,34 @@
+# A container that sends right away, before Portcullis has applied rules for it. Its first
+# packets come from an address the rules don't know yet; they must be held until its rules
+# are in place, and then be allowed or denied by them.
+services:
+  # Keeps the network managed before `fast` starts.
+  anchor:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+  fast:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    profiles: [late]
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.egress.tcp=ip:198.51.100.3,tcp:80
+      - portcullis.egress.udp=ip:198.51.100.4/32,udp:9000
+      - portcullis.egress.dyn=host:dyn.test,tcp:80
+    # Everything at once, as the container starts; each line is prefixed with its probe.
+    command:
+      - sh
+      - -c
+      - |
+        nc -v -w 10 198.51.100.3 80 </dev/null 2>&1 | sed 's/^/tcp: /' &
+        printf ping | socat -t10 -T10 - UDP:198.51.100.4:9000 2>&1 | sed 's/^/udp: /' &
+        nslookup -timeout=10 dyn.test 2>&1 | sed 's/^/dns: /' &
+        nc -v -w 10 198.51.100.4 80 </dev/null 2>&1 | sed 's/^/denied: /' &
+        wait
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

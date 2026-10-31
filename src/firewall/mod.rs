@@ -5,7 +5,9 @@ pub mod test_support;
 
 use thiserror::Error;
 
-pub use nftables::{DenyAction, LOG_PREFIX, LogAllowed, NftablesFirewall, Options};
+pub use nftables::{
+    DenyAction, HOLD_EXPIRED_MARK, LOG_PREFIX, LogAllowed, NftablesFirewall, Options,
+};
 pub use plan::{Destination, HostSet, Plan, Rule};
 
 #[derive(Debug, Error)]

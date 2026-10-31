@@ -13,9 +13,11 @@ By default a container can open connections to any address on the internet and t
 
 ## How it works
 
-Portcullis is a daemon that runs on the Docker host. It watches the Docker API for containers and networks, turns their labels into firewall rules, and rebuilds the rules whenever something changes. Each rebuild replaces the whole ruleset in one atomic step, so there is never a moment with half-applied rules.
+Portcullis is a daemon that runs on the Docker host. It watches the Docker API for containers and networks, turns their labels into firewall rules, and updates the rules whenever something changes. Each update happens in one atomic step, so there is never a moment with half-applied rules.
 
 The rules are nftables rules, kept in two tables of its own: an `inet` table for traffic leaving a container's network, and a `bridge` table for traffic between containers on the same network. A Linux bridge passes that traffic directly between containers, without the IP-level hooks Docker's own rules use, so only the bridge table can see it. Both work next to Docker's rules whether Docker itself uses iptables or nftables.
+
+A container can start sending before Portcullis has seen it start. Its first packets then come from an address the rules don't know yet. Portcullis doesn't deny them: the firewall holds them until the container's rules are in place and then runs them through those rules, so they are allowed or denied as if the rules had been there all along. TCP and UDP are only delayed, not lost. Packets whose source is still unknown after 2 seconds are denied as spoofed (see [Limitations and details](#limitations-and-details)).
 
 Portcullis only removes access. Traffic that a policy allows still goes through Docker's own rules afterwards, so things Docker blocks (internal networks, isolation between networks) stay blocked.
 
@@ -336,7 +338,7 @@ labels:
 ## Limitations and details
 
 - IPv6 is not supported, by design. Portcullis uses a network's IPv4 subnet and matches containers by their IPv4 address only, so on a network with IPv6 enabled their IPv6 traffic is not restricted. Don't enable IPv6 on enforced networks.
-- Containers can't use addresses that aren't theirs: traffic entering an enforced network's bridge is only accepted from a known container address together with that container's MAC address, and is denied otherwise. A container with the `NET_ADMIN` capability that copies both the address and the MAC of another container on the same network can still pass as it, although both containers then fight over the MAC and their traffic breaks. Closing this would mean tying each address to the container's own port on the bridge, but Docker's API doesn't say which host-side interface belongs to which container, and finding out would mean looking inside every container's network namespace. Don't give `NET_ADMIN` to containers you don't trust on networks with containers whose policy they could borrow.
+- Containers can't use addresses that aren't theirs: traffic entering an enforced network's bridge is only accepted from a known container address together with that container's MAC address. Anything else is held for up to 2 seconds, in case it comes from a container that just started, and then denied. A container with the `NET_ADMIN` capability that copies both the address and the MAC of another container on the same network can still pass as it, although both containers then fight over the MAC and their traffic breaks. Closing this would mean tying each address to the container's own port on the bridge, but Docker's API doesn't say which host-side interface belongs to which container, and finding out would mean looking inside every container's network namespace. Don't give `NET_ADMIN` to containers you don't trust on networks with containers whose policy they could borrow.
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
 - DNS policies can't restrict everything a container resolves; see [What can and can't be controlled](#what-can-and-cant-be-controlled).
 - Filtering traffic between containers needs connection tracking for bridged traffic. The kernel loads the `nf_conntrack_bridge` module for this the first time Portcullis installs its rules.
@@ -345,9 +347,9 @@ labels:
 - If a hostname has no known addresses, its rules allow nothing until a container looks it up or Portcullis can resolve it. Everything else is applied as usual. Portcullis retries its own lookup every 30 seconds.
 - Domains on events are best effort. They are missing for containers whose DNS lookups Portcullis can't see, for connections to addresses obtained some other way, and for HTTPS hostnames (TLS SNI), which Portcullis doesn't look at.
 - DNS answers over TCP that span more than one packet aren't inspected; they still reach the container.
-- Portcullis uses NFLOG group 4242 and NFQUEUE 4242. Other software on the host must not use the same numbers.
+- Portcullis uses NFLOG group 4242 and NFQUEUE 4242 and 4243. Other software on the host must not use the same numbers.
 - Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.enable` value on a network enforces it. An enforced network without a usable subnet is logged and not enforced.
-- Portcullis removes its rules when it starts and when it stops. Containers are unrestricted while it is not running, and if it crashes, the last rules stay in place until it is started again.
+- Portcullis removes its rules when it starts and when it stops. Containers are unrestricted while it is not running. If it crashes, the last rules stay in place until it is started again, and containers that start on an enforced network in the meantime can't send anything: their packets are held for Portcullis and then dropped by the kernel.
 
 ## License
 

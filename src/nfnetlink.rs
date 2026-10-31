@@ -8,8 +8,10 @@
 //!
 //! Only the parts of the protocols Portcullis needs are implemented.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, Write as _};
 use std::net::Ipv4Addr;
+use std::os::fd::AsFd;
 
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_NETFILTER};
 
@@ -55,10 +57,44 @@ const NFQNL_CFG_CMD_BIND: u8 = 1;
 const NFQNL_COPY_PACKET: u8 = 2;
 const NFQA_PACKET_HDR: u16 = 1;
 const NFQA_VERDICT_HDR: u16 = 2;
+const NFQA_MARK: u16 = 3;
+const NFQA_HWADDR: u16 = 9;
 const NFQA_PAYLOAD: u16 = 10;
 
 const NF_ACCEPT: u32 = 1;
-const NF_DROP: u32 = 0;
+const NF_REPEAT: u32 = 4;
+
+/// What happens to a held packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueVerdict {
+    /// Let it continue past the rule that queued it.
+    Accept,
+    /// Run it through the hook again from the start, with the rules as they are now,
+    /// optionally setting the packet mark first.
+    Repeat { mark: Option<u32> },
+}
+
+fn encode_verdict(queue: u16, id: u32, verdict: QueueVerdict) -> Vec<u8> {
+    let code = match verdict {
+        QueueVerdict::Accept => NF_ACCEPT,
+        QueueVerdict::Repeat { .. } => NF_REPEAT,
+    };
+    let mut header = Vec::with_capacity(8);
+    header.extend_from_slice(&code.to_be_bytes());
+    header.extend_from_slice(&id.to_be_bytes());
+    let mut attributes = attribute(NFQA_VERDICT_HDR, &header);
+    if let QueueVerdict::Repeat { mark: Some(mark) } = verdict {
+        attributes.extend(attribute(NFQA_MARK, &mark.to_be_bytes()));
+    }
+    encode(
+        (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_VERDICT,
+        NLM_F_REQUEST,
+        0,
+        AF_UNSPEC,
+        queue,
+        &attributes,
+    )
+}
 
 /// Receive buffer: large enough that bursts of logged packets aren't lost.
 const RECEIVE_BUFFER: i32 = 4 << 20;
@@ -82,6 +118,8 @@ pub struct LoggedPacket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedPacket {
     pub id: u32,
+    /// Source MAC address of the frame, when the kernel knows it.
+    pub hwaddr: Option<MacAddress>,
     /// The packet, starting at the IP header.
     pub payload: Vec<u8>,
 }
@@ -213,21 +251,45 @@ impl NfqueueSocket {
         Ok(parse_queued(&self.inner.buffer))
     }
 
-    /// Release (`accept`) or discard a held packet.
-    pub fn verdict(&self, id: u32, accept: bool) -> io::Result<()> {
-        let mut header = Vec::with_capacity(8);
-        header.extend_from_slice(&(if accept { NF_ACCEPT } else { NF_DROP }).to_be_bytes());
-        header.extend_from_slice(&id.to_be_bytes());
-        let message = encode(
-            (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_VERDICT,
-            NLM_F_REQUEST,
-            0,
-            AF_UNSPEC,
-            self.queue,
-            &attribute(NFQA_VERDICT_HDR, &header),
-        );
-        self.inner.socket.send(&message, 0)?;
+    /// Decide what happens to a held packet.
+    pub fn verdict(&self, id: u32, verdict: QueueVerdict) -> io::Result<()> {
+        self.inner
+            .socket
+            .send(&encode_verdict(self.queue, id, verdict), 0)?;
         Ok(())
+    }
+
+    /// A handle that issues verdicts from another thread while this one waits for packets.
+    /// The kernel only accepts verdicts from the socket the queue is bound to; the handle
+    /// writes to a duplicate of its file descriptor, which is the same socket.
+    pub fn verdict_writer(&self) -> io::Result<VerdictWriter> {
+        Ok(VerdictWriter {
+            socket: File::from(self.inner.socket.as_fd().try_clone_to_owned()?),
+            queue: self.queue,
+        })
+    }
+}
+
+/// Issues verdicts for an [`NfqueueSocket`] from another thread.
+#[derive(Debug)]
+pub struct VerdictWriter {
+    socket: File,
+    queue: u16,
+}
+
+impl VerdictWriter {
+    pub fn verdict(&self, id: u32, verdict: QueueVerdict) -> io::Result<()> {
+        let message = encode_verdict(self.queue, id, verdict);
+        // One write is one datagram, i.e. one netlink message.
+        let written = (&self.socket).write(&message)?;
+        if written == message.len() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short netlink write",
+            ))
+        }
     }
 }
 
@@ -259,20 +321,27 @@ fn parse_queued(buffer: &[u8]) -> Vec<QueuedPacket> {
         .filter(|message| message.message_type == (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_PACKET)
         .filter_map(|message| {
             let mut id = None;
+            let mut hwaddr = None;
             let mut payload = Vec::new();
             for (kind, value) in attributes(message.body.get(NFGENMSG_LEN..)?) {
                 match kind {
                     NFQA_PACKET_HDR => id = be_u32(value),
+                    NFQA_HWADDR => hwaddr = hardware_address(value),
                     NFQA_PAYLOAD => payload = value.to_vec(),
                     _ => {}
                 }
             }
-            Some(QueuedPacket { id: id?, payload })
+            Some(QueuedPacket {
+                id: id?,
+                hwaddr,
+                payload,
+            })
         })
         .collect()
 }
 
-/// `struct nfulnl_msg_packet_hw`: big-endian length, padding, address.
+/// `struct nfulnl_msg_packet_hw` and `struct nfqnl_msg_packet_hw`: big-endian length,
+/// padding, address.
 fn hardware_address(value: &[u8]) -> Option<MacAddress> {
     let length = u16::from_be_bytes(value.get(..2)?.try_into().ok()?);
     if length != 6 {
@@ -544,6 +613,10 @@ pub mod tests {
         let mut header = 42_u32.to_be_bytes().to_vec();
         header.extend_from_slice(&[0x08, 0x00, 2]);
         let mut attributes = attribute(NFQA_PACKET_HDR, &header);
+        attributes.extend(attribute(
+            NFQA_HWADDR,
+            &[0, 6, 0, 0, 2, 0x42, 0xac, 0x12, 0, 2, 0, 0],
+        ));
         attributes.extend(attribute(NFQA_PAYLOAD, b"packet"));
         let buffer = encode(
             (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_PACKET,
@@ -557,8 +630,51 @@ pub mod tests {
             parse_queued(&buffer),
             vec![QueuedPacket {
                 id: 42,
+                hwaddr: Some(MacAddress::new([2, 0x42, 0xac, 0x12, 0, 2])),
                 payload: b"packet".to_vec()
             }]
+        );
+    }
+
+    #[test]
+    fn encodes_verdicts() {
+        let parse = |message: &[u8]| -> Vec<(u16, Vec<u8>)> {
+            attributes(
+                message
+                    .get(NLMSG_HDRLEN + NFGENMSG_LEN..)
+                    .expect("attributes"),
+            )
+            .map(|(kind, value)| (kind, value.to_vec()))
+            .collect()
+        };
+        let accept = parse(&encode_verdict(9, 42, QueueVerdict::Accept));
+        assert_eq!(
+            accept,
+            vec![(
+                NFQA_VERDICT_HDR,
+                [1_u32.to_be_bytes(), 42_u32.to_be_bytes()].concat()
+            )]
+        );
+
+        let repeat = parse(&encode_verdict(
+            9,
+            42,
+            QueueVerdict::Repeat { mark: Some(0xabcd) },
+        ));
+        assert_eq!(
+            repeat,
+            vec![
+                (
+                    NFQA_VERDICT_HDR,
+                    [4_u32.to_be_bytes(), 42_u32.to_be_bytes()].concat()
+                ),
+                (NFQA_MARK, 0xabcd_u32.to_be_bytes().to_vec()),
+            ]
+        );
+        let message = encode_verdict(9, 42, QueueVerdict::Accept);
+        assert_eq!(
+            message.get(NLMSG_HDRLEN + 2..NLMSG_HDRLEN + 4),
+            Some(9_u16.to_be_bytes().as_slice())
         );
     }
 
