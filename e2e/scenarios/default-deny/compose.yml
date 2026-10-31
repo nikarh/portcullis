@@ -1,0 +1,22 @@
+# Containers without labels on an enabled network, and one on a plain network.
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    # Docker's DNS (127.0.0.11) forwards names it doesn't know to this upstream.
+    dns: [198.51.100.2]
+  peer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+  free:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [open]
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true
+  open: {}

@@ -1,0 +1,15 @@
+# api.test resolves to 198.51.100.3 on the Docker host; unresolvable.test doesn't resolve.
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.api=host:api.test,tcp:443
+      - portcullis.egress.broken=host:unresolvable.test,tcp:443
+      - portcullis.egress.ip=ip:198.51.100.5,tcp:80
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

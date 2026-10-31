@@ -1,0 +1,12 @@
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.tcp=ip:198.51.100.3,tcp:80
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

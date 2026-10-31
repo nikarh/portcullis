@@ -1,0 +1,18 @@
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.good=ip:198.51.100.3,tcp:80
+      - portcullis.egress.bad=ip:not-an-address,tcp:80
+      - portcullis.icc.mode=allowlisted
+  peer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

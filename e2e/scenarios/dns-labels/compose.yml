@@ -1,0 +1,25 @@
+services:
+  by-ip:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.dns.0=ip:198.51.100.2
+  any:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.dns.0=*
+  runtime:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.dns.0=runtime
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

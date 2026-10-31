@@ -1,0 +1,41 @@
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.db=container:db,tcp:5432
+      - portcullis.icc.allow.cache=container:cache-alias,tcp:6379
+      - portcullis.icc.allow.named=container:pc-e2e-named,tcp:8080
+  db:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    scale: 2
+    networks: [net]
+  cache:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks:
+      net:
+        aliases: [cache-alias]
+  named:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    container_name: pc-e2e-named
+    networks: [net]
+  other:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+  loner:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=deny
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

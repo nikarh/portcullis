@@ -1,0 +1,11 @@
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    ports: ["18080:8080"]
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

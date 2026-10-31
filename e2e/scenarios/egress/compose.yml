@@ -1,0 +1,14 @@
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.tcp=ip:198.51.100.3,tcp:80
+      - portcullis.egress.udp=ip:198.51.100.4/32,udp:9000
+      - portcullis.egress.range=ip:198.51.100.0/30,tcp:8080
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

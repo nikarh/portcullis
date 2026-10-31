@@ -1,0 +1,14 @@
+# Run with --dns-mode proxy --dns-proxy-bind 198.51.100.1:53.
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.1]
+    labels:
+      - portcullis.egress.api=host:api.test,tcp:443
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true
