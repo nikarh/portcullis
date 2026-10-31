@@ -32,8 +32,6 @@ pub enum FirewallError {
     LibCommandFailure { code: i32, stderr: String },
     #[error("libnftables context lock poisoned")]
     LibContextLock,
-    #[error("dns resolve failed for host {host}: {message}")]
-    DnsResolve { host: String, message: String },
 }
 
 pub enum ActiveFirewall {

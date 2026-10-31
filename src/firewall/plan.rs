@@ -22,9 +22,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ipnet::IpNet;
-use tracing::trace;
+use tracing::{error, trace};
 
-use super::FirewallError;
 use crate::dns::PolicyDnsResolver;
 use crate::model::{
     Container, DnsTarget, EgressTarget, IccAllowRule, IccMode, NetworkAttachment, Protocol,
@@ -153,7 +152,7 @@ pub struct Plan {
 
 impl Plan {
     /// Build the plan for `state`, resolving every distinct hostname exactly once.
-    pub fn build<R>(state: &RuntimeState, resolver: &mut R) -> Result<Self, FirewallError>
+    pub fn build<R>(state: &RuntimeState, resolver: &mut R) -> Self
     where
         R: PolicyDnsResolver,
     {
@@ -169,7 +168,7 @@ impl Plan {
 
         for container in state.containers().values() {
             for attachment in &container.attachments {
-                planner.plan_attachment(container, attachment)?;
+                planner.plan_attachment(container, attachment);
             }
         }
 
@@ -178,7 +177,7 @@ impl Plan {
             .enforced_subnets
             .extend(state.networks().values().map(|network| network.subnet));
 
-        Ok(planner.plan)
+        planner.plan
     }
 
     /// Rules of `source`, in evaluation order. A source's rules end with an implicit drop.
@@ -215,16 +214,12 @@ impl<'s, R> Planner<'s, '_, R>
 where
     R: PolicyDnsResolver,
 {
-    fn plan_attachment(
-        &mut self,
-        container: &'s Container,
-        attachment: &'s NetworkAttachment,
-    ) -> Result<(), FirewallError> {
+    fn plan_attachment(&mut self, container: &'s Container, attachment: &'s NetworkAttachment) {
         let source = attachment.ip_address;
         // An address can only belong to one container at a time. Should stale state ever
         // contain it twice, the first owner wins, as it would in a linear rule list.
         if !self.seen_sources.insert(source) {
-            return Ok(());
+            return;
         }
 
         let start = self.plan.rules.len();
@@ -258,7 +253,7 @@ where
                 }
                 EgressTarget::IpCidr(_) => continue,
                 EgressTarget::Hostname(host) => {
-                    let index = self.host_set(host)?;
+                    let index = self.host_set(host);
                     if let Some(set) = self.plan.host_sets.get_mut(index) {
                         if source.is_ipv4() {
                             set.used_v4 = true;
@@ -282,7 +277,6 @@ where
             address: source,
             rules: start..self.plan.rules.len(),
         });
-        Ok(())
     }
 
     fn plan_dns(
@@ -367,18 +361,20 @@ where
         }
     }
 
-    fn host_set(&mut self, host: &'s str) -> Result<usize, FirewallError> {
+    /// Index of the set for `host`. A hostname that can't be resolved gets an empty set,
+    /// so its rules allow nothing while the rest of the policy still applies.
+    fn host_set(&mut self, host: &'s str) -> usize {
         if let Some(index) = self.host_index.get(host) {
-            return Ok(*index);
+            return *index;
         }
 
-        let addresses = self
-            .resolver
-            .resolve(host)
-            .map_err(|error| FirewallError::DnsResolve {
-                host: host.to_string(),
-                message: error.to_string(),
-            })?;
+        let addresses = match self.resolver.resolve(host) {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                error!(%host, %error, "failed to resolve hostname; its rules allow nothing until it resolves");
+                Arc::from([])
+            }
+        };
         trace!(%host, ip_count = addresses.len(), ?addresses, "resolved hostname addresses");
 
         let index = self.plan.host_sets.len();
@@ -389,7 +385,7 @@ where
             used_v6: false,
         });
         self.host_index.insert(host, index);
-        Ok(index)
+        index
     }
 }
 
@@ -452,7 +448,7 @@ mod tests {
 
     fn build(state: &RuntimeState) -> (Plan, MockResolver) {
         let mut resolver = MockResolver::default();
-        let plan = Plan::build(state, &mut resolver).expect("plan should build");
+        let plan = Plan::build(state, &mut resolver);
         (plan, resolver)
     }
 
@@ -613,18 +609,22 @@ mod tests {
     }
 
     #[test]
-    fn reports_resolve_errors() {
-        let mut state = test_support::hostname_state();
-        let mut web = state.containers().get("abc").cloned().expect("web fixture");
-        web.policy.egress = vec![crate::model::EgressRule {
-            target: EgressTarget::Hostname("unknown.example.com".to_string()),
-            ports: vec![test_support::tcp(443)],
-        }];
-        state.apply_action(crate::model::RuntimeStateAction::CreateContainer {
-            container: Box::new(web),
-        });
-
-        let result = Plan::build(&state, &mut MockResolver::default());
-        assert!(matches!(result, Err(FirewallError::DnsResolve { .. })));
+    fn unresolvable_hostname_allows_nothing_but_keeps_the_rest() {
+        let (plan, _) = build(&test_support::unresolvable_state());
+        let set = plan.host_set(0).expect("host set");
+        assert!(set.addresses.is_empty());
+        assert!(set.used_v4);
+        let rules = rules_of(&plan, "172.18.0.2");
+        assert!(rules.contains(&Rule::AcceptPort {
+            destination: Destination::HostSet(0),
+            protocol: Protocol::Tcp,
+            port: 443,
+        }));
+        assert!(rules.contains(&Rule::AcceptPort {
+            destination: Destination::Net(net("8.8.8.0/24")),
+            protocol: Protocol::Tcp,
+            port: 853,
+        }));
+        assert_eq!(plan.enforced_subnets, vec![net("172.18.0.0/16")]);
     }
 }

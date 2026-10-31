@@ -40,7 +40,7 @@ where
     where
         Dns: PolicyDnsResolver,
     {
-        let plan = Plan::build(state, resolver)?;
+        let plan = Plan::build(state, resolver);
         info!(
             source_count = plan.sources.len(),
             rule_count = plan.rule_count(),
@@ -644,7 +644,7 @@ mod tests {
     use crate::firewall::test_support::{self, MockResolver};
 
     fn render(state: &RuntimeState) -> String {
-        let plan = Plan::build(state, &mut MockResolver::default()).expect("plan should build");
+        let plan = Plan::build(state, &mut MockResolver::default());
         let mut script = String::new();
         render_apply_script(&plan, &mut script).expect("script should render");
         script
@@ -771,6 +771,31 @@ add chain inet portcullis s0
                 "ip daddr 8.8.8.0/24 tcp dport 853 accept",
             ],
         );
+    }
+
+    #[test]
+    fn renders_unresolvable_hostname_as_empty_set() {
+        let script = render(&test_support::unresolvable_state());
+        assert!(script.contains("add set inet portcullis pc_h4_"));
+        assert!(!script.contains("add element"));
+        assert!(script.contains("ip daddr @pc_h4_"));
+        assert_rules(
+            &script,
+            "172.18.0.2",
+            &["ip daddr 8.8.8.0/24 tcp dport 853 accept"],
+        );
+    }
+
+    #[test]
+    fn apply_succeeds_with_unresolvable_hostname() {
+        let firewall = NftablesFirewall::new(RecordingRunner::default());
+        firewall
+            .apply(
+                &test_support::unresolvable_state(),
+                &mut MockResolver::default(),
+            )
+            .expect("apply should succeed");
+        assert_eq!(firewall.runner.scripts.lock().expect("lock").len(), 1);
     }
 
     #[derive(Default)]

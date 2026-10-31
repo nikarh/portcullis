@@ -13,6 +13,8 @@ use crate::model::{
 };
 
 pub const HOST: &str = "api.example.com";
+/// A hostname [`MockResolver`] fails to resolve.
+pub const UNRESOLVABLE_HOST: &str = "unresolvable.example.com";
 
 /// Resolves [`HOST`] to one IPv4 and one IPv6 address and counts lookups.
 #[derive(Default)]
@@ -191,6 +193,32 @@ pub fn ipv6_state() -> RuntimeState {
                 EgressRule {
                     target: EgressTarget::IpCidr(net("2001:db8::/32")),
                     ports: vec![tcp(443)],
+                },
+            ],
+        ),
+    );
+    state
+}
+
+/// `web` with one hostname rule that can't be resolved and one CIDR rule.
+pub fn unresolvable_state() -> RuntimeState {
+    let mut state = RuntimeState::default();
+    add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+    add_container(
+        &mut state,
+        "abc",
+        "web",
+        &[("net0", "172.18.0.2", &[])],
+        policy(
+            IccMode::Deny,
+            vec![
+                EgressRule {
+                    target: EgressTarget::Hostname(UNRESOLVABLE_HOST.to_string()),
+                    ports: vec![tcp(443)],
+                },
+                EgressRule {
+                    target: EgressTarget::IpCidr(net("8.8.8.0/24")),
+                    ports: vec![tcp(853)],
                 },
             ],
         ),

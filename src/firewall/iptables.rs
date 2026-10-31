@@ -120,7 +120,7 @@ where
     where
         Dns: PolicyDnsResolver,
     {
-        let plan = Plan::build(state, resolver)?;
+        let plan = Plan::build(state, resolver);
         info!(
             source_count = plan.sources.len(),
             rule_count = plan.rule_count(),
@@ -529,7 +529,7 @@ mod tests {
     use crate::firewall::test_support::{self, MockResolver};
 
     fn render(state: &RuntimeState, use_ipset: bool) -> (String, String) {
-        let plan = Plan::build(state, &mut MockResolver::default()).expect("plan should build");
+        let plan = Plan::build(state, &mut MockResolver::default());
         let mut ipset = String::new();
         render_ipset_script(&plan, &mut ipset).expect("ipset script should render");
         let mut iptables = String::new();
@@ -641,8 +641,7 @@ mod tests {
         let plan = Plan::build(
             &test_support::hostname_state(),
             &mut MockResolver::default(),
-        )
-        .expect("plan should build");
+        );
         let mut script = String::new();
         render_iptables_script(&plan, CHAIN_NAME, 3, false, &mut script)
             .expect("script should render");
@@ -782,6 +781,42 @@ mod tests {
             assert!(has_line(second, &format!("-X PORTCULLIS_S{index}")));
         }
         assert!(!has_line(second, "-X PORTCULLIS_S0"));
+    }
+
+    #[test]
+    fn renders_unresolvable_hostname_as_empty_set() {
+        let (ipset, script) = render(&test_support::unresolvable_state(), true);
+        assert!(ipset.contains("create pc_h4_"));
+        assert!(!ipset.contains("add "));
+        assert!(script.contains("--match-set pc_h4_"));
+        assert_rules(
+            &script,
+            "172.18.0.2",
+            &["-d 8.8.8.0/24 -p tcp --dport 853 -j RETURN"],
+        );
+
+        let (_, script) = render(&test_support::unresolvable_state(), false);
+        assert!(!script.contains("--dport 443"));
+        assert_rules(
+            &script,
+            "172.18.0.2",
+            &["-d 8.8.8.0/24 -p tcp --dport 853 -j RETURN"],
+        );
+    }
+
+    #[test]
+    fn apply_succeeds_with_unresolvable_hostname() {
+        let firewall = IptablesFirewall::new(RecordingRunner::default(), true);
+        firewall
+            .apply(
+                &test_support::unresolvable_state(),
+                &mut MockResolver::default(),
+            )
+            .expect("apply should succeed");
+        assert_eq!(
+            firewall.runner.iptables_scripts.lock().expect("lock").len(),
+            1
+        );
     }
 
     #[test]

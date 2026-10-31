@@ -252,7 +252,7 @@ labels:
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close. Replies to incoming connections are always allowed, so published ports keep working.
 - A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too.
-- In `lazy` mode, if a hostname can't be resolved, rebuilding the rules fails. At startup Portcullis exits. Later, the previous rules stay in place until the next successful rebuild, changes to other containers wait as well, and a new container on an enforced network has no access at all until then.
+- If a hostname can't be resolved, Portcullis logs an error and its rules allow nothing until it resolves again. Everything else is applied as usual. Failed lookups are retried every 30 seconds.
 - Portcullis refuses to start if any container on the host, running or stopped, has an invalid Portcullis label, or a network has an invalid `portcullis.network.enforce` value. A container created with an invalid label while Portcullis is running is logged and gets no access at all.
 - Portcullis removes its rules when it starts and when it stops. Containers are unrestricted while it is not running, and if it crashes, the last rules stay in place until it is started again.
 - With the iptables backend and no `ipset`, every hostname rule becomes one firewall rule per resolved address.

@@ -45,6 +45,9 @@ impl UpstreamResolver for SystemUpstreamResolver {
     }
 }
 
+/// How long a failed lookup is remembered as "no addresses" before it is retried.
+const NEGATIVE_TTL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 struct CacheEntry {
     values: Arc<[IpAddr]>,
@@ -175,7 +178,15 @@ where
         }
 
         trace!(%host, "DNS cache miss");
-        let values = self.resolver.resolve_host(host)?;
+        let values = match self.resolver.resolve_host(host) {
+            Ok(values) => values,
+            Err(error) => {
+                // Remember the failure briefly, so that callers don't block on the resolver
+                // for the same broken name over and over.
+                self.store_values(host, &Arc::from([]), NEGATIVE_TTL.min(self.ttl));
+                return Err(error);
+            }
+        };
 
         // Allocation note:
         // 1) `values` allocates a Vec for upstream results.
@@ -251,10 +262,6 @@ where
     R: UpstreamResolver,
 {
     fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
-        let cached = self.cache.resolve_cached(host);
-        if !cached.is_empty() {
-            return Ok(cached);
-        }
         DnsProxyCache::resolve(self.cache, host)
     }
 }
@@ -329,6 +336,19 @@ mod tests {
 
         let second = cache.resolve("api.example.com");
         assert!(second.is_ok());
+        assert_eq!(resolver.call_count(), 1);
+    }
+
+    #[test]
+    fn failed_lookup_is_remembered_as_empty() {
+        let resolver = MockResolver::with_mapping(&[]);
+        let mut cache = DnsProxyCache::new(resolver.clone(), Duration::from_secs(300), 128);
+
+        assert!(cache.resolve("missing.example.com").is_err());
+        let second = cache
+            .resolve("missing.example.com")
+            .expect("cached failure");
+        assert!(second.is_empty());
         assert_eq!(resolver.call_count(), 1);
     }
 
