@@ -25,12 +25,14 @@ use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
 use crate::dns::normalize;
 use crate::events::{Dns, Event, EventBus};
-use crate::firewall::NftablesFirewall;
+use crate::firewall::{LogAllowed, NftablesFirewall};
 use crate::nfnetlink::{Ipv4Packet, NfqueueSocket, PROTOCOL_TCP};
 
-/// Start inspecting DNS answers held in NFQUEUE `queue`.
+/// Start inspecting DNS answers held in NFQUEUE `queue`. Answers are reported as events
+/// where allowed connections are (`log_allowed`).
 pub fn spawn(
     queue: u16,
+    log_allowed: LogAllowed,
     firewall: Arc<NftablesFirewall>,
     directory: Arc<Directory>,
     hosts: SharedHosts,
@@ -49,7 +51,12 @@ pub fn spawn(
             for packet in packets {
                 if let Some(answer) = Answer::parse(&packet.payload) {
                     allow_addresses(&answer, &firewall, &directory, &hosts);
-                    bus.publish(&Event::Dns(answer.event(&directory)));
+                    let monitor = directory
+                        .source(answer.container)
+                        .is_some_and(|info| info.monitor);
+                    if log_allowed.logs(monitor) {
+                        bus.publish(&Event::Dns(answer.event(&directory)));
+                    }
                 }
                 // Answers are always released; inspection never blocks DNS.
                 if let Err(error) = socket.verdict(packet.id, true) {

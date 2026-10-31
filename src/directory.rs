@@ -24,6 +24,8 @@ pub struct SourceInfo {
     pub container: String,
     pub network: String,
     pub mac: Option<MacAddress>,
+    /// The container's network is in monitor mode.
+    pub monitor: bool,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +55,7 @@ impl Directory {
                 container: source.container.to_string(),
                 network: source.network.clone(),
                 mac: source.mac,
+                monitor: source.monitor,
             };
             if let Some(mac) = source.mac {
                 snapshot.by_mac.insert(mac, (source.address, info.clone()));

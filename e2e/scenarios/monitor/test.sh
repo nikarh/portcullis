@@ -6,6 +6,7 @@ EVENT_SAVE="${RESULTS_DIR}/monitor-events.jsonl"
 : >"${EVENT_SAVE}"
 event "outbound traffic is reported as would-deny" 'event=connection verdict=would_deny reason=egress container~app destination=198.51.100.5 destination_port=80' tcp app 198.51.100.5 80
 event "ICC is reported as would-deny" 'event=connection verdict=would_deny reason=icc container~loner destination_container~peer destination_port=5432' tcp loner "${peer_ip}" 5432
+event "DNS lookups are reported" 'event=dns container~app name=api.test answers~198.51.100.3' resolve app api.test
 event "allowed connections are reported too" 'event=connection verdict=allowed reason=icc container~app destination_container~peer' tcp app "${peer_ip}" 5432
 flush_checks
 audit_suggests() {

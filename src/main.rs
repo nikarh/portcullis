@@ -217,8 +217,9 @@ OPTIONS:
   --deny-action <reject|drop>  Reject denied traffic with an ICMP error, or drop it
                                silently (default: reject)
   --log-allowed <always|monitor|never>
-                               Which allowed connections are reported; denied ones always
-                               are (default: monitor, i.e. on networks in monitor mode)
+                               Which allowed connections and DNS lookups are reported;
+                               denied ones always are (default: monitor, i.e. on networks
+                               in monitor mode)
   --hostname-hold <seconds>    How long an address of a host: rule stays allowed after it
                                was last seen in a DNS answer (default: 3600)
   --events-socket <path>       Serve events as JSON lines on this Unix socket (mode 0600;
@@ -473,6 +474,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     .map_err(MainError::ConnectionLog)?;
     dns_inspect::spawn(
         DNS_QUEUE,
+        config.log_allowed,
         Arc::clone(&firewall),
         Arc::clone(&directory),
         Arc::clone(&hosts),

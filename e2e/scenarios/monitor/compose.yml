@@ -4,6 +4,7 @@ services:
     image: portcullis-e2e-tester
     pull_policy: never
     networks: [net]
+    dns: [198.51.100.2]
   loner:
     image: portcullis-e2e-tester
     pull_policy: never

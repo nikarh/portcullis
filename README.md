@@ -53,7 +53,7 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. On startup an
 | `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
 | `--monitor` | off | Monitor mode on every network: report what would be denied, deny nothing. |
 | `--deny-action <reject\|drop>` | `reject` | `reject` answers denied traffic with an ICMP "administratively prohibited" error, so applications fail immediately with "Host is unreachable". `drop` discards it silently, and applications wait for their own timeout. |
-| `--log-allowed <always\|monitor\|never>` | `monitor` | Which allowed connections are reported. Denied ones always are. `monitor` reports them on networks in monitor mode only. |
+| `--log-allowed <always\|monitor\|never>` | `monitor` | Which allowed connections and successful DNS lookups are reported. Denied ones always are. `monitor` reports them on networks in monitor mode only. |
 | `--hostname-hold <seconds>` | `3600` | How long an address of a `host:` rule stays allowed after it was last seen, see [Hostname rules](#hostname-rules). |
 | `--events-socket <path>` | off | Serve events as JSON lines on a Unix socket. |
 | `--alert-exec <command>` | off | Run a command for every denial and warning, see [Alerts](#alerts). |
@@ -103,15 +103,17 @@ A connection event:
 | `query` | For denied DNS queries, the name asked for. |
 | `detail` | For `source`, what's wrong, such as which container's address was used. |
 
-Each new connection produces one event; replies and the rest of a connection don't. Other events:
+A flow (container, destination, protocol and port) is reported at most once a minute, however many connections it makes; the kernel filters out repeats before they reach Portcullis. Replies and the rest of a connection are never reported. Other events:
 
 | Event | When |
 |---|---|
-| `dns` | A container received a DNS answer: the name, its CNAME aliases, the answer addresses and the resolver. |
+| `dns` | A container received a DNS answer: the name, its CNAME aliases, the answer addresses and the resolver. Reported where allowed connections are (`--log-allowed`). |
 | `container` | A container address became managed (`action: managed`, with its `mode`) or stopped being managed (`released`). |
 | `warning` | `invalid_label`, `invalid_network`, `dns_not_observable` (see [DNS visibility](#dns-visibility)), or `events_lost` (the kernel produced log entries faster than Portcullis read them). |
 | `applied` | Rules were updated: the managed container addresses, and hostnames of `host:` rules with no known addresses. It comes after everything else the update caused. |
 | `apply_failed` | Updating the rules failed; the previous rules stay in place. |
+
+How much is written depends mostly on the mode. In enforce mode with the default `--log-allowed monitor`, only denials are reported, so once the labels are right there is little to nothing. Monitor mode reports every flow and every DNS lookup of the monitored containers; it is meant for rolling out, not to stay on.
 
 Portcullis doesn't store events. Send them to whatever already collects your logs (journald, Loki, Elasticsearch, Vector) and search and alert there, or use the alert hook.
 
