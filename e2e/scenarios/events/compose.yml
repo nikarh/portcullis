@@ -1,0 +1,29 @@
+# Denials are reported with who, what, and why.
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.icc.mode=deny
+  peer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+  spoofer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    cap_add: [NET_ADMIN]
+    networks: [net]
+  # Started by the test, to see the warning for a container without observable DNS.
+  late:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    profiles: [late]
+    networks: [net]
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

@@ -16,14 +16,16 @@ The host needs `qemu-system-x86_64`, `genisoimage` (or `mkisofs`), `ssh`, `rsync
 
 ## How it works
 
-`suite.sh` runs inside the VM as root. It starts Portcullis, runs every scenario, stops Portcullis with SIGTERM and checks that no rules are left behind. Then it repeats two scenarios with `--deny-action drop`, and runs one scenario in DNS proxy mode.
+`suite.sh` runs inside the VM as root. It starts Portcullis (with an event socket, and an alert hook appending to a file), runs every scenario, stops Portcullis with SIGTERM and checks that no rules are left behind. Then it repeats two scenarios with `--deny-action drop`.
 
-Outbound targets live in a network namespace routed from the Docker host (`outside.sh`), so traffic to them is forwarded and filtered like traffic to the internet. It serves TCP 80, 443 and 8080 and UDP 9000 on `198.51.100.2` to `.5`, and a DNS server on `198.51.100.2` that resolves `api.test` to `.3` and `other.test` to `.4`. The Docker host resolves the same names through `/etc/hosts`.
+Outbound targets live in a network namespace routed from the Docker host (`outside.sh`), so traffic to them is forwarded and filtered like traffic to the internet. It serves TCP 80, 443 and 8080 and UDP 9000 on `198.51.100.2` to `.5`, and a DNS server on `198.51.100.2` that resolves `api.test` to `.3`, `other.test` to `.4` and `dyn.test` to `.5`. The Docker host resolves `api.test` and `other.test` through `/etc/hosts`, but not `dyn.test`, so Portcullis can only learn its address from a container's lookup.
 
 Each scenario in `scenarios/<name>/` is a Compose project on a network with `portcullis.enable=true`, plus a `test.sh` with checks. No check waits for a timeout to pass:
 
 - `wait_managed <address>...` blocks until Portcullis's event stream (`--events-socket`) reports rules in place for those containers. Call it before checking anything a container's rules decide.
 - `allowed <description> <probe>` passes only when the probe shows the peer's answer.
 - `blocked <description> <probe>` passes only when the probe shows the rejection Portcullis sends ("Host is unreachable", or SERVFAIL from Docker's DNS server). In drop mode it passes when a kernel packet trace (`nft monitor trace`) shows one of Portcullis's chains dropping the probe.
+- `event <description> <filters> <probe>` subscribes to the event stream, runs the probe, and passes when an event matches every filter (`key=value` or `key~text`, see `expect-event.py`).
+- `wait_for_line <file> <pattern>` waits (through inotify) until a line of the file matches, for alerts.
 
 Probes (`tcp`, `udp`, `dns`, `resolve`, `from_outside`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname. The checks of a scenario run in parallel; a failed check prints the probe's output.

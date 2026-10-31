@@ -222,6 +222,42 @@ blocked() {
   fi
 }
 
+# event <description> <filters> <probe...>: the probe's traffic must produce an event matching
+# all filters (`key=value` or `key~text`, see expect-event.py). With EVENT_SAVE set, every
+# event seen is also appended to that file.
+event() {
+  local description="$1" filters="$2"
+  shift 2
+  check "event: ${description}" expect_event "${filters}" "$@"
+}
+
+expect_event() {
+  local filters="$1"
+  shift
+  local save=()
+  [[ -n "${EVENT_SAVE:-}" ]] && save=(--save "${EVENT_SAVE}")
+  # shellcheck disable=SC2086 # filters are separate words
+  coproc WATCH { exec python3 "${E2E_DIR}/expect-event.py" "${EVENTS_SOCKET}" 10 "${save[@]}" ${filters} 2>&1; }
+  local pid="${WATCH_PID}" fd ready
+  exec {fd}<&"${WATCH[0]}"
+  # Subscribed before the traffic happens, so the event can't be missed.
+  read -r ready <&"${fd}"
+  "$@" >/dev/null 2>&1
+  cat <&"${fd}"
+  exec {fd}<&-
+  wait "${pid}"
+}
+
+# wait_for_line <file> <pattern>: block until a line of the file matches (grep -E).
+wait_for_line() {
+  local file="$1" pattern="$2" deadline=$((SECONDS + 10))
+  touch "${file}"
+  until grep -Eq -- "${pattern}" "${file}"; do
+    ((SECONDS < deadline)) || { echo "no line matching ${pattern} in ${file}"; return 1; }
+    inotifywait -qq -t 2 -e modify "${file}" || true
+  done
+}
+
 # wait_managed <address...>: block until Portcullis reports rules in place for them.
 wait_managed() {
   local address
@@ -243,10 +279,13 @@ wait_managed() {
 PORTCULLIS_PID=""
 PORTCULLIS_LOG=/tmp/portcullis-e2e.log
 EVENTS_SOCKET=/run/portcullis-e2e.sock
+# Alerts are appended here, one JSON event per line.
+ALERT_LOG=/tmp/portcullis-e2e-alerts.log
 
 # start_portcullis [extra args...]: start in the background and wait for the first apply.
 start_portcullis() {
   : >"${PORTCULLIS_LOG}"
+  : >"${ALERT_LOG}"
   rm -f "${EVENTS_SOCKET}"
   # Watch for the socket before starting, so its creation can't be missed. Portcullis
   # creates it under a temporary name and renames it into place.
@@ -256,7 +295,8 @@ start_portcullis() {
       --format %f "${EVENTS_SOCKET%/*}" 2>&1
   }
   "${PORTCULLIS_BIN}" --log-level debug --events-socket "${EVENTS_SOCKET}" \
-    --deny-action "${DENY_ACTION}" "$@" >>"${PORTCULLIS_LOG}" 2>&1 &
+    --deny-action "${DENY_ACTION}" --alert-exec "cat >> ${ALERT_LOG}" "$@" \
+    >>"${PORTCULLIS_LOG}" 2>&1 &
   PORTCULLIS_PID=$!
   # Then wait for the first apply on the event stream.
   if read -r line <&"${SOCKET_WATCH[0]}" && [[ -S "${EVENTS_SOCKET}" ]] \

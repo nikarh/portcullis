@@ -6,7 +6,7 @@
 #   198.51.100.2  DNS (dnsmasq, udp+tcp/53), TCP 80/443/8080, UDP echo 9000
 #   198.51.100.3  same services, the address of api.test
 #   198.51.100.4  same services, the address of other.test
-#   198.51.100.5  same services, not in DNS
+#   198.51.100.5  same services, the address of dyn.test, which only this DNS server knows
 # The Docker host reaches it via 198.51.100.1.
 #
 #   outside.sh up | down
@@ -44,6 +44,7 @@ up() {
   ip netns exec "${NS}" setsid dnsmasq --keep-in-foreground --no-resolv --no-hosts \
     --listen-address=198.51.100.2 --bind-interfaces --pid-file="${RUN_DIR}/dnsmasq.pid" \
     --address=/api.test/198.51.100.3 --address=/other.test/198.51.100.4 \
+    --address=/dyn.test/198.51.100.5 \
     >/dev/null 2>&1 &
 
   # Wait until the services listen.

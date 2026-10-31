@@ -1,12 +1,13 @@
-# Run with --dns-mode proxy --dns-proxy-bind 198.51.100.1:53.
+# dyn.test resolves only through the outside DNS server, not on the Docker host, so its
+# address is only allowed once Portcullis has seen the container's lookup.
 services:
   app:
     image: portcullis-e2e-tester
     pull_policy: never
     networks: [net]
-    dns: [198.51.100.1]
+    dns: [198.51.100.2]
     labels:
-      - portcullis.egress.api=host:api.test,tcp:443
+      - portcullis.egress.dyn=host:dyn.test,tcp:80
 
 networks:
   net:

@@ -18,6 +18,10 @@ SCENARIOS=(
   invalid-labels
   restart
   spoofing
+  dns-inspection
+  monitor
+  events
+  alerts
 )
 
 # E2E_SCENARIOS="icc egress" runs only those.
@@ -90,13 +94,6 @@ if start_portcullis; then
   assert_cleaned_up
 fi
 DENY_ACTION=reject
-
-log "DNS proxy mode"
-if start_portcullis --dns-mode proxy --dns-proxy-bind 198.51.100.1:53; then
-  run_scenario hostname-proxy
-  stop_portcullis
-  assert_cleaned_up
-fi
 
 if ((FAILURES > 0)); then
   log "${FAILURES} of ${CHECKS} checks failed; Portcullis log: ${PORTCULLIS_LOG}"

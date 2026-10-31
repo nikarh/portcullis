@@ -1,0 +1,21 @@
+# A network in monitor mode: nothing is denied, everything that would be is reported.
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+  loner:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=deny
+  peer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=monitor
