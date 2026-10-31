@@ -9,6 +9,8 @@ pub enum LoggingError {
     Init(String),
     #[error("invalid log level: {0}")]
     InvalidLogLevel(String),
+    #[error("invalid log format: {0}")]
+    InvalidLogFormat(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,22 +49,42 @@ impl FromStr for LogLevel {
     }
 }
 
-pub fn init_logging_with_level(level: LogLevel) -> Result<(), LoggingError> {
+/// Output format of diagnostic logs and of events written to stdout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl FromStr for LogFormat {
+    type Err = LoggingError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            _ => Err(LoggingError::InvalidLogFormat(value.to_string())),
+        }
+    }
+}
+
+/// Diagnostic logs go to stderr; stdout carries events (see `events`).
+pub fn init_logging(level: LogLevel, format: LogFormat) -> Result<(), LoggingError> {
     let filter = EnvFilter::new(format!(
         "{},portcullis={}",
         level.as_filter_value(),
         level.as_filter_value()
     ));
-    init_subscriber(filter)
-}
-
-fn init_subscriber(filter: EnvFilter) -> Result<(), LoggingError> {
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
-        .with_thread_ids(true)
-        .try_init()
-        .map_err(|error| LoggingError::Init(error.to_string()))
+        .with_writer(std::io::stderr);
+    match format {
+        LogFormat::Text => builder.try_init(),
+        LogFormat::Json => builder.json().try_init(),
+    }
+    .map_err(|error| LoggingError::Init(error.to_string()))
 }
 
 #[cfg(test)]

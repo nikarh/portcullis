@@ -21,15 +21,15 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::ops::Range;
-use std::sync::Arc;
+use std::time::Duration;
 
 use ipnet::IpNet;
 use tracing::{error, trace};
 
-use crate::dns::PolicyDnsResolver;
+use crate::dns::{HostResolver, normalize};
 use crate::model::{
-    Container, DnsTarget, EgressTarget, IccAllowRule, IccMode, MacAddress, NetworkAttachment,
-    Protocol, RuntimeState,
+    Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule, IccMode, MacAddress,
+    NetworkAttachment, Protocol, RuntimeState,
 };
 
 pub const DNS_PORT: u16 = 53;
@@ -57,6 +57,8 @@ pub enum Rule {
     DenyDns { protocol: Protocol },
     /// Allow all traffic to a subnet (ICC allow).
     AcceptNet(IpNet),
+    /// Allow all traffic to an address of the host itself, such as the network gateway.
+    AcceptHost(IpAddr),
     /// Deny all traffic to a subnet (ICC deny).
     DenyNet(IpNet),
     /// Allow traffic to `destination` on a single port.
@@ -71,6 +73,11 @@ pub enum Rule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub address: IpAddr,
+    pub container: ContainerName,
+    /// Name of the network the address belongs to.
+    pub network: String,
+    /// Monitor mode: denials are reported, not enforced.
+    pub monitor: bool,
     /// The container's MAC address on the network the address belongs to. Packets from the
     /// address are only accepted with this MAC, so containers can't borrow others' addresses.
     pub mac: Option<MacAddress>,
@@ -124,11 +131,14 @@ impl fmt::Display for SetName {
 pub const SET_PREFIX_V4: &str = "pc_h4_";
 pub const SET_PREFIX_V6: &str = "pc_h6_";
 
-/// Resolved addresses of one hostname, shared by every rule that targets it.
+/// Known addresses of one hostname, shared by every rule that targets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostSet {
     pub id: HostSetId,
-    pub addresses: Arc<[IpAddr]>,
+    /// The hostname, normalized.
+    pub host: String,
+    /// Addresses and how long each stays allowed.
+    pub addresses: Vec<(IpAddr, Duration)>,
     /// Whether any IPv4 rule references this set.
     pub used_v4: bool,
     /// Whether any IPv6 rule references this set.
@@ -136,13 +146,29 @@ pub struct HostSet {
 }
 
 impl HostSet {
-    pub fn v4(&self) -> impl Iterator<Item = IpAddr> + '_ {
-        self.addresses.iter().copied().filter(IpAddr::is_ipv4)
+    pub fn v4(&self) -> impl Iterator<Item = (IpAddr, Duration)> + '_ {
+        self.addresses
+            .iter()
+            .copied()
+            .filter(|(address, _)| address.is_ipv4())
     }
 
-    pub fn v6(&self) -> impl Iterator<Item = IpAddr> + '_ {
-        self.addresses.iter().copied().filter(IpAddr::is_ipv6)
+    pub fn v6(&self) -> impl Iterator<Item = (IpAddr, Duration)> + '_ {
+        self.addresses
+            .iter()
+            .copied()
+            .filter(|(address, _)| address.is_ipv6())
     }
+}
+
+/// The bridge interface of a managed network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedBridge {
+    pub name: String,
+    pub network: String,
+    pub subnet: IpNet,
+    /// Monitor mode: denials are reported, not enforced.
+    pub monitor: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -153,24 +179,31 @@ pub struct Plan {
     rules: Vec<Rule>,
     /// Hostname sets, one per distinct hostname.
     pub host_sets: Vec<HostSet>,
-    /// Bridge interfaces of enforced networks. Traffic entering from them with a source
-    /// that isn't a managed address (and MAC) is denied.
-    pub enforced_bridges: Vec<String>,
+    /// Bridges of managed networks. Traffic entering from them with a source that isn't a
+    /// managed address (and MAC) is denied.
+    pub bridges: Vec<ManagedBridge>,
     /// Hostnames that could not be resolved; their sets are empty.
     pub unresolved_hosts: Vec<String>,
 }
 
 impl Plan {
     /// Build the plan for `state`, resolving every distinct hostname exactly once.
-    /// `host_resolvers` are the host's DNS servers, see [`crate::host_dns`].
-    pub fn build<R>(state: &RuntimeState, resolver: &mut R, host_resolvers: &[IpAddr]) -> Self
+    /// `host_resolvers` are the host's DNS servers, see [`crate::host_dns`]. With
+    /// `monitor_all`, every network is in monitor mode.
+    pub fn build<R>(
+        state: &RuntimeState,
+        resolver: &mut R,
+        host_resolvers: &[IpAddr],
+        monitor_all: bool,
+    ) -> Self
     where
-        R: PolicyDnsResolver,
+        R: HostResolver,
     {
         let mut planner = Planner {
             state,
             resolver,
             host_resolvers,
+            monitor_all,
             plan: Self::default(),
             seen_sources: HashSet::new(),
             host_index: HashMap::new(),
@@ -184,13 +217,19 @@ impl Plan {
             }
         }
 
-        planner.plan.enforced_bridges.extend(
-            state
-                .networks()
-                .values()
-                .map(|network| network.bridge.clone()),
-        );
-        planner.plan.enforced_bridges.sort_unstable();
+        planner
+            .plan
+            .bridges
+            .extend(state.networks().values().map(|network| ManagedBridge {
+                name: network.bridge.clone(),
+                network: network.name.clone(),
+                subnet: network.subnet,
+                monitor: monitor_all || network.monitor,
+            }));
+        planner
+            .plan
+            .bridges
+            .sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
         planner.plan
     }
@@ -223,6 +262,7 @@ impl Plan {
 struct Planner<'s, 'r, R> {
     state: &'s RuntimeState,
     resolver: &'r mut R,
+    monitor_all: bool,
     host_resolvers: &'s [IpAddr],
     plan: Plan,
     seen_sources: HashSet<IpAddr>,
@@ -236,7 +276,7 @@ struct Planner<'s, 'r, R> {
 
 impl<'s, R> Planner<'s, '_, R>
 where
-    R: PolicyDnsResolver,
+    R: HostResolver,
 {
     fn plan_attachment(&mut self, container: &'s Container, attachment: &'s NetworkAttachment) {
         let source = attachment.ip_address;
@@ -292,25 +332,32 @@ where
         let egress = egress_start..self.plan.rules.len();
 
         let icc_start = self.plan.rules.len();
-        if let Some(network) = network
-            && policy.icc_mode != IccMode::Allow
-        {
+        if let Some(network) = network {
             // The gateway is the host itself, not another container.
             if let Some(gateway) = network
                 .gateway
                 .filter(|gateway| same_family(source, *gateway))
             {
-                self.plan.rules.push(Rule::AcceptNet(IpNet::from(gateway)));
+                self.plan.rules.push(Rule::AcceptHost(gateway));
             }
-            if policy.icc_mode == IccMode::AllowListed {
-                self.plan_icc_allow_list(source, attachment, &policy.icc_allow);
+            match policy.icc_mode {
+                IccMode::Allow => self.plan.rules.push(Rule::AcceptNet(network.subnet)),
+                IccMode::Deny => self.plan.rules.push(Rule::DenyNet(network.subnet)),
+                IccMode::AllowListed => {
+                    self.plan_icc_allow_list(source, attachment, &policy.icc_allow);
+                    self.plan.rules.push(Rule::DenyNet(network.subnet));
+                }
             }
-            self.plan.rules.push(Rule::DenyNet(network.subnet));
         }
         let icc = icc_start..self.plan.rules.len();
 
         self.plan.sources.push(Source {
             address: source,
+            container: container.name.clone(),
+            network: network
+                .map(|network| network.name.clone())
+                .unwrap_or_default(),
+            monitor: self.monitor_all || network.is_some_and(|network| network.monitor),
             mac: attachment.mac_address,
             egress,
             icc,
@@ -325,10 +372,16 @@ where
         for target in targets {
             match target {
                 // Docker's DNS server forwards from the container's address to the
-                // container's `--dns` servers, or to the host's when it has none.
+                // container's `--dns` servers, else to the daemon-wide ones, else to the
+                // host's.
                 DnsTarget::Docker => {
                     if container.runtime_dns_servers.is_empty() {
-                        self.scratch.extend_from_slice(self.host_resolvers);
+                        let daemon_dns = self.state.daemon_dns();
+                        self.scratch.extend_from_slice(if daemon_dns.is_empty() {
+                            self.host_resolvers
+                        } else {
+                            daemon_dns
+                        });
                     } else {
                         self.scratch
                             .extend(container.runtime_dns_servers.iter().copied());
@@ -408,19 +461,23 @@ where
             return *index;
         }
 
-        let addresses = match self.resolver.resolve(host) {
+        let normalized = normalize(host);
+        let addresses = match self.resolver.addresses(&normalized) {
             Ok(addresses) => addresses,
             Err(error) => {
                 error!(%host, %error, "failed to resolve hostname; its rules allow nothing until it resolves");
-                self.plan.unresolved_hosts.push(host.to_string());
-                Arc::from([])
+                Vec::new()
             }
         };
-        trace!(%host, ip_count = addresses.len(), ?addresses, "resolved hostname addresses");
+        if addresses.is_empty() {
+            self.plan.unresolved_hosts.push(normalized.clone());
+        }
+        trace!(%host, ip_count = addresses.len(), ?addresses, "known hostname addresses");
 
         let index = self.plan.host_sets.len();
         self.plan.host_sets.push(HostSet {
-            id: HostSetId::for_host(host),
+            id: HostSetId::for_host(&normalized),
+            host: normalized,
             addresses,
             used_v4: false,
             used_v6: false,
@@ -489,7 +546,7 @@ mod tests {
 
     fn build(state: &RuntimeState) -> (Plan, MockResolver) {
         let mut resolver = MockResolver::default();
-        let plan = Plan::build(state, &mut resolver, &test_support::host_resolvers());
+        let plan = Plan::build(state, &mut resolver, &test_support::host_resolvers(), false);
         (plan, resolver)
     }
 
@@ -547,15 +604,21 @@ mod tests {
         assert_eq!(
             icc_of(&plan, "172.18.0.2"),
             vec![
-                Rule::AcceptNet(net("172.18.0.1/32")),
+                Rule::AcceptHost(ip("172.18.0.1")),
                 Rule::DenyNet(net("172.18.0.0/16"))
             ]
         );
-        assert_eq!(plan.enforced_bridges, vec!["br-net0".to_string()]);
+        assert_eq!(
+            plan.bridges
+                .iter()
+                .map(|bridge| bridge.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["br-net0"]
+        );
     }
 
     fn dns_destinations(state: &RuntimeState, host_resolvers: &[IpAddr]) -> Vec<IpAddr> {
-        let plan = Plan::build(state, &mut MockResolver::default(), host_resolvers);
+        let plan = Plan::build(state, &mut MockResolver::default(), host_resolvers, false);
         let mut destinations: Vec<_> = rules_of(&plan, "172.18.0.2")
             .into_iter()
             .filter_map(|rule| match rule {
@@ -603,6 +666,23 @@ mod tests {
     fn none_dns_allows_nothing() {
         let state = with_dns(vec![DnsTarget::None], &["1.1.1.1"]);
         assert!(dns_destinations(&state, &[ip("9.9.9.9")]).is_empty());
+    }
+
+    #[test]
+    fn docker_dns_follows_daemon_dns_servers() {
+        let mut state = with_dns(vec![DnsTarget::Docker], &[]);
+        state.set_daemon_dns(vec![ip("10.0.0.53")]);
+        assert_eq!(
+            dns_destinations(&state, &[ip("9.9.9.9")]),
+            vec![ip("10.0.0.53")]
+        );
+        // The container's own servers still win.
+        let mut state = with_dns(vec![DnsTarget::Docker], &["1.1.1.1"]);
+        state.set_daemon_dns(vec![ip("10.0.0.53")]);
+        assert_eq!(
+            dns_destinations(&state, &[ip("9.9.9.9")]),
+            vec![ip("1.1.1.1")]
+        );
     }
 
     #[test]
@@ -657,9 +737,15 @@ mod tests {
     }
 
     #[test]
-    fn icc_allow_has_no_icc_rules() {
+    fn icc_allow_accepts_its_network() {
         let (plan, _) = build(&test_support::icc_state());
-        assert!(icc_of(&plan, "172.18.0.3").is_empty());
+        assert_eq!(
+            icc_of(&plan, "172.18.0.3"),
+            vec![
+                Rule::AcceptHost(ip("172.18.0.1")),
+                Rule::AcceptNet(net("172.18.0.0/16"))
+            ]
+        );
     }
 
     #[test]
@@ -740,6 +826,12 @@ mod tests {
             protocol: Protocol::Tcp,
             port: 853,
         }));
-        assert_eq!(plan.enforced_bridges, vec!["br-net0".to_string()]);
+        assert_eq!(
+            plan.bridges
+                .iter()
+                .map(|bridge| bridge.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["br-net0"]
+        );
     }
 }

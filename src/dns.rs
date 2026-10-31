@@ -1,10 +1,24 @@
-use std::collections::{HashMap, VecDeque};
+//! Addresses of the hostnames used in `host:` rules.
+//!
+//! Addresses come from two places:
+//! - DNS answers containers receive, which Portcullis inspects (see `dns_inspect`), with the
+//!   answer's TTL;
+//! - Portcullis's own lookup through the host's resolver when a hostname has no known
+//!   addresses, so that containers that resolved it before Portcullis started aren't cut
+//!   off.
+//!
+//! Every address stays allowed for at least the hold time after it was last seen, since
+//! applications often keep using an address for longer than its TTL.
+
+use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tracing::{debug, trace};
+use tracing::trace;
+
+/// How long a failed lookup is remembered before it is retried.
+const RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum DnsError {
@@ -12,16 +26,17 @@ pub enum DnsError {
     LookupFailed { host: String, message: String },
 }
 
-/// `UpstreamResolver` is a trait that defines a method for resolving hostnames to IP addresses
-/// by querying an upstream DNS server.
+/// Resolves hostnames through some resolver.
 pub trait UpstreamResolver {
     fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError>;
 }
 
-pub trait PolicyDnsResolver {
-    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError>;
+/// The addresses currently allowed for a hostname, with how long each stays allowed.
+pub trait HostResolver {
+    fn addresses(&mut self, host: &str) -> Result<Vec<(IpAddr, Duration)>, DnsError>;
 }
 
+/// The host's resolver (`getaddrinfo`).
 #[derive(Debug, Clone, Copy)]
 pub struct SystemUpstreamResolver;
 
@@ -36,234 +51,113 @@ impl UpstreamResolver for SystemUpstreamResolver {
             })?
             .map(|address| address.ip())
             .collect();
-        // Same canonical form as the DNS runtime, so unchanged results compare equal.
         ips.sort_unstable();
         ips.dedup();
-
         trace!(%host, result_count = ips.len(), ?ips, "system DNS lookup result");
         Ok(ips)
     }
 }
 
-/// How long a failed lookup is remembered as "no addresses" before it is retried.
-const NEGATIVE_TTL: Duration = Duration::from_secs(30);
-
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    values: Arc<[IpAddr]>,
-    expires_at: Instant,
+#[derive(Debug, Default)]
+struct HostEntry {
+    /// Address and when it stops being allowed.
+    addresses: HashMap<IpAddr, Instant>,
+    /// After a failed lookup: don't look the hostname up again before this.
+    retry_at: Option<Instant>,
 }
 
+/// Known addresses of hostnames, normalized to lower case without a trailing dot.
 #[derive(Debug)]
-pub struct DnsProxyCache<R>
-where
-    R: UpstreamResolver,
-{
+pub struct HostAddresses<R> {
     resolver: R,
-    max_size: usize,
-    ttl: Duration,
-    entries: HashMap<String, CacheEntry>,
-    lru: VecDeque<String>,
+    hold: Duration,
+    entries: HashMap<String, HostEntry>,
 }
 
-impl<R> DnsProxyCache<R>
+impl<R> HostAddresses<R>
 where
     R: UpstreamResolver,
 {
-    pub fn new(resolver: R, ttl: Duration, max_size: usize) -> Self {
+    pub fn new(resolver: R, hold: Duration) -> Self {
         Self {
             resolver,
-            max_size,
-            ttl,
+            hold,
             entries: HashMap::new(),
-            lru: VecDeque::new(),
         }
     }
 
+    /// Record an address a DNS answer gave for `host`. Returns how long it is allowed.
+    pub fn observe(
+        &mut self,
+        host: &str,
+        address: IpAddr,
+        ttl: Duration,
+        now: Instant,
+    ) -> Duration {
+        let allowed_for = ttl.max(self.hold);
+        let expires = now + allowed_for;
+        let entry = self.entries.entry(normalize(host)).or_default();
+        let current = entry.addresses.entry(address).or_insert(expires);
+        *current = (*current).max(expires);
+        entry.retry_at = None;
+        allowed_for
+    }
+
+    /// Whether `address` is currently allowed for `host`.
     #[must_use]
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub fn allows(&self, host: &str, address: IpAddr, now: Instant) -> bool {
+        self.entries
+            .get(&normalize(host))
+            .and_then(|entry| entry.addresses.get(&address))
+            .is_some_and(|expires| *expires > now)
     }
 
-    fn purge_expired(&mut self, now: Instant) {
-        if self.entries.is_empty() {
-            return;
-        }
+    fn addresses_at(
+        &mut self,
+        host: &str,
+        now: Instant,
+    ) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
+        let host = normalize(host);
+        let entry = self.entries.entry(host.clone()).or_default();
+        entry.addresses.retain(|_, expires| *expires > now);
 
-        trace!(
-            entry_count = self.entries.len(),
-            "purging expired DNS cache entries"
-        );
-
-        let mut expired_keys = Vec::new();
-        for (host, entry) in &self.entries {
-            if entry.expires_at <= now {
-                expired_keys.push(host.clone());
+        if entry.addresses.is_empty() && entry.retry_at.is_none_or(|retry_at| retry_at <= now) {
+            match self.resolver.resolve_host(&host) {
+                Ok(addresses) => {
+                    for address in addresses {
+                        entry.addresses.insert(address, now + self.hold);
+                    }
+                }
+                Err(error) => {
+                    entry.retry_at = Some(now + RETRY_AFTER);
+                    return Err(error);
+                }
             }
         }
 
-        for key in &expired_keys {
-            self.entries.remove(key);
-        }
-
-        if !expired_keys.is_empty() {
-            self.lru.retain(|host| !expired_keys.contains(host));
-            debug!(
-                expired_count = expired_keys.len(),
-                "expired DNS cache entries removed"
-            );
-        }
-    }
-
-    fn touch_lru(&mut self, host: &str) {
-        self.lru.retain(|entry| entry != host);
-        self.lru.push_back(host.to_string());
-    }
-
-    fn enforce_limit(&mut self) {
-        while self.entries.len() > self.max_size {
-            let Some(oldest) = self.lru.pop_front() else {
-                break;
-            };
-            if self.entries.remove(&oldest).is_some() {
-                debug!(%oldest, max_size = self.max_size, "evicted DNS cache entry due to size limit");
-            }
-        }
-    }
-
-    fn store_values(&mut self, host: &str, values: &Arc<[IpAddr]>, ttl: Duration) {
-        let expires_at = Instant::now() + ttl;
-        self.entries.insert(
-            host.to_string(),
-            CacheEntry {
-                values: Arc::clone(values),
-                expires_at,
-            },
-        );
-        self.touch_lru(host);
-        self.enforce_limit();
-    }
-
-    pub fn resolve_cached(&mut self, host: &str) -> Arc<[IpAddr]> {
-        let now = Instant::now();
-        self.purge_expired(now);
-        if let Some(entry) = self.entries.get(host)
-            && entry.expires_at > now
-        {
-            let values = Arc::clone(&entry.values);
-            self.touch_lru(host);
-            return values;
-        }
-        Arc::from(Vec::<IpAddr>::new().into_boxed_slice())
-    }
-
-    pub fn insert_with_ttl(&mut self, host: &str, values: Vec<IpAddr>, ttl: Duration) {
-        let addresses: Arc<[IpAddr]> = Arc::<[IpAddr]>::from(values.into_boxed_slice());
-        self.store_values(host, &addresses, ttl);
-    }
-
-    pub fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
-        let now = Instant::now();
-        self.purge_expired(now);
-
-        if let Some(entry) = self.entries.get(host)
-            && entry.expires_at > now
-        {
-            let values = Arc::clone(&entry.values);
-            let value_count = values.len();
-            self.touch_lru(host);
-            trace!(%host, ip_count = value_count, "DNS cache hit");
-            return Ok(values);
-        }
-
-        trace!(%host, "DNS cache miss");
-        let values = match self.resolver.resolve_host(host) {
-            Ok(values) => values,
-            Err(error) => {
-                // Remember the failure briefly, so that callers don't block on the resolver
-                // for the same broken name over and over.
-                self.store_values(host, &Arc::from([]), NEGATIVE_TTL.min(self.ttl));
-                return Err(error);
-            }
-        };
-
-        // Allocation note:
-        // 1) `values` allocates a Vec for upstream results.
-        // 2) `Arc<[IpAddr]>` allocates once to store deduplicated addresses for cheap cache-hit cloning.
-        // 3) Host key String is stored in HashMap and LRU deque.
-        let addresses: Arc<[IpAddr]> = Arc::<[IpAddr]>::from(values.into_boxed_slice());
-        self.store_values(host, &addresses, self.ttl);
-
-        trace!(
-            %host,
-            ip_count = addresses.len(),
-            ttl_secs = self.ttl.as_secs(),
-            cache_size = self.entries.len(),
-            "stored DNS cache entry"
-        );
-
+        let mut addresses: Vec<_> = entry
+            .addresses
+            .iter()
+            .map(|(address, expires)| (*address, expires.saturating_duration_since(now)))
+            .collect();
+        addresses.sort_unstable();
         Ok(addresses)
     }
 }
 
-impl<R> PolicyDnsResolver for DnsProxyCache<R>
+impl<R> HostResolver for HostAddresses<R>
 where
     R: UpstreamResolver,
 {
-    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
-        DnsProxyCache::resolve(self, host)
+    fn addresses(&mut self, host: &str) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
+        self.addresses_at(host, Instant::now())
     }
 }
 
-pub struct CacheOnlyDnsResolver<'a, R>
-where
-    R: UpstreamResolver,
-{
-    cache: &'a mut DnsProxyCache<R>,
-}
-
-impl<'a, R> CacheOnlyDnsResolver<'a, R>
-where
-    R: UpstreamResolver,
-{
-    pub const fn new(cache: &'a mut DnsProxyCache<R>) -> Self {
-        Self { cache }
-    }
-}
-
-impl<R> PolicyDnsResolver for CacheOnlyDnsResolver<'_, R>
-where
-    R: UpstreamResolver,
-{
-    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
-        Ok(self.cache.resolve_cached(host))
-    }
-}
-
-pub struct CacheFallbackDnsResolver<'a, R>
-where
-    R: UpstreamResolver,
-{
-    cache: &'a mut DnsProxyCache<R>,
-}
-
-impl<'a, R> CacheFallbackDnsResolver<'a, R>
-where
-    R: UpstreamResolver,
-{
-    pub const fn new(cache: &'a mut DnsProxyCache<R>) -> Self {
-        Self { cache }
-    }
-}
-
-impl<R> PolicyDnsResolver for CacheFallbackDnsResolver<'_, R>
-where
-    R: UpstreamResolver,
-{
-    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
-        DnsProxyCache::resolve(self.cache, host)
-    }
+/// Lower case without the trailing dot of fully qualified names.
+#[must_use]
+pub fn normalize(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -272,110 +166,98 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct MockResolver {
-        calls: Arc<Mutex<Vec<String>>>,
-        mapping: HashMap<String, Vec<IpAddr>>,
-    }
-
-    impl MockResolver {
-        fn with_mapping(mapping: &[(&str, &[&str])]) -> Self {
-            let mut values = HashMap::new();
-            for (host, ips) in mapping {
-                let mut parsed = Vec::new();
-                for ip in *ips {
-                    let value = match ip.parse() {
-                        Ok(address) => address,
-                        Err(error) => panic!("failed to parse test ip address: {error}"),
-                    };
-                    parsed.push(value);
-                }
-                values.insert((*host).to_string(), parsed);
-            }
-
-            Self {
-                calls: Arc::new(Mutex::new(Vec::new())),
-                mapping: values,
-            }
-        }
-
-        fn call_count(&self) -> usize {
-            let guard = match self.calls.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock call list: {error}"),
-            };
-            guard.len()
-        }
+        calls: Arc<Mutex<usize>>,
+        answer: Vec<IpAddr>,
     }
 
     impl UpstreamResolver for MockResolver {
         fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
-            let mut guard = match self.calls.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock call list: {error}"),
-            };
-            guard.push(host.to_string());
-
-            self.mapping
-                .get(host)
-                .cloned()
-                .ok_or_else(|| DnsError::LookupFailed {
+            *self.calls.lock().expect("lock") += 1;
+            if self.answer.is_empty() {
+                return Err(DnsError::LookupFailed {
                     host: host.to_string(),
-                    message: "missing host mapping".to_string(),
-                })
+                    message: "not found".to_string(),
+                });
+            }
+            Ok(self.answer.clone())
         }
     }
 
+    fn ip(value: &str) -> IpAddr {
+        value.parse().expect("ip")
+    }
+
+    const HOLD: Duration = Duration::from_secs(3600);
+
     #[test]
-    fn cache_hit_returns_cached_addresses() {
-        let resolver = MockResolver::with_mapping(&[("api.example.com", &["1.1.1.1"])]);
-        let mut cache = DnsProxyCache::new(resolver.clone(), Duration::from_secs(300), 128);
-
-        let first = cache.resolve("api.example.com");
-        assert!(first.is_ok());
-
-        let second = cache.resolve("api.example.com");
-        assert!(second.is_ok());
-        assert_eq!(resolver.call_count(), 1);
+    fn looks_up_unknown_hostnames_once() {
+        let resolver = MockResolver {
+            answer: vec![ip("1.1.1.1")],
+            ..MockResolver::default()
+        };
+        let mut hosts = HostAddresses::new(resolver.clone(), HOLD);
+        let now = Instant::now();
+        assert_eq!(
+            hosts
+                .addresses_at("API.example.com.", now)
+                .expect("addresses"),
+            vec![(ip("1.1.1.1"), HOLD)]
+        );
+        hosts
+            .addresses_at("api.example.com", now)
+            .expect("addresses");
+        assert_eq!(*resolver.calls.lock().expect("lock"), 1);
     }
 
     #[test]
-    fn failed_lookup_is_remembered_as_empty() {
-        let resolver = MockResolver::with_mapping(&[]);
-        let mut cache = DnsProxyCache::new(resolver.clone(), Duration::from_secs(300), 128);
-
-        assert!(cache.resolve("missing.example.com").is_err());
-        let second = cache
-            .resolve("missing.example.com")
-            .expect("cached failure");
-        assert!(second.is_empty());
-        assert_eq!(resolver.call_count(), 1);
+    fn retries_failed_lookups_after_a_while() {
+        let resolver = MockResolver::default();
+        let mut hosts = HostAddresses::new(resolver.clone(), HOLD);
+        let now = Instant::now();
+        assert!(hosts.addresses_at("missing.test", now).is_err());
+        assert!(
+            hosts
+                .addresses_at("missing.test", now)
+                .expect("cached")
+                .is_empty()
+        );
+        assert_eq!(*resolver.calls.lock().expect("lock"), 1);
+        assert!(
+            hosts
+                .addresses_at("missing.test", now + RETRY_AFTER)
+                .is_err()
+        );
+        assert_eq!(*resolver.calls.lock().expect("lock"), 2);
     }
 
     #[test]
-    fn ttl_zero_forces_relookup() {
-        let resolver = MockResolver::with_mapping(&[("api.example.com", &["1.1.1.1"])]);
-        let mut cache = DnsProxyCache::new(resolver.clone(), Duration::from_secs(0), 128);
-
-        let _ = cache.resolve("api.example.com");
-        let _ = cache.resolve("api.example.com");
-
-        assert_eq!(resolver.call_count(), 2);
+    fn observed_addresses_are_held_at_least_the_hold_time() {
+        let mut hosts = HostAddresses::new(MockResolver::default(), HOLD);
+        let now = Instant::now();
+        assert_eq!(
+            hosts.observe("api.test", ip("1.1.1.1"), Duration::from_secs(60), now),
+            HOLD
+        );
+        let long = Duration::from_secs(7200);
+        assert_eq!(hosts.observe("api.test", ip("2.2.2.2"), long, now), long);
+        assert_eq!(
+            hosts.addresses_at("api.test", now).expect("addresses"),
+            vec![(ip("1.1.1.1"), HOLD), (ip("2.2.2.2"), long)]
+        );
+        // Expired addresses are gone; the hostname is then looked up again.
+        assert!(hosts.addresses_at("api.test", now + long).is_err());
     }
 
     #[test]
-    fn max_size_enforces_eviction() {
-        let resolver = MockResolver::with_mapping(&[
-            ("a.example.com", &["1.1.1.1"]),
-            ("b.example.com", &["2.2.2.2"]),
-            ("c.example.com", &["3.3.3.3"]),
-        ]);
-        let mut cache = DnsProxyCache::new(resolver, Duration::from_secs(300), 2);
-
-        let _ = cache.resolve("a.example.com");
-        let _ = cache.resolve("b.example.com");
-        let _ = cache.resolve("c.example.com");
-
-        assert_eq!(cache.len(), 2);
+    fn tells_which_addresses_a_host_allows() {
+        let mut hosts = HostAddresses::new(MockResolver::default(), HOLD);
+        let now = Instant::now();
+        hosts.observe("a.test", ip("1.1.1.1"), HOLD, now);
+        hosts.observe("b.test", ip("2.2.2.2"), HOLD, now);
+        assert!(hosts.allows("A.test.", ip("1.1.1.1"), now));
+        assert!(!hosts.allows("b.test", ip("1.1.1.1"), now));
+        assert!(!hosts.allows("a.test", ip("1.1.1.1"), now + HOLD));
     }
 }

@@ -1,63 +1,442 @@
-//! Optional event stream on a Unix socket.
+//! Events: what Portcullis decides and observes.
 //!
-//! Every connected client receives one JSON object per line: the current state right after
-//! connecting, then one event for every rule update. The stream is read-only; anything a
-//! client sends is ignored.
+//! Every event goes to the configured sinks:
+//! - stdout, one line per event, as text or JSON (`--log-format`);
+//! - the event socket (`--events-socket`), as JSON lines, for tools;
+//! - the alert hook (`--alert-exec`), for denials and warnings, de-duplicated.
+//!
+//! Diagnostic logs go to stderr and are not events.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write as _};
 use std::net::IpAddr;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::logging::LogFormat;
 
 /// Socket permissions: owner only. The stream exposes container addresses and errors.
 const SOCKET_MODE: u32 = 0o600;
 /// A client that can't take a line within this time is disconnected, so a stalled reader
-/// never delays rule updates.
+/// never delays anything else.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+/// An alert command running longer than this is killed.
+const ALERT_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Allowed,
+    Denied,
+    /// Monitor mode: the policy would have denied this, but it was let through.
+    WouldDeny,
+}
+
+/// Which part of the policy decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    /// Outbound traffic, decided by `portcullis.egress.*`.
+    Egress,
+    /// DNS traffic, decided by `portcullis.dns.*`.
+    Dns,
+    /// Traffic to a container on the same network, decided by `portcullis.icc.*`.
+    Icc,
+    /// A source address that doesn't belong to the container sending it.
+    Source,
+}
+
+/// Where a connection's domain comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainSource {
+    /// The container looked the name up, and Portcullis saw the answer.
+    Dns,
+    /// The address belongs to a `host:` rule.
+    Rule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Connection {
+    pub verdict: Verdict,
+    pub reason: Reason,
+    /// The container that sent the traffic, if known.
+    pub container: Option<String>,
+    pub network: Option<String>,
+    pub protocol: String,
+    pub source: IpAddr,
+    pub source_port: Option<u16>,
+    pub destination: IpAddr,
+    pub destination_port: Option<u16>,
+    /// The container at the destination, for traffic between containers.
+    pub destination_container: Option<String>,
+    pub domain: Option<String>,
+    pub domain_source: Option<DomainSource>,
+    /// The name a denied DNS query asked for.
+    pub query: Option<String>,
+    /// Extra explanation, e.g. why a source is considered spoofed.
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dns {
+    pub container: Option<String>,
+    pub network: Option<String>,
+    pub resolver: IpAddr,
+    pub name: String,
+    pub record_type: String,
+    pub response_code: String,
+    /// CNAME targets the name resolved through.
+    pub aliases: Vec<String>,
+    pub answers: Vec<IpAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningKind {
+    /// A container label is invalid and was ignored.
+    InvalidLabel,
+    /// A network's configuration prevents enforcing it.
+    InvalidNetwork,
+    /// Portcullis can't see this container's DNS lookups.
+    DnsNotObservable,
+    /// The kernel dropped logged packets because they weren't read fast enough.
+    EventsLost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Warning {
+    pub kind: WarningKind,
+    pub container: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Enforce,
+    Monitor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerAction {
+    /// Rules now apply to this container address.
+    Managed,
+    /// Rules no longer apply to this container address.
+    Released,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerChange {
+    pub action: ContainerAction,
+    pub container: String,
+    pub network: String,
+    pub address: IpAddr,
+    pub mode: Mode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
-pub enum Event<'a> {
+pub enum Event {
     /// Rules were applied.
     Applied {
         /// Increases by one with every successful apply.
         generation: u64,
         /// Managed container addresses.
-        sources: &'a [IpAddr],
-        /// Hostnames from egress rules that could not be resolved; their rules allow nothing.
-        unresolved_hosts: &'a [String],
+        sources: Vec<IpAddr>,
+        /// Hostnames of `host:` rules with no known addresses; their rules allow nothing.
+        unresolved_hosts: Vec<String>,
     },
     /// Applying rules failed; the previous rules stay in place.
-    ApplyFailed { error: &'a str },
+    ApplyFailed {
+        error: String,
+    },
+    Container(ContainerChange),
+    Connection(Connection),
+    Dns(Dns),
+    Warning(Warning),
 }
 
-#[derive(Default)]
-struct Shared {
-    clients: Mutex<Vec<UnixStream>>,
+impl Event {
+    /// The de-duplication key of events that raise alerts.
+    fn alert_key(&self) -> Option<String> {
+        match self {
+            Self::Connection(connection) if connection.verdict == Verdict::Denied => {
+                let destination = connection
+                    .destination_container
+                    .clone()
+                    .or_else(|| connection.domain.clone())
+                    .or_else(|| connection.query.clone())
+                    .unwrap_or_else(|| connection.destination.to_string());
+                Some(format!(
+                    "connection {} {:?} {} {}/{}",
+                    connection.container.as_deref().unwrap_or("?"),
+                    connection.reason,
+                    destination,
+                    connection.protocol,
+                    connection.destination_port.unwrap_or_default(),
+                ))
+            }
+            Self::ApplyFailed { error } => Some(format!("apply_failed {error}")),
+            Self::Warning(warning) => Some(format!(
+                "warning {:?} {} {}",
+                warning.kind,
+                warning.container.as_deref().unwrap_or("?"),
+                warning.message
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// An event with its time, as written to every sink.
+#[derive(Serialize)]
+struct Record<'a> {
+    time: &'a str,
+    #[serde(flatten)]
+    event: &'a Event,
+}
+
+/// Configuration of the event sinks.
+#[derive(Debug, Clone, Default)]
+pub struct Sinks {
+    /// Write events to stdout in this format.
+    pub stdout: Option<LogFormat>,
+    pub socket: Option<PathBuf>,
+    pub alert_command: Option<String>,
+    pub alert_interval: Duration,
+}
+
+/// Publishes events to the configured sinks. Cheap to clone; usable from any thread.
+#[derive(Clone)]
+pub struct EventBus {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    stdout: Option<LogFormat>,
+    socket: Option<SocketSink>,
+    alerts: Option<AlertSink>,
+    generation: AtomicU64,
+}
+
+impl EventBus {
+    pub fn new(sinks: &Sinks) -> io::Result<Self> {
+        let socket = sinks.socket.as_deref().map(SocketSink::bind).transpose()?;
+        let alerts = sinks
+            .alert_command
+            .clone()
+            .map(|command| AlertSink::start(command, sinks.alert_interval));
+        Ok(Self {
+            inner: Arc::new(Inner {
+                stdout: sinks.stdout,
+                socket,
+                alerts,
+                generation: AtomicU64::new(0),
+            }),
+        })
+    }
+
+    pub fn applied(&self, sources: Vec<IpAddr>, unresolved_hosts: Vec<String>) {
+        let generation = self.inner.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.publish(&Event::Applied {
+            generation,
+            sources,
+            unresolved_hosts,
+        });
+    }
+
+    pub fn publish(&self, event: &Event) {
+        let time = timestamp(SystemTime::now());
+        let record = Record { time: &time, event };
+        let json = serde_json::to_string(&record).unwrap_or_default();
+
+        match self.inner.stdout {
+            Some(LogFormat::Json) => print_line(&json),
+            Some(LogFormat::Text) => print_line(&text(&time, event)),
+            None => {}
+        }
+        if let Some(socket) = &self.inner.socket {
+            socket.send(&json, matches!(event, Event::Applied { .. }));
+        }
+        if let (Some(alerts), Some(key)) = (&self.inner.alerts, event.alert_key()) {
+            alerts.raise(key, json);
+        }
+    }
+}
+
+fn print_line(line: &str) {
+    let mut stdout = io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+/// An event with its time, as read back from a sink.
+#[derive(Debug, Deserialize)]
+pub struct Line {
+    pub time: String,
+    #[serde(flatten)]
+    pub event: Event,
+}
+
+/// One human-readable line.
+pub fn text(time: &str, event: &Event) -> String {
+    let mut line = format!("{time} ");
+    let _ = match event {
+        Event::Applied {
+            generation,
+            sources,
+            unresolved_hosts,
+        } => {
+            let _ = write!(
+                line,
+                "applied rules (generation {generation}, {} container addresses)",
+                sources.len()
+            );
+            if unresolved_hosts.is_empty() {
+                Ok(())
+            } else {
+                write!(line, ", unresolved: {}", unresolved_hosts.join(", "))
+            }
+        }
+        Event::ApplyFailed { error } => write!(line, "failed to apply rules: {error}"),
+        Event::Container(change) => write!(
+            line,
+            "{} {} {} on {} ({})",
+            match change.action {
+                ContainerAction::Managed => "managing",
+                ContainerAction::Released => "releasing",
+            },
+            change.container,
+            change.address,
+            change.network,
+            match change.mode {
+                Mode::Enforce => "enforce",
+                Mode::Monitor => "monitor",
+            }
+        ),
+        Event::Connection(connection) => write_connection(&mut line, connection),
+        Event::Dns(dns) => {
+            let _ = write!(
+                line,
+                "dns {} {} {} via {}: {}",
+                dns.container.as_deref().unwrap_or("?"),
+                dns.record_type,
+                dns.name,
+                dns.resolver,
+                dns.response_code
+            );
+            if !dns.aliases.is_empty() {
+                let _ = write!(line, " (via {})", dns.aliases.join(", "));
+            }
+            for answer in &dns.answers {
+                let _ = write!(line, " {answer}");
+            }
+            Ok(())
+        }
+        Event::Warning(warning) => write!(
+            line,
+            "warning {}: {}",
+            warning.container.as_deref().unwrap_or("-"),
+            warning.message
+        ),
+    };
+    line
+}
+
+fn write_connection(line: &mut String, connection: &Connection) -> std::fmt::Result {
+    let verdict = match connection.verdict {
+        Verdict::Allowed => "allowed",
+        Verdict::Denied => "DENIED",
+        Verdict::WouldDeny => "would deny",
+    };
+    let reason = match connection.reason {
+        Reason::Egress => "egress",
+        Reason::Dns => "dns",
+        Reason::Icc => "icc",
+        Reason::Source => "source",
+    };
+    write!(
+        line,
+        "{verdict} {reason} {} {}",
+        connection.container.as_deref().unwrap_or("?"),
+        connection.source
+    )?;
+    write!(line, " -> ")?;
+    if let Some(container) = &connection.destination_container {
+        write!(line, "{container} ({})", connection.destination)?;
+    } else if let Some(domain) = &connection.domain {
+        write!(line, "{domain} ({})", connection.destination)?;
+    } else {
+        write!(line, "{}", connection.destination)?;
+    }
+    match connection.destination_port {
+        Some(port) => write!(line, " {}/{port}", connection.protocol)?,
+        None => write!(line, " {}", connection.protocol)?,
+    }
+    if let Some(query) = &connection.query {
+        write!(line, " query {query}")?;
+    }
+    if let Some(detail) = &connection.detail {
+        write!(line, " ({detail})")?;
+    }
+    Ok(())
+}
+
+/// RFC 3339 UTC timestamp with millisecond precision.
+fn timestamp(time: SystemTime) -> String {
+    let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = since_epoch.as_secs();
+    let days = i64::try_from(seconds / 86_400).unwrap_or_default();
+    let of_day = seconds % 86_400;
+    // Howard Hinnant's days-to-civil algorithm.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        of_day / 3600,
+        of_day % 3600 / 60,
+        of_day % 60,
+        since_epoch.subsec_millis()
+    )
+}
+
+struct SocketSink {
+    path: PathBuf,
+    clients: Arc<Mutex<Vec<UnixStream>>>,
     /// The latest `applied` line, sent to clients when they connect.
-    last_applied: Mutex<Option<String>>,
+    last_applied: Arc<Mutex<Option<String>>>,
 }
 
-/// Publishes events to connected clients. Does nothing when no socket was configured.
-#[derive(Default)]
-pub struct EventSink {
-    shared: Option<Arc<Shared>>,
-    path: Option<PathBuf>,
-    generation: u64,
-}
-
-impl EventSink {
+impl SocketSink {
     /// Listen on `path`. A stale socket left at `path` is replaced; any other existing file
     /// is an error.
-    pub fn bind(path: &Path) -> io::Result<Self> {
+    fn bind(path: &Path) -> io::Result<Self> {
         if let Ok(metadata) = fs::symlink_metadata(path) {
             if !metadata.file_type().is_socket() {
                 return Err(io::Error::new(
@@ -76,56 +455,44 @@ impl EventSink {
         fs::set_permissions(&temporary, fs::Permissions::from_mode(SOCKET_MODE))?;
         fs::rename(&temporary, path)?;
 
-        let shared = Arc::new(Shared::default());
-        let accepting = Arc::clone(&shared);
-        thread::spawn(move || accept_clients(&listener, &accepting));
+        let clients = Arc::new(Mutex::new(Vec::new()));
+        let last_applied = Arc::new(Mutex::new(None));
+        let (accept_clients, accept_last) = (Arc::clone(&clients), Arc::clone(&last_applied));
+        thread::spawn(move || accept(&listener, &accept_clients, &accept_last));
 
         Ok(Self {
-            shared: Some(shared),
-            path: Some(path.to_path_buf()),
-            generation: 0,
+            path: path.to_path_buf(),
+            clients,
+            last_applied,
         })
     }
 
-    pub fn applied(&mut self, sources: &[IpAddr], unresolved_hosts: &[String]) {
-        let Some(shared) = &self.shared else {
-            return;
-        };
-        self.generation += 1;
-        let line = to_line(&Event::Applied {
-            generation: self.generation,
-            sources,
-            unresolved_hosts,
-        });
-        *shared
-            .last_applied
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(line.clone());
-        broadcast(shared, &line);
-    }
-
-    pub fn apply_failed(&self, error: &str) {
-        if let Some(shared) = &self.shared {
-            broadcast(shared, &to_line(&Event::ApplyFailed { error }));
+    fn send(&self, json: &str, is_applied: bool) {
+        let mut line = String::with_capacity(json.len() + 1);
+        line.push_str(json);
+        line.push('\n');
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        if is_applied {
+            *self
+                .last_applied
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(line.clone());
         }
+        clients.retain_mut(|client| client.write_all(line.as_bytes()).is_ok());
     }
 }
 
-impl Drop for EventSink {
+impl Drop for SocketSink {
     fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(&self.path);
     }
 }
 
-fn to_line(event: &Event<'_>) -> String {
-    let mut line = serde_json::to_string(event).unwrap_or_default();
-    line.push('\n');
-    line
-}
-
-fn accept_clients(listener: &UnixListener, shared: &Shared) {
+fn accept(
+    listener: &UnixListener,
+    clients: &Mutex<Vec<UnixStream>>,
+    last_applied: &Mutex<Option<String>>,
+) {
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(stream) => stream,
@@ -139,14 +506,10 @@ fn accept_clients(listener: &UnixListener, shared: &Shared) {
         }
         debug!("event stream client connected");
 
-        // Hold the client list while sending the snapshot, so no event can slip in between
-        // the snapshot and the client being registered.
-        let mut clients = shared
-            .clients
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let snapshot = shared
-            .last_applied
+        // Hold the client list while sending the current state, so no event can slip in
+        // between the state and the client being registered.
+        let mut clients = clients.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = last_applied
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
@@ -159,12 +522,87 @@ fn accept_clients(listener: &UnixListener, shared: &Shared) {
     }
 }
 
-fn broadcast(shared: &Shared, line: &str) {
-    shared
-        .clients
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .retain_mut(|client| client.write_all(line.as_bytes()).is_ok());
+/// Runs the alert command for alert-worthy events, at most once per key and interval.
+struct AlertSink {
+    sender: Mutex<Sender<String>>,
+    interval: Duration,
+    last_raised: Mutex<HashMap<String, Instant>>,
+}
+
+impl AlertSink {
+    fn start(command: String, interval: Duration) -> Self {
+        let (sender, receiver) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for json in receiver {
+                run_alert(&command, &json);
+            }
+        });
+        Self {
+            sender: Mutex::new(sender),
+            interval,
+            last_raised: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn raise(&self, key: String, json: String) {
+        let now = Instant::now();
+        {
+            let mut last_raised = self
+                .last_raised
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            last_raised.retain(|_, raised| now.duration_since(*raised) < self.interval);
+            if last_raised.contains_key(&key) {
+                return;
+            }
+            last_raised.insert(key, now);
+        }
+        let _ = self
+            .sender
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(json);
+    }
+}
+
+/// Run `command` with `sh -c`, the event as JSON on stdin.
+fn run_alert(command: &str, json: &str) {
+    let child = Command::new("/bin/sh")
+        .args(["-c", command])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            warn!(%error, "failed to run alert command");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(json.as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    warn!(%status, "alert command failed");
+                }
+                return;
+            }
+            Ok(None) if started.elapsed() < ALERT_TIMEOUT => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                warn!("alert command timed out; killing it");
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -173,70 +611,168 @@ mod tests {
 
     use super::*;
 
-    fn temp_socket(name: &str) -> PathBuf {
+    fn temp_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("portcullis-events-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("temp dir");
         dir.join(name)
     }
 
-    fn read_line(reader: &mut BufReader<UnixStream>) -> serde_json::Value {
+    fn read_json(reader: &mut BufReader<UnixStream>) -> serde_json::Value {
         let mut line = String::new();
         reader.read_line(&mut line).expect("line");
         serde_json::from_str(&line).expect("json")
     }
 
+    fn denied(port: u16) -> Event {
+        Event::Connection(Connection {
+            verdict: Verdict::Denied,
+            reason: Reason::Egress,
+            container: Some("web".to_string()),
+            network: Some("backend".to_string()),
+            protocol: "tcp".to_string(),
+            source: "172.18.0.2".parse().expect("ip"),
+            source_port: Some(40000),
+            destination: "104.18.3.4".parse().expect("ip"),
+            destination_port: Some(port),
+            destination_container: None,
+            domain: Some("api.stripe.com".to_string()),
+            domain_source: Some(DomainSource::Dns),
+            query: None,
+            detail: None,
+        })
+    }
+
     #[test]
-    fn disabled_sink_does_nothing() {
-        let mut sink = EventSink::default();
-        sink.applied(&[], &[]);
-        sink.apply_failed("error");
-        assert_eq!(sink.generation, 0);
+    fn formats_timestamps() {
+        let time = UNIX_EPOCH + Duration::from_millis(1_793_389_871_123);
+        assert_eq!(timestamp(time), "2026-10-30T19:51:11.123Z");
+        assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            timestamp(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn formats_connection_events_as_text() {
+        let line = text("T", &denied(443));
+        assert_eq!(
+            line,
+            "T DENIED egress web 172.18.0.2 -> api.stripe.com (104.18.3.4) tcp/443"
+        );
+    }
+
+    #[test]
+    fn serializes_events_with_their_kind() {
+        let json = serde_json::to_value(Record {
+            time: "T",
+            event: &denied(443),
+        })
+        .expect("json");
+        assert_eq!(json["event"], "connection");
+        assert_eq!(json["verdict"], "denied");
+        assert_eq!(json["reason"], "egress");
+        assert_eq!(json["domain_source"], "dns");
+        assert_eq!(json["time"], "T");
+    }
+
+    #[test]
+    fn only_denials_and_problems_raise_alerts() {
+        assert!(denied(443).alert_key().is_some());
+        let Event::Connection(mut monitored) = denied(443) else {
+            unreachable!()
+        };
+        monitored.verdict = Verdict::WouldDeny;
+        assert!(Event::Connection(monitored).alert_key().is_none());
+        assert!(
+            Event::ApplyFailed { error: "x".into() }
+                .alert_key()
+                .is_some()
+        );
+        assert!(
+            Event::Applied {
+                generation: 1,
+                sources: Vec::new(),
+                unresolved_hosts: Vec::new()
+            }
+            .alert_key()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn alerts_are_deduplicated() {
+        let output = temp_path("alerts.log");
+        let _ = fs::remove_file(&output);
+        let bus = EventBus::new(&Sinks {
+            alert_command: Some(format!("cat >> {}", output.display())),
+            alert_interval: Duration::from_secs(600),
+            ..Sinks::default()
+        })
+        .expect("bus");
+        bus.publish(&denied(443));
+        bus.publish(&denied(443));
+        bus.publish(&denied(80));
+        // Wait for the worker: it handles alerts in order, so a marker alert run after
+        // them proves they're done.
+        let marker = temp_path("alerts.done");
+        let _ = fs::remove_file(&marker);
+        run_alert(&format!("touch {}", marker.display()), "");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_to_string(&output).map_or(0, |text| text.lines().count()) < 2
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let lines = fs::read_to_string(&output).expect("alerts");
+        assert_eq!(lines.lines().count(), 2, "{lines}");
+        assert!(lines.contains("\"destination_port\":443"));
+        assert!(lines.contains("\"destination_port\":80"));
     }
 
     #[test]
     fn streams_events_and_sends_state_on_connect() {
-        let path = temp_socket("stream.sock");
-        let mut sink = EventSink::bind(&path).expect("bind");
+        let path = temp_path("stream.sock");
+        let bus = EventBus::new(&Sinks {
+            socket: Some(path.clone()),
+            ..Sinks::default()
+        })
+        .expect("bus");
         let mode = fs::metadata(&path).expect("socket").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
 
-        let address: IpAddr = "172.18.0.2".parse().expect("ip");
-        sink.applied(&[address], &["broken.test".to_string()]);
+        bus.applied(
+            vec!["172.18.0.2".parse().expect("ip")],
+            vec!["broken.test".to_string()],
+        );
 
         // A client connecting later gets the current state first.
         let mut reader = BufReader::new(UnixStream::connect(&path).expect("connect"));
-        let snapshot = read_line(&mut reader);
+        let snapshot = read_json(&mut reader);
         assert_eq!(snapshot["event"], "applied");
         assert_eq!(snapshot["generation"], 1);
         assert_eq!(snapshot["sources"][0], "172.18.0.2");
         assert_eq!(snapshot["unresolved_hosts"][0], "broken.test");
 
         // Wait until the client is registered before publishing more.
-        while sink
-            .shared
-            .as_ref()
-            .expect("shared")
-            .clients
-            .lock()
-            .expect("lock")
-            .is_empty()
-        {
+        let socket = bus.inner.socket.as_ref().expect("socket");
+        while socket.clients.lock().expect("lock").is_empty() {
             thread::yield_now();
         }
-        sink.apply_failed("nft said no");
-        sink.applied(&[], &[]);
-        assert_eq!(read_line(&mut reader)["event"], "apply_failed");
-        assert_eq!(read_line(&mut reader)["generation"], 2);
+        bus.publish(&denied(443));
+        bus.applied(Vec::new(), Vec::new());
+        assert_eq!(read_json(&mut reader)["event"], "connection");
+        assert_eq!(read_json(&mut reader)["generation"], 2);
 
-        drop(sink);
+        drop(bus);
         assert!(!path.exists());
     }
 
     #[test]
     fn refuses_to_replace_a_regular_file() {
-        let path = temp_socket("not-a-socket");
+        let path = temp_path("not-a-socket");
         fs::write(&path, "data").expect("write");
-        assert!(EventSink::bind(&path).is_err());
+        assert!(SocketSink::bind(&path).is_err());
         assert!(path.exists());
     }
 }

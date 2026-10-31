@@ -2,11 +2,11 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::time::Duration;
 
 use ipnet::IpNet;
 
-use crate::dns::{DnsError, PolicyDnsResolver};
+use crate::dns::{DnsError, HostResolver};
 use crate::model::{
     Container, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
     MacAddress, Network, NetworkAttachment, PortSpec, Protocol, RuntimeState, RuntimeStateAction,
@@ -22,11 +22,14 @@ pub struct MockResolver {
     pub calls: usize,
 }
 
-impl PolicyDnsResolver for MockResolver {
-    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
+/// How long test addresses stay allowed.
+pub const HOLD: Duration = Duration::from_secs(3600);
+
+impl HostResolver for MockResolver {
+    fn addresses(&mut self, host: &str) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
         self.calls += 1;
         if host == HOST {
-            return Ok(Arc::from([ip("1.1.1.1"), ip("2606:4700::1111")]));
+            return Ok(vec![(ip("1.1.1.1"), HOLD), (ip("2606:4700::1111"), HOLD)]);
         }
         Err(DnsError::LookupFailed {
             host: host.to_string(),
@@ -63,6 +66,7 @@ pub fn add_network(state: &mut RuntimeState, id: &str, subnet: &str, gateway: &s
             subnet: net(subnet),
             gateway: Some(ip(gateway)),
             bridge: format!("br-{id}"),
+            monitor: false,
         },
     });
 }

@@ -29,6 +29,33 @@ pub fn host_resolvers() -> Vec<IpAddr> {
     })
 }
 
+/// Where Docker's daemon configuration lives.
+const DOCKER_DAEMON_CONFIG: &str = "/etc/docker/daemon.json";
+
+/// DNS servers set daemon-wide with `dns` in Docker's `daemon.json`. With these, Docker's
+/// DNS server forwards every container's lookups from the container's own address, where
+/// Portcullis can see them, even for containers without DNS servers of their own.
+#[must_use]
+pub fn docker_daemon_dns() -> Vec<IpAddr> {
+    std::fs::read_to_string(DOCKER_DAEMON_CONFIG)
+        .map(|contents| daemon_dns_from(&contents))
+        .unwrap_or_default()
+}
+
+fn daemon_dns_from(contents: &str) -> Vec<IpAddr> {
+    serde_json::from_str::<serde_json::Value>(contents)
+        .ok()
+        .and_then(|config| {
+            config.get("dns")?.as_array().map(|servers| {
+                servers
+                    .iter()
+                    .filter_map(|server| server.as_str()?.parse().ok())
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 fn resolvers_from(
     resolv_conf: &str,
     systemd_resolv_conf: impl FnOnce() -> Option<String>,
@@ -84,6 +111,16 @@ mod tests {
             Some("nameserver 10.0.2.3\nnameserver 127.0.0.1\n".to_string())
         });
         assert_eq!(servers, vec![ip("10.0.2.3")]);
+    }
+
+    #[test]
+    fn reads_daemon_dns() {
+        assert_eq!(
+            daemon_dns_from(r#"{"dns": ["10.0.0.1", "bogus"], "log-driver": "local"}"#),
+            vec![ip("10.0.0.1")]
+        );
+        assert!(daemon_dns_from("{}").is_empty());
+        assert!(daemon_dns_from("not json").is_empty());
     }
 
     #[test]

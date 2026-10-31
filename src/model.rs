@@ -219,6 +219,8 @@ pub struct Network {
     pub gateway: Option<IpAddr>,
     /// Name of the network's bridge interface on the host.
     pub bridge: String,
+    /// `portcullis.enable=monitor`: evaluate the policy, but only report what it would deny.
+    pub monitor: bool,
 }
 
 /// An Ethernet MAC address.
@@ -229,6 +231,12 @@ impl MacAddress {
     #[cfg(test)]
     #[must_use]
     pub const fn new(octets: [u8; 6]) -> Self {
+        Self(octets)
+    }
+}
+
+impl From<[u8; 6]> for MacAddress {
+    fn from(octets: [u8; 6]) -> Self {
         Self(octets)
     }
 }
@@ -279,6 +287,8 @@ pub struct Container {
 pub struct RuntimeState {
     containers: HashMap<ContainerId, Container>,
     networks: HashMap<NetworkId, Network>,
+    /// DNS servers set daemon-wide in Docker's `daemon.json`.
+    daemon_dns: Vec<IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +328,16 @@ impl RuntimeState {
     #[must_use]
     pub fn networks(&self) -> &HashMap<NetworkId, Network> {
         &self.networks
+    }
+
+    /// DNS servers Docker's DNS forwards to for containers without their own.
+    #[must_use]
+    pub fn daemon_dns(&self) -> &[IpAddr] {
+        &self.daemon_dns
+    }
+
+    pub fn set_daemon_dns(&mut self, servers: Vec<IpAddr>) {
+        self.daemon_dns = servers;
     }
 
     fn remove_network(&mut self, network_id: &NetworkId) -> bool {

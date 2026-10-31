@@ -1,11 +1,12 @@
 mod nftables;
 mod plan;
 #[cfg(test)]
-mod test_support;
+pub mod test_support;
 
 use thiserror::Error;
 
-pub use nftables::{DenyAction, NftablesFirewall};
+pub use nftables::{DenyAction, LOG_PREFIX, LogAllowed, NftablesFirewall, Options};
+pub use plan::{Destination, HostSet, Plan, Rule};
 
 #[derive(Debug, Error)]
 pub enum FirewallError {

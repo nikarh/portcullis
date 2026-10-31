@@ -11,6 +11,7 @@ use crate::docker::raw::{
     DockerHostConfig, DockerNetworkInspect,
 };
 use crate::docker::{DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind};
+use crate::events::{Warning, WarningKind};
 use crate::labels::parse_policy;
 use crate::model::{
     Container, ContainerId, ContainerPolicy, MacAddress, Network, NetworkAttachment, NetworkId,
@@ -30,18 +31,40 @@ pub enum MonitorError {
     MissingNetworkSubnet(String),
 }
 
-/// Policy from a container's labels. Invalid labels are logged and skipped.
-fn policy_from_labels(container: &str, labels: &IndexMap<String, String>) -> ContainerPolicy {
+/// Policy from a container's labels. Invalid labels are logged, reported and skipped.
+fn policy_from_labels(
+    container: &str,
+    labels: &IndexMap<String, String>,
+    warnings: &mut Vec<Warning>,
+) -> ContainerPolicy {
+    let container = container.trim_start_matches('/');
     let (policy, errors) = parse_policy(labels);
     for error in errors {
-        error!(container = container.trim_start_matches('/'), %error, "ignoring invalid portcullis label");
+        error!(container, %error, "ignoring invalid portcullis label");
+        warnings.push(Warning {
+            kind: WarningKind::InvalidLabel,
+            container: Some(container.to_string()),
+            message: format!("ignoring invalid label: {error}"),
+        });
     }
     policy
 }
 
+fn network_warning(warnings: &mut Vec<Warning>, network: &DockerNetworkInspect, message: &str) {
+    error!(network = %network.name, "{message}");
+    warnings.push(Warning {
+        kind: WarningKind::InvalidNetwork,
+        container: None,
+        message: format!("network {}: {message}", network.name),
+    });
+}
+
 /// The managed network for `network`, or `None` when Portcullis doesn't manage it. Invalid
 /// configuration is logged rather than failing the caller.
-fn network_from_inspect(network: &DockerNetworkInspect) -> Option<Network> {
+fn network_from_inspect(
+    network: &DockerNetworkInspect,
+    warnings: &mut Vec<Warning>,
+) -> Option<Network> {
     // Ignore non-bridge networks
     if !network.driver.is_bridge() {
         debug!(
@@ -54,19 +77,23 @@ fn network_from_inspect(network: &DockerNetworkInspect) -> Option<Network> {
     }
 
     // Ignore non-portcullis networks
-    if !is_portcullis_enabled(network) {
+    let Some(monitor) = portcullis_mode(network, warnings) else {
         debug!(
             network_id = %network.id,
             network_name = %network.name,
             "ignoring non-portcullis network"
         );
         return None;
-    }
+    };
 
-    let (subnet, gateway) = match network_primary_config(network) {
+    let (subnet, gateway) = match network_primary_config(network, warnings) {
         Ok(value) => value,
         Err(error) => {
-            error!(network = %network.name, %error, "can't enforce network without a valid subnet");
+            network_warning(
+                warnings,
+                network,
+                &format!("can't enforce the network without a valid subnet: {error}"),
+            );
             return None;
         }
     };
@@ -77,6 +104,7 @@ fn network_from_inspect(network: &DockerNetworkInspect) -> Option<Network> {
         subnet,
         gateway,
         bridge: bridge_name(network),
+        monitor,
     })
 }
 
@@ -98,6 +126,8 @@ fn parse_mac(value: Option<&str>) -> Option<MacAddress> {
 
 pub struct DockerMonitor<A> {
     api: A,
+    /// Configuration problems found since the last `take_warnings`.
+    warnings: Vec<Warning>,
 }
 
 impl<A> DockerMonitor<A>
@@ -105,7 +135,15 @@ where
     A: DockerApi,
 {
     pub const fn new(api: A) -> Self {
-        Self { api }
+        Self {
+            api,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Configuration problems found since the last call.
+    pub fn take_warnings(&mut self) -> Vec<Warning> {
+        std::mem::take(&mut self.warnings)
     }
 
     pub fn initialize(&mut self) -> Result<RuntimeState, MonitorError> {
@@ -116,13 +154,26 @@ where
 
         let mut networks_by_id = HashMap::new();
         for network in networks {
-            if let Some(data) = network_from_inspect(&network) {
+            if let Some(data) = network_from_inspect(&network, &mut self.warnings) {
                 networks_by_id.insert(data.id.clone(), data);
             }
         }
         let mut containers_by_id = HashMap::new();
         for summary in containers {
-            let container = Self::build_container_from_summary(&networks_by_id, summary);
+            let mut container =
+                Self::build_container_from_summary(&networks_by_id, summary, &mut self.warnings);
+            // The container list doesn't include DNS settings; managed containers need them.
+            if !container.attachments.is_empty() {
+                match self.api.inspect_container(&container.id) {
+                    Ok(inspect) => {
+                        container.runtime_dns_servers =
+                            runtime_dns_servers(inspect.host_config.as_ref());
+                    }
+                    Err(error) => {
+                        debug!(container = %container.name, %error, "failed to inspect container");
+                    }
+                }
+            }
             containers_by_id.insert(container.id.clone(), container);
         }
         let mut state = RuntimeState::default();
@@ -143,7 +194,9 @@ where
                 DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
                     container_id: event.id.into(),
                 })),
-                DockerEventAction::Create => Ok(Self::create_container_action(event)),
+                DockerEventAction::Create => {
+                    Ok(Self::create_container_action(event, &mut self.warnings))
+                }
                 DockerEventAction::Rename => {
                     let Some(name) = event.name else {
                         return Ok(None);
@@ -175,8 +228,9 @@ where
     fn build_container_from_inspect(
         state: &RuntimeState,
         inspect: DockerContainerInspect,
+        warnings: &mut Vec<Warning>,
     ) -> Result<Box<Container>, MonitorError> {
-        let policy = policy_from_labels(&inspect.name, &inspect.config.labels);
+        let policy = policy_from_labels(&inspect.name, &inspect.config.labels, warnings);
         let runtime_dns_servers = runtime_dns_servers(inspect.host_config.as_ref());
 
         let mut attachments = Vec::new();
@@ -226,17 +280,22 @@ where
 
         match self.api.inspect_container(container_id) {
             Ok(inspect) => {
-                let container = Self::build_container_from_inspect(state, inspect)?;
+                let container =
+                    Self::build_container_from_inspect(state, inspect, &mut self.warnings)?;
                 Ok(Some(RuntimeStateAction::CreateContainer { container }))
             }
             Err(error) => Err(error.into()),
         }
     }
 
-    fn create_container_action(event: DockerEvent) -> Option<RuntimeStateAction> {
+    fn create_container_action(
+        event: DockerEvent,
+        warnings: &mut Vec<Warning>,
+    ) -> Option<RuntimeStateAction> {
         let policy = policy_from_labels(
             event.name.as_deref().unwrap_or(&event.id),
             &event.attributes,
+            warnings,
         );
 
         let name = event.name?;
@@ -304,7 +363,7 @@ where
         debug!(%network_id, "resolving network runtime state action");
         match self.api.inspect_network(network_id) {
             Ok(network) => {
-                if let Some(network) = network_from_inspect(&network) {
+                if let Some(network) = network_from_inspect(&network, &mut self.warnings) {
                     Ok(Some(RuntimeStateAction::UpsertNetwork { network }))
                 } else {
                     Ok(Some(RuntimeStateAction::RemoveNetwork {
@@ -322,8 +381,10 @@ where
     fn build_container_from_summary(
         managed_networks: &HashMap<NetworkId, Network>,
         summary: DockerContainerSummary,
+        warnings: &mut Vec<Warning>,
     ) -> Container {
-        let policy = policy_from_labels(&container_summary_name(&summary), &summary.labels);
+        let policy =
+            policy_from_labels(&container_summary_name(&summary), &summary.labels, warnings);
         let runtime_dns_servers = runtime_dns_servers(summary.host_config.as_ref());
 
         let mut attachments = Vec::new();
@@ -369,6 +430,7 @@ fn is_not_found(error: &DockerError) -> bool {
 /// dual-stack networks the other configuration is IPv6, which Portcullis doesn't manage.
 fn network_primary_config(
     network: &DockerNetworkInspect,
+    warnings: &mut Vec<Warning>,
 ) -> Result<(IpNet, Option<IpAddr>), MonitorError> {
     let configs = network
         .ipam
@@ -382,7 +444,11 @@ fn network_primary_config(
             Ok(subnet @ IpNet::V4(_)) => Some((subnet, config)),
             Ok(IpNet::V6(_)) => None,
             Err(_) => {
-                error!(network = %network.name, subnet = ?config.subnet, "ignoring invalid network subnet");
+                network_warning(
+                    warnings,
+                    network,
+                    &format!("ignoring invalid subnet {:?}", config.subnet),
+                );
                 None
             }
         })
@@ -391,7 +457,11 @@ fn network_primary_config(
     let gateway = config.gateway.as_deref().and_then(|value| {
         let gateway = value.parse::<IpAddr>().ok().filter(IpAddr::is_ipv4);
         if gateway.is_none() {
-            error!(network = %network.name, gateway = value, "ignoring invalid network gateway");
+            network_warning(
+                warnings,
+                network,
+                &format!("ignoring invalid gateway {value}"),
+            );
         }
         gateway
     });
@@ -399,29 +469,25 @@ fn network_primary_config(
     Ok((subnet, gateway))
 }
 
-/// Whether the network opted in. An invalid value is logged and treated as enforced, so a
+/// Whether the network opted in, and in which mode: `Some(false)` for `true` (enforce),
+/// `Some(true)` for `monitor`. An invalid value is reported and treated as enforced, so a
 /// typo restricts containers instead of silently leaving them open.
-fn is_portcullis_enabled(network: &DockerNetworkInspect) -> bool {
+fn portcullis_mode(network: &DockerNetworkInspect, warnings: &mut Vec<Warning>) -> Option<bool> {
     const LABEL_KEY: &str = "portcullis.enable";
-    let Some(value) = network
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get(LABEL_KEY))
-        .cloned()
-    else {
-        return false;
-    };
+    let value = network.labels.as_ref()?.get(LABEL_KEY)?;
     match value.as_str() {
-        "true" => true,
-        "false" => false,
+        "true" => Some(false),
+        "monitor" => Some(true),
+        "false" => None,
         _ => {
-            error!(
-                network = %network.name,
-                label = LABEL_KEY,
-                %value,
-                "invalid label value, expected true or false; enforcing the network"
+            network_warning(
+                warnings,
+                network,
+                &format!(
+                    "invalid {LABEL_KEY} value {value:?}, expected true, monitor or false; enforcing the network"
+                ),
             );
-            true
+            Some(false)
         }
     }
 }
@@ -663,6 +729,7 @@ mod tests {
                 subnet,
                 gateway,
                 bridge: format!("br-{network_id}"),
+                monitor: false,
             },
         });
     }
@@ -934,6 +1001,46 @@ mod tests {
             unmanaged,
             Some(RuntimeStateAction::RemoveNetwork { network_id }) if network_id == "net1".into()
         ));
+    }
+
+    #[test]
+    fn collect_state_reads_dns_servers_of_managed_containers() {
+        let mut api = MockDockerApi::default();
+        api.networks_list.push(network_inspect(
+            "net0",
+            "managed",
+            "172.20.0.0/16",
+            Some("172.20.0.1"),
+            DockerNetworkDriver::Bridge,
+            Some("true"),
+        ));
+        api.containers_list.push(container_summary(
+            "abc",
+            "/web",
+            &[],
+            &[("managed", "net0", "172.20.0.2")],
+        ));
+        api.containers_list
+            .push(container_summary("def", "/other", &[], &[]));
+        let mut inspect =
+            container_inspect("abc", "/web", &[], &[("managed", "net0", "172.20.0.2")]);
+        inspect.host_config = Some(DockerHostConfig {
+            dns: Some(vec!["9.9.9.9".to_string()]),
+        });
+        api.containers.insert("abc".to_string(), inspect);
+
+        let mut monitor = DockerMonitor::new(api);
+        let state = monitor.initialize().expect("initialize should succeed");
+        let web = state.containers().get("abc").expect("web");
+        assert!(
+            web.runtime_dns_servers
+                .contains(&"9.9.9.9".parse::<IpAddr>().expect("ip"))
+        );
+        // Only managed containers are inspected.
+        assert_eq!(
+            monitor.api.inspect_container_requests.borrow().as_slice(),
+            ["abc".to_string()]
+        );
     }
 
     #[test]
