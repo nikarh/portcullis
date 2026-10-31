@@ -52,12 +52,12 @@ pub enum Rule {
         destination: Option<IpAddr>,
         protocol: Protocol,
     },
-    /// Drop any other DNS.
-    DropDns { protocol: Protocol },
+    /// Deny any other DNS.
+    DenyDns { protocol: Protocol },
     /// Allow all traffic to a subnet (ICC allow).
     AcceptNet(IpNet),
-    /// Drop all traffic to a subnet (ICC deny).
-    DropNet(IpNet),
+    /// Deny all traffic to a subnet (ICC deny).
+    DenyNet(IpNet),
     /// Allow traffic to `destination` on a single port.
     AcceptPort {
         destination: Destination,
@@ -237,12 +237,12 @@ where
         }
 
         let policy = &container.policy;
-        let subnet = self
+        let network = self
             .state
             .networks()
             .get(&attachment.network_id)
-            .map(|network| network.subnet)
-            .filter(|subnet| same_family(source, subnet.addr()));
+            .filter(|network| same_family(source, network.subnet.addr()));
+        let subnet = network.map(|network| network.subnet);
 
         let egress_start = self.plan.rules.len();
         // Traffic within the network is up to the ICC rules. It only reaches the routed
@@ -282,15 +282,20 @@ where
         let egress = egress_start..self.plan.rules.len();
 
         let icc_start = self.plan.rules.len();
-        if let Some(subnet) = subnet {
-            match policy.icc_mode {
-                IccMode::Allow => {}
-                IccMode::Deny => self.plan.rules.push(Rule::DropNet(subnet)),
-                IccMode::AllowListed => {
-                    self.plan_icc_allow_list(source, attachment, &policy.icc_allow);
-                    self.plan.rules.push(Rule::DropNet(subnet));
-                }
+        if let Some(network) = network
+            && policy.icc_mode != IccMode::Allow
+        {
+            // The gateway is the host itself, not another container.
+            if let Some(gateway) = network
+                .gateway
+                .filter(|gateway| same_family(source, *gateway))
+            {
+                self.plan.rules.push(Rule::AcceptNet(IpNet::from(gateway)));
             }
+            if policy.icc_mode == IccMode::AllowListed {
+                self.plan_icc_allow_list(source, attachment, &policy.icc_allow);
+            }
+            self.plan.rules.push(Rule::DenyNet(network.subnet));
         }
         let icc = icc_start..self.plan.rules.len();
 
@@ -349,7 +354,7 @@ where
 
         self.plan
             .rules
-            .extend(DNS_PROTOCOLS.map(|protocol| Rule::DropDns { protocol }));
+            .extend(DNS_PROTOCOLS.map(|protocol| Rule::DenyDns { protocol }));
     }
 
     fn plan_icc_allow_list(
@@ -509,10 +514,10 @@ mod tests {
                     destination: Some(resolver),
                     protocol: Protocol::Tcp
                 },
-                Rule::DropDns {
+                Rule::DenyDns {
                     protocol: Protocol::Udp
                 },
-                Rule::DropDns {
+                Rule::DenyDns {
                     protocol: Protocol::Tcp
                 },
                 Rule::AcceptPort {
@@ -529,7 +534,10 @@ mod tests {
         );
         assert_eq!(
             icc_of(&plan, "172.18.0.2"),
-            vec![Rule::DropNet(net("172.18.0.0/16"))]
+            vec![
+                Rule::AcceptNet(net("172.18.0.1/32")),
+                Rule::DenyNet(net("172.18.0.0/16"))
+            ]
         );
         assert_eq!(plan.enforced_subnets, vec![net("172.18.0.0/16")]);
     }

@@ -5,7 +5,7 @@ mod test_support;
 
 use thiserror::Error;
 
-pub use nftables::NftablesFirewall;
+pub use nftables::{DenyAction, NftablesFirewall};
 
 #[derive(Debug, Error)]
 pub enum FirewallError {

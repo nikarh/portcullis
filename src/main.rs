@@ -30,7 +30,7 @@ use crate::dns_proxy::{
     DnsApplyAck, DnsResolvedEvent, DnsRuntimeHandle, DnsRuntimeMode, spawn_dns_runtime,
 };
 use crate::docker::{DockerClient, DockerError, DockerEvent, DockerEventClient};
-use crate::firewall::{FirewallError, NftablesFirewall};
+use crate::firewall::{DenyAction, FirewallError, NftablesFirewall};
 use crate::logging::{LogLevel, LoggingError};
 use crate::model::{EgressTarget, RuntimeState};
 use crate::monitor::{DockerMonitor, MonitorError};
@@ -56,6 +56,7 @@ impl FromStr for DnsMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
     docker_socket: String,
+    deny_action: DenyAction,
     dns_mode: DnsMode,
     dns_proxy_bind: SocketAddr,
     log_level: LogLevel,
@@ -65,6 +66,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             docker_socket: "/var/run/docker.sock".to_string(),
+            deny_action: DenyAction::Reject,
             dns_mode: DnsMode::Lazy,
             dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 1053)),
             log_level: LogLevel::Info,
@@ -78,6 +80,8 @@ enum MainError {
     Args(#[from] pico_args::Error),
     #[error("invalid DNS mode: {0}")]
     InvalidDnsMode(String),
+    #[error("invalid deny action: {0}")]
+    InvalidDenyAction(String),
     #[error("invalid DNS proxy bind address: {0}")]
     InvalidDnsProxyBind(String),
     #[error("unexpected positional arguments: {0:?}")]
@@ -132,6 +136,13 @@ fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
     if let Some(socket) = args.opt_value_from_str::<_, String>("--docker-socket")? {
         config.docker_socket = socket;
     }
+    if let Some(action) = args.opt_value_from_str::<_, String>("--deny-action")? {
+        config.deny_action = match action.as_str() {
+            "reject" => DenyAction::Reject,
+            "drop" => DenyAction::Drop,
+            _ => return Err(MainError::InvalidDenyAction(action)),
+        };
+    }
     if let Some(mode) = args.opt_value_from_str::<_, String>("--dns-mode")? {
         config.dns_mode = DnsMode::from_str(&mode)?;
     }
@@ -157,10 +168,12 @@ fn print_help() -> Result<(), std::io::Error> {
 portcullis prototype
 
 USAGE:
-  portcullis [--docker-socket <path>] [--dns-mode <lazy|proxy>] [--dns-proxy-bind <host:port>] [--log-level <error|warn|info|debug|trace>]
+  portcullis [--docker-socket <path>] [--deny-action <reject|drop>] [--dns-mode <lazy|proxy>] [--dns-proxy-bind <host:port>] [--log-level <error|warn|info|debug|trace>]
 
 OPTIONS:
   --docker-socket      Path to Docker Unix socket (default: /var/run/docker.sock)
+  --deny-action        Reject denied traffic with an ICMP error, or drop it silently
+                       (default: reject)
   --dns-mode           DNS behavior mode: lazy or proxy (default: lazy)
   --dns-proxy-bind     UDP bind address for DNS proxy mode (default: 127.0.0.1:1053)
   --log-level          Logging level (default: info)
@@ -297,7 +310,7 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let monitor_client = DockerClient::connect(&config.docker_socket)?;
     let mut monitor = DockerMonitor::new(monitor_client);
-    let firewall = NftablesFirewall::with_libnftables()?;
+    let firewall = NftablesFirewall::with_libnftables(config.deny_action)?;
 
     info!("performing startup firewall cleanup");
     firewall.cleanup()?;
@@ -480,6 +493,7 @@ mod tests {
             config,
             Some(Config {
                 docker_socket: "/var/run/docker.sock".to_string(),
+                deny_action: DenyAction::Reject,
                 dns_mode: DnsMode::Lazy,
                 dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 1053)),
                 log_level: LogLevel::Info,
@@ -492,6 +506,8 @@ mod tests {
         let args = Arguments::from_vec(vec![
             "--docker-socket".into(),
             "/tmp/docker.sock".into(),
+            "--deny-action".into(),
+            "drop".into(),
             "--dns-mode".into(),
             "proxy".into(),
             "--dns-proxy-bind".into(),
@@ -504,11 +520,19 @@ mod tests {
             config,
             Some(Config {
                 docker_socket: "/tmp/docker.sock".to_string(),
+                deny_action: DenyAction::Drop,
                 dns_mode: DnsMode::Proxy,
                 dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 5300)),
                 log_level: LogLevel::Debug,
             })
         );
+    }
+
+    #[test]
+    fn parse_config_rejects_invalid_deny_action() {
+        let args = Arguments::from_vec(vec!["--deny-action".into(), "bad".into()]);
+        let result = parse_config(args);
+        assert!(matches!(result, Err(MainError::InvalidDenyAction(_))));
     }
 
     #[test]

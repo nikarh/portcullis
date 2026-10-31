@@ -16,11 +16,12 @@ use crate::model::RuntimeState;
 /// Name of both managed tables.
 const TABLE_NAME: &str = "portcullis";
 /// Priority of both base chains: before Docker's filter chains.
-const FORWARD_HOOK_PRIORITY: i32 = -1;
+const HOOK_PRIORITY: i32 = -1;
 
-/// The managed tables: `inet` sees traffic routed out of a container's network, `bridge`
-/// sees traffic between containers on the same network, which a bridge switches without
-/// passing the IP hooks (unless `br_netfilter` is loaded).
+/// The managed tables: `inet` sees traffic routed out of a container's network (forward
+/// hook), `bridge` sees traffic between containers on the same network, which a bridge
+/// switches without passing the IP hooks unless `br_netfilter` is loaded (prerouting hook:
+/// the bridge family only supports `reject` there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Table {
     Inet,
@@ -47,6 +48,15 @@ enum Chain {
     Icc(usize),
 }
 
+impl Table {
+    const fn hook(self) -> &'static str {
+        match self {
+            Self::Inet => "forward",
+            Self::Bridge => "prerouting",
+        }
+    }
+}
+
 impl Chain {
     const fn table(self) -> Table {
         match self {
@@ -59,12 +69,7 @@ impl Chain {
 
 impl fmt::Display for Chain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ", self.table())?;
-        match self {
-            Self::Base(_) => f.write_str("forward"),
-            Self::Egress(index) => write!(f, "egress{index}"),
-            Self::Icc(index) => write!(f, "icc{index}"),
-        }
+        write!(f, "{} {}", self.table(), ChainName(*self))
     }
 }
 
@@ -74,7 +79,7 @@ struct ChainName(Chain);
 impl fmt::Display for ChainName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Chain::Base(_) => f.write_str("forward"),
+            Chain::Base(table) => f.write_str(table.hook()),
             Chain::Egress(index) => write!(f, "egress{index}"),
             Chain::Icc(index) => write!(f, "icc{index}"),
         }
@@ -86,16 +91,36 @@ pub trait NftRunner {
     fn run_script(&self, script: String) -> Result<(), FirewallError>;
 }
 
+/// What happens to traffic a policy doesn't allow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DenyAction {
+    /// Answer with an ICMP "administratively prohibited" error, so clients fail at once.
+    #[default]
+    Reject,
+    /// Discard silently; clients wait for their own timeout.
+    Drop,
+}
+
+impl fmt::Display for DenyAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Reject => "reject with icmpx admin-prohibited",
+            Self::Drop => "drop",
+        })
+    }
+}
+
 pub struct NftablesFirewall<R = LibNftablesRunner> {
     runner: R,
+    deny: DenyAction,
 }
 
 impl<R> NftablesFirewall<R>
 where
     R: NftRunner,
 {
-    pub const fn new(runner: R) -> Self {
-        Self { runner }
+    pub const fn new(runner: R, deny: DenyAction) -> Self {
+        Self { runner, deny }
     }
 
     pub fn apply<Dns>(
@@ -117,7 +142,7 @@ where
         );
 
         let mut script = String::with_capacity(plan.rule_count() * 64);
-        render_apply_script(&plan, &mut script)?;
+        render_apply_script(&plan, self.deny, &mut script)?;
         self.runner.run_script(script)
     }
 
@@ -131,9 +156,9 @@ where
 }
 
 impl NftablesFirewall<LibNftablesRunner> {
-    pub fn with_libnftables() -> Result<Self, FirewallError> {
+    pub fn with_libnftables(deny: DenyAction) -> Result<Self, FirewallError> {
         let runner = LibNftablesRunner::new()?;
-        Ok(Self::new(runner))
+        Ok(Self::new(runner, deny))
     }
 }
 
@@ -156,7 +181,7 @@ fn render_table_reset(out: &mut String) -> fmt::Result {
 ///
 /// Both tables are deleted and recreated inside the same transaction, so the swap is
 /// atomic and chains and sets no longer needed disappear together with the old tables.
-fn render_apply_script(plan: &Plan, out: &mut String) -> fmt::Result {
+fn render_apply_script(plan: &Plan, deny: DenyAction, out: &mut String) -> fmt::Result {
     render_table_reset(out)?;
 
     // Routed traffic.
@@ -183,15 +208,15 @@ fn render_apply_script(plan: &Plan, out: &mut String) -> fmt::Result {
             out,
             format_args!("add rule {base} {family} saddr"),
             subnets,
-            " drop",
+            format_args!(" {deny}"),
         )?;
     }
     for (index, source) in plan.sources.iter().enumerate() {
         let chain = Chain::Egress(index);
         for rule in plan.egress_rules(source) {
-            render_rule(plan, source.address, chain, rule, out)?;
+            render_rule(plan, source.address, chain, rule, deny, out)?;
         }
-        writeln!(out, "add rule {chain} drop")?;
+        writeln!(out, "add rule {chain} {deny}")?;
     }
 
     // Traffic between containers on the same network.
@@ -209,7 +234,7 @@ fn render_apply_script(plan: &Plan, out: &mut String) -> fmt::Result {
     for (index, source) in plan.sources.iter().enumerate() {
         let chain = Chain::Icc(index);
         for rule in plan.icc_rules(source) {
-            render_rule(plan, source.address, chain, rule, out)?;
+            render_rule(plan, source.address, chain, rule, deny, out)?;
         }
     }
     Ok(())
@@ -225,7 +250,8 @@ fn render_base_chain(out: &mut String, table: Table) -> fmt::Result {
     writeln!(out, "add table {table}")?;
     writeln!(
         out,
-        "add chain {base} {{ type filter hook forward priority {FORWARD_HOOK_PRIORITY}; policy accept; }}"
+        "add chain {base} {{ type filter hook {} priority {HOOK_PRIORITY}; policy accept; }}",
+        table.hook()
     )?;
     // Policy applies to new connections only; replies and established flows skip it.
     writeln!(out, "add rule {base} ct state established,related accept")
@@ -262,7 +288,7 @@ fn render_elements<T: fmt::Display>(
     out: &mut String,
     head: fmt::Arguments<'_>,
     elements: impl Iterator<Item = T>,
-    tail: &str,
+    tail: impl fmt::Display,
 ) -> fmt::Result {
     let mut elements = elements.peekable();
     if elements.peek().is_none() {
@@ -275,9 +301,7 @@ fn render_elements<T: fmt::Display>(
         }
         write!(out, "{element}")?;
     }
-    out.push_str(" }");
-    out.push_str(tail);
-    out.push('\n');
+    writeln!(out, " }}{tail}")?;
     Ok(())
 }
 
@@ -320,6 +344,7 @@ fn render_rule(
     source: IpAddr,
     chain: Chain,
     rule: &Rule,
+    deny: DenyAction,
     out: &mut String,
 ) -> fmt::Result {
     let f = family(source);
@@ -334,16 +359,16 @@ fn render_rule(
             }
             writeln!(out, "{} dport {DNS_PORT} accept", protocol.as_str())
         }
-        Rule::DropDns { protocol } => writeln!(
+        Rule::DenyDns { protocol } => writeln!(
             out,
-            "add rule {chain} {} dport {DNS_PORT} drop",
+            "add rule {chain} {} dport {DNS_PORT} {deny}",
             protocol.as_str()
         ),
         Rule::AcceptNet(destination) => {
             writeln!(out, "add rule {chain} {f} daddr {destination} accept")
         }
-        Rule::DropNet(destination) => {
-            writeln!(out, "add rule {chain} {f} daddr {destination} drop")
+        Rule::DenyNet(destination) => {
+            writeln!(out, "add rule {chain} {f} daddr {destination} {deny}")
         }
         Rule::AcceptPort {
             destination,
@@ -741,7 +766,7 @@ mod tests {
             &test_support::host_resolvers(),
         );
         let mut script = String::new();
-        render_apply_script(&plan, &mut script).expect("script should render");
+        render_apply_script(&plan, DenyAction::Drop, &mut script).expect("script should render");
         script
     }
 
@@ -752,7 +777,12 @@ mod tests {
     /// Name of the chain the base chain of `table` ("inet" or "bridge") dispatches
     /// `source` to.
     fn chain_of(script: &str, table: &str, source: &str) -> String {
-        let prefix = format!("add rule {table} portcullis forward ");
+        let base = if table == "bridge" {
+            "prerouting"
+        } else {
+            "forward"
+        };
+        let prefix = format!("add rule {table} portcullis {base} ");
         let needle = format!(" {source} : goto ");
         script
             .lines()
@@ -797,14 +827,36 @@ add chain inet portcullis egress0
             "add rule inet portcullis forward ip saddr vmap { 172.18.0.2 : goto egress0 }",
             "add rule inet portcullis forward ip saddr { 172.18.0.0/16 } drop",
             "add rule inet portcullis egress0 drop",
-            "add chain bridge portcullis forward { type filter hook forward priority -1; policy accept; }",
-            "add rule bridge portcullis forward ct state established,related accept",
-            "add rule bridge portcullis forward ip saddr vmap { 172.18.0.2 : goto icc0 }",
+            "add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }",
+            "add rule bridge portcullis prerouting ct state established,related accept",
+            "add rule bridge portcullis prerouting ip saddr vmap { 172.18.0.2 : goto icc0 }",
+            "add rule bridge portcullis icc0 ip daddr 172.18.0.1/32 accept",
+            "add rule bridge portcullis icc0 ip daddr 172.18.0.0/16 drop",
         ] {
             assert!(has_line(&script, expected), "missing line: {expected}");
         }
         // nothing for families without sources
         assert!(!script.contains("ip6 saddr"));
+    }
+
+    #[test]
+    fn renders_reject_as_deny_action() {
+        let plan = Plan::build(
+            &test_support::hostname_state(),
+            &mut MockResolver::default(),
+            &test_support::host_resolvers(),
+        );
+        let mut script = String::new();
+        render_apply_script(&plan, DenyAction::Reject, &mut script).expect("script should render");
+        assert!(!script.contains(" drop"));
+        for expected in [
+            "add rule inet portcullis forward ip saddr { 172.18.0.0/16 } reject with icmpx admin-prohibited",
+            "add rule inet portcullis egress0 udp dport 53 reject with icmpx admin-prohibited",
+            "add rule inet portcullis egress0 reject with icmpx admin-prohibited",
+            "add rule bridge portcullis icc0 ip daddr 172.18.0.0/16 reject with icmpx admin-prohibited",
+        ] {
+            assert!(has_line(&script, expected), "missing line: {expected}");
+        }
     }
 
     #[test]
@@ -897,7 +949,7 @@ add chain inet portcullis egress0
 
     #[test]
     fn apply_succeeds_with_unresolvable_hostname() {
-        let firewall = NftablesFirewall::new(RecordingRunner::default());
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), DenyAction::Drop);
         firewall
             .apply(
                 &test_support::unresolvable_state(),
@@ -922,7 +974,7 @@ add chain inet portcullis egress0
 
     #[test]
     fn apply_runs_single_script() {
-        let firewall = NftablesFirewall::new(RecordingRunner::default());
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), DenyAction::Drop);
         firewall
             .apply(
                 &test_support::hostname_state(),
@@ -936,7 +988,7 @@ add chain inet portcullis egress0
 
     #[test]
     fn cleanup_deletes_table_even_if_missing() {
-        let firewall = NftablesFirewall::new(RecordingRunner::default());
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), DenyAction::Drop);
         firewall.cleanup().expect("cleanup should succeed");
         let scripts = firewall.runner.scripts.lock().expect("lock");
         assert_eq!(

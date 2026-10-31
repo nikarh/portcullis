@@ -48,6 +48,7 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. On startup an
 | Option | Default | Description |
 |---|---|---|
 | `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
+| `--deny-action <reject\|drop>` | `reject` | `reject` answers denied traffic with an ICMP "administratively prohibited" error, so applications fail immediately with "Host is unreachable". `drop` discards it silently, and applications wait for their own timeout. |
 | `--dns-mode <lazy\|proxy>` | `lazy` | How hostname rules get their addresses, see [Hostname rules](#hostname-rules). |
 | `--dns-proxy-bind <ip:port>` | `127.0.0.1:1053` | Where the DNS proxy listens in `proxy` mode. |
 | `--log-level <error\|warn\|info\|debug\|trace>` | `info` | `trace` logs every firewall script that gets applied. |
