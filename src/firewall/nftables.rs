@@ -1371,6 +1371,9 @@ flush chain bridge portcullis icc0
                 decided("add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip", 'd', "source", "drop"),
                 "add rule bridge portcullis icc0 ip daddr 172.18.0.1 accept".into(),
                 decided("add rule bridge portcullis icc0 ip daddr 172.18.0.0/16", 'd', "icc", "drop"),
+                // Broadcast and multicast reach every container on the bridge.
+                decided("add rule bridge portcullis icc0 ip daddr 255.255.255.255/32", 'd', "icc", "drop"),
+                decided("add rule bridge portcullis icc0 ip daddr 224.0.0.0/4", 'd', "icc", "drop"),
             ],
         );
         // nothing for families without sources

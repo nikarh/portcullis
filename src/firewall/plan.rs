@@ -23,7 +23,7 @@ use std::net::IpAddr;
 use std::ops::Range;
 use std::time::Duration;
 
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use tracing::{error, trace};
 
 use crate::dns::{HostResolver, normalize};
@@ -34,6 +34,15 @@ use crate::model::{
 
 pub const DNS_PORT: u16 = 53;
 const DNS_PROTOCOLS: [Protocol; 2] = [Protocol::Udp, Protocol::Tcp];
+/// IPv4 destinations that reach every container on a bridge besides the subnet itself:
+/// the limited broadcast address and multicast.
+const ICC_BROADCAST_V4: [IpNet; 2] = [
+    IpNet::V4(Ipv4Net::new_assert(std::net::Ipv4Addr::BROADCAST, 32)),
+    IpNet::V4(Ipv4Net::new_assert(
+        std::net::Ipv4Addr::new(224, 0, 0, 0),
+        4,
+    )),
+];
 
 /// Destination of an [`Rule::AcceptPort`] rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,10 +351,10 @@ where
             }
             match policy.icc_mode {
                 IccMode::Allow => self.plan.rules.push(Rule::AcceptNet(network.subnet)),
-                IccMode::Deny => self.plan.rules.push(Rule::DenyNet(network.subnet)),
+                IccMode::Deny => self.deny_icc(network.subnet),
                 IccMode::AllowListed => {
                     self.plan_icc_allow_list(source, attachment, &policy.icc_allow);
-                    self.plan.rules.push(Rule::DenyNet(network.subnet));
+                    self.deny_icc(network.subnet);
                 }
             }
         }
@@ -419,6 +428,17 @@ where
         self.plan
             .rules
             .extend(DNS_PROTOCOLS.map(|protocol| Rule::DenyDns { protocol }));
+    }
+
+    /// Deny traffic to other containers of the network: to its subnet, and to broadcast and
+    /// multicast addresses, which reach every container on the bridge.
+    fn deny_icc(&mut self, subnet: IpNet) {
+        self.plan.rules.push(Rule::DenyNet(subnet));
+        if subnet.addr().is_ipv4() {
+            self.plan
+                .rules
+                .extend(ICC_BROADCAST_V4.iter().map(|net| Rule::DenyNet(*net)));
+        }
     }
 
     fn plan_icc_allow_list(
@@ -605,7 +625,9 @@ mod tests {
             icc_of(&plan, "172.18.0.2"),
             vec![
                 Rule::AcceptHost(ip("172.18.0.1")),
-                Rule::DenyNet(net("172.18.0.0/16"))
+                Rule::DenyNet(net("172.18.0.0/16")),
+                Rule::DenyNet(net("255.255.255.255/32")),
+                Rule::DenyNet(net("224.0.0.0/4")),
             ]
         );
         assert_eq!(
