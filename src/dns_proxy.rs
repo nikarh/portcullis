@@ -136,7 +136,6 @@ async fn run_lazy_runtime(
                 match message {
                     Some(DnsControlMessage::SetTrackedHosts(value)) => {
                         tracked_hosts = value;
-                        resolve_hosts_and_emit(&tracked_hosts, &event_tx).await;
                     }
                     Some(DnsControlMessage::ResolveTrackedNow) => {
                         resolve_hosts_and_emit(&tracked_hosts, &event_tx).await;

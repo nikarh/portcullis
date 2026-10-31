@@ -22,7 +22,9 @@ use pico_args::Arguments;
 use thiserror::Error;
 use tracing::{debug, error, info, trace};
 
-use crate::dns::{CacheOnlyDnsResolver, DnsProxyCache, SystemUpstreamResolver};
+use crate::dns::{
+    CacheFallbackDnsResolver, CacheOnlyDnsResolver, DnsProxyCache, SystemUpstreamResolver,
+};
 use crate::dns_proxy::{
     DnsApplyAck, DnsResolvedEvent, DnsRuntimeHandle, DnsRuntimeMode, spawn_dns_runtime,
 };
@@ -202,13 +204,24 @@ fn write_stderr_line(message: &str) -> Result<(), std::io::Error> {
 
 fn apply_firewall(
     firewall: &ActiveFirewall,
+    mode: DnsMode,
     state: &RuntimeState,
     dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
 ) -> Result<(), MainError> {
-    let mut resolver = CacheOnlyDnsResolver::new(dns_cache);
-    firewall
-        .apply(state, &mut resolver)
-        .map_err(MainError::Firewall)
+    match mode {
+        DnsMode::Lazy => {
+            let mut resolver = CacheFallbackDnsResolver::new(dns_cache);
+            firewall
+                .apply(state, &mut resolver)
+                .map_err(MainError::Firewall)
+        }
+        DnsMode::Proxy => {
+            let mut resolver = CacheOnlyDnsResolver::new(dns_cache);
+            firewall
+                .apply(state, &mut resolver)
+                .map_err(MainError::Firewall)
+        }
+    }
 }
 
 fn collect_policy_hostnames(state: &RuntimeState) -> HashSet<String> {
@@ -340,7 +353,7 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.initialize()?;
-    apply_firewall(&firewall, &runtime_state, &mut dns_cache)?;
+    apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache)?;
     info!("firewall rules applied");
 
     let (docker_tx, docker_rx) = unbounded::<DockerWorkerEvent>();
@@ -403,7 +416,12 @@ fn run(config: &Config) -> Result<(), MainError> {
                                 trace!("docker event produced no policy state changes");
                             }
                             Ok(true) => {
-                                if let Err(error) = apply_firewall(&firewall, &runtime_state, &mut dns_cache) {
+                                if let Err(error) = apply_firewall(
+                                    &firewall,
+                                    config.dns_mode,
+                                    &runtime_state,
+                                    &mut dns_cache,
+                                ) {
                                     error!(%error, "firewall apply failed; continuing");
                                 } else {
                                     refresh_dns_tracking(&dns_runtime, &runtime_state, config.dns_mode);
@@ -423,7 +441,12 @@ fn run(config: &Config) -> Result<(), MainError> {
                                 match monitor.initialize() {
                                     Ok(state) => {
                                         runtime_state = state;
-                                        if let Err(error) = apply_firewall(&firewall, &runtime_state, &mut dns_cache) {
+                                        if let Err(error) = apply_firewall(
+                                            &firewall,
+                                            config.dns_mode,
+                                            &runtime_state,
+                                            &mut dns_cache,
+                                        ) {
                                             error!(%error, "firewall apply failed after reconnect; continuing");
                                         } else {
                                             refresh_dns_tracking(&dns_runtime, &runtime_state, config.dns_mode);
@@ -448,7 +471,8 @@ fn run(config: &Config) -> Result<(), MainError> {
                 };
                 debug!(host = %event.host, ip_count = event.addresses.len(), "received DNS resolution event");
                 dns_cache.insert_with_ttl(&event.host, event.addresses.clone(), event.ttl);
-                let apply_result = apply_firewall(&firewall, &runtime_state, &mut dns_cache);
+                let apply_result =
+                    apply_firewall(&firewall, config.dns_mode, &runtime_state, &mut dns_cache);
                 if let Some(ack) = event.ack {
                     let _ = ack.send(if apply_result.is_ok() {
                         DnsApplyAck::Applied

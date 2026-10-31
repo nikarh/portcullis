@@ -227,6 +227,35 @@ where
     }
 }
 
+pub struct CacheFallbackDnsResolver<'a, R>
+where
+    R: UpstreamResolver,
+{
+    cache: &'a mut DnsProxyCache<R>,
+}
+
+impl<'a, R> CacheFallbackDnsResolver<'a, R>
+where
+    R: UpstreamResolver,
+{
+    pub const fn new(cache: &'a mut DnsProxyCache<R>) -> Self {
+        Self { cache }
+    }
+}
+
+impl<R> PolicyDnsResolver for CacheFallbackDnsResolver<'_, R>
+where
+    R: UpstreamResolver,
+{
+    fn resolve(&mut self, host: &str) -> Result<Arc<[IpAddr]>, DnsError> {
+        let cached = self.cache.resolve_cached(host);
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+        DnsProxyCache::resolve(self.cache, host)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
