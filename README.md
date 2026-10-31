@@ -155,7 +155,7 @@ Containers normally resolve names through Docker's DNS server (`127.0.0.11`). It
 - If the container has its own DNS servers (`docker run --dns`, Compose `dns:`), Docker forwards to them from the container's address. These queries go through the container's policy.
 - Otherwise Docker forwards to the host's DNS servers from the host itself (Docker 29; older versions forwarded from the container's address). Portcullis can't see these queries, so such a container can always resolve outside names through Docker's DNS.
 
-Besides that, any DNS query a container sends itself (port 53, UDP and TCP) is dropped unless its destination is allowed with:
+Besides that, any DNS query a container sends itself (port 53, UDP and TCP) is denied unless its destination is allowed with:
 
 ```text
 portcullis.dns.<name>=<target>
