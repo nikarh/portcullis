@@ -6,7 +6,8 @@ event "first denial" 'event=connection verdict=denied container~alerts-app desti
 flush_checks
 check "alert raised for a denial" wait_for_line "${ALERT_LOG}" "${first}"
 flush_checks
-event "same denial again" 'event=connection verdict=denied container~alerts-app destination_port=81' tcp app 198.51.100.5 81
+# Within a minute the repeat isn't reported again, but still denied.
+blocked "same denial again" tcp app 198.51.100.5 81
 flush_checks
 event "another denial" 'event=connection verdict=denied container~alerts-app destination_port=82' tcp app 198.51.100.5 82
 flush_checks

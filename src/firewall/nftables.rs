@@ -145,7 +145,9 @@ pub enum LogAllowed {
 }
 
 impl LogAllowed {
-    const fn logs(self, monitor: bool) -> bool {
+    /// Whether allowed traffic of a source in (or not in) monitor mode is reported.
+    #[must_use]
+    pub const fn logs(self, monitor: bool) -> bool {
         match self {
             Self::Always => true,
             Self::Monitor => monitor,
@@ -271,6 +273,8 @@ struct Outcome {
     /// What to report, if anything; denials are always reported.
     reason: Option<&'static str>,
     snaplen: u16,
+    /// The traffic is IPv6 (for the de-duplication key).
+    ipv6: bool,
 }
 
 impl Outcome {
@@ -281,6 +285,7 @@ impl Outcome {
             monitor,
             reason,
             snaplen: LOG_SNAPLEN,
+            ipv6: false,
         }
     }
 
@@ -291,6 +296,7 @@ impl Outcome {
             monitor,
             reason: Some(reason),
             snaplen: LOG_SNAPLEN,
+            ipv6: false,
         }
     }
 
@@ -298,28 +304,87 @@ impl Outcome {
         self.snaplen = snaplen;
         self
     }
-}
 
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    const fn for_address(mut self, address: IpAddr) -> Self {
+        self.ipv6 = address.is_ipv6();
+        self
+    }
+
+    /// The log prefix, if this outcome is reported.
+    fn log_prefix(&self) -> Option<(char, &'static str)> {
         let (verdict, log) = match (self.allow, self.monitor) {
             (true, monitor) => ('a', self.options.log_allowed.logs(monitor)),
             (false, false) => ('d', true),
             (false, true) => ('w', true),
         };
-        if let (true, Some(reason)) = (log, self.reason) {
-            write!(
-                f,
-                "log prefix \"{LOG_PREFIX}:{verdict}:{reason}\" group {} snaplen {} ",
-                self.options.log_group, self.snaplen
-            )?;
-        }
+        self.reason.filter(|_| log).map(|reason| (verdict, reason))
+    }
+}
+
+/// The verdict alone.
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.allow || self.monitor {
             f.write_str("accept")
         } else {
             write!(f, "{}", self.options.deny)
         }
     }
+}
+
+/// Recently reported flows: (source, destination, protocol, port), one set per address
+/// family and table. A flow is reported once per timeout, however many packets it sends.
+const LOGGED_SET_V4: &str = "logged4";
+const LOGGED_SET_V6: &str = "logged6";
+const LOGGED_TIMEOUT: &str = "60s";
+const LOGGED_SIZE: u32 = 65_536;
+
+fn render_logged_sets(out: &mut String, table: Table) -> fmt::Result {
+    let families: &[(&str, &str)] = match table {
+        Table::Inet => &[(LOGGED_SET_V4, "ipv4_addr"), (LOGGED_SET_V6, "ipv6_addr")],
+        Table::Bridge => &[(LOGGED_SET_V4, "ipv4_addr")],
+    };
+    for (name, address) in families {
+        writeln!(
+            out,
+            "add set {table} {name} {{ type {address} . {address} . inet_proto . inet_service; flags dynamic,timeout; timeout {LOGGED_TIMEOUT}; size {LOGGED_SIZE}; }}"
+        )?;
+    }
+    Ok(())
+}
+
+/// Render a decision: `head` (`add rule <chain> <match>`) followed by the outcome. A
+/// reported outcome gets a rule before it that logs the packet, but only the first of its
+/// flow within the de-duplication timeout; the verdict rule applies to every packet.
+fn decide(out: &mut String, head: fmt::Arguments<'_>, outcome: Outcome) -> fmt::Result {
+    if let Some((verdict, reason)) = outcome.log_prefix() {
+        let (set, ip) = if outcome.ipv6 {
+            (LOGGED_SET_V6, "ip6")
+        } else {
+            (LOGGED_SET_V4, "ip")
+        };
+        let key = format_args!("{ip} saddr . {ip} daddr . meta l4proto . th dport");
+        writeln!(
+            out,
+            "{head} {key} != @{set} add @{set} {{ {key} }} log prefix \"{LOG_PREFIX}:{verdict}:{reason}\" group {} snaplen {}",
+            outcome.options.log_group, outcome.snaplen
+        )?;
+    }
+    writeln!(out, "{head} {outcome}")
+}
+
+/// `{ e1, e2, ... }`, or `None` without elements.
+fn set_literal<T: fmt::Display>(elements: impl Iterator<Item = T>) -> Option<String> {
+    let mut literal = String::new();
+    for (index, element) in elements.enumerate() {
+        literal.push_str(if index == 0 { "{ " } else { ", " });
+        let _ = write!(literal, "{element}");
+    }
+    if literal.is_empty() {
+        return None;
+    }
+    literal.push_str(" }");
+    Some(literal)
 }
 
 /// Render the full apply script.
@@ -344,6 +409,7 @@ fn render_apply_script(plan: &Plan, options: Options, out: &mut String) -> fmt::
     let base = Chain::Base(Table::Inet);
     writeln!(out, "add table {}", Table::Inet)?;
     render_base_chain(out, Table::Inet)?;
+    render_logged_sets(out, Table::Inet)?;
     if let Some(queue) = options.dns_queue {
         // Hold DNS answers to managed containers until the addresses they contain are
         // allowed. `bypass` lets them through when Portcullis isn't listening.
@@ -395,10 +461,10 @@ fn render_apply_script(plan: &Plan, options: Options, out: &mut String) -> fmt::
         for rule in plan.egress_rules(source) {
             render_rule(plan, source, chain, rule, options, out)?;
         }
-        writeln!(
+        decide(
             out,
-            "add rule {chain} {}",
-            Outcome::deny(options, source.monitor, "egress")
+            format_args!("add rule {chain}"),
+            Outcome::deny(options, source.monitor, "egress").for_address(source.address),
         )?;
     }
 
@@ -406,6 +472,7 @@ fn render_apply_script(plan: &Plan, options: Options, out: &mut String) -> fmt::
     // traffic between containers on the same network.
     writeln!(out, "add table {}", Table::Bridge)?;
     render_base_chain(out, Table::Bridge)?;
+    render_logged_sets(out, Table::Bridge)?;
     writeln!(
         out,
         "add rule {} ct state established,related accept",
@@ -512,18 +579,18 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         "",
     )?;
     for monitor in [true, false] {
-        render_elements(
-            out,
-            format_args!("add rule {base} meta ibrname"),
-            plan.bridges
-                .iter()
-                .filter(|bridge| bridge.monitor == monitor)
-                .map(|bridge| Quoted(&bridge.name)),
-            format_args!(
-                " ether type ip {}",
-                Outcome::deny(options, monitor, "source")
-            ),
-        )?;
+        let bridges = plan
+            .bridges
+            .iter()
+            .filter(|bridge| bridge.monitor == monitor)
+            .map(|bridge| Quoted(&bridge.name));
+        if let Some(bridges) = set_literal(bridges) {
+            decide(
+                out,
+                format_args!("add rule {base} meta ibrname {bridges} ether type ip"),
+                Outcome::deny(options, monitor, "source"),
+            )?;
+        }
     }
     Ok(())
 }
@@ -628,7 +695,8 @@ fn render_rule(
     let f = family(source.address);
     let icc = matches!(chain, Chain::Icc(_));
     let reason = if icc { "icc" } else { "egress" };
-    let allow = Outcome::allow(options, source.monitor, Some(reason));
+    let allow = Outcome::allow(options, source.monitor, Some(reason)).for_address(source.address);
+    let deny = |reason| Outcome::deny(options, source.monitor, reason).for_address(source.address);
     match *rule {
         // DNS traffic itself is reported from the DNS answers Portcullis inspects.
         Rule::AcceptDns {
@@ -641,26 +709,27 @@ fn render_rule(
             }
             writeln!(out, "{} dport {DNS_PORT} accept", protocol.as_str())
         }
-        Rule::DenyDns { protocol } => writeln!(
+        Rule::DenyDns { protocol } => decide(
             out,
-            "add rule {chain} {} dport {DNS_PORT} {}",
-            protocol.as_str(),
-            Outcome::deny(options, source.monitor, "dns").snaplen(LOG_SNAPLEN_DNS)
+            format_args!("add rule {chain} {} dport {DNS_PORT}", protocol.as_str()),
+            deny("dns").snaplen(LOG_SNAPLEN_DNS),
         ),
         // Within the network, ICC rules decide; see the egress rules.
         Rule::AcceptNet(destination) if !icc => {
             writeln!(out, "add rule {chain} {f} daddr {destination} accept")
         }
-        Rule::AcceptNet(destination) => {
-            writeln!(out, "add rule {chain} {f} daddr {destination} {allow}")
-        }
+        Rule::AcceptNet(destination) => decide(
+            out,
+            format_args!("add rule {chain} {f} daddr {destination}"),
+            allow,
+        ),
         Rule::AcceptHost(destination) => {
             writeln!(out, "add rule {chain} {f} daddr {destination} accept")
         }
-        Rule::DenyNet(destination) => writeln!(
+        Rule::DenyNet(destination) => decide(
             out,
-            "add rule {chain} {f} daddr {destination} {}",
-            Outcome::deny(options, source.monitor, reason)
+            format_args!("add rule {chain} {f} daddr {destination}"),
+            deny(reason),
         ),
         Rule::AcceptPort {
             destination,
@@ -669,13 +738,19 @@ fn render_rule(
         } => {
             let protocol = protocol.as_str();
             match destination {
-                Destination::Net(destination) => writeln!(
+                Destination::Net(destination) => decide(
                     out,
-                    "add rule {chain} {f} daddr {destination} {protocol} dport {port} {allow}"
+                    format_args!(
+                        "add rule {chain} {f} daddr {destination} {protocol} dport {port}"
+                    ),
+                    allow,
                 ),
-                Destination::Addr(destination) => writeln!(
+                Destination::Addr(destination) => decide(
                     out,
-                    "add rule {chain} {f} daddr {destination} {protocol} dport {port} {allow}"
+                    format_args!(
+                        "add rule {chain} {f} daddr {destination} {protocol} dport {port}"
+                    ),
+                    allow,
                 ),
                 Destination::HostSet(index) => {
                     let Some(set) = plan.host_set(index) else {
@@ -686,10 +761,13 @@ fn render_rule(
                     } else {
                         SET_PREFIX_V6
                     };
-                    writeln!(
+                    decide(
                         out,
-                        "add rule {chain} {f} daddr @{} {protocol} dport {port} {allow}",
-                        set.id.name(prefix)
+                        format_args!(
+                            "add rule {chain} {f} daddr @{} {protocol} dport {port}",
+                            set.id.name(prefix)
+                        ),
+                        allow,
                     )
                 }
             }
@@ -1080,22 +1158,33 @@ mod tests {
         render_with(state, OPTIONS, false)
     }
 
-    /// The log statement and verdict of a decision.
-    fn logged(verdict: char, reason: &str, action: &str) -> String {
+    /// The de-duplicated log statement of a reported IPv4 decision.
+    fn log_rule(verdict: char, reason: &str) -> String {
         let snaplen = if reason == "dns" { 512 } else { 128 };
-        format!("log prefix \"pc:{verdict}:{reason}\" group 7 snaplen {snaplen} {action}")
+        let key = "ip saddr . ip daddr . meta l4proto . th dport";
+        format!(
+            "{key} != @logged4 add @logged4 {{ {key} }} log prefix \"pc:{verdict}:{reason}\" group 7 snaplen {snaplen}"
+        )
+    }
+
+    /// The two rules of a reported decision: the log rule, then the verdict rule.
+    fn decided(head: &str, verdict: char, reason: &str, action: &str) -> String {
+        format!("{head} {}\n{head} {action}", log_rule(verdict, reason))
     }
 
     fn has_line(script: &str, expected: &str) -> bool {
         script.lines().any(|line| line == expected)
     }
 
+    /// Every expected entry is a line, or consecutive lines, of the script.
     fn assert_lines(script: &str, expected: &[String]) {
-        for line in expected {
-            assert!(
-                has_line(script, line),
-                "missing line: {line}\nin:\n{script}"
-            );
+        for lines in expected {
+            let found = if lines.contains('\n') {
+                script.contains(&format!("{lines}\n"))
+            } else {
+                has_line(script, lines)
+            };
+            assert!(found, "missing:\n{lines}\nin:\n{script}");
         }
     }
 
@@ -1109,6 +1198,8 @@ add table bridge portcullis
 delete table bridge portcullis
 add table inet portcullis
 add chain inet portcullis forward { type filter hook forward priority -1; policy accept; }
+add set inet portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
+add set inet portcullis logged6 { type ipv6_addr . ipv6_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add rule inet portcullis forward ct state established,related accept
 add chain inet portcullis egress0
 ";
@@ -1122,18 +1213,15 @@ add chain inet portcullis egress0
                 "add rule inet portcullis forward ip saddr vmap { 172.18.0.2 : goto egress0 }".into(),
                 // Reported by the bridge table already.
                 "add rule inet portcullis forward iifname { \"br-net0\" } drop".into(),
-                format!("add rule inet portcullis egress0 {}", logged('d', "egress", "drop")),
+                decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
                 "add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }".into(),
                 "add rule bridge portcullis prerouting ct state established,related accept".into(),
                 "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept".into(),
                 "add rule bridge portcullis prerouting ether type != ip accept".into(),
                 "add rule bridge portcullis prerouting ip saddr . ether saddr vmap { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }".into(),
-                format!(
-                    "add rule bridge portcullis prerouting meta ibrname {{ \"br-net0\" }} ether type ip {}",
-                    logged('d', "source", "drop")
-                ),
+                decided("add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip", 'd', "source", "drop"),
                 "add rule bridge portcullis icc0 ip daddr 172.18.0.1 accept".into(),
-                format!("add rule bridge portcullis icc0 ip daddr 172.18.0.0/16 {}", logged('d', "icc", "drop")),
+                decided("add rule bridge portcullis icc0 ip daddr 172.18.0.0/16", 'd', "icc", "drop"),
             ],
         );
         // nothing for families without sources
@@ -1153,17 +1241,18 @@ add chain inet portcullis egress0
             &script,
             &[
                 format!("add rule inet portcullis forward iifname {{ \"br-net0\" }} {reject}"),
-                format!(
-                    "add rule inet portcullis egress0 udp dport 53 {}",
-                    logged('d', "dns", reject)
+                decided(
+                    "add rule inet portcullis egress0 udp dport 53",
+                    'd',
+                    "dns",
+                    reject,
                 ),
-                format!(
-                    "add rule inet portcullis egress0 {}",
-                    logged('d', "egress", reject)
-                ),
-                format!(
-                    "add rule bridge portcullis prerouting meta ibrname {{ \"br-net0\" }} ether type ip {}",
-                    logged('d', "source", reject)
+                decided("add rule inet portcullis egress0", 'd', "egress", reject),
+                decided(
+                    "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip",
+                    'd',
+                    "source",
+                    reject,
                 ),
             ],
         );
@@ -1177,21 +1266,24 @@ add chain inet portcullis egress0
         assert_lines(
             &script,
             &[
-                format!(
-                    "add rule inet portcullis egress0 {}",
-                    logged('w', "egress", "accept")
+                decided("add rule inet portcullis egress0", 'w', "egress", "accept"),
+                decided(
+                    "add rule inet portcullis egress0 udp dport 53",
+                    'w',
+                    "dns",
+                    "accept",
                 ),
-                format!(
-                    "add rule inet portcullis egress0 udp dport 53 {}",
-                    logged('w', "dns", "accept")
+                decided(
+                    "add rule bridge portcullis icc0 ip daddr 172.18.0.0/16",
+                    'w',
+                    "icc",
+                    "accept",
                 ),
-                format!(
-                    "add rule bridge portcullis icc0 ip daddr 172.18.0.0/16 {}",
-                    logged('w', "icc", "accept")
-                ),
-                format!(
-                    "add rule bridge portcullis prerouting meta ibrname {{ \"br-net0\" }} ether type ip {}",
-                    logged('w', "source", "accept")
+                decided(
+                    "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip",
+                    'w',
+                    "source",
+                    "accept",
                 ),
             ],
         );
@@ -1211,12 +1303,9 @@ add chain inet portcullis egress0
         let script = render_with(&test_support::icc_state(), options, false);
         assert!(script.contains(&format!(
             "ip daddr 172.18.0.10 tcp dport 5432 {}",
-            logged('a', "icc", "accept")
+            log_rule('a', "icc")
         )));
-        assert!(script.contains(&format!(
-            "ip daddr 172.18.0.0/16 {}",
-            logged('a', "icc", "accept")
-        )));
+        assert!(script.contains(&format!("ip daddr 172.18.0.0/16 {}", log_rule('a', "icc"))));
         assert!(!script.contains("172.18.0.3 . 02:42:ac:12:00:03 : accept"));
 
         // By default, only in monitor mode.
@@ -1227,10 +1316,7 @@ add chain inet portcullis egress0
         let enforced = render_with(&test_support::hostname_state(), options, false);
         assert!(!enforced.contains("pc:a:"));
         let monitored = render_with(&test_support::hostname_state(), options, true);
-        assert!(monitored.contains(&format!(
-            "tcp dport 443 {}",
-            logged('a', "egress", "accept")
-        )));
+        assert!(monitored.contains(&format!("tcp dport 443 {}", log_rule('a', "egress"))));
     }
 
     #[test]
@@ -1292,9 +1378,11 @@ add chain inet portcullis egress0
                 format!(
                     "add rule bridge portcullis {chain} ip daddr 172.18.0.10 tcp dport 5432 accept"
                 ),
-                format!(
-                    "add rule bridge portcullis {chain} ip daddr 172.18.0.0/16 {}",
-                    logged('d', "icc", "drop")
+                decided(
+                    &format!("add rule bridge portcullis {chain} ip daddr 172.18.0.0/16"),
+                    'd',
+                    "icc",
+                    "drop",
                 ),
             ],
         );
