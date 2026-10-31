@@ -157,6 +157,7 @@ Implicit behavior:
 ICC target lookup notes:
 - `container:<value>` is resolved from Docker runtime metadata, not DNS.
 - `<value>` can be container ID, container name, or network alias.
+- Lookup is scoped to the source container's networks, like Docker's embedded DNS: only targets on a shared network match, and only their addresses on that network are allowed.
 
 ## Docker Compose Examples
 
@@ -230,7 +231,7 @@ services:
 - Prototype quality, not fully production hardened.
 - Docker network handling currently supports only `bridge` driver networks; other drivers are ignored.
 - DNS path currently resolver-driven (not a full packet-level DNS proxy listener yet).
-- Backend behavior differences can exist between `nftables` and `iptables` edge cases.
+- Both backends render the same rule plan, but the `iptables` backend manages IPv4 only.
 
 ## License
 Licensed under either of:

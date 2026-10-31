@@ -57,7 +57,7 @@ Portcullis exists to provide:
 - Hostname-to-IP mappings are dynamic; long-running environments need robust reconciliation and garbage collection strategy.
 
 4. **Backend parity**
-- nftables and iptables behavior may differ in edge cases due to backend semantics.
+- Both backends render the same backend-agnostic rule plan; the iptables backend manages IPv4 only.
 
 5. **Operational safeguards**
 - Additional hardening is still needed for HA operation, rollback guarantees, and advanced telemetry.
@@ -141,6 +141,10 @@ ICC allowlist resolution details:
 - container ID,
 - container name (`/name` and `name`),
 - Docker network aliases from endpoint metadata.
+- Matching is scoped per network, the same way Docker's embedded DNS resolves names: for each
+  network of the source container, only targets attached to that network match, and only
+  their addresses on that network are allowed. Aliases are per network too.
+- A key matching several containers (e.g. a scaled Compose service alias) allows all of them.
 
 Implicit DNS behavior:
 - For policy-enabled containers, DNS is policy-controlled per container.
@@ -250,7 +254,11 @@ portcullis.icc.allow.0=container:db,tcp:5432
 
 Behavior in `allow-listed` mode:
 - allow only listed `container:port` ICC flows,
-- deny other ICC flows between managed containers.
+- deny other ICC flows within the source container's networks.
+
+Behavior in other modes:
+- `allow`: allow all traffic to the source container's network subnets.
+- `deny`: drop all traffic to the source container's network subnets.
 
 ---
 
