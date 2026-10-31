@@ -2,8 +2,8 @@
 //!
 //! The planner turns [`RuntimeState`] into one ordered rule list per managed source address,
 //! the hostname address sets those rules reference, and the enforced network subnets. Both
-//! the iptables and the nftables backends only render this plan, so policy semantics live in
-//! exactly one place and cannot drift apart.
+//! firewall backends only render this plan, so policy semantics live in one place and a
+//! future backend (such as eBPF) only needs a renderer.
 //!
 //! Evaluation model shared by both backends, for traffic forwarded from a container:
 //! 1. packets of established or related connections pass;

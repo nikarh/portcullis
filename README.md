@@ -15,7 +15,7 @@ By default a container can open connections to any address on the internet and t
 
 Portcullis is a daemon that runs on the Docker host. It watches the Docker API for containers and networks, turns their labels into firewall rules, and rebuilds the rules whenever something changes. Each rebuild replaces the whole ruleset in one atomic step, so there is never a moment with half-applied rules.
 
-It has two firewall backends: nftables, and iptables (with ipset when it is installed). By default it uses the same one Docker uses. The two backends enforce the same policy, and the labels don't depend on which one runs.
+The rules are nftables rules, kept in Portcullis's own tables. They work next to Docker's rules whether Docker itself uses iptables or nftables.
 
 Portcullis only removes access. Traffic that a policy allows still goes through Docker's own rules afterwards, so things Docker blocks (internal networks, isolation between networks) stay blocked.
 
@@ -26,7 +26,6 @@ Portcullis only removes access. Traffic that a policy allows still goes through 
 - Linux, with Portcullis running as root (it needs to manage the firewall and read the Docker socket).
 - Docker with bridge networks.
 - `libnftables`, for both building and running.
-- For the iptables backend: `iptables-restore` and `iptables-save`. `ipset` is optional and makes hostname rules cheaper.
 
 ### Building
 
@@ -49,7 +48,6 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. On startup an
 | Option | Default | Description |
 |---|---|---|
 | `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
-| `--firewall-backend <auto\|nftables\|iptables>` | `auto` | `auto` picks the backend Docker itself uses. |
 | `--dns-mode <lazy\|proxy>` | `lazy` | How hostname rules get their addresses, see [Hostname rules](#hostname-rules). |
 | `--dns-proxy-bind <ip:port>` | `127.0.0.1:1053` | Where the DNS proxy listens in `proxy` mode. |
 | `--log-level <error\|warn\|info\|debug\|trace>` | `info` | `trace` logs every firewall script that gets applied. |
@@ -259,7 +257,6 @@ labels:
 - If a hostname can't be resolved, Portcullis logs an error and its rules allow nothing until it resolves again. Everything else is applied as usual. Failed lookups are retried every 30 seconds.
 - Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.enable` value on a network enforces it. An enforced network without a usable subnet is logged and not enforced.
 - Portcullis removes its rules when it starts and when it stops. Containers are unrestricted while it is not running, and if it crashes, the last rules stay in place until it is started again.
-- With the iptables backend and no `ipset`, every hostname rule becomes one firewall rule per resolved address.
 
 ## License
 

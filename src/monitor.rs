@@ -472,11 +472,11 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::*;
+    use crate::docker::DockerEvent;
     use crate::docker::raw::{
         DockerContainerConfig, DockerContainerSummaryNetworkSettings, DockerIpam, DockerIpamConfig,
         DockerNetworkDriver, DockerNetworkSettings,
     };
-    use crate::docker::{DockerEvent, DockerFirewallBackend};
 
     #[derive(Default)]
     struct MockDockerApi {
@@ -527,10 +527,6 @@ mod tests {
                     status: 404,
                     body: format!("network not found: {network_id}"),
                 })
-        }
-
-        fn firewall_backend(&mut self) -> Result<DockerFirewallBackend, DockerError> {
-            Ok(DockerFirewallBackend::Nftables)
         }
     }
 

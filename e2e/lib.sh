@@ -163,10 +163,7 @@ wait_managed() {
 }
 
 ruleset() {
-  case "${BACKEND}" in
-    nftables) nft list table inet portcullis 2>/dev/null ;;
-    iptables) iptables-save -t filter 2>/dev/null | grep -E '^-A PORTCULLIS_EGRESS ' ;;
-  esac
+  nft list table inet portcullis 2>/dev/null
 }
 
 # --- portcullis ----------------------------------------------------------------------------
@@ -177,7 +174,7 @@ PORTCULLIS_LOG=/tmp/portcullis-e2e.log
 # start_portcullis [extra args...]: start in the background and wait for the first apply.
 start_portcullis() {
   : >"${PORTCULLIS_LOG}"
-  "${PORTCULLIS_BIN}" --firewall-backend "${BACKEND}" --log-level debug "$@" \
+  "${PORTCULLIS_BIN}" --log-level debug "$@" \
     >>"${PORTCULLIS_LOG}" 2>&1 &
   PORTCULLIS_PID=$!
   local attempt
@@ -190,7 +187,7 @@ start_portcullis() {
     fi
     sleep 0.1
   done
-  fail "portcullis did not start (${BACKEND})"
+  fail "portcullis did not start"
   tail -20 "${PORTCULLIS_LOG}" >&2
   return 1
 }
@@ -215,7 +212,7 @@ run_scenario() {
   local dir="${E2E_DIR}/scenarios/${name}"
   PROJECT="pc-${name}"
   COMPOSE_FILE="${dir}/compose.yml"
-  log "scenario ${name} (${BACKEND})"
+  log "scenario ${name}"
 
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   if ! dc up -d --quiet-pull >/dev/null 2>&1; then

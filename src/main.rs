@@ -29,33 +29,11 @@ use crate::dns::{
 use crate::dns_proxy::{
     DnsApplyAck, DnsResolvedEvent, DnsRuntimeHandle, DnsRuntimeMode, spawn_dns_runtime,
 };
-use crate::docker::{
-    DockerApi, DockerClient, DockerError, DockerEvent, DockerEventClient, DockerFirewallBackend,
-};
-use crate::firewall::{ActiveFirewall, FirewallError};
+use crate::docker::{DockerClient, DockerError, DockerEvent, DockerEventClient};
+use crate::firewall::{FirewallError, NftablesFirewall};
 use crate::logging::{LogLevel, LoggingError};
 use crate::model::{EgressTarget, RuntimeState};
 use crate::monitor::{DockerMonitor, MonitorError};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FirewallBackend {
-    Auto,
-    Nftables,
-    Iptables,
-}
-
-impl FromStr for FirewallBackend {
-    type Err = MainError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "auto" => Ok(Self::Auto),
-            "nftables" => Ok(Self::Nftables),
-            "iptables" => Ok(Self::Iptables),
-            _ => Err(MainError::InvalidFirewallBackend(value.to_string())),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DnsMode {
@@ -78,7 +56,6 @@ impl FromStr for DnsMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
     docker_socket: String,
-    firewall_backend: FirewallBackend,
     dns_mode: DnsMode,
     dns_proxy_bind: SocketAddr,
     log_level: LogLevel,
@@ -88,7 +65,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             docker_socket: "/var/run/docker.sock".to_string(),
-            firewall_backend: FirewallBackend::Auto,
             dns_mode: DnsMode::Lazy,
             dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 1053)),
             log_level: LogLevel::Info,
@@ -100,8 +76,6 @@ impl Default for Config {
 enum MainError {
     #[error("argument parsing failed: {0}")]
     Args(#[from] pico_args::Error),
-    #[error("invalid firewall backend: {0}")]
-    InvalidFirewallBackend(String),
     #[error("invalid DNS mode: {0}")]
     InvalidDnsMode(String),
     #[error("invalid DNS proxy bind address: {0}")]
@@ -158,9 +132,6 @@ fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
     if let Some(socket) = args.opt_value_from_str::<_, String>("--docker-socket")? {
         config.docker_socket = socket;
     }
-    if let Some(backend) = args.opt_value_from_str::<_, String>("--firewall-backend")? {
-        config.firewall_backend = FirewallBackend::from_str(&backend)?;
-    }
     if let Some(mode) = args.opt_value_from_str::<_, String>("--dns-mode")? {
         config.dns_mode = DnsMode::from_str(&mode)?;
     }
@@ -186,11 +157,10 @@ fn print_help() -> Result<(), std::io::Error> {
 portcullis prototype
 
 USAGE:
-  portcullis [--docker-socket <path>] [--firewall-backend <auto|nftables|iptables>] [--dns-mode <lazy|proxy>] [--dns-proxy-bind <host:port>] [--log-level <error|warn|info|debug|trace>]
+  portcullis [--docker-socket <path>] [--dns-mode <lazy|proxy>] [--dns-proxy-bind <host:port>] [--log-level <error|warn|info|debug|trace>]
 
 OPTIONS:
   --docker-socket      Path to Docker Unix socket (default: /var/run/docker.sock)
-  --firewall-backend   Firewall implementation: auto, nftables, or iptables (default: auto)
   --dns-mode           DNS behavior mode: lazy or proxy (default: lazy)
   --dns-proxy-bind     UDP bind address for DNS proxy mode (default: 127.0.0.1:1053)
   --log-level          Logging level (default: info)
@@ -204,7 +174,7 @@ fn write_stderr_line(message: &str) -> Result<(), std::io::Error> {
 }
 
 fn apply_firewall(
-    firewall: &ActiveFirewall,
+    firewall: &NftablesFirewall,
     mode: DnsMode,
     state: &RuntimeState,
     dns_cache: &mut DnsProxyCache<SystemUpstreamResolver>,
@@ -319,40 +289,18 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     info!(
         docker_socket = %config.docker_socket,
-        firewall_backend = ?config.firewall_backend,
         dns_mode = ?config.dns_mode,
         dns_proxy_bind = %config.dns_proxy_bind,
         log_level = ?config.log_level,
         "portcullis prototype started"
     );
 
-    let mut monitor_client = DockerClient::connect(&config.docker_socket)?;
-
-    let selected_backend = match config.firewall_backend {
-        FirewallBackend::Auto => match monitor_client.firewall_backend()? {
-            DockerFirewallBackend::Nftables => FirewallBackend::Nftables,
-            DockerFirewallBackend::Iptables => FirewallBackend::Iptables,
-        },
-        backend => backend,
-    };
-
-    info!(
-        configured_backend = ?config.firewall_backend,
-        selected_backend = ?selected_backend,
-        "selected firewall backend"
-    );
-
+    let monitor_client = DockerClient::connect(&config.docker_socket)?;
     let mut monitor = DockerMonitor::new(monitor_client);
-
-    let firewall = match selected_backend {
-        FirewallBackend::Auto => unreachable!("auto backend must be resolved before execution"),
-        FirewallBackend::Nftables => ActiveFirewall::with_nftables()?,
-        FirewallBackend::Iptables => ActiveFirewall::with_iptables(),
-    };
+    let firewall = NftablesFirewall::with_libnftables()?;
 
     info!("performing startup firewall cleanup");
     firewall.cleanup()?;
-    firewall.initialize()?;
 
     let mut dns_cache = DnsProxyCache::new(SystemUpstreamResolver, Duration::from_secs(300), 2048);
     let mut runtime_state = monitor.initialize()?;
@@ -532,7 +480,6 @@ mod tests {
             config,
             Some(Config {
                 docker_socket: "/var/run/docker.sock".to_string(),
-                firewall_backend: FirewallBackend::Auto,
                 dns_mode: DnsMode::Lazy,
                 dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 1053)),
                 log_level: LogLevel::Info,
@@ -545,8 +492,6 @@ mod tests {
         let args = Arguments::from_vec(vec![
             "--docker-socket".into(),
             "/tmp/docker.sock".into(),
-            "--firewall-backend".into(),
-            "nftables".into(),
             "--dns-mode".into(),
             "proxy".into(),
             "--dns-proxy-bind".into(),
@@ -559,19 +504,11 @@ mod tests {
             config,
             Some(Config {
                 docker_socket: "/tmp/docker.sock".to_string(),
-                firewall_backend: FirewallBackend::Nftables,
                 dns_mode: DnsMode::Proxy,
                 dns_proxy_bind: SocketAddr::from(([127, 0, 0, 1], 5300)),
                 log_level: LogLevel::Debug,
             })
         );
-    }
-
-    #[test]
-    fn parse_config_rejects_invalid_backend() {
-        let args = Arguments::from_vec(vec!["--firewall-backend".into(), "bad".into()]);
-        let result = parse_config(args);
-        assert!(matches!(result, Err(MainError::InvalidFirewallBackend(_))));
     }
 
     #[test]

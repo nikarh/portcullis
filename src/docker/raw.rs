@@ -148,40 +148,6 @@ pub struct DockerIpamConfig {
     pub gateway: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerInfo {
-    #[serde(rename = "FirewallBackend")]
-    pub firewall_backend: Option<DockerFirewallInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum DockerFirewallInfo {
-    Value(String),
-    Object {
-        #[serde(rename = "Driver")]
-        driver: Option<String>,
-        #[serde(rename = "Backend")]
-        backend: Option<String>,
-        #[serde(rename = "Name")]
-        name: Option<String>,
-    },
-}
-
-impl DockerFirewallInfo {
-    #[must_use]
-    pub fn into_backend(self) -> Option<String> {
-        match self {
-            Self::Value(value) => Some(value),
-            Self::Object {
-                driver,
-                backend,
-                name,
-            } => driver.or(backend).or(name),
-        }
-    }
-}
-
 fn deserialize_optional_ipaddr<'de, D>(deserializer: D) -> Result<Option<IpAddr>, D::Error>
 where
     D: Deserializer<'de>,

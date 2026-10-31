@@ -1,12 +1,11 @@
 # End-to-end tests
 
-The suite runs Portcullis against real Docker containers and checks what traffic gets through, with both firewall backends. Everything runs in a throwaway Debian VM under QEMU, so the host's firewall and network are never touched.
+The suite runs Portcullis against real Docker containers and checks what traffic gets through. Everything runs in a throwaway Debian VM under QEMU, so the host's firewall and network are never touched.
 
 ## Running
 
 ```bash
-e2e/run.sh                          # both backends
-e2e/run.sh iptables                 # one backend
+e2e/run.sh
 E2E_SCENARIOS="icc egress" e2e/run.sh
 KEEP_VM=1 e2e/run.sh                # leave the VM running for the next run
 ```
@@ -17,7 +16,7 @@ The host needs `qemu-system-x86_64`, `genisoimage` (or `mkisofs`), `ssh`, `rsync
 
 ## How it works
 
-`suite.sh` runs inside the VM as root. For each backend it starts Portcullis, runs every scenario, stops Portcullis with SIGTERM and checks that no rules are left behind. A last pass runs Portcullis in DNS proxy mode.
+`suite.sh` runs inside the VM as root. It starts Portcullis, runs every scenario, stops Portcullis with SIGTERM and checks that no rules are left behind. A last pass runs Portcullis in DNS proxy mode.
 
 Outbound targets live in a network namespace routed from the Docker host (`outside.sh`), so traffic to them is forwarded and filtered like traffic to the internet. It serves TCP 80, 443 and 8080 and UDP 9000 on `198.51.100.2` to `.5`, and a DNS server on `198.51.100.2` that resolves `api.test` to `.3` and `other.test` to `.4`. The Docker host resolves the same names through `/etc/hosts`.
 

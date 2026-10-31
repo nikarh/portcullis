@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Runs every scenario against each firewall backend. Runs as root inside the test VM;
-# use e2e/run.sh from the host.
+# Runs every scenario. Runs as root inside the test VM; use e2e/run.sh from the host.
 #
-#   suite.sh [backend...]    backends: nftables iptables (default: both)
+#   suite.sh
 #   E2E_SCENARIOS="icc egress" suite.sh   only those scenarios
 set -uo pipefail
 
@@ -33,15 +32,6 @@ fi
 # Remove anything a previous, interrupted run may have left behind.
 remove_leftovers() {
   nft delete table inet portcullis 2>/dev/null
-  iptables -D DOCKER-USER -j PORTCULLIS_EGRESS 2>/dev/null
-  local chain
-  for chain in $(iptables-save -t filter | sed -n 's/^:\(PORTCULLIS_[A-Z0-9_]*\) .*/\1/p'); do
-    iptables -F "${chain}"
-  done
-  for chain in $(iptables-save -t filter | sed -n 's/^:\(PORTCULLIS_[A-Z0-9_]*\) .*/\1/p'); do
-    iptables -X "${chain}"
-  done
-  ipset list -n 2>/dev/null | grep -E '^pc_[ht]4_' | xargs -r -n1 ipset destroy
   return 0
 }
 
@@ -67,8 +57,6 @@ teardown() {
 assert_cleaned_up() {
   local leftovers=()
   nft list table inet portcullis >/dev/null 2>&1 && leftovers+=("nftables table")
-  iptables-save -t filter | grep -qE '^:PORTCULLIS_|-j PORTCULLIS_' && leftovers+=("iptables chains")
-  ipset list -n 2>/dev/null | grep -qE '^pc_[ht]4_' && leftovers+=("ipsets")
   if ((${#leftovers[@]})); then
     fail "rules removed on shutdown (left behind: ${leftovers[*]})"
   else
@@ -79,24 +67,20 @@ assert_cleaned_up() {
 setup
 trap teardown EXIT
 
-BACKENDS=("$@")
-((${#BACKENDS[@]})) || BACKENDS=(nftables iptables)
-
-for BACKEND in "${BACKENDS[@]}"; do
-  log "backend ${BACKEND}"
-
-  start_portcullis || continue
+if start_portcullis; then
   for scenario in "${SCENARIOS[@]}"; do
     run_scenario "${scenario}"
   done
   stop_portcullis
   assert_cleaned_up
+fi
 
-  start_portcullis --dns-mode proxy --dns-proxy-bind 198.51.100.1:53 || continue
+log "DNS proxy mode"
+if start_portcullis --dns-mode proxy --dns-proxy-bind 198.51.100.1:53; then
   run_scenario hostname-proxy
   stop_portcullis
   assert_cleaned_up
-done
+fi
 
 if ((FAILURES > 0)); then
   log "${FAILURES} of ${CHECKS} checks failed; Portcullis log: ${PORTCULLIS_LOG}"

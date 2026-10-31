@@ -3,10 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
 use crate::docker::normalize_socket_path;
-use crate::docker::raw::{
-    DockerContainerInspect, DockerContainerSummary, DockerFirewallInfo, DockerInfo,
-    DockerNetworkInspect,
-};
+use crate::docker::raw::{DockerContainerInspect, DockerContainerSummary, DockerNetworkInspect};
 use serde::Deserialize;
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -21,8 +18,6 @@ pub enum DockerError {
     InvalidHttpResponse(String),
     #[error("invalid JSON from docker output: {0}")]
     InvalidJson(String),
-    #[error("unsupported docker firewall backend: {0}")]
-    UnsupportedFirewallBackend(String),
     #[error("service state error: {0}")]
     ServiceState(String),
 }
@@ -35,13 +30,6 @@ pub trait DockerApi {
         container_id: &str,
     ) -> Result<DockerContainerInspect, DockerError>;
     fn inspect_network(&mut self, network_id: &str) -> Result<DockerNetworkInspect, DockerError>;
-    fn firewall_backend(&mut self) -> Result<DockerFirewallBackend, DockerError>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DockerFirewallBackend {
-    Nftables,
-    Iptables,
 }
 
 #[derive(Debug)]
@@ -109,21 +97,6 @@ impl DockerApi for DockerClient {
 
     fn inspect_network(&mut self, network_id: &str) -> Result<DockerNetworkInspect, DockerError> {
         self.request_json(&format!("/networks/{network_id}"))
-    }
-
-    fn firewall_backend(&mut self) -> Result<DockerFirewallBackend, DockerError> {
-        debug!("detecting docker firewall backend");
-        let info: DockerInfo = self.request_json("/info")?;
-        let backend = info
-            .firewall_backend
-            .and_then(DockerFirewallInfo::into_backend)
-            .unwrap_or_else(|| "iptables".to_string())
-            .to_lowercase();
-        match backend.as_str() {
-            "nftables" => Ok(DockerFirewallBackend::Nftables),
-            "iptables" => Ok(DockerFirewallBackend::Iptables),
-            _ => Err(DockerError::UnsupportedFirewallBackend(backend)),
-        }
     }
 }
 
