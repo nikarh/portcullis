@@ -66,6 +66,12 @@ pub enum Rule {
     DenyDns { protocol: Protocol },
     /// Allow all traffic to a subnet (ICC allow).
     AcceptNet(IpNet),
+    /// Leave traffic to the other containers of the source's own network (`subnet`) to the
+    /// ICC rules, but not traffic to the host there (`gateway`).
+    AcceptPeers {
+        subnet: IpNet,
+        gateway: Option<IpAddr>,
+    },
     /// Allow all traffic to an address of the host itself, such as the network gateway.
     AcceptHost(IpAddr),
     /// Deny all traffic to a subnet (ICC deny).
@@ -301,13 +307,18 @@ where
             .networks()
             .get(&attachment.network_id)
             .filter(|network| same_family(source, network.subnet.addr()));
-        let subnet = network.map(|network| network.subnet);
 
         let egress_start = self.plan.rules.len();
         // Traffic within the network is up to the ICC rules. It only reaches the routed
         // path at all when br_netfilter is loaded; don't let the egress deny catch it there.
-        if let Some(subnet) = subnet {
-            self.plan.rules.push(Rule::AcceptNet(subnet));
+        // The gateway is the host, and traffic to the host follows the egress rules.
+        if let Some(network) = network {
+            self.plan.rules.push(Rule::AcceptPeers {
+                subnet: network.subnet,
+                gateway: network
+                    .gateway
+                    .filter(|gateway| same_family(source, *gateway)),
+            });
         }
         self.plan_dns(source, &policy.dns_targets, container);
 
@@ -594,7 +605,10 @@ mod tests {
         assert_eq!(
             rules_of(&plan, "172.18.0.2"),
             vec![
-                Rule::AcceptNet(net("172.18.0.0/16")),
+                Rule::AcceptPeers {
+                    subnet: net("172.18.0.0/16"),
+                    gateway: Some(ip("172.18.0.1")),
+                },
                 Rule::AcceptDns {
                     destination: Some(resolver),
                     protocol: Protocol::Udp

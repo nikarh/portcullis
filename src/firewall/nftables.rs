@@ -17,11 +17,11 @@ use crate::model::{ContainerName, RuntimeState};
 
 /// Name of both managed tables.
 const TABLE_NAME: &str = "portcullis";
-/// Priority of both base chains: before Docker's filter chains.
+/// Priority of all base chains: before Docker's filter chains.
 const HOOK_PRIORITY: i32 = -1;
 
 /// The managed tables: `inet` sees traffic routed out of a container's network (forward
-/// hook), `bridge` sees traffic between containers on the same network, which a bridge
+/// hook) and traffic to the host itself (input hook), `bridge` sees traffic between containers on the same network, which a bridge
 /// switches without passing the IP hooks unless `br_netfilter` is loaded (prerouting hook:
 /// the bridge family only supports `reject` there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +40,12 @@ impl fmt::Display for Table {
 }
 
 /// A chain, displayed as `<family> <table> <chain>`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Chain {
     /// The base chain of a table.
     Base(Table),
+    /// Base chain of the inet table for traffic addressed to the host itself.
+    Input,
     /// Egress rules of the n-th source, in the inet table.
     Egress(usize),
     /// ICC rules of the n-th source, in the bridge table.
@@ -63,7 +65,7 @@ impl Chain {
     const fn table(self) -> Table {
         match self {
             Self::Base(table) => table,
-            Self::Egress(_) => Table::Inet,
+            Self::Input | Self::Egress(_) => Table::Inet,
             Self::Icc(_) => Table::Bridge,
         }
     }
@@ -82,6 +84,7 @@ impl fmt::Display for ChainName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Chain::Base(table) => f.write_str(table.hook()),
+            Chain::Input => f.write_str("input"),
             Chain::Egress(index) => write!(f, "egress{index}"),
             Chain::Icc(index) => write!(f, "icc{index}"),
         }
@@ -465,7 +468,11 @@ fn render_apply_script(
         .any(|(address, container)| sources.get(address) != Some(container));
     for table in [Table::Inet, Table::Bridge] {
         writeln!(out, "add table {table}")?;
-        render_base_chain(out, table)?;
+        render_base_chain(out, Chain::Base(table), table.hook())?;
+        if table == Table::Inet {
+            render_base_chain(out, Chain::Input, "input")?;
+            writeln!(out, "flush chain {}", Chain::Input)?;
+        }
         render_logged_sets(out, table, reassigned)?;
         writeln!(out, "flush chain {}", Chain::Base(table))?;
     }
@@ -493,32 +500,12 @@ fn render_apply_script(
             ),
         )?;
     }
-    writeln!(out, "add rule {base} ct state established,related accept")?;
-    for (family, is_family) in FAMILIES {
-        let entries = plan
-            .sources
-            .iter()
-            .enumerate()
-            .filter(|(_, source)| is_family(&source.address))
-            .map(|(index, source)| Dispatch(source.address, Verdict::Goto(Chain::Egress(index))));
-        render_elements(
-            out,
-            format_args!("add rule {base} {family} saddr vmap"),
-            entries,
-            "",
-        )?;
+    // Traffic to the host itself (services on the host, and other containers' published
+    // ports through Docker's userland proxy) leaves the container's network as much as
+    // routed traffic does, and follows the same rules.
+    for base in [base, Chain::Input] {
+        render_egress_dispatch(out, plan, options, base)?;
     }
-    // Unknown or spoofed sources of enforced networks; the bridge table already reported
-    // them.
-    render_elements(
-        out,
-        format_args!("add rule {base} iifname"),
-        plan.bridges
-            .iter()
-            .filter(|bridge| !bridge.monitor)
-            .map(|bridge| Quoted(&bridge.name)),
-        format_args!(" {}", options.deny),
-    )?;
     for (index, source) in plan.sources.iter().enumerate() {
         let chain = Chain::Egress(index);
         for rule in plan.egress_rules(source) {
@@ -550,6 +537,41 @@ fn render_apply_script(
         }
     }
     Ok(installed)
+}
+
+/// Send traffic from containers through their egress chains, from `base`.
+fn render_egress_dispatch(
+    out: &mut String,
+    plan: &Plan,
+    options: Options,
+    base: Chain,
+) -> fmt::Result {
+    writeln!(out, "add rule {base} ct state established,related accept")?;
+    for (family, is_family) in FAMILIES {
+        let entries = plan
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| is_family(&source.address))
+            .map(|(index, source)| Dispatch(source.address, Verdict::Goto(Chain::Egress(index))));
+        render_elements(
+            out,
+            format_args!("add rule {base} {family} saddr vmap"),
+            entries,
+            "",
+        )?;
+    }
+    // Unknown or spoofed sources of enforced networks; the bridge table already reported
+    // them.
+    render_elements(
+        out,
+        format_args!("add rule {base} iifname"),
+        plan.bridges
+            .iter()
+            .filter(|bridge| !bridge.monitor)
+            .map(|bridge| Quoted(&bridge.name)),
+        format_args!(" {}", options.deny),
+    )
 }
 
 /// Create or flush the chains and sets of `plan`, and remove those of `previous` it doesn't
@@ -623,12 +645,10 @@ type Family = (&'static str, fn(&IpAddr) -> bool);
 
 const FAMILIES: [Family; 2] = [("ip", IpAddr::is_ipv4), ("ip6", IpAddr::is_ipv6)];
 
-fn render_base_chain(out: &mut String, table: Table) -> fmt::Result {
-    let base = Chain::Base(table);
+fn render_base_chain(out: &mut String, chain: Chain, hook: &str) -> fmt::Result {
     writeln!(
         out,
-        "add chain {base} {{ type filter hook {} priority {HOOK_PRIORITY}; policy accept; }}",
-        table.hook()
+        "add chain {chain} {{ type filter hook {hook} priority {HOOK_PRIORITY}; policy accept; }}"
     )
 }
 
@@ -859,9 +879,12 @@ fn render_rule(
             format_args!("add rule {chain} {} dport {DNS_PORT}", protocol.as_str()),
             deny("dns").snaplen(LOG_SNAPLEN_DNS),
         ),
-        // Within the network, ICC rules decide; see the egress rules.
-        Rule::AcceptNet(destination) if !icc => {
-            writeln!(out, "add rule {chain} {f} daddr {destination} accept")
+        Rule::AcceptPeers { subnet, gateway } => {
+            write!(out, "add rule {chain} {f} daddr {subnet} ")?;
+            if let Some(gateway) = gateway {
+                write!(out, "{f} daddr != {gateway} ")?;
+            }
+            writeln!(out, "accept")
         }
         Rule::AcceptNet(destination) => decide(
             out,
@@ -1339,6 +1362,8 @@ mod tests {
         let expected_head = "\
 add table inet portcullis
 add chain inet portcullis forward { type filter hook forward priority -1; policy accept; }
+add chain inet portcullis input { type filter hook input priority -1; policy accept; }
+flush chain inet portcullis input
 add set inet portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set inet portcullis logged6 { type ipv6_addr . ipv6_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 flush chain inet portcullis forward
@@ -1359,6 +1384,12 @@ flush chain bridge portcullis icc0
             &script,
             &[
                 "add rule inet portcullis forward ip saddr vmap { 172.18.0.2 : goto egress0 }".into(),
+                // Traffic to the host follows the same rules.
+                "add rule inet portcullis input ct state established,related accept".into(),
+                "add rule inet portcullis input ip saddr vmap { 172.18.0.2 : goto egress0 }".into(),
+                "add rule inet portcullis input iifname { \"br-net0\" } drop".into(),
+                // The gateway is the host: traffic to it follows the egress rules.
+                "add rule inet portcullis egress0 ip daddr 172.18.0.0/16 ip daddr != 172.18.0.1 accept".into(),
                 // Reported by the bridge table already.
                 "add rule inet portcullis forward iifname { \"br-net0\" } drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
@@ -1436,6 +1467,7 @@ flush chain bridge portcullis icc0
             // Deleting a table or base chain would drop every packet held in its queues.
             assert!(!script.contains("delete table"), "{script}");
             assert!(!script.contains("delete chain inet portcullis forward"));
+            assert!(!script.contains("delete chain inet portcullis input"));
             assert!(!script.contains("delete chain bridge portcullis prerouting"));
         }
 
