@@ -294,6 +294,11 @@ fn render_ipset_cleanup_script(sets: &str, out: &mut String) -> fmt::Result {
 
 /// Render the `iptables-restore --noflush` script replacing the contents of `chain`.
 ///
+/// Allowed traffic `RETURN`s to `DOCKER-USER` instead of being accepted, so Docker's own
+/// rules (network isolation, internal networks, ICC settings) still apply: the policy can
+/// only take access away, never grant it. This matches nftables, where `accept` in our
+/// base chain doesn't skip Docker's chains.
+///
 /// The iptables backend only manages IPv4; IPv6 rules of the plan are skipped.
 fn render_iptables_script(
     plan: &Plan,
@@ -327,7 +332,7 @@ fn render_rule(
             if let Some(IpAddr::V4(destination)) = destination {
                 write!(out, "-d {destination}/32 ")?;
             }
-            writeln!(out, "-p {} --dport {DNS_PORT} -j ACCEPT", protocol.as_str())
+            writeln!(out, "-p {} --dport {DNS_PORT} -j RETURN", protocol.as_str())
         }
         Rule::DropDns {
             source: IpAddr::V4(source),
@@ -340,7 +345,7 @@ fn render_rule(
         Rule::AcceptNet {
             source: IpAddr::V4(source),
             destination: IpNet::V4(destination),
-        } => writeln!(out, "-A {chain} -s {source}/32 -d {destination} -j ACCEPT"),
+        } => writeln!(out, "-A {chain} -s {source}/32 -d {destination} -j RETURN"),
         Rule::DropNet {
             source: IpAddr::V4(source),
             destination: IpNet::V4(destination),
@@ -355,11 +360,11 @@ fn render_rule(
             match destination {
                 Destination::Net(IpNet::V4(destination)) => writeln!(
                     out,
-                    "-A {chain} -s {source}/32 -d {destination} -p {protocol} --dport {port} -j ACCEPT"
+                    "-A {chain} -s {source}/32 -d {destination} -p {protocol} --dport {port} -j RETURN"
                 ),
                 Destination::Addr(IpAddr::V4(destination)) => writeln!(
                     out,
-                    "-A {chain} -s {source}/32 -d {destination}/32 -p {protocol} --dport {port} -j ACCEPT"
+                    "-A {chain} -s {source}/32 -d {destination}/32 -p {protocol} --dport {port} -j RETURN"
                 ),
                 Destination::HostSet(index) => {
                     let Some(set) = plan.host_set(index) else {
@@ -368,14 +373,14 @@ fn render_rule(
                     if use_ipset {
                         writeln!(
                             out,
-                            "-A {chain} -s {source}/32 -m set --match-set {} dst -p {protocol} --dport {port} -j ACCEPT",
+                            "-A {chain} -s {source}/32 -m set --match-set {} dst -p {protocol} --dport {port} -j RETURN",
                             set.id.name(SET_PREFIX_V4)
                         )
                     } else {
                         for destination in set.v4() {
                             writeln!(
                                 out,
-                                "-A {chain} -s {source}/32 -d {destination}/32 -p {protocol} --dport {port} -j ACCEPT"
+                                "-A {chain} -s {source}/32 -d {destination}/32 -p {protocol} --dport {port} -j RETURN"
                             )?;
                         }
                         Ok(())
@@ -480,7 +485,7 @@ mod tests {
         let (_, script) = render(&test_support::hostname_state(), false);
         assert!(has_line(
             &script,
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 1.1.1.1/32 -p tcp --dport 443 -j ACCEPT"
+            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 1.1.1.1/32 -p tcp --dport 443 -j RETURN"
         ));
         assert!(!script.contains("--match-set"));
     }
@@ -499,12 +504,12 @@ mod tests {
         // allow: subnet accept
         assert!(has_line(
             &script,
-            "-A PORTCULLIS_EGRESS -s 172.18.0.3/32 -d 172.18.0.0/16 -j ACCEPT"
+            "-A PORTCULLIS_EGRESS -s 172.18.0.3/32 -d 172.18.0.0/16 -j RETURN"
         ));
         // allow-listed: alias target on the same network, then subnet drop
         assert!(has_line(
             &script,
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.10/32 -p tcp --dport 5432 -j ACCEPT"
+            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.10/32 -p tcp --dport 5432 -j RETURN"
         ));
         assert!(has_line(
             &script,
@@ -517,8 +522,8 @@ mod tests {
     fn renders_dns_and_baseline_rules() {
         let (_, script) = render(&test_support::hostname_state(), false);
         for expected in [
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p udp --dport 53 -j ACCEPT",
-            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p tcp --dport 53 -j ACCEPT",
+            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p udp --dport 53 -j RETURN",
+            "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -d 172.18.0.1/32 -p tcp --dport 53 -j RETURN",
             "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -p udp --dport 53 -j DROP",
             "-A PORTCULLIS_EGRESS -s 172.18.0.2/32 -j DROP",
             "-A PORTCULLIS_EGRESS -s 172.18.0.0/16 -j DROP",
