@@ -84,6 +84,19 @@ spoof_tcp() {
   in_svc "$1" sh -c "ip addr add $2/32 dev eth0 2>/dev/null; nc -v -w 5 -s $2 $3 $4 </dev/null" 2>&1
 }
 
+# craft <service> <craft.py arguments...>: send a hand-made packet through a raw socket
+# (default capabilities suffice); see e2e/images/tester/craft.py.
+craft() {
+  local service="$1"
+  shift
+  in_svc "${service}" craft "$@" 2>&1
+}
+
+# ping_probe <service> <address>
+ping_probe() {
+  in_svc "$1" ping -c 1 -W 3 "$2" 2>&1
+}
+
 # from_outside <address> <port>: connect from the outside network.
 from_outside() {
   ip netns exec pc-outside nc -v -w 3 "$1" "$2" </dev/null 2>&1
@@ -96,6 +109,8 @@ answered() {
     udp | fast_udp) grep -v 'socat\[' <<<"$2" | grep -q . ;;
     dns) grep -Eq '^[0-9a-f.:]+$' <<<"$2" ;;
     resolve | fast_dns) grep -A1 '^Name:' <<<"$2" | grep -q '^Address' ;;
+    craft) grep -q '^answered' <<<"$2" ;;
+    ping_probe) grep -q ' 0% packet loss' <<<"$2" ;;
     *) return 1 ;;
   esac
 }
@@ -105,6 +120,7 @@ rejected() {
   case "$1" in
     # Docker's DNS server answers SERVFAIL when its upstream rejects the query.
     resolve) grep -Eq 'SERVFAIL|unreachable' <<<"$2" ;;
+    craft) grep -q '^rejected' <<<"$2" ;;
     *) grep -Eqi 'unreachable|no route to host' <<<"$2" ;;
   esac
 }
@@ -212,6 +228,26 @@ allowed() {
   check "allowed: ${description}" expect_answer "$@"
 }
 
+# unanswered <description> <probe...>: the probe ran and nothing answered it. For packets
+# whose rejection can't come back to the sender (spoofed sources, frames that aren't IP),
+# so this waits for the probe's listening time (craft.py --wait) to pass.
+unanswered() {
+  local description="$1"
+  shift
+  check "unanswered: ${description}" expect_no_answer "$@"
+}
+
+expect_no_answer() {
+  local output
+  output="$("$@")"
+  printf '%s\n' "${output}"
+  case "$1" in
+    craft) grep -Eq '^(nothing|rejected)' <<<"${output}" && ! grep -q '^answered' <<<"${output}" ;;
+    ping_probe) grep -q '100% packet loss' <<<"${output}" ;;
+    *) return 1 ;;
+  esac
+}
+
 # blocked <description> <probe...>: call wait_managed first so rules are in place.
 blocked() {
   local description="$1"
@@ -273,6 +309,23 @@ wait_managed() {
     sed 's/\x1b\[[0-9;]*m//g' "${PORTCULLIS_LOG}" | grep -E 'ERROR|WARN' | tail -5 >&2
     return 1
   fi
+}
+
+# host_service <port>: serve TCP <port> on every address of the Docker host, answering
+# "host"; returns once it listens. Stop it with stop_host_service.
+host_service() {
+  local line
+  coproc HOST_SERVICE { exec socat -d -d "TCP-LISTEN:$1,fork,reuseaddr" SYSTEM:'echo host' 2>&1; }
+  while read -r line <&"${HOST_SERVICE[0]}"; do
+    [[ "${line}" == *listening* ]] && return 0
+  done
+  fail "host service on port $1 did not start"
+  return 1
+}
+
+stop_host_service() {
+  [[ -n "${HOST_SERVICE_PID:-}" ]] && kill "${HOST_SERVICE_PID}" 2>/dev/null
+  return 0
 }
 
 # --- portcullis ----------------------------------------------------------------------------

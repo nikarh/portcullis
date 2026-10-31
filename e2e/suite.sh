@@ -18,6 +18,7 @@ SCENARIOS=(
   invalid-labels
   restart
   spoofing
+  bypass
   fast-start
   dns-inspection
   monitor

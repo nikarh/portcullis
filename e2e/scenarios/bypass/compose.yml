@@ -1,0 +1,36 @@
+# Ways a container could try to get around its rules. Every probe works with Docker's
+# default capabilities: hand-made packets go through a raw socket (NET_RAW).
+services:
+  # May reach 198.51.100.3 and api.test on TCP 80, UDP 9001 on .3, and use the lying
+  # resolver on .4; no other container.
+  attacker:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=deny
+      - portcullis.egress.web=ip:198.51.100.3,tcp:80,udp:9001
+      - portcullis.egress.api=host:api.test,tcp:80
+      - portcullis.dns.rogue=ip:198.51.100.4
+  # Has a policy worth borrowing, and a published port.
+  victim:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.udp=ip:198.51.100.4,udp:9000
+      - portcullis.egress.api=host:api.test,tcp:80
+    ports:
+      - "18080:8080"
+  # Shows the probes work where the rules allow them.
+  control:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.host=ip:198.51.100.1,tcp:7777
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true
