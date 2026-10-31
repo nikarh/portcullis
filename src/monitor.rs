@@ -26,10 +26,8 @@ pub enum MonitorError {
         container_id: String,
         network_name: String,
     },
-    #[error("missing subnet for network id: {0}")]
+    #[error("no IPv4 subnet for network id: {0}")]
     MissingNetworkSubnet(String),
-    #[error("invalid subnet in network id {network_id}: {subnet}")]
-    InvalidNetworkSubnet { network_id: String, subnet: String },
 }
 
 /// Policy from a container's labels. Invalid labels are logged and skipped.
@@ -355,27 +353,31 @@ fn is_not_found(error: &DockerError) -> bool {
     matches!(error, DockerError::ApiHttpStatus { status: 404, .. })
 }
 
+/// The network's IPv4 subnet and gateway. A bridge network has at most one IPv4 subnet; on
+/// dual-stack networks the other configuration is IPv6, which Portcullis doesn't manage.
 fn network_primary_config(
     network: &DockerNetworkInspect,
 ) -> Result<(IpNet, Option<IpAddr>), MonitorError> {
-    let config = network
+    let configs = network
         .ipam
         .as_ref()
-        .and_then(|ipam| ipam.config.as_ref())
-        .and_then(|configs| configs.iter().next());
+        .and_then(|ipam| ipam.config.as_deref())
+        .unwrap_or_default();
 
-    let subnet = config
-        .and_then(|c| c.subnet.as_deref())
+    let (subnet, config) = configs
+        .iter()
+        .find_map(|config| match config.subnet.as_deref()?.parse::<IpNet>() {
+            Ok(subnet @ IpNet::V4(_)) => Some((subnet, config)),
+            Ok(IpNet::V6(_)) => None,
+            Err(_) => {
+                error!(network = %network.name, subnet = ?config.subnet, "ignoring invalid network subnet");
+                None
+            }
+        })
         .ok_or_else(|| MonitorError::MissingNetworkSubnet(network.id.clone()))?;
-    let subnet = subnet
-        .parse::<IpNet>()
-        .map_err(|_| MonitorError::InvalidNetworkSubnet {
-            network_id: network.id.clone(),
-            subnet: subnet.to_string(),
-        })?;
 
-    let gateway = config.and_then(|c| c.gateway.as_deref()).and_then(|value| {
-        let gateway = value.parse::<IpAddr>().ok();
+    let gateway = config.gateway.as_deref().and_then(|value| {
+        let gateway = value.parse::<IpAddr>().ok().filter(IpAddr::is_ipv4);
         if gateway.is_none() {
             error!(network = %network.name, gateway = value, "ignoring invalid network gateway");
         }
@@ -930,6 +932,41 @@ mod tests {
         let mut monitor = DockerMonitor::new(api);
         let state = monitor.initialize().expect("initialize should succeed");
         assert!(state.networks().contains_key("net0"));
+    }
+
+    #[test]
+    fn collect_state_uses_the_ipv4_subnet_of_dual_stack_networks() {
+        let mut api = MockDockerApi::default();
+        let mut network = network_inspect(
+            "net0",
+            "dual",
+            "fd00::/64",
+            Some("fd00::1"),
+            DockerNetworkDriver::Bridge,
+            Some("true"),
+        );
+        if let Some(configs) = network.ipam.as_mut().and_then(|ipam| ipam.config.as_mut()) {
+            configs.push(DockerIpamConfig {
+                subnet: Some("172.20.0.0/16".to_string()),
+                gateway: Some("172.20.0.1".to_string()),
+            });
+        }
+        api.networks_list.push(network);
+
+        let mut monitor = DockerMonitor::new(api);
+        let state = monitor.initialize().expect("initialize should succeed");
+        let network = state
+            .networks()
+            .get("net0")
+            .expect("net0 should be managed");
+        assert_eq!(
+            network.subnet,
+            "172.20.0.0/16".parse::<IpNet>().expect("subnet")
+        );
+        assert_eq!(
+            network.gateway,
+            Some("172.20.0.1".parse().expect("gateway"))
+        );
     }
 
     #[test]
