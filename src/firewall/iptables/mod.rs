@@ -699,7 +699,6 @@ mod tests {
             gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
         });
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "abc".to_string().into(),
             container: Box::new(Container {
                 id: "abc".to_string().into(),
                 name: "web".to_string().into(),
@@ -737,7 +736,6 @@ mod tests {
         apply(&mut container);
 
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id,
             container: Box::new(container),
         });
     }
@@ -778,7 +776,6 @@ mod tests {
             Err(error) => panic!("failed to parse subnet: {error}"),
         };
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "peer".to_string().into(),
             container: Box::new(Container {
                 id: "peer".to_string().into(),
                 name: "/peer".to_string().into(),
@@ -844,7 +841,6 @@ mod tests {
     fn build_commands_adds_icc_allow_for_same_network_container_ips() {
         let mut state = sample_state();
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "peer".to_string().into(),
             container: Box::new(Container {
                 id: "peer".to_string().into(),
                 name: "peer".to_string().into(),

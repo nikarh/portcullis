@@ -238,7 +238,6 @@ pub enum RuntimeStateAction {
         networks: HashMap<NetworkId, Network>,
     },
     CreateContainer {
-        id: ContainerId,
         container: Box<Container>,
     },
     RenameContainer {
@@ -311,16 +310,15 @@ impl RuntimeState {
 
                 true
             }
-            RuntimeStateAction::CreateContainer { id, container } => {
-                if let Some(previous) = self.containers.get(&id).cloned() {
-                    self.containers_by_name.remove(&previous.name);
-                }
-
+            RuntimeStateAction::CreateContainer { container } => {
                 let has_networks = !container.attachments.is_empty();
 
-                self.containers_by_name
-                    .insert(container.name.clone(), id.clone());
-                self.containers.insert(id.clone(), *container);
+                let id = container.id.clone();
+                let name = container.name.clone();
+                if let Some(previous) = self.containers.insert(id.clone(), *container) {
+                    self.containers_by_name.remove(&previous.name);
+                }
+                self.containers_by_name.insert(name, id);
 
                 has_networks
             }

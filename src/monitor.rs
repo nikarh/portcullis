@@ -151,7 +151,7 @@ where
     fn build_container_from_inspect(
         state: &RuntimeState,
         inspect: DockerContainerInspect,
-    ) -> Result<(ContainerId, Box<Container>), MonitorError> {
+    ) -> Result<Box<Container>, MonitorError> {
         let policy = parse_policy(&inspect.config.labels)?;
         let runtime_dns_servers = runtime_dns_servers(inspect.host_config.as_ref());
 
@@ -183,18 +183,13 @@ where
             });
         }
 
-        let id = ContainerId::from(inspect.id);
-
-        Ok((
-            id.clone(),
-            Box::new(Container {
-                id,
-                name: inspect.name.trim_start_matches('/').to_string().into(),
-                attachments,
-                runtime_dns_servers,
-                policy,
-            }),
-        ))
+        Ok(Box::new(Container {
+            id: inspect.id.into(),
+            name: inspect.name.trim_start_matches('/').to_string().into(),
+            attachments,
+            runtime_dns_servers,
+            policy,
+        }))
     }
 
     fn inspect_container_action(
@@ -206,8 +201,8 @@ where
 
         match self.api.inspect_container(container_id) {
             Ok(inspect) => {
-                let (id, container) = Self::build_container_from_inspect(state, inspect)?;
-                Ok(Some(RuntimeStateAction::CreateContainer { id, container }))
+                let container = Self::build_container_from_inspect(state, inspect)?;
+                Ok(Some(RuntimeStateAction::CreateContainer { container }))
             }
             Err(error) => Err(error.into()),
         }
@@ -222,11 +217,9 @@ where
             return Ok(None);
         };
 
-        let id = ContainerId::from(event.id);
         Ok(Some(RuntimeStateAction::CreateContainer {
-            id: id.clone(),
             container: Box::new(Container {
-                id,
+                id: event.id.into(),
                 name: name.trim_start_matches('/').to_string().into(),
                 attachments: Vec::new(),
                 runtime_dns_servers: HashSet::new(),
@@ -650,9 +643,8 @@ mod tests {
         });
     }
 
-    fn add_container(state: &mut RuntimeState, id: &str, container: Container) {
+    fn add_container(state: &mut RuntimeState, container: Container) {
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: id.to_string().into(),
             container: Box::new(container),
         });
     }
@@ -739,8 +731,8 @@ mod tests {
             .expect("connect action should resolve");
 
         match action {
-            Some(RuntimeStateAction::CreateContainer { id, container }) => {
-                assert_eq!(id.as_str(), "abc");
+            Some(RuntimeStateAction::CreateContainer { container }) => {
+                assert_eq!(container.id.as_str(), "abc");
                 assert_eq!(container.attachments.len(), 1);
             }
             _ => panic!("expected create container action"),
@@ -784,7 +776,7 @@ mod tests {
             .expect("connect action should resolve");
 
         match action {
-            Some(RuntimeStateAction::CreateContainer { container, .. }) => {
+            Some(RuntimeStateAction::CreateContainer { container }) => {
                 assert!(container.attachments.is_empty());
             }
             _ => panic!("expected create container action"),
@@ -799,7 +791,6 @@ mod tests {
         let mut state = RuntimeState::default();
         add_container(
             &mut state,
-            "abc",
             Container {
                 id: "abc".to_string().into(),
                 name: "web".to_string().into(),

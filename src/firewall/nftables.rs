@@ -642,7 +642,6 @@ mod common_tests {
             gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
         });
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "abc".to_string().into(),
             container: Box::new(Container {
                 id: "abc".to_string().into(),
                 name: "web".to_string().into(),
@@ -679,7 +678,6 @@ mod common_tests {
 
         apply(&mut container);
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id,
             container: Box::new(container),
         });
     }
@@ -719,7 +717,6 @@ mod common_tests {
             Err(error) => panic!("failed to parse peer ip: {error}"),
         };
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "peer".to_string().into(),
             container: Box::new(Container {
                 id: "peer".to_string().into(),
                 name: "/peer".to_string().into(),
@@ -1220,7 +1217,6 @@ mod firewall_tests {
             gateway: Some("172.18.0.1".parse().expect("gateway fixture should parse")),
         });
         state.apply_action(RuntimeStateAction::CreateContainer {
-            id: "abc".to_string().into(),
             container: Box::new(Container {
                 id: "abc".to_string().into(),
                 name: "web".to_string().into(),
