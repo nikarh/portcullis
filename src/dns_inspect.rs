@@ -96,16 +96,16 @@ impl Answer {
             _ => packet.data,
         };
         let message = Message::from_vec(data).ok()?;
-        if message.message_type() != MessageType::Response {
+        if message.metadata.message_type != MessageType::Response {
             return None;
         }
-        let query = message.queries().first()?;
+        let query = message.queries.first()?;
 
         let mut aliases = Vec::new();
         let mut addresses = Vec::new();
-        for record in message.answers() {
-            let ttl = Duration::from_secs(u64::from(record.ttl()));
-            match record.data() {
+        for record in message.answers {
+            let ttl = Duration::from_secs(u64::from(record.ttl));
+            match &record.data {
                 RData::A(address) => addresses.push((IpAddr::V4(address.0), ttl)),
                 RData::AAAA(address) => addresses.push((IpAddr::V6(address.0), ttl)),
                 RData::CNAME(target) => aliases.push(normalize(&target.0.to_utf8())),
@@ -118,7 +118,7 @@ impl Answer {
             resolver: IpAddr::V4(packet.source),
             name: normalize(&query.name().to_utf8()),
             record_type: query.query_type().to_string(),
-            response_code: message.response_code().to_string(),
+            response_code: message.metadata.response_code.to_string(),
             aliases,
             addresses,
         })
@@ -192,7 +192,7 @@ fn allow_addresses(
 mod tests {
     use std::str::FromStr;
 
-    use hickory_proto::op::{Message, MessageType, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::{A, CNAME};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
@@ -203,8 +203,7 @@ mod tests {
     fn response() -> Vec<u8> {
         let name = Name::from_str("www.Example.test.").expect("name");
         let target = Name::from_str("cdn.example.net.").expect("name");
-        let mut message = Message::new();
-        message.set_message_type(MessageType::Response);
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
         message.add_query(Query::query(name.clone(), RecordType::A));
         message.add_answer(Record::from_rdata(
             name,
@@ -263,7 +262,7 @@ mod tests {
 
     #[test]
     fn ignores_queries_and_other_traffic() {
-        let mut query = Message::new();
+        let mut query = Message::new(0, MessageType::Query, OpCode::Query);
         query.add_query(Query::query(
             Name::from_str("a.test.").expect("name"),
             RecordType::A,

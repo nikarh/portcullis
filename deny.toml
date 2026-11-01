@@ -17,10 +17,13 @@ ignore = []
 [licenses]
 version = 2
 confidence-threshold = 0.93
-allow = ["MIT", "Unicode-3.0"]
+# Apache-2.0, BSD-3-Clause and ISC come with the build-time bindgen.
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0"]
 
 [bans]
 multiple-versions = "deny"
+# The ecosystem is moving from syn 2 to 3; both are build-time only (derive macros).
+skip = [{ crate = "syn@2.0.119", reason = "tracing-attributes still uses syn 2" }]
 # Lint level for when a crate version requirement is `*`
 wildcards = "deny"
 highlight = "simplest-path"

@@ -12,7 +12,7 @@ categories = ["network-programming", "virtualization"]
 [dependencies]
 crossbeam-channel = "0.5.15"
 ctrlc = { version = "3.5.2", features = ["termination"] }
-hickory-proto = "0.25.2"
+hickory-proto = "0.26.3"
 indexmap = { version = "2.12.0", features = ["serde"] }
 ipnet = "2.11"
 netlink-sys = "0.9.0"

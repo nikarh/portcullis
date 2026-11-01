@@ -142,12 +142,12 @@ fn query_names(packet: &Ipv4Packet<'_>) -> Result<Vec<String>, &'static str> {
     let mut names = Vec::new();
     for data in messages {
         let message = Message::from_vec(data).map_err(|_| "not a DNS message")?;
-        if message.message_type() != MessageType::Query || message.queries().is_empty() {
+        if message.metadata.message_type != MessageType::Query || message.queries.is_empty() {
             return Err("not a DNS query");
         }
         names.extend(
             message
-                .queries()
+                .queries
                 .iter()
                 .map(|query| normalize(&query.name().to_utf8())),
         );
@@ -195,7 +195,7 @@ fn denied(
 
 #[cfg(test)]
 mod tests {
-    use hickory_proto::op::{Message, MessageType, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
 
     use super::*;
@@ -228,8 +228,7 @@ mod tests {
     }
 
     fn query(names: &[&str], message_type: MessageType) -> Vec<u8> {
-        let mut message = Message::new();
-        message.set_message_type(message_type);
+        let mut message = Message::new(0, message_type, OpCode::Query);
         for name in names {
             message.add_query(Query::query(
                 Name::from_ascii(name).expect("name"),

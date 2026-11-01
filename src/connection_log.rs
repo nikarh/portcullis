@@ -360,7 +360,7 @@ fn query_name(packet: &Ipv4Packet<'_>) -> Option<String> {
         _ => packet.data,
     };
     let message = Message::from_vec(data).ok()?;
-    let query = message.queries().first()?;
+    let query = message.queries.first()?;
     Some(crate::dns::normalize(&query.name().to_utf8()))
 }
 
@@ -377,7 +377,7 @@ fn protocol_name(protocol: u8) -> String {
 mod tests {
     use std::time::Duration;
 
-    use hickory_proto::op::{Message, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
 
     use super::*;
@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn reports_denied_dns_queries() {
         let (directory, hosts) = setup();
-        let mut message = Message::new();
+        let mut message = Message::new(0, MessageType::Query, OpCode::Query);
         message.add_query(Query::query(
             Name::from_ascii("Blocked.Test.").expect("name"),
             RecordType::A,
