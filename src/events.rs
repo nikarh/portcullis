@@ -17,7 +17,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -119,6 +119,8 @@ pub enum WarningKind {
     DnsNotObservable,
     /// The kernel dropped logged packets because they weren't read fast enough.
     EventsLost,
+    /// A container raised so many alerts that further ones are held back for a while.
+    AlertsSuppressed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,8 +280,28 @@ impl EventBus {
         if let Some(socket) = &self.inner.socket {
             socket.send(&json, matches!(event, Event::Applied { .. }));
         }
-        if let (Some(alerts), Some(key)) = (&self.inner.alerts, event.alert_key()) {
-            alerts.raise(key, json);
+        let (Some(alerts), Some(key)) = (&self.inner.alerts, event.alert_key()) else {
+            return;
+        };
+        let container = match event {
+            Event::Connection(connection) => Some(connection.container.as_deref().unwrap_or("?")),
+            _ => None,
+        };
+        match alerts.admit(key, container) {
+            Admission::Raise => alerts.raise(json),
+            Admission::Duplicate | Admission::Suppressed => {}
+            Admission::StartSuppressing { container, until } => {
+                alerts.raise(json);
+                self.publish(&Event::Warning(Warning {
+                    kind: WarningKind::AlertsSuppressed,
+                    container: Some(container),
+                    message: format!(
+                        "more than {ALERTS_PER_CONTAINER} alerts within {} s; until {}, its denials are only reported as events",
+                        alerts.interval.as_secs(),
+                        timestamp(until),
+                    ),
+                }));
+            }
         }
     }
 }
@@ -532,46 +554,97 @@ fn accept(
     }
 }
 
-/// Runs the alert command for alert-worthy events, at most once per key and interval.
+/// Distinct alerts one container may raise per alert interval. A container probing many
+/// destinations would otherwise raise an alert for each, and since alerts run one after
+/// another, bury every later alert, of any container, under hours of backlog.
+const ALERTS_PER_CONTAINER: usize = 10;
+/// Alerts waiting for the command at most; more are dropped.
+const ALERT_QUEUE: usize = 256;
+
+/// Runs the alert command for alert-worthy events, at most once per key and interval, and
+/// at most [`ALERTS_PER_CONTAINER`] times per container and interval.
 struct AlertSink {
-    sender: Mutex<Sender<String>>,
+    sender: SyncSender<String>,
     interval: Duration,
-    last_raised: Mutex<HashMap<String, Instant>>,
+    state: Mutex<AlertState>,
+}
+
+#[derive(Default)]
+struct AlertState {
+    last_raised: HashMap<String, Instant>,
+    /// Per container: when its current interval started, and how many alerts it raised.
+    per_container: HashMap<String, (Instant, usize)>,
+}
+
+/// What to do with an alert.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Raise,
+    /// Raised within the interval already.
+    Duplicate,
+    /// The container's last alert before its alerts are held back until `until`.
+    StartSuppressing {
+        container: String,
+        until: SystemTime,
+    },
+    Suppressed,
 }
 
 impl AlertSink {
     fn start(command: String, interval: Duration) -> Self {
-        let (sender, receiver) = mpsc::channel::<String>();
+        let (sender, receiver) = mpsc::sync_channel::<String>(ALERT_QUEUE);
         thread::spawn(move || {
             for json in receiver {
                 run_alert(&command, &json);
             }
         });
         Self {
-            sender: Mutex::new(sender),
+            sender,
             interval,
-            last_raised: Mutex::new(HashMap::new()),
+            state: Mutex::new(AlertState::default()),
         }
     }
 
-    fn raise(&self, key: String, json: String) {
+    /// Decide on the alert `key` of `container` (none for alerts about Portcullis itself).
+    fn admit(&self, key: String, container: Option<&str>) -> Admission {
         let now = Instant::now();
-        {
-            let mut last_raised = self
-                .last_raised
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            last_raised.retain(|_, raised| now.duration_since(*raised) < self.interval);
-            if last_raised.contains_key(&key) {
-                return;
-            }
-            last_raised.insert(key, now);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let interval = self.interval;
+        state
+            .last_raised
+            .retain(|_, raised| now.duration_since(*raised) < interval);
+        state
+            .per_container
+            .retain(|_, (started, _)| now.duration_since(*started) < interval);
+        if state.last_raised.contains_key(&key) {
+            return Admission::Duplicate;
         }
-        let _ = self
-            .sender
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .send(json);
+        let admission = match container {
+            None => Admission::Raise,
+            Some(container) => {
+                let (started, count) = state
+                    .per_container
+                    .entry(container.to_string())
+                    .or_insert((now, 0));
+                *count += 1;
+                match (*count).cmp(&ALERTS_PER_CONTAINER) {
+                    std::cmp::Ordering::Less => Admission::Raise,
+                    std::cmp::Ordering::Equal => Admission::StartSuppressing {
+                        container: container.to_string(),
+                        until: SystemTime::now() + interval.saturating_sub(now - *started),
+                    },
+                    std::cmp::Ordering::Greater => return Admission::Suppressed,
+                }
+            }
+        };
+        state.last_raised.insert(key, now);
+        admission
+    }
+
+    fn raise(&self, json: String) {
+        if let Err(TrySendError::Full(_)) = self.sender.try_send(json) {
+            warn!("too many alerts waiting for the alert command; dropping one");
+        }
     }
 }
 
@@ -707,6 +780,37 @@ mod tests {
             }
             .alert_key()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn alerts_are_limited_per_container() {
+        let sink = AlertSink::start("true".to_string(), Duration::from_secs(600));
+        let admissions: Vec<Admission> = (0..12)
+            .map(|port| sink.admit(format!("probe {port}"), Some("attacker")))
+            .collect();
+        assert!(
+            admissions
+                .iter()
+                .take(ALERTS_PER_CONTAINER - 1)
+                .all(|admission| *admission == Admission::Raise)
+        );
+        assert!(matches!(
+            admissions.get(ALERTS_PER_CONTAINER - 1),
+            Some(Admission::StartSuppressing { container, .. }) if container == "attacker"
+        ));
+        assert!(
+            admissions
+                .iter()
+                .skip(ALERTS_PER_CONTAINER)
+                .all(|admission| *admission == Admission::Suppressed)
+        );
+        // Other containers, and Portcullis itself, still raise alerts.
+        assert_eq!(sink.admit("probe".into(), Some("other")), Admission::Raise);
+        assert_eq!(sink.admit("apply_failed".into(), None), Admission::Raise);
+        assert_eq!(
+            sink.admit("apply_failed".into(), None),
+            Admission::Duplicate
         );
     }
 
