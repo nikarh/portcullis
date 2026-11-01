@@ -24,6 +24,7 @@ SCENARIOS=(
   monitor
   events
   alerts
+  checks
 )
 
 # E2E_SCENARIOS="icc egress" runs only those.

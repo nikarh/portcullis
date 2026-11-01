@@ -1,0 +1,69 @@
+# Configurations that get around the rules without sending anything Portcullis could deny.
+services:
+  # Also on a network that isn't enforced.
+  twonets:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net, open]
+  # Labels on a container that uses the host's network.
+  hostnet:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    network_mode: host
+    command: ["sleep", "infinity"]
+    labels:
+      - portcullis.egress.web=ip:198.51.100.3,tcp:80
+  # Shares the network namespace of a restricted container.
+  sidecar:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    network_mode: "service:twonets"
+    command: ["sleep", "infinity"]
+  # The Docker socket and NET_ADMIN on a restricted container.
+  escape:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+  # The same, acknowledged.
+  acknowledged:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - portcullis.ack=docker-socket,net-admin,dns-not-observable
+  # Puts the IPv6 networks to use: Compose only creates networks that are.
+  dualstack:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [v6, v6acknowledged]
+    labels:
+      - portcullis.ack=dns-not-observable
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true
+  open: {}
+  v6:
+    enable_ipv6: true
+    labels:
+      - portcullis.enable=true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/16
+        - subnet: fd00:31::/64
+  v6acknowledged:
+    enable_ipv6: true
+    labels:
+      - portcullis.enable=true
+      - portcullis.ack=ipv6-network
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+        - subnet: fd00:29::/64

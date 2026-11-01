@@ -187,6 +187,7 @@ fn build_events_path(since: i64) -> Result<String, DockerError> {
         "type": ["container", "network"],
         "event": [
             "create",
+            "start",
             "rename",
             "update",
             "destroy",

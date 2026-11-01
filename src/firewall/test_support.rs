@@ -69,6 +69,7 @@ pub fn add_network(state: &mut RuntimeState, id: &str, subnet: &str, gateway: &s
             name: id.to_string(),
             subnet: net(subnet),
             gateway: Some(ip(gateway)),
+            ipv6: false,
             bridge: format!("br-{id}"),
             monitor: false,
         },
@@ -127,6 +128,7 @@ pub fn policy(icc_mode: IccMode, egress: Vec<EgressRule>) -> ContainerPolicy {
         egress,
         icc_allow: Vec::new(),
         dns_targets: vec![DnsTarget::Docker],
+        ..ContainerPolicy::default()
     }
 }
 

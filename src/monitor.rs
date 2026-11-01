@@ -12,7 +12,7 @@ use crate::docker::raw::{
 };
 use crate::docker::{DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind};
 use crate::events::{Warning, WarningKind};
-use crate::labels::parse_policy;
+use crate::labels::{parse_acknowledged, parse_policy};
 use crate::model::{
     Container, ContainerId, ContainerPolicy, MacAddress, Network, NetworkAttachment, NetworkId,
     RuntimeState, RuntimeStateAction,
@@ -98,11 +98,33 @@ fn network_from_inspect(
         }
     };
 
+    let labels = network.labels.clone().unwrap_or_default();
+    let (acknowledged, errors) = parse_acknowledged(&labels);
+    for error in errors {
+        network_warning(
+            warnings,
+            network,
+            &format!("ignoring invalid label: {error}"),
+        );
+    }
+    if network.enable_ipv6 && !acknowledged.contains(&WarningKind::Ipv6Network) {
+        warn!(network = %network.name, "IPv6 is enabled on an enforced network");
+        warnings.push(Warning {
+            kind: WarningKind::Ipv6Network,
+            container: None,
+            message: format!(
+                "network {}: IPv6 is enabled, but Portcullis only manages IPv4: all IPv6 traffic of its containers is denied",
+                network.name
+            ),
+        });
+    }
+
     Some(Network {
         id: network.id.clone().into(),
         name: network.name.clone(),
         subnet,
         gateway,
+        ipv6: network.enable_ipv6,
         bridge: bridge_name(network),
         monitor,
     })
@@ -144,6 +166,24 @@ where
     /// Configuration problems found since the last call.
     pub fn take_warnings(&mut self) -> Vec<Warning> {
         std::mem::take(&mut self.warnings)
+    }
+
+    /// Look for configurations that get around the rules in container `id`, see `checks`.
+    pub fn check_container(&mut self, state: &RuntimeState, id: &str) {
+        match self.api.inspect_container(id) {
+            Ok(inspect) => self
+                .warnings
+                .extend(crate::checks::container_warnings(&inspect, state)),
+            Err(error) => debug!(container = %id, %error, "can't inspect container for checks"),
+        }
+    }
+
+    /// The same for every container.
+    pub fn check_containers(&mut self, state: &RuntimeState) {
+        let ids: Vec<String> = state.containers().keys().map(ToString::to_string).collect();
+        for id in ids {
+            self.check_container(state, &id);
+        }
     }
 
     pub fn initialize(&mut self) -> Result<RuntimeState, MonitorError> {
@@ -645,6 +685,7 @@ mod tests {
             }),
             labels,
             options: None,
+            enable_ipv6: false,
         }
     }
 
@@ -714,6 +755,7 @@ mod tests {
                 networks: Some(network_map),
                 sandbox_key: Some("/var/run/docker/netns/abc".to_string()),
             }),
+            mounts: Vec::new(),
         }
     }
 
@@ -741,6 +783,7 @@ mod tests {
                 name: network_id.to_string(),
                 subnet,
                 gateway,
+                ipv6: false,
                 bridge: format!("br-{network_id}"),
                 monitor: false,
             },
@@ -1040,6 +1083,7 @@ mod tests {
             container_inspect("abc", "/web", &[], &[("managed", "net0", "172.20.0.2")]);
         inspect.host_config = Some(DockerHostConfig {
             dns: Some(vec!["9.9.9.9".to_string()]),
+            ..DockerHostConfig::default()
         });
         api.containers.insert("abc".to_string(), inspect);
 

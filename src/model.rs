@@ -189,6 +189,8 @@ pub struct ContainerPolicy {
     pub egress: Vec<EgressRule>,
     pub icc_allow: Vec<IccAllowRule>,
     pub dns_targets: Vec<DnsTarget>,
+    /// Configuration warnings acknowledged with `portcullis.ack`, not reported.
+    pub acknowledged: HashSet<crate::events::WarningKind>,
 }
 
 impl Default for ContainerPolicy {
@@ -198,6 +200,7 @@ impl Default for ContainerPolicy {
             egress: Vec::new(),
             icc_allow: Vec::new(),
             dns_targets: vec![DnsTarget::Docker],
+            acknowledged: HashSet::new(),
         }
     }
 }
@@ -217,6 +220,8 @@ pub struct Network {
     pub name: String,
     pub subnet: IpNet,
     pub gateway: Option<IpAddr>,
+    /// IPv6 is enabled on the network (Portcullis denies it on enforced networks).
+    pub ipv6: bool,
     /// Name of the network's bridge interface on the host.
     pub bridge: String,
     /// `portcullis.enable=monitor`: evaluate the policy, but only report what it would deny.

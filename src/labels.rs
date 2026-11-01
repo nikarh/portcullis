@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -5,6 +6,7 @@ use indexmap::IndexMap;
 use ipnet::IpNet;
 use thiserror::Error;
 
+use crate::events::WarningKind;
 use crate::model::{
     ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode, PortSpec, Protocol,
 };
@@ -13,6 +15,8 @@ const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
 const ICC_ALLOW_PREFIX: &str = "portcullis.icc.allow.";
 const DNS_PREFIX: &str = "portcullis.dns.";
+/// Configuration warnings acknowledged for a container or network, comma-separated.
+pub const ACK_LABEL: &str = "portcullis.ack";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LabelParseError {
@@ -34,6 +38,38 @@ pub enum LabelParseError {
     MissingPorts(String),
     #[error("invalid dns target in {0}: {1}")]
     InvalidDnsTarget(String, String),
+    #[error("unknown warning in {ACK_LABEL}: {0} (expected one of {1})")]
+    UnknownAcknowledgement(String, String),
+}
+
+/// The warnings a `portcullis.ack` label acknowledges. Unknown names are returned as errors.
+pub fn parse_acknowledged(
+    labels: &IndexMap<String, String>,
+) -> (HashSet<WarningKind>, Vec<LabelParseError>) {
+    let mut acknowledged = HashSet::new();
+    let mut errors = Vec::new();
+    for name in labels
+        .get(ACK_LABEL)
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        match WarningKind::acknowledgeable(name) {
+            Some(kind) => {
+                acknowledged.insert(kind);
+            }
+            None => errors.push(LabelParseError::UnknownAcknowledgement(
+                name.to_string(),
+                WarningKind::ACKNOWLEDGEABLE
+                    .iter()
+                    .map(|(ack, _)| *ack)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
+        }
+    }
+    (acknowledged, errors)
 }
 
 /// Parse a container's policy from its labels.
@@ -42,7 +78,7 @@ pub enum LabelParseError {
 /// the rest of the policy down with it. Skipping a label never grants access: egress, ICC
 /// allow and DNS labels only add access, and an invalid ICC mode falls back to `deny`.
 pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<LabelParseError>) {
-    let mut errors = Vec::new();
+    let (acknowledged, mut errors) = parse_acknowledged(labels);
     let icc_mode = match labels.get(ICC_MODE_LABEL) {
         None => IccMode::Allow,
         Some(mode) => parse_icc_mode(mode).unwrap_or_else(|error| {
@@ -83,6 +119,7 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
         egress,
         icc_allow,
         dns_targets,
+        acknowledged,
     };
     (policy, errors)
 }
@@ -295,7 +332,21 @@ mod tests {
         assert!(policy.dns_targets.is_empty());
     }
 
+    use crate::events::WarningKind;
     use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol};
+
+    #[test]
+    fn parses_acknowledged_warnings() {
+        let (policy, errors) = parse_policy(&labels(&[(
+            "portcullis.ack",
+            "docker-socket, unenforced-network,bogus",
+        )]));
+        assert_eq!(
+            policy.acknowledged,
+            HashSet::from([WarningKind::DockerSocket, WarningKind::UnenforcedNetwork])
+        );
+        assert_eq!(errors.len(), 1);
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> IndexMap<String, String> {
         pairs

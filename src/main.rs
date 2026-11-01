@@ -1,5 +1,6 @@
 #![allow(clippy::multiple_crate_versions)]
 
+mod checks;
 mod connection_log;
 mod conntrack;
 mod directory;
@@ -36,7 +37,9 @@ use tracing::{error, info, trace, warn};
 use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
 use crate::dns::{HostAddresses, SystemUpstreamResolver};
-use crate::docker::{DockerClient, DockerError, DockerEvent, DockerEventClient};
+use crate::docker::{
+    DockerClient, DockerError, DockerEvent, DockerEventAction, DockerEventClient, DockerEventKind,
+};
 use crate::events::{
     ContainerAction, ContainerChange, Event, EventBus, Mode, Sinks, Warning, WarningKind,
 };
@@ -489,6 +492,10 @@ impl Applier {
 
         for container in state.containers().values() {
             if container.attachments.is_empty()
+                || container
+                    .policy
+                    .acknowledged
+                    .contains(&WarningKind::DnsNotObservable)
                 || !container.runtime_dns_servers.is_empty()
                 || !state.daemon_dns().is_empty()
                 || !self
@@ -591,6 +598,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     };
 
     let mut runtime_state = monitor.initialize()?;
+    monitor.check_containers(&runtime_state);
     publish_warnings(&mut monitor, &bus);
     applier.apply(&mut runtime_state)?;
 
@@ -619,6 +627,12 @@ fn run(config: &Config) -> Result<(), MainError> {
                 match message {
                     DockerWorkerEvent::Event(event) => {
                         trace!(event = ?event, "docker event received");
+                        if event.kind == DockerEventKind::Container
+                            && event.action == DockerEventAction::Start
+                        {
+                            monitor.check_container(&runtime_state, &event.id);
+                            publish_warnings(&mut monitor, &bus);
+                        }
                         if !event.is_relevant_for_policy_refresh() {
                             continue;
                         }
@@ -644,6 +658,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                                 match monitor.initialize() {
                                     Ok(state) => {
                                         runtime_state = state;
+                                        monitor.check_containers(&runtime_state);
                                         publish_warnings(&mut monitor, &bus);
                                         if let Err(error) = applier.apply(&mut runtime_state) {
                                             error!(%error, "firewall apply failed after reconnect; continuing");

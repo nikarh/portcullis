@@ -108,7 +108,7 @@ pub struct Dns {
     pub answers: Vec<IpAddr>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningKind {
     /// A container label is invalid and was ignored.
@@ -121,6 +121,44 @@ pub enum WarningKind {
     EventsLost,
     /// A container raised so many alerts that further ones are held back for a while.
     AlertsSuppressed,
+    /// A container on an enforced network is also on a network that isn't enforced.
+    UnenforcedNetwork,
+    /// A container has `portcullis.*` labels that have no effect.
+    UnusedLabels,
+    /// A container shares another container's network namespace.
+    SharedNetwork,
+    /// A restricted container has the Docker socket.
+    DockerSocket,
+    /// A restricted container is privileged.
+    Privileged,
+    /// A restricted container has the `NET_ADMIN` capability.
+    NetAdmin,
+    /// An enforced network has IPv6 enabled.
+    Ipv6Network,
+}
+
+impl WarningKind {
+    /// Configuration warnings a `portcullis.ack` label can acknowledge, by the name the
+    /// label uses.
+    pub const ACKNOWLEDGEABLE: [(&'static str, Self); 8] = [
+        ("dns-not-observable", Self::DnsNotObservable),
+        ("unenforced-network", Self::UnenforcedNetwork),
+        ("unused-labels", Self::UnusedLabels),
+        ("shared-network", Self::SharedNetwork),
+        ("docker-socket", Self::DockerSocket),
+        ("privileged", Self::Privileged),
+        ("net-admin", Self::NetAdmin),
+        ("ipv6-network", Self::Ipv6Network),
+    ];
+
+    /// The warning a `portcullis.ack` value names.
+    #[must_use]
+    pub fn acknowledgeable(name: &str) -> Option<Self> {
+        Self::ACKNOWLEDGEABLE
+            .iter()
+            .find(|(ack, _)| *ack == name)
+            .map(|(_, kind)| *kind)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -18,6 +18,15 @@ pub struct DockerContainerSummary {
     pub network_settings: Option<DockerContainerSummaryNetworkSettings>,
 }
 
+/// A volume or bind mount of a container.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DockerMount {
+    #[serde(rename = "Source", default)]
+    pub source: String,
+    #[serde(rename = "Destination", default)]
+    pub destination: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DockerContainerSummaryNetworkSettings {
     #[serde(rename = "Networks")]
@@ -49,6 +58,8 @@ pub struct DockerContainerInspect {
     pub host_config: Option<DockerHostConfig>,
     #[serde(rename = "NetworkSettings")]
     pub network_settings: Option<DockerNetworkSettings>,
+    #[serde(rename = "Mounts", default)]
+    pub mounts: Vec<DockerMount>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -57,10 +68,17 @@ pub struct DockerContainerConfig {
     pub labels: IndexMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct DockerHostConfig {
-    #[serde(rename = "Dns")]
+    #[serde(rename = "Dns", default)]
     pub dns: Option<Vec<String>>,
+    /// `bridge`, `host`, `none`, `container:<id>` or a network's name.
+    #[serde(rename = "NetworkMode", default)]
+    pub network_mode: Option<String>,
+    #[serde(rename = "Privileged", default)]
+    pub privileged: bool,
+    #[serde(rename = "CapAdd", default)]
+    pub cap_add: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +116,8 @@ pub struct DockerNetworkInspect {
     pub labels: Option<IndexMap<String, String>>,
     #[serde(rename = "Options", default)]
     pub options: Option<IndexMap<String, String>>,
+    #[serde(rename = "EnableIPv6", default)]
+    pub enable_ipv6: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
