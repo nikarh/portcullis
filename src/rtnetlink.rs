@@ -53,6 +53,8 @@ pub struct Link {
     pub peer_namespace: Option<i32>,
 }
 
+/// A netlink socket for requests and dumps: `NETLINK_ROUTE` here, `NETLINK_NETFILTER` for
+/// connection tracking.
 pub struct RouteSocket {
     socket: Socket,
     buffer: Vec<u8>,
@@ -61,7 +63,11 @@ pub struct RouteSocket {
 
 impl RouteSocket {
     pub fn open() -> io::Result<Self> {
-        let mut socket = Socket::new(NETLINK_ROUTE)?;
+        Self::open_protocol(NETLINK_ROUTE)
+    }
+
+    pub fn open_protocol(protocol: isize) -> io::Result<Self> {
+        let mut socket = Socket::new(protocol)?;
         socket.bind_auto()?;
         socket.connect(&SocketAddr::new(0, 0))?;
         Ok(Self {
@@ -109,7 +115,7 @@ impl RouteSocket {
 
     /// Send a request and pass every answer to `handle` until it returns true, the dump
     /// ends, or the kernel reports an error.
-    fn exchange(
+    pub fn exchange(
         &mut self,
         message_type: u16,
         flags: u16,

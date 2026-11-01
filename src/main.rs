@@ -1,6 +1,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 mod connection_log;
+mod conntrack;
 mod directory;
 mod dns;
 mod dns_inspect;
@@ -41,7 +42,7 @@ use crate::events::{
 };
 use crate::firewall::{DenyAction, FirewallError, LogAllowed, NftablesFirewall, Options, Plan};
 use crate::logging::{LogFormat, LogLevel, LoggingError};
-use crate::model::RuntimeState;
+use crate::model::{ContainerId, MacAddress, RuntimeState};
 use crate::monitor::{DockerMonitor, MonitorError};
 use crate::source_hold::SourceHold;
 
@@ -321,6 +322,9 @@ struct Managed {
 }
 
 /// Applies rules and reports what changed.
+/// Who an address belongs to: a recreated container has a new ID, and usually a new MAC.
+type Owner = (ContainerId, Option<MacAddress>);
+
 struct Applier {
     source_hold: SourceHold,
     firewall: Arc<NftablesFirewall>,
@@ -329,6 +333,8 @@ struct Applier {
     bus: EventBus,
     monitor_all: bool,
     managed: HashMap<IpAddr, Managed>,
+    /// The container (and its MAC) each container address belonged to at the last update.
+    owners: HashMap<IpAddr, Owner>,
     /// Containers already reported as not having observable DNS.
     unobservable_reported: HashSet<String>,
 }
@@ -344,6 +350,7 @@ impl Applier {
         });
         state.set_ports(ports);
         let state = &*state;
+        self.forget_reassigned_connections(state);
         let result = {
             let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
             hosts.prune(Instant::now());
@@ -369,6 +376,34 @@ impl Applier {
                 });
                 Err(MainError::Firewall(error))
             }
+        }
+    }
+
+    /// Delete the tracked connections of addresses that left their container, before rules
+    /// for a new owner are applied (see `conntrack`). Addresses that just appeared keep
+    /// theirs: that is every address when Portcullis starts.
+    fn forget_reassigned_connections(&mut self, state: &RuntimeState) {
+        let owners: HashMap<IpAddr, Owner> = state
+            .containers()
+            .values()
+            .flat_map(|container| {
+                container.attachments.iter().map(|attachment| {
+                    (
+                        attachment.ip_address,
+                        (container.id.clone(), attachment.mac_address),
+                    )
+                })
+            })
+            .collect();
+        let reassigned: HashSet<IpAddr> = self
+            .owners
+            .iter()
+            .filter(|(address, owner)| owners.get(address) != Some(owner))
+            .map(|(address, _)| *address)
+            .collect();
+        self.owners = owners;
+        if let Err(error) = conntrack::forget(&reassigned) {
+            warn!(%error, "can't forget the tracked connections of reassigned addresses; a container that got a removed container's address may keep using its connections");
         }
     }
 
@@ -511,6 +546,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         bus: bus.clone(),
         monitor_all: config.monitor,
         managed: HashMap::new(),
+        owners: HashMap::new(),
         unobservable_reported: HashSet::new(),
     };
 
