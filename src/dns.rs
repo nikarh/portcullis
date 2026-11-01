@@ -71,6 +71,13 @@ struct HostEntry {
     retry_at: Option<Instant>,
 }
 
+/// Addresses one container may learn for one hostname from DNS answers, while they are
+/// allowed. A container that may ask a resolver of its own could otherwise answer itself
+/// with millions of addresses, each held for at least `--hostname-hold`, and make every
+/// rule update of every container slow. Real hostnames come nowhere near it; past it, new
+/// addresses are refused (and connections to them denied) until old ones expire.
+pub const MAX_ADDRESSES_PER_HOST: usize = 4096;
+
 /// Known addresses of hostnames, normalized to lower case without a trailing dot.
 ///
 /// Addresses from DNS answers belong to the container that received the answer: a
@@ -101,7 +108,8 @@ where
     }
 
     /// Record an address a DNS answer to `container` gave for `host`. Returns how long it
-    /// is allowed.
+    /// is allowed, or `None` when the container's addresses for the hostname are at
+    /// [`MAX_ADDRESSES_PER_HOST`].
     pub fn observe(
         &mut self,
         container: &str,
@@ -109,17 +117,22 @@ where
         address: IpAddr,
         ttl: Duration,
         now: Instant,
-    ) -> Duration {
+    ) -> Option<Duration> {
         let allowed_for = ttl.max(self.hold);
         let expires = now + allowed_for;
-        let current = self
+        let addresses = self
             .observed
             .entry((container.to_string(), normalize(host)))
-            .or_default()
-            .entry(address)
-            .or_insert(expires);
+            .or_default();
+        if addresses.len() >= MAX_ADDRESSES_PER_HOST && !addresses.contains_key(&address) {
+            addresses.retain(|_, expires| *expires > now);
+            if addresses.len() >= MAX_ADDRESSES_PER_HOST {
+                return None;
+            }
+        }
+        let current = addresses.entry(address).or_insert(expires);
         *current = (*current).max(expires);
-        allowed_for
+        Some(allowed_for)
     }
 
     /// Whether `address` is currently allowed for `host` in `container`'s rules.
@@ -300,12 +313,12 @@ mod tests {
                 Duration::from_secs(60),
                 now
             ),
-            HOLD
+            Some(HOLD)
         );
         let long = Duration::from_secs(7200);
         assert_eq!(
             hosts.observe("web", "api.test", ip("2.2.2.2"), long, now),
-            long
+            Some(long)
         );
         assert_eq!(
             hosts
@@ -315,6 +328,41 @@ mod tests {
         );
         // Expired addresses are gone; the hostname is then looked up again.
         assert!(hosts.addresses_at("web", "api.test", now + long).is_err());
+    }
+
+    #[test]
+    fn limits_the_addresses_a_container_learns_for_a_hostname() {
+        let mut hosts = HostAddresses::new(MockResolver::default(), HOLD);
+        let now = Instant::now();
+        let address = |index: usize| {
+            let index = u32::try_from(index).expect("index");
+            IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + index))
+        };
+        for index in 0..MAX_ADDRESSES_PER_HOST {
+            assert!(
+                hosts
+                    .observe("rogue", "api.test", address(index), HOLD, now)
+                    .is_some()
+            );
+        }
+        let extra = address(MAX_ADDRESSES_PER_HOST);
+        assert_eq!(hosts.observe("rogue", "api.test", extra, HOLD, now), None);
+        assert!(!hosts.allows("rogue", "api.test", extra, now));
+        // Known addresses are renewed, other hostnames and containers aren't affected, and
+        // room frees up as addresses expire.
+        assert!(
+            hosts
+                .observe("rogue", "api.test", address(0), HOLD, now)
+                .is_some()
+        );
+        assert!(hosts.observe("rogue", "b.test", extra, HOLD, now).is_some());
+        assert!(hosts.observe("web", "api.test", extra, HOLD, now).is_some());
+        let later = now + HOLD + Duration::from_secs(1);
+        assert!(
+            hosts
+                .observe("rogue", "api.test", extra, HOLD, later)
+                .is_some()
+        );
     }
 
     #[test]

@@ -16,8 +16,12 @@ use crate::dns::normalize;
 use crate::firewall::{Destination, HostSet, Plan, Rule};
 use crate::model::MacAddress;
 
-/// Observations kept before expired ones are pruned.
+/// Observations kept before expired ones are pruned, at most once per [`PRUNE_EVERY`].
 const PRUNE_ABOVE: usize = 16_384;
+const PRUNE_EVERY: Duration = Duration::from_secs(1);
+/// Observations kept at most: domains on events are best effort, and a container answering
+/// itself through a resolver of its own mustn't make them grow without bound.
+const MAX_OBSERVATIONS: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceInfo {
@@ -46,8 +50,14 @@ struct Snapshot {
 #[derive(Debug, Default)]
 pub struct Directory {
     snapshot: RwLock<Snapshot>,
+    observations: Mutex<Observations>,
+}
+
+#[derive(Debug, Default)]
+struct Observations {
     /// (container address, destination) to the name the container looked up, until when.
-    observations: Mutex<HashMap<(IpAddr, IpAddr), (String, Instant)>>,
+    names: HashMap<(IpAddr, IpAddr), (String, Instant)>,
+    pruned: Option<Instant>,
 }
 
 impl Directory {
@@ -113,6 +123,7 @@ impl Directory {
             self.observations
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
+                .names
                 .retain(|(container, _), _| !reassigned.contains(container));
         }
     }
@@ -177,10 +188,21 @@ impl Directory {
             .observations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if observations.len() > PRUNE_ABOVE {
-            observations.retain(|_, (_, expires)| *expires > now);
+        if observations.names.len() > PRUNE_ABOVE
+            && observations
+                .pruned
+                .is_none_or(|pruned| now.duration_since(pruned) >= PRUNE_EVERY)
+        {
+            observations.names.retain(|_, (_, expires)| *expires > now);
+            observations.pruned = Some(now);
         }
-        observations.insert((container, address), (normalize(name), now + valid_for));
+        let key = (container, address);
+        if observations.names.len() >= MAX_OBSERVATIONS && !observations.names.contains_key(&key) {
+            return;
+        }
+        observations
+            .names
+            .insert(key, (normalize(name), now + valid_for));
     }
 
     /// The name the container at `container` looked up to get `address`.
@@ -190,6 +212,7 @@ impl Directory {
         self.observations
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .names
             .get(&(container, address))
             .filter(|(_, expires)| *expires > now)
             .map(|(name, _)| name.clone())

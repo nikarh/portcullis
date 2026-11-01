@@ -13,7 +13,7 @@ use super::plan::{
     DNS_PORT, Destination, HostSet, ICC_BROADCAST_V4, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6,
     Source,
 };
-use crate::dns::HostResolver;
+use crate::dns::{HostResolver, MAX_ADDRESSES_PER_HOST};
 use crate::model::{ContainerName, MacAddress, RuntimeState};
 
 /// Name of both managed tables.
@@ -1106,7 +1106,11 @@ fn render_set(
     addresses: impl Iterator<Item = (IpAddr, Duration)>,
 ) -> Result<String, fmt::Error> {
     let name = format!("{} {}", Table::Inet, set.id.name(prefix));
-    writeln!(out, "add set {name} {{ type {type_name}; flags timeout; }}")?;
+    // Bounded in the kernel too: addresses are added from DNS answers between updates.
+    writeln!(
+        out,
+        "add set {name} {{ type {type_name}; flags timeout; size {HOST_SET_SIZE}; }}"
+    )?;
     writeln!(out, "flush set {name}")?;
     render_elements(
         out,
@@ -1116,6 +1120,10 @@ fn render_set(
     )?;
     Ok(name)
 }
+
+/// Room in a hostname set: the addresses a container may learn for a hostname, and those
+/// Portcullis resolves itself.
+const HOST_SET_SIZE: usize = MAX_ADDRESSES_PER_HOST * 2;
 
 /// A set element with a timeout, at least one second.
 struct Timed(IpAddr, Duration);
@@ -2117,7 +2125,7 @@ flush chain bridge portcullis icc0
     fn renders_hostname_sets_with_timeouts_once_per_container_and_host() {
         let script = render(&test_support::shared_hostname_state());
         assert_eq!(script.matches("add set inet portcullis pc_h4_").count(), 2);
-        assert!(script.contains("{ type ipv4_addr; flags timeout; }"));
+        assert!(script.contains("{ type ipv4_addr; flags timeout; size 8192; }"));
         assert!(script.contains(" { 1.1.1.1 timeout 3600s }\n"));
         assert_eq!(script.matches("ct original ip daddr @pc_h4_").count(), 2);
         // no IPv6 source references the host, so no IPv6 set is created

@@ -164,11 +164,13 @@ fn allow_addresses(
             answer
                 .addresses
                 .iter()
-                .map(|(address, ttl)| {
-                    (
-                        *address,
-                        hosts.observe(&owner.container, &set.host, *address, *ttl, now),
-                    )
+                .filter_map(|(address, ttl)| {
+                    let allowed_for =
+                        hosts.observe(&owner.container, &set.host, *address, *ttl, now);
+                    if allowed_for.is_none() {
+                        debug!(container = %owner.container, host = %set.host, %address, "too many addresses for a hostname; not allowing more until some expire");
+                    }
+                    Some((*address, allowed_for?))
                 })
                 .collect()
         };
