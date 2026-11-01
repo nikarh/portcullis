@@ -5,6 +5,9 @@ Documentation=https://github.com/nikarh/portcullis
 # no container on an enforced network starts unrestricted, at boot or ever. It waits for
 # Docker on its own.
 Before=docker.service
+# A failed Portcullis leaves its rules in place, so containers stay restricted until it
+# is back. Keep trying for as long as it takes.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
@@ -12,6 +15,27 @@ ExecStart=/usr/local/bin/portcullis --events-socket /run/portcullis.sock
 Restart=on-failure
 RestartSec=2s
 StateDirectory=portcullis
+StateDirectoryMode=0700
+
+# Portcullis runs as root: it manages the firewall and reads the Docker socket. It only
+# writes its state directory and the events socket. The rest keeps a compromised
+# Portcullis, or an --alert-exec command, from changing the system. The Docker socket
+# still gives root on the host, so this limits mistakes more than attackers.
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target docker.service
