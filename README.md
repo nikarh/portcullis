@@ -329,7 +329,8 @@ Portcullis assumes a container may be compromised and actively try to get past i
 - When Docker gives a removed container's address to a new container, Portcullis deletes the old container's tracked connections first, so the new container can't keep using them.
 - Fragmented packets are put back together before the rules look at them, so fragments can't hide or rewrite ports.
 - Packets from a port Portcullis doesn't know yet (a container that just started) are held for at most 2 seconds and then denied. Flooding that queue makes the kernel drop them, it never lets them through.
-- What a container learns from DNS answers is bounded: at most 4096 addresses per hostname at a time.
+- Addresses a container learns from DNS answers only count for its own `host:` rules, so a container that may ask a resolver of its choice can't widen anyone else's (see [Hostname rules](#hostname-rules)). What it learns is bounded too: at most 4096 addresses per hostname at a time.
+- Traffic denied for using someone else's address or MAC is dropped, not rejected, whatever `--deny-action` says: a rejection would only go back to the sender, addressed to someone else.
 
 Reports can't be flooded away either. A flood of new flows can fill the set Portcullis uses to report each flow once a minute; denials are then still reported, up to 10 a second per rule. A container's alerts are limited as described under [Alerts](#alerts).
 
