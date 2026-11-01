@@ -314,6 +314,9 @@ struct Outcome {
     snaplen: u16,
     /// What reports are de-duplicated by.
     key: LogKey,
+    /// Denied traffic is dropped whatever the deny action: it can't be rejected (frames
+    /// that aren't IP), or a rejection would go to an address the sender only claims.
+    drop: bool,
 }
 
 /// What reports of a decision are de-duplicated by.
@@ -323,8 +326,7 @@ enum LogKey {
     Ipv4,
     /// The same for IPv6.
     Ipv6,
-    /// A frame that may not even be IP: the bridge port, source MAC and ether type. Such
-    /// frames are dropped, since only IP can be rejected.
+    /// A frame that may not even be IP: the bridge port, source MAC and ether type.
     Frame,
 }
 
@@ -337,6 +339,7 @@ impl Outcome {
             reason,
             snaplen: LOG_SNAPLEN,
             key: LogKey::Ipv4,
+            drop: false,
         }
     }
 
@@ -348,6 +351,7 @@ impl Outcome {
             reason: Some(reason),
             snaplen: LOG_SNAPLEN,
             key: LogKey::Ipv4,
+            drop: false,
         }
     }
 
@@ -367,6 +371,12 @@ impl Outcome {
 
     const fn for_frame(mut self) -> Self {
         self.key = LogKey::Frame;
+        self.drop = true;
+        self
+    }
+
+    const fn dropped(mut self) -> Self {
+        self.drop = true;
         self
     }
 
@@ -386,7 +396,7 @@ impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.allow || self.monitor {
             f.write_str("accept")
-        } else if self.key == LogKey::Frame {
+        } else if self.drop {
             f.write_str("drop")
         } else {
             write!(f, "{}", self.options.deny)
@@ -791,7 +801,7 @@ fn render_denied_frames(
     selector: &str,
 ) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
-    let source = Outcome::deny(options, monitor, "source");
+    let source = Outcome::deny(options, monitor, "source").dropped();
     decide(
         out,
         format_args!("add rule {base} {selector} ether type ip"),
@@ -1507,11 +1517,18 @@ mod tests {
     }
 
     /// The rules denying, or reporting, the frames of a selector in the bridge base chain.
-    fn denied_frames(selector: &str, verdict: char, action: &str) -> String {
+    /// They drop whatever the deny action: a rejection would go to the address the sender
+    /// claims, or can't be sent for frames that aren't IP.
+    fn denied_frames(selector: &str, verdict: char) -> String {
         let head = format!("add rule bridge portcullis prerouting {selector}");
         let frame_action = if verdict == 'w' { "accept" } else { "drop" };
         [
-            decided(&format!("{head} ether type ip"), verdict, "source", action),
+            decided(
+                &format!("{head} ether type ip"),
+                verdict,
+                "source",
+                frame_action,
+            ),
             format!(
                 "{head} ether type arp {}\n{head} ether type arp {frame_action}",
                 frame_log_rule(verdict, "source")
@@ -1592,7 +1609,7 @@ flush chain bridge portcullis icc0
                 "add rule bridge portcullis prerouting ether saddr . arp saddr ether . arp saddr ip { 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 } accept".into(),
                 // Everything else is denied: IPv4 and ARP as a source that isn't the
                 // sender's, other frames (IPv6, VLAN tags) as frames.
-                denied_frames("meta ibrname { \"br-net0\" }", 'd', "drop"),
+                denied_frames("meta ibrname { \"br-net0\" }", 'd'),
                 // Established traffic passes once its source checked out.
                 "add rule bridge portcullis icc0 ct state established accept\nadd rule bridge portcullis icc0 ct state related ct original ip saddr 172.18.0.2 accept\nadd rule bridge portcullis icc0 ct state related ct reply ip saddr 172.18.0.2 accept\nadd rule bridge portcullis icc0 ip daddr 172.18.0.1 accept".into(),
                 decided("add rule bridge portcullis icc0 ip daddr 172.18.0.0/16", 'd', "icc", "drop"),
@@ -1613,9 +1630,9 @@ flush chain bridge portcullis icc0
         };
         let script = render_with(&test_support::hostname_state(), options, false);
         let expected = [
-            denied_frames("meta ibrname { \"br-net0\" } meta mark 0x70630001", 'd', "drop"),
+            denied_frames("meta ibrname { \"br-net0\" } meta mark 0x70630001", 'd'),
             "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type { ip, arp } queue num 9".to_string(),
-            denied_frames("meta ibrname { \"br-net0\" }", 'd', "drop"),
+            denied_frames("meta ibrname { \"br-net0\" }", 'd'),
         ]
         .join("\n");
         assert!(script.contains(&format!("{expected}\n")), "{script}");
@@ -1789,7 +1806,6 @@ flush chain bridge portcullis icc0
         let known_port = denied_frames(
             "meta ibrname { \"br-net0\", \"br-net1\" } iifname { \"veth0a1b2c3\" }",
             'd',
-            "drop",
         );
         let held = "add rule bridge portcullis prerouting meta ibrname { \"br-net0\", \"br-net1\" } ether type { ip, arp } queue num 9";
         let position = |text: &str| script.find(text).unwrap_or(usize::MAX);
@@ -1804,11 +1820,10 @@ flush chain bridge portcullis icc0
         };
         let script = render_with(&test_support::hostname_state(), options, false);
         let reject = "reject with icmpx admin-prohibited";
-        // Only frames that aren't IPv4 can't be rejected.
+        // Only traffic denied for what it is, not where it goes, is dropped.
         for line in script.lines().filter(|line| line.ends_with(" drop")) {
             assert!(
-                line.starts_with("add rule bridge portcullis prerouting ")
-                    && !line.contains("ether type ip "),
+                line.starts_with("add rule bridge portcullis prerouting "),
                 "{line}"
             );
         }
@@ -1823,7 +1838,7 @@ flush chain bridge portcullis icc0
                     reject,
                 ),
                 decided("add rule inet portcullis egress0", 'd', "egress", reject),
-                denied_frames("meta ibrname { \"br-net0\" }", 'd', reject),
+                denied_frames("meta ibrname { \"br-net0\" }", 'd'),
             ],
         );
     }
@@ -1849,7 +1864,7 @@ flush chain bridge portcullis icc0
                     "icc",
                     "accept",
                 ),
-                denied_frames("meta ibrname { \"br-net0\" }", 'w', "accept"),
+                denied_frames("meta ibrname { \"br-net0\" }", 'w'),
             ],
         );
     }
