@@ -10,7 +10,8 @@ use tracing::{info, trace};
 
 use super::FirewallError;
 use super::plan::{
-    DNS_PORT, Destination, HostSet, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
+    DNS_PORT, Destination, HostSet, ICC_BROADCAST_V4, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6,
+    Source,
 };
 use crate::dns::HostResolver;
 use crate::model::{ContainerName, MacAddress, RuntimeState};
@@ -48,6 +49,9 @@ enum Chain {
     Input,
     /// Base chain of the bridge table for frames a bridge delivers to the host itself.
     BridgeInput,
+    /// Base chain of the bridge table for frames a bridge passes from one container to
+    /// another.
+    BridgeForward,
     /// Egress rules of the n-th source, in the inet table.
     Egress(usize),
     /// ICC rules of the n-th source, in the bridge table.
@@ -68,7 +72,7 @@ impl Chain {
         match self {
             Self::Base(table) => table,
             Self::Input | Self::Egress(_) => Table::Inet,
-            Self::BridgeInput | Self::Icc(_) => Table::Bridge,
+            Self::BridgeInput | Self::BridgeForward | Self::Icc(_) => Table::Bridge,
         }
     }
 }
@@ -87,6 +91,7 @@ impl fmt::Display for ChainName {
         match self.0 {
             Chain::Base(table) => f.write_str(table.hook()),
             Chain::Input | Chain::BridgeInput => f.write_str("input"),
+            Chain::BridgeForward => f.write_str("forward"),
             Chain::Egress(index) => write!(f, "egress{index}"),
             Chain::Icc(index) => write!(f, "icc{index}"),
         }
@@ -521,6 +526,10 @@ fn render_apply_script(
         };
         render_base_chain(out, input, "input")?;
         writeln!(out, "flush chain {input}")?;
+        if table == Table::Bridge {
+            render_base_chain(out, Chain::BridgeForward, "forward")?;
+            writeln!(out, "flush chain {}", Chain::BridgeForward)?;
+        }
         render_logged_sets(out, table, reassigned)?;
         writeln!(out, "flush chain {}", Chain::Base(table))?;
     }
@@ -574,6 +583,7 @@ fn render_apply_script(
     if !plan.bridges.is_empty() {
         render_bridge_dispatch(out, plan, options)?;
         render_link_local(out, plan, options)?;
+        render_bridged_destinations(out, plan, options)?;
     }
     for (index, source) in ipv4_sources() {
         if icc_chain_needed(plan, source, options) {
@@ -821,6 +831,36 @@ fn render_link_local(out: &mut String, plan: &Plan, options: Options) -> fmt::Re
                 Chain::BridgeInput
             ),
             Outcome::deny(options, monitor, "frame").for_frame(),
+        )?;
+    }
+    Ok(())
+}
+
+/// A bridge passes a frame to whichever port has its destination MAC, whatever its IP
+/// destination. The ICC rules only see IP destinations: a frame to another container's MAC,
+/// addressed to that container's address on another network, would pass them, and the
+/// container would accept it. IPv4 passed from one container to another must therefore be
+/// addressed to the network itself, or be broadcast or multicast (which the ICC rules
+/// check). The bridge's forward hook can only drop.
+fn render_bridged_destinations(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+    for bridge in plan
+        .bridges
+        .iter()
+        .filter(|bridge| bridge.subnet.addr().is_ipv4())
+    {
+        let Some(destinations) =
+            set_literal(std::iter::once(&bridge.subnet).chain(&ICC_BROADCAST_V4))
+        else {
+            continue;
+        };
+        decide(
+            out,
+            format_args!(
+                "add rule {} meta ibrname {} ip daddr != {destinations}",
+                Chain::BridgeForward,
+                Quoted(&bridge.name),
+            ),
+            Outcome::deny(options, bridge.monitor, "icc").dropped(),
         )?;
     }
     Ok(())
@@ -1641,6 +1681,8 @@ add table bridge portcullis
 add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }
 add chain bridge portcullis input { type filter hook input priority -1; policy accept; }
 flush chain bridge portcullis input
+add chain bridge portcullis forward { type filter hook forward priority -1; policy accept; }
+flush chain bridge portcullis forward
 add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis frames { type ifname . ether_addr . ether_type; flags dynamic,timeout; timeout 60s; size 65536; }
 flush chain bridge portcullis prerouting
@@ -1745,6 +1787,7 @@ flush chain bridge portcullis icc0
             assert!(!script.contains("delete chain inet portcullis input"));
             assert!(!script.contains("delete chain bridge portcullis prerouting"));
             assert!(!script.contains("delete chain bridge portcullis input"));
+            assert!(!script.contains("delete chain bridge portcullis forward"));
         }
 
         // What the previous update created and this one doesn't need is removed; the rest
@@ -1891,6 +1934,7 @@ flush chain bridge portcullis icc0
         for line in script.lines().filter(|line| line.ends_with(" drop")) {
             assert!(
                 line.starts_with("add rule bridge portcullis prerouting ")
+                    || line.starts_with("add rule bridge portcullis forward ")
                     || line.contains(LINK_LOCAL_GROUP),
                 "{line}"
             );

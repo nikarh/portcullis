@@ -36,7 +36,7 @@ pub const DNS_PORT: u16 = 53;
 const DNS_PROTOCOLS: [Protocol; 2] = [Protocol::Udp, Protocol::Tcp];
 /// IPv4 destinations that reach every container on a bridge besides the subnet itself:
 /// the limited broadcast address and multicast.
-const ICC_BROADCAST_V4: [IpNet; 2] = [
+pub const ICC_BROADCAST_V4: [IpNet; 2] = [
     IpNet::V4(Ipv4Net::new_assert(std::net::Ipv4Addr::BROADCAST, 32)),
     IpNet::V4(Ipv4Net::new_assert(
         std::net::Ipv4Addr::new(224, 0, 0, 0),
