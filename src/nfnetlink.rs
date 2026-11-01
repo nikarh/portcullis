@@ -499,9 +499,66 @@ impl<'a> Ipv4Packet<'a> {
     }
 }
 
+/// The parts of an ARP packet (Ethernet and IPv4) Portcullis looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArpPacket {
+    pub sender_mac: MacAddress,
+    pub sender: Ipv4Addr,
+    pub target: Ipv4Addr,
+}
+
+impl ArpPacket {
+    /// Hardware type Ethernet, protocol type IPv4, 6-byte MACs and 4-byte addresses.
+    const HEADER: [u8; 6] = [0, 1, 8, 0, 6, 4];
+
+    #[must_use]
+    pub fn parse(packet: &[u8]) -> Option<Self> {
+        if packet.get(..6)? != Self::HEADER {
+            return None;
+        }
+        let sender_mac = <[u8; 6]>::try_from(packet.get(8..14)?).ok()?;
+        let sender = <[u8; 4]>::try_from(packet.get(14..18)?).ok()?;
+        let target = <[u8; 4]>::try_from(packet.get(24..28)?).ok()?;
+        Some(Self {
+            sender_mac: MacAddress::from(sender_mac),
+            sender: Ipv4Addr::from(sender),
+            target: Ipv4Addr::from(target),
+        })
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    /// An ARP request from `sender` for `target`.
+    pub fn arp(sender_mac: [u8; 6], sender: [u8; 4], target: [u8; 4]) -> Vec<u8> {
+        let mut packet = ArpPacket::HEADER.to_vec();
+        packet.extend_from_slice(&[0, 1]);
+        packet.extend_from_slice(&sender_mac);
+        packet.extend_from_slice(&sender);
+        packet.extend_from_slice(&[0; 6]);
+        packet.extend_from_slice(&target);
+        packet
+    }
+
+    #[test]
+    fn parses_arp_packets() {
+        let packet = arp([2, 0, 0, 0, 0, 1], [172, 18, 0, 2], [172, 18, 0, 1]);
+        assert_eq!(
+            ArpPacket::parse(&packet),
+            Some(ArpPacket {
+                sender_mac: MacAddress::from([2, 0, 0, 0, 0, 1]),
+                sender: Ipv4Addr::new(172, 18, 0, 2),
+                target: Ipv4Addr::new(172, 18, 0, 1),
+            })
+        );
+        assert_eq!(ArpPacket::parse(&packet[..20]), None);
+        assert_eq!(
+            ArpPacket::parse(&ipv4([1; 4], [2; 4], PROTOCOL_UDP, &[])),
+            None
+        );
+    }
 
     /// An IPv4 packet with the given transport header and data.
     pub fn ipv4(source: [u8; 4], destination: [u8; 4], protocol: u8, transport: &[u8]) -> Vec<u8> {

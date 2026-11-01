@@ -13,7 +13,7 @@ use super::plan::{
     DNS_PORT, Destination, HostSet, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
 };
 use crate::dns::HostResolver;
-use crate::model::{ContainerName, RuntimeState};
+use crate::model::{ContainerName, MacAddress, RuntimeState};
 
 /// Name of both managed tables.
 const TABLE_NAME: &str = "portcullis";
@@ -312,8 +312,20 @@ struct Outcome {
     /// What to report, if anything; denials are always reported.
     reason: Option<&'static str>,
     snaplen: u16,
-    /// The traffic is IPv6 (for the de-duplication key).
-    ipv6: bool,
+    /// What reports are de-duplicated by.
+    key: LogKey,
+}
+
+/// What reports of a decision are de-duplicated by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogKey {
+    /// The flow of an IPv4 packet: addresses, protocol and destination port.
+    Ipv4,
+    /// The same for IPv6.
+    Ipv6,
+    /// A frame that may not even be IP: the bridge port, source MAC and ether type. Such
+    /// frames are dropped, since only IP can be rejected.
+    Frame,
 }
 
 impl Outcome {
@@ -324,7 +336,7 @@ impl Outcome {
             monitor,
             reason,
             snaplen: LOG_SNAPLEN,
-            ipv6: false,
+            key: LogKey::Ipv4,
         }
     }
 
@@ -335,7 +347,7 @@ impl Outcome {
             monitor,
             reason: Some(reason),
             snaplen: LOG_SNAPLEN,
-            ipv6: false,
+            key: LogKey::Ipv4,
         }
     }
 
@@ -345,7 +357,16 @@ impl Outcome {
     }
 
     const fn for_address(mut self, address: IpAddr) -> Self {
-        self.ipv6 = address.is_ipv6();
+        self.key = if address.is_ipv6() {
+            LogKey::Ipv6
+        } else {
+            LogKey::Ipv4
+        };
+        self
+    }
+
+    const fn for_frame(mut self) -> Self {
+        self.key = LogKey::Frame;
         self
     }
 
@@ -365,6 +386,8 @@ impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.allow || self.monitor {
             f.write_str("accept")
+        } else if self.key == LogKey::Frame {
+            f.write_str("drop")
         } else {
             write!(f, "{}", self.options.deny)
         }
@@ -375,19 +398,24 @@ impl fmt::Display for Outcome {
 /// family and table. A flow is reported once per timeout, however many packets it sends.
 const LOGGED_SET_V4: &str = "logged4";
 const LOGGED_SET_V6: &str = "logged6";
+/// Recently reported frames: (bridge port, source MAC, ether type), in the bridge table.
+const LOGGED_SET_FRAMES: &str = "frames";
 const LOGGED_TIMEOUT: &str = "60s";
 const LOGGED_SIZE: u32 = 65_536;
 
 /// Create the sets of reported flows; with `flush`, forget the flows reported so far.
 fn render_logged_sets(out: &mut String, table: Table, flush: bool) -> fmt::Result {
-    let families: &[(&str, &str)] = match table {
-        Table::Inet => &[(LOGGED_SET_V4, "ipv4_addr"), (LOGGED_SET_V6, "ipv6_addr")],
-        Table::Bridge => &[(LOGGED_SET_V4, "ipv4_addr")],
+    const FLOW_V4: &str = "ipv4_addr . ipv4_addr . inet_proto . inet_service";
+    const FLOW_V6: &str = "ipv6_addr . ipv6_addr . inet_proto . inet_service";
+    const FRAME: &str = "ifname . ether_addr . ether_type";
+    let sets: &[(&str, &str)] = match table {
+        Table::Inet => &[(LOGGED_SET_V4, FLOW_V4), (LOGGED_SET_V6, FLOW_V6)],
+        Table::Bridge => &[(LOGGED_SET_V4, FLOW_V4), (LOGGED_SET_FRAMES, FRAME)],
     };
-    for (name, address) in families {
+    for (name, key) in sets {
         writeln!(
             out,
-            "add set {table} {name} {{ type {address} . {address} . inet_proto . inet_service; flags dynamic,timeout; timeout {LOGGED_TIMEOUT}; size {LOGGED_SIZE}; }}"
+            "add set {table} {name} {{ type {key}; flags dynamic,timeout; timeout {LOGGED_TIMEOUT}; size {LOGGED_SIZE}; }}"
         )?;
         if flush {
             writeln!(out, "flush set {table} {name}")?;
@@ -401,12 +429,17 @@ fn render_logged_sets(out: &mut String, table: Table, flush: bool) -> fmt::Resul
 /// flow within the de-duplication timeout; the verdict rule applies to every packet.
 fn decide(out: &mut String, head: fmt::Arguments<'_>, outcome: Outcome) -> fmt::Result {
     if let Some((verdict, reason)) = outcome.log_prefix() {
-        let (set, ip) = if outcome.ipv6 {
-            (LOGGED_SET_V6, "ip6")
-        } else {
-            (LOGGED_SET_V4, "ip")
+        let (set, key) = match outcome.key {
+            LogKey::Ipv4 => (
+                LOGGED_SET_V4,
+                "ip saddr . ip daddr . meta l4proto . th dport",
+            ),
+            LogKey::Ipv6 => (
+                LOGGED_SET_V6,
+                "ip6 saddr . ip6 daddr . meta l4proto . th dport",
+            ),
+            LogKey::Frame => (LOGGED_SET_FRAMES, "iifname . ether saddr . ether type"),
         };
-        let key = format_args!("{ip} saddr . {ip} daddr . meta l4proto . th dport");
         writeln!(
             out,
             "{head} {key} != @{set} add @{set} {{ {key} }} log prefix \"{LOG_PREFIX}:{verdict}:{reason}\" group {} snaplen {}",
@@ -671,13 +704,19 @@ fn render_base_chain(out: &mut String, chain: Chain, hook: &str) -> fmt::Result 
     )
 }
 
-/// Bridge base chain: only frames entering a managed network's bridge are checked. An
-/// IPv4 frame passes only when its source address belongs to a managed container and comes
-/// with that container's MAC; it then continues to the container's ICC rules, if any.
-/// Everything else IPv4 is denied, which stops containers from using addresses that aren't
-/// theirs; with a source queue, it is held first, in case it comes from a container whose
-/// rules aren't applied yet (see `source_hold`). ARP and IPv6 pass; other frames, such as
-/// VLAN-tagged ones, are denied on enforced bridges.
+/// Bridge base chain: only frames entering a managed network's bridge are checked. A frame
+/// passes only when it comes from a managed container's own port on the bridge, with that
+/// container's MAC and, for IPv4 and ARP, its address; IPv4 then continues to the
+/// container's ICC rules, if any. That stops containers from sending as another container,
+/// and from taking over another container's MAC in the bridge's forwarding table or its
+/// address in the neighbours' ARP caches.
+///
+/// Everything else is denied: on enforced bridges, IPv4 and ARP from a port that belongs to
+/// no managed container yet are held first, in case they come from a container whose rules
+/// aren't applied yet (see `source_hold`). Other kinds of frames, such as IPv6 or
+/// VLAN-tagged ones, are never accepted on enforced bridges: the receiving container's
+/// kernel could unwrap a VLAN tag (even VLAN ID 0) past every check here, and Portcullis
+/// doesn't manage IPv6.
 fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
     render_elements(
@@ -686,21 +725,6 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         plan.bridges.iter().map(|bridge| Quoted(&bridge.name)),
         " accept",
     )?;
-    // A VLAN-tagged frame (even with VLAN ID 0, which receivers treat as untagged) would
-    // carry IPv4 past every check below, so enforced bridges only pass ARP and IPv6 besides
-    // IPv4. Other frames aren't IP, can't be reported by address, and are denied silently.
-    writeln!(out, "add rule {base} ether type {{ arp, ip6 }} accept")?;
-    render_elements(
-        out,
-        format_args!("add rule {base} meta ibrname"),
-        plan.bridges
-            .iter()
-            .filter(|bridge| !bridge.monitor)
-            .map(|bridge| Quoted(&bridge.name)),
-        format_args!(" ether type != ip {}", options.deny),
-    )?;
-    writeln!(out, "add rule {base} ether type != ip accept")?;
-
     render_known_sources(out, plan, options, base)?;
     let bridges = |monitor: bool| {
         set_literal(
@@ -711,42 +735,101 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         )
     };
     if let Some(monitored) = bridges(true) {
-        decide(
-            out,
-            format_args!("add rule {base} meta ibrname {monitored} ether type ip"),
-            Outcome::deny(options, true, "source"),
-        )?;
+        render_denied_frames(out, options, true, &format!("meta ibrname {monitored}"))?;
     }
     let Some(enforced) = bridges(false) else {
         return Ok(());
     };
-    let deny = Outcome::deny(options, false, "source");
-    let Some(queue) = options.source_queue else {
-        return decide(
+    // From a managed container's port, but not with its own address and MAC: denied at once.
+    let enforced_bridges: BTreeSet<&str> = plan
+        .bridges
+        .iter()
+        .filter(|bridge| !bridge.monitor)
+        .map(|bridge| bridge.network.as_str())
+        .collect();
+    if let Some(ports) = set_literal(
+        plan.sources
+            .iter()
+            .filter(|source| enforced_bridges.contains(source.network.as_str()))
+            .filter_map(|source| source.port.as_ref())
+            .map(|port| Quoted(&port.name)),
+    ) {
+        render_denied_frames(
             out,
-            format_args!("add rule {base} meta ibrname {enforced} ether type ip"),
-            deny,
-        );
-    };
-    // Held before, and the source stayed unknown.
+            options,
+            false,
+            &format!("meta ibrname {enforced} iifname {ports}"),
+        )?;
+    }
+    if let Some(queue) = options.source_queue {
+        // Held before, and the source stayed unknown.
+        render_denied_frames(
+            out,
+            options,
+            false,
+            &format!("meta ibrname {enforced} meta mark {HOLD_EXPIRED_MARK:#x}"),
+        )?;
+        // A port no managed container has (yet): most likely a container that just started,
+        // or that got the address of a removed one, and that Portcullis hasn't applied rules
+        // for. Hold the packet until the next update; if the source stays unknown, it is
+        // denied above once the hold expires.
+        writeln!(
+            out,
+            "add rule {base} meta ibrname {enforced} ether type {{ ip, arp }} queue num {queue}"
+        )?;
+    }
+    render_denied_frames(out, options, false, &format!("meta ibrname {enforced}"))
+}
+
+/// Deny (or in monitor mode, report) frames of the bridge base chain matching `selector`:
+/// IPv4 and ARP as using a source that isn't the sender's, anything else as a frame
+/// enforced networks don't carry.
+fn render_denied_frames(
+    out: &mut String,
+    options: Options,
+    monitor: bool,
+    selector: &str,
+) -> fmt::Result {
+    let base = Chain::Base(Table::Bridge);
+    let source = Outcome::deny(options, monitor, "source");
     decide(
         out,
-        format_args!(
-            "add rule {base} meta ibrname {enforced} ether type ip meta mark {HOLD_EXPIRED_MARK:#x}"
-        ),
-        deny,
+        format_args!("add rule {base} {selector} ether type ip"),
+        source,
     )?;
-    // A source no container has (yet): most likely a container that just started, or that
-    // got the address of a removed one, and that Portcullis hasn't applied rules for. Hold
-    // the packet until the next update; spoofed sources stay unknown and are denied above
-    // once the hold expires.
-    writeln!(
+    decide(
         out,
-        "add rule {base} meta ibrname {enforced} ether type ip queue num {queue}"
+        format_args!("add rule {base} {selector} ether type arp"),
+        source.for_frame(),
+    )?;
+    decide(
+        out,
+        format_args!("add rule {base} {selector}"),
+        Outcome::deny(options, monitor, "frame").for_frame(),
     )
 }
 
-/// Send frames from managed containers' own address, MAC and port to their ICC rules.
+/// How a managed container's frames are recognised: by port, MAC and address where its port
+/// is known; by MAC and address where not; by address alone without a MAC (Docker always
+/// reports one for bridge endpoints).
+enum SourceKey<'a> {
+    Port(&'a str, MacAddress, IpAddr),
+    Mac(MacAddress, IpAddr),
+    Address(IpAddr),
+}
+
+impl<'a> SourceKey<'a> {
+    fn of(source: &'a Source) -> Self {
+        match (source.mac, &source.port) {
+            (Some(mac), Some(port)) => Self::Port(&port.name, mac, source.address),
+            (Some(mac), None) => Self::Mac(mac, source.address),
+            (None, _) => Self::Address(source.address),
+        }
+    }
+}
+
+/// Send frames from managed containers' own port, MAC and address to their ICC rules, and
+/// accept their ARP.
 fn render_known_sources(
     out: &mut String,
     plan: &Plan,
@@ -760,52 +843,84 @@ fn render_known_sources(
             Verdict::Accept
         }
     };
-    let ipv4 = || {
+    let keys = || {
         plan.sources
             .iter()
             .enumerate()
             .filter(|(_, source)| source.address.is_ipv4())
+            .map(|(index, source)| (index, source, SourceKey::of(source)))
     };
-    // A container's address and MAC, from its own port on the bridge. A raw socket is
-    // enough to send with another container's address and MAC, but not from its port.
+    // A raw socket is enough to send with another container's address and MAC, but not
+    // from its port.
     render_elements(
         out,
         format_args!("add rule {base} iifname . ip saddr . ether saddr vmap"),
-        ipv4().filter_map(|(index, source)| {
-            let mac = source.mac?;
-            let port = source.port.as_ref()?;
-            Some(Dispatch(
-                format_args!("{} . {} . {mac}", Quoted(&port.name), source.address).to_string(),
+        keys().filter_map(|(index, source, key)| match key {
+            SourceKey::Port(port, mac, address) => Some(Dispatch(
+                format!("{} . {address} . {mac}", Quoted(port)),
                 verdict(index, source),
-            ))
+            )),
+            _ => None,
         }),
         "",
     )?;
-    // Where the port isn't known, only the address and MAC.
     render_elements(
         out,
         format_args!("add rule {base} ip saddr . ether saddr vmap"),
-        ipv4().filter_map(|(index, source)| {
-            let mac = source.mac?;
-            if source.port.is_some() {
-                return None;
-            }
-            Some(Dispatch(
-                format_args!("{} . {mac}", source.address).to_string(),
+        keys().filter_map(|(index, source, key)| match key {
+            SourceKey::Mac(mac, address) => Some(Dispatch(
+                format!("{address} . {mac}"),
                 verdict(index, source),
-            ))
+            )),
+            _ => None,
         }),
         "",
     )?;
-    // Docker always reports a MAC for bridge endpoints; without one, only the address is
-    // checked.
     render_elements(
         out,
         format_args!("add rule {base} ip saddr vmap"),
-        ipv4()
-            .filter(|(_, source)| source.mac.is_none())
-            .map(|(index, source)| Dispatch(source.address, verdict(index, source))),
+        keys().filter_map(|(index, source, key)| match key {
+            SourceKey::Address(address) => Some(Dispatch(address, verdict(index, source))),
+            _ => None,
+        }),
         "",
+    )?;
+    // ARP may only announce the container's own address and MAC, or no address at all
+    // (0.0.0.0, a probe for whether an address is in use).
+    let unspecified = IpAddr::from([0, 0, 0, 0]);
+    render_elements(
+        out,
+        format_args!("add rule {base} iifname . ether saddr . arp saddr ether . arp saddr ip"),
+        keys()
+            .flat_map(|(_, _, key)| match key {
+                SourceKey::Port(port, mac, address) => [address, unspecified]
+                    .map(|address| Some(format!("{} . {mac} . {mac} . {address}", Quoted(port)))),
+                _ => [None, None],
+            })
+            .flatten(),
+        " accept",
+    )?;
+    render_elements(
+        out,
+        format_args!("add rule {base} ether saddr . arp saddr ether . arp saddr ip"),
+        keys()
+            .flat_map(|(_, _, key)| match key {
+                SourceKey::Mac(mac, address) => {
+                    [address, unspecified].map(|address| Some(format!("{mac} . {mac} . {address}")))
+                }
+                _ => [None, None],
+            })
+            .flatten(),
+        " accept",
+    )?;
+    render_elements(
+        out,
+        format_args!("add rule {base} arp saddr ip"),
+        keys().filter_map(|(_, _, key)| match key {
+            SourceKey::Address(address) => Some(address),
+            _ => None,
+        }),
+        " accept",
     )
 }
 
@@ -1383,6 +1498,32 @@ mod tests {
         )
     }
 
+    /// The de-duplicated log statement of a reported frame decision.
+    fn frame_log_rule(verdict: char, reason: &str) -> String {
+        let key = "iifname . ether saddr . ether type";
+        format!(
+            "{key} != @frames add @frames {{ {key} }} log prefix \"pc:{verdict}:{reason}\" group 7 snaplen 128"
+        )
+    }
+
+    /// The rules denying, or reporting, the frames of a selector in the bridge base chain.
+    fn denied_frames(selector: &str, verdict: char, action: &str) -> String {
+        let head = format!("add rule bridge portcullis prerouting {selector}");
+        let frame_action = if verdict == 'w' { "accept" } else { "drop" };
+        [
+            decided(&format!("{head} ether type ip"), verdict, "source", action),
+            format!(
+                "{head} ether type arp {}\n{head} ether type arp {frame_action}",
+                frame_log_rule(verdict, "source")
+            ),
+            format!(
+                "{head} {}\n{head} {frame_action}",
+                frame_log_rule(verdict, "frame")
+            ),
+        ]
+        .join("\n")
+    }
+
     /// The two rules of a reported decision: the log rule, then the verdict rule.
     fn decided(head: &str, verdict: char, reason: &str, action: &str) -> String {
         format!("{head} {}\n{head} {action}", log_rule(verdict, reason))
@@ -1418,6 +1559,7 @@ flush chain inet portcullis forward
 add table bridge portcullis
 add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }
 add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
+add set bridge portcullis frames { type ifname . ether_addr . ether_type; flags dynamic,timeout; timeout 60s; size 65536; }
 flush chain bridge portcullis prerouting
 add chain inet portcullis egress0
 flush chain inet portcullis egress0
@@ -1445,11 +1587,12 @@ flush chain bridge portcullis icc0
                 "add rule inet portcullis forward iifname { \"br-net0\" } drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
                 "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept".into(),
-                "add rule bridge portcullis prerouting ether type { arp, ip6 } accept".into(),
-                "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type != ip drop".into(),
-                "add rule bridge portcullis prerouting ether type != ip accept".into(),
                 "add rule bridge portcullis prerouting ip saddr . ether saddr vmap { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }".into(),
-                decided("add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip", 'd', "source", "drop"),
+                // ARP may only announce the container's own address and MAC.
+                "add rule bridge portcullis prerouting ether saddr . arp saddr ether . arp saddr ip { 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 } accept".into(),
+                // Everything else is denied: IPv4 and ARP as a source that isn't the
+                // sender's, other frames (IPv6, VLAN tags) as frames.
+                denied_frames("meta ibrname { \"br-net0\" }", 'd', "drop"),
                 // Established traffic passes once its source checked out.
                 "add rule bridge portcullis icc0 ct state established accept\nadd rule bridge portcullis icc0 ct state related ct original ip saddr 172.18.0.2 accept\nadd rule bridge portcullis icc0 ct state related ct reply ip saddr 172.18.0.2 accept\nadd rule bridge portcullis icc0 ip daddr 172.18.0.1 accept".into(),
                 decided("add rule bridge portcullis icc0 ip daddr 172.18.0.0/16", 'd', "icc", "drop"),
@@ -1469,12 +1612,10 @@ flush chain bridge portcullis icc0
             ..OPTIONS
         };
         let script = render_with(&test_support::hostname_state(), options, false);
-        let head =
-            "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip";
         let expected = [
-            "add rule bridge portcullis prerouting ip saddr . ether saddr vmap { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }".to_string(),
-            decided(&format!("{head} meta mark 0x70630001"), 'd', "source", "drop"),
-            format!("{head} queue num 9"),
+            denied_frames("meta ibrname { \"br-net0\" } meta mark 0x70630001", 'd', "drop"),
+            "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type { ip, arp } queue num 9".to_string(),
+            denied_frames("meta ibrname { \"br-net0\" }", 'd', "drop"),
         ]
         .join("\n");
         assert!(script.contains(&format!("{expected}\n")), "{script}");
@@ -1634,6 +1775,25 @@ flush chain bridge portcullis icc0
             by_mac.contains("172.18.0.3 . 02:42:ac:12:00:03"),
             "{script}"
         );
+        // ARP may only announce web's own address and MAC, from its port.
+        assert!(has_line(
+            &script,
+            "add rule bridge portcullis prerouting iifname . ether saddr . arp saddr ether . arp saddr ip { \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 } accept"
+        ));
+        // Anything else from web's port is denied at once, not held.
+        let options = Options {
+            source_queue: Some(9),
+            ..OPTIONS
+        };
+        let script = render_with(&state, options, false);
+        let known_port = denied_frames(
+            "meta ibrname { \"br-net0\", \"br-net1\" } iifname { \"veth0a1b2c3\" }",
+            'd',
+            "drop",
+        );
+        let held = "add rule bridge portcullis prerouting meta ibrname { \"br-net0\", \"br-net1\" } ether type { ip, arp } queue num 9";
+        let position = |text: &str| script.find(text).unwrap_or(usize::MAX);
+        assert!(position(&known_port) < position(held), "{script}");
     }
 
     #[test]
@@ -1644,7 +1804,14 @@ flush chain bridge portcullis icc0
         };
         let script = render_with(&test_support::hostname_state(), options, false);
         let reject = "reject with icmpx admin-prohibited";
-        assert!(!script.contains(" drop"));
+        // Only frames that aren't IPv4 can't be rejected.
+        for line in script.lines().filter(|line| line.ends_with(" drop")) {
+            assert!(
+                line.starts_with("add rule bridge portcullis prerouting ")
+                    && !line.contains("ether type ip "),
+                "{line}"
+            );
+        }
         assert_lines(
             &script,
             &[
@@ -1656,12 +1823,7 @@ flush chain bridge portcullis icc0
                     reject,
                 ),
                 decided("add rule inet portcullis egress0", 'd', "egress", reject),
-                decided(
-                    "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip",
-                    'd',
-                    "source",
-                    reject,
-                ),
+                denied_frames("meta ibrname { \"br-net0\" }", 'd', reject),
             ],
         );
     }
@@ -1670,7 +1832,7 @@ flush chain bridge portcullis icc0
     fn monitor_mode_reports_instead_of_denying() {
         let script = render_with(&test_support::hostname_state(), OPTIONS, true);
         assert!(!script.contains(" drop\n"), "{script}");
-        assert!(!script.contains("iifname"), "{script}");
+        assert!(!script.contains("iifname {"), "{script}");
         assert_lines(
             &script,
             &[
@@ -1687,12 +1849,7 @@ flush chain bridge portcullis icc0
                     "icc",
                     "accept",
                 ),
-                decided(
-                    "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip",
-                    'w',
-                    "source",
-                    "accept",
-                ),
+                denied_frames("meta ibrname { \"br-net0\" }", 'w', "accept"),
             ],
         );
     }

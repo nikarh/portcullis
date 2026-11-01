@@ -1,8 +1,8 @@
 //! Holds packets from sources the rules don't know yet, instead of denying them.
 //!
 //! A container can start sending before Portcullis has seen it start and applied rules for
-//! it. Those first packets come from an address, MAC and bridge port the rules don't know, which looks
-//! the same as a spoofed source. Docker also hands the address of a removed container to
+//! it. Its first packets (IPv4, and ARP for its neighbours) come from an address, MAC and
+//! bridge port the rules don't know, which looks the same as a spoofed source. Docker also hands the address of a removed container to
 //! the next one at once, with a new MAC. The bridge table queues them (NFQUEUE) instead of denying them, and
 //! this module holds them:
 //!
@@ -27,7 +27,7 @@ use tracing::{debug, error, warn};
 use crate::directory::Directory;
 use crate::firewall::HOLD_EXPIRED_MARK;
 use crate::model::MacAddress;
-use crate::nfnetlink::{Ipv4Packet, NfqueueSocket, QueueVerdict};
+use crate::nfnetlink::{ArpPacket, Ipv4Packet, NfqueueSocket, QueueVerdict};
 
 /// Longest wait when nothing is held.
 const IDLE_WAIT: Duration = Duration::from_secs(3600);
@@ -79,8 +79,7 @@ pub fn spawn(queue: u16, grace: Duration, directory: Arc<Directory>) -> io::Resu
                 .unwrap_or_else(PoisonError::into_inner)
                 .extend(packets.iter().map(|packet| Held {
                     id: packet.id,
-                    source:
-                        Ipv4Packet::parse(&packet.payload).map(|parsed| IpAddr::V4(parsed.source)),
+                    source: source_address(&packet.payload),
                     mac: packet.hwaddr,
                     port: packet.physindev,
                     deadline: now + grace,
@@ -125,6 +124,14 @@ pub fn spawn(queue: u16, grace: Duration, directory: Arc<Directory>) -> io::Resu
     });
 
     Ok(SourceHold { wake })
+}
+
+/// The source address of a held IPv4 packet, or the address an ARP packet announces.
+fn source_address(payload: &[u8]) -> Option<IpAddr> {
+    Ipv4Packet::parse(payload)
+        .map(|packet| packet.source)
+        .or_else(|| ArpPacket::parse(payload).map(|packet| packet.sender))
+        .map(IpAddr::V4)
 }
 
 /// Take the packets that can be released from `pending`: replay those whose source is now
@@ -185,6 +192,19 @@ mod tests {
         assert_eq!(verdicts, vec![(1, QueueVerdict::Repeat { mark: None })]);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.first().map(|held| held.id), Some(2));
+    }
+
+    #[test]
+    fn takes_the_source_of_arp_from_the_address_it_announces() {
+        use crate::nfnetlink::tests::{arp, ipv4, udp};
+        assert_eq!(
+            source_address(&arp([2, 0, 0, 0, 0, 1], [172, 18, 0, 5], [172, 18, 0, 1])),
+            Some(ip("172.18.0.5"))
+        );
+        assert_eq!(
+            source_address(&ipv4([172, 18, 0, 6], [1; 4], 17, &udp(1, 2, b""))),
+            Some(ip("172.18.0.6"))
+        );
     }
 
     #[test]
