@@ -48,7 +48,7 @@ The binary is `target/release/portcullis`.
 sudo ./target/release/portcullis
 ```
 
-Portcullis runs in the foreground until it gets SIGINT or SIGTERM. On startup and on shutdown it removes all firewall rules it owns.
+Portcullis runs in the foreground until it gets SIGINT or SIGTERM. See [Stopping and removing Portcullis](#stopping-and-removing-portcullis) for what happens to its rules then.
 
 | Option | Default | Description |
 |---|---|---|
@@ -62,6 +62,27 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. On startup an
 | `--alert-interval <seconds>` | `600` | Raise the same alert at most once per interval. |
 | `--log-format <text\|json>` | `text` | Format of events (stdout) and diagnostic logs (stderr). |
 | `--log-level <error\|warn\|info\|debug\|trace>` | `info` | Level of diagnostic logs. `trace` logs every firewall script that gets applied. |
+| `--on-exit <keep\|remove>` | `keep` | What happens to the firewall rules when Portcullis stops, see [Stopping and removing Portcullis](#stopping-and-removing-portcullis). |
+
+### Stopping and removing Portcullis
+
+By default (`--on-exit keep`), the firewall rules stay in place when Portcullis stops, whether it stops cleanly or crashes. A restart or an upgrade doesn't leave containers unrestricted:
+
+- Containers that were running keep their last rules. Changes to labels, networks and hostname addresses aren't picked up until Portcullis runs again.
+- Containers that start on an enforced network in the meantime can't send anything: they have no rules yet, so their packets are held for Portcullis and then dropped by the kernel. They get their rules as soon as Portcullis is back.
+- DNS answers are let through without inspection, and nothing is reported.
+
+When Portcullis starts again, its first update replaces the old rules in one step.
+
+To remove the rules, for example after deciding not to use Portcullis anymore, run:
+
+```bash
+sudo portcullis cleanup
+```
+
+With `--on-exit remove`, Portcullis removes its rules itself, when it starts and when it stops cleanly. Containers are then unrestricted while it isn't running. After a crash the rules stay, as with `keep`.
+
+The rules live in the kernel only, so a reboot removes them either way.
 
 ### Rolling out a policy
 
@@ -392,7 +413,7 @@ labels:
 - DNS answers over TCP that span more than one packet aren't inspected; they still reach the container.
 - Portcullis uses NFLOG group 4242 and NFQUEUE 4242 and 4243. Other software on the host must not use the same numbers.
 - Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.enable` value on a network enforces it. An enforced network without a usable subnet is logged and not enforced.
-- Portcullis removes its rules when it starts and when it stops. Containers are unrestricted while it is not running. If it crashes, the last rules stay in place until it is started again, and containers that start on an enforced network in the meantime can't send anything: their packets are held for Portcullis and then dropped by the kernel.
+- While Portcullis isn't running, its last rules stay in force (by default) but nothing is updated or reported, see [Stopping and removing Portcullis](#stopping-and-removing-portcullis). With `--on-exit remove`, containers are unrestricted while it isn't running.
 
 ## License
 
