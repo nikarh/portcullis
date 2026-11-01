@@ -58,6 +58,8 @@ pub enum Reason {
     Source,
     /// A kind of frame enforced networks don't carry: IPv6, VLAN-tagged, or not IP at all.
     Frame,
+    /// More open connections, or new connections per second, than the container's limit.
+    Limit,
 }
 
 /// Where a connection's domain comes from.
@@ -135,6 +137,8 @@ pub enum WarningKind {
     NetAdmin,
     /// An enforced network has IPv6 enabled.
     Ipv6Network,
+    /// A container misbehaved and was cut off from its networks (or would have been).
+    Quarantined,
 }
 
 impl WarningKind {
@@ -435,6 +439,7 @@ fn write_connection(line: &mut String, connection: &Connection) -> std::fmt::Res
         Reason::Icc => "icc",
         Reason::Source => "source",
         Reason::Frame => "frame",
+        Reason::Limit => "limit",
     };
     let address =
         |address: Option<IpAddr>| address.map_or_else(|| "-".to_string(), |a| a.to_string());

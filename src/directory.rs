@@ -32,6 +32,10 @@ pub struct SourceInfo {
     pub port: Option<u32>,
     /// The container's network is in monitor mode.
     pub monitor: bool,
+    /// The container may be quarantined when it misbehaves.
+    pub quarantine: bool,
+    /// IPv6 is enabled on the container's network.
+    pub ipv6_network: bool,
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +68,12 @@ impl Directory {
     /// Take over the containers, bridges and hostname sets of the applied plan.
     pub fn update(&self, plan: &Plan) {
         let mut snapshot = Snapshot::default();
+        let ipv6_networks: std::collections::HashSet<&str> = plan
+            .bridges
+            .iter()
+            .filter(|bridge| bridge.ipv6)
+            .map(|bridge| bridge.network.as_str())
+            .collect();
         for source in &plan.sources {
             let info = SourceInfo {
                 container: source.container.to_string(),
@@ -71,6 +81,8 @@ impl Directory {
                 mac: source.mac,
                 port: source.port.as_ref().map(|port| port.index),
                 monitor: source.monitor,
+                quarantine: source.quarantine,
+                ipv6_network: ipv6_networks.contains(source.network.as_str()),
             };
             if let Some(mac) = source.mac {
                 snapshot.by_mac.insert(mac, (source.address, info.clone()));
@@ -137,6 +149,16 @@ impl Directory {
     #[must_use]
     pub fn by_mac(&self, mac: MacAddress) -> Option<(IpAddr, SourceInfo)> {
         self.read().by_mac.get(&mac).cloned()
+    }
+
+    /// One of a container's addresses, by the container's name.
+    #[must_use]
+    pub fn container(&self, name: &str) -> Option<SourceInfo> {
+        self.read()
+            .sources
+            .values()
+            .find(|info| info.container == name)
+            .cloned()
     }
 
     /// The container behind a bridge port, given the port's interface index, with its

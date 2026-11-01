@@ -14,7 +14,7 @@ use super::plan::{
     Source,
 };
 use crate::dns::{HostResolver, MAX_ADDRESSES_PER_HOST};
-use crate::model::{ContainerName, MacAddress, RuntimeState};
+use crate::model::{ConnectionLimit, ContainerName, MacAddress, RuntimeState};
 
 /// Name of both managed tables.
 const TABLE_NAME: &str = "portcullis";
@@ -52,6 +52,9 @@ enum Chain {
     /// Base chain of the bridge table for frames a bridge passes from one container to
     /// another.
     BridgeForward,
+    /// Reports and denies connections over a container's limit: open connections, or new
+    /// connections per second (`rate`), in monitor mode or not.
+    Limited { rate: bool, monitor: bool },
     /// Egress rules of the n-th source, in the inet table.
     Egress(usize),
     /// ICC rules of the n-th source, in the bridge table.
@@ -72,7 +75,9 @@ impl Chain {
         match self {
             Self::Base(table) => table,
             Self::Input | Self::Egress(_) => Table::Inet,
-            Self::BridgeInput | Self::BridgeForward | Self::Icc(_) => Table::Bridge,
+            Self::BridgeInput | Self::BridgeForward | Self::Limited { .. } | Self::Icc(_) => {
+                Table::Bridge
+            }
         }
     }
 }
@@ -92,6 +97,12 @@ impl fmt::Display for ChainName {
             Chain::Base(table) => f.write_str(table.hook()),
             Chain::Input | Chain::BridgeInput => f.write_str("input"),
             Chain::BridgeForward => f.write_str("forward"),
+            Chain::Limited { rate, monitor } => write!(
+                f,
+                "limit_{}{}",
+                if rate { "rate" } else { "open" },
+                if monitor { "_monitor" } else { "" }
+            ),
             Chain::Egress(index) => write!(f, "egress{index}"),
             Chain::Icc(index) => write!(f, "icc{index}"),
         }
@@ -135,6 +146,8 @@ pub struct Options {
     /// NFQUEUE number packets from not yet known sources on enforced networks are held in
     /// until the next rule update, instead of being denied. See `source_hold`.
     pub source_queue: Option<u16>,
+    /// Open connections a container may have at a time, unless its labels say otherwise.
+    pub connection_limit: Option<u32>,
 }
 
 impl Default for Options {
@@ -145,9 +158,15 @@ impl Default for Options {
             log_allowed: LogAllowed::Monitor,
             dns_queue: None,
             source_queue: None,
+            connection_limit: Some(DEFAULT_CONNECTION_LIMIT),
         }
     }
 }
+
+/// Open connections a container may have at a time by default: far more than most services
+/// need, and a fraction of the host's connection tracking table, which every container
+/// shares.
+pub const DEFAULT_CONNECTION_LIMIT: u32 = 16_384;
 
 /// Packet mark of held packets whose source stayed unknown: they are denied when they come
 /// back.
@@ -579,6 +598,7 @@ fn render_apply_script(
         if table == Table::Bridge {
             render_base_chain(out, Chain::BridgeForward, "forward")?;
             writeln!(out, "flush chain {}", Chain::BridgeForward)?;
+            render_quarantined_set(out, plan)?;
         }
         render_logged_sets(out, table, reassigned)?;
         writeln!(out, "flush chain {}", Chain::Base(table))?;
@@ -731,10 +751,28 @@ fn render_objects(
                 .filter(|(_, source)| icc_chain_needed(plan, source, options))
                 .map(|(index, _)| Chain::Icc(index)),
         );
-    for chain in chains {
+    let limited = (!plan.bridges.is_empty())
+        .then_some([false, true])
+        .into_iter()
+        .flatten()
+        .flat_map(|rate| [false, true].map(|monitor| Chain::Limited { rate, monitor }));
+    for chain in chains.chain(limited) {
         writeln!(out, "add chain {chain}")?;
         writeln!(out, "flush chain {chain}")?;
         installed.chains.insert(chain.to_string());
+    }
+    for limit in limits(plan, options).into_keys() {
+        let name = format!("{} {}", Table::Bridge, limit.set_name());
+        let flags = if limit.rate {
+            "dynamic,timeout; timeout 60s"
+        } else {
+            "dynamic"
+        };
+        writeln!(
+            out,
+            "add set {name} {{ type ifname; flags {flags}; size 65536; }}"
+        )?;
+        installed.sets.insert(name);
     }
     for set in &plan.host_sets {
         if set.used_v4 {
@@ -803,6 +841,7 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         plan.bridges.iter().map(|bridge| Quoted(&bridge.name)),
         " accept",
     )?;
+    render_limits(out, plan, options)?;
     render_known_sources(out, plan, options, base)?;
     let bridges = |monitor: bool| {
         set_literal(
@@ -857,6 +896,117 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         )?;
     }
     render_denied_frames(out, options, false, &format!("meta ibrname {enforced}"))
+}
+
+/// The set of quarantined containers' bridge ports, refilled on every update.
+const QUARANTINED_SET: &str = "quarantined";
+
+fn render_quarantined_set(out: &mut String, plan: &Plan) -> fmt::Result {
+    let name = format!("{} {QUARANTINED_SET}", Table::Bridge);
+    writeln!(out, "add set {name} {{ type ifname; }}")?;
+    writeln!(out, "flush set {name}")?;
+    render_elements(
+        out,
+        format_args!("add element {name}"),
+        plan.sources
+            .iter()
+            .filter(|source| source.quarantined && !source.monitor)
+            .filter_map(|source| source.port.as_ref())
+            .map(|port| port.name.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(Quoted),
+        "",
+    )
+}
+
+/// A limit shared by some containers: open connections or new connections per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Limit {
+    rate: bool,
+    value: u32,
+    monitor: bool,
+}
+
+impl Limit {
+    /// The set counting each port's connections, or new connections, under this limit.
+    fn set_name(self) -> String {
+        format!("{}{}", if self.rate { "new" } else { "conns" }, self.value)
+    }
+}
+
+/// Containers by the limits they are under, by their bridge ports. Containers whose port
+/// isn't known aren't limited.
+fn limits(plan: &Plan, options: Options) -> BTreeMap<Limit, BTreeSet<&str>> {
+    let mut limits: BTreeMap<Limit, BTreeSet<&str>> = BTreeMap::new();
+    for source in &plan.sources {
+        let Some(port) = &source.port else {
+            continue;
+        };
+        let open = match source.connection_limit {
+            ConnectionLimit::Default => options.connection_limit,
+            ConnectionLimit::Unlimited => None,
+            ConnectionLimit::At(value) => Some(value),
+        };
+        let found = [(false, open), (true, source.new_connection_rate)];
+        for (rate, value) in found {
+            if let Some(value) = value {
+                let limit = Limit {
+                    rate,
+                    value,
+                    monitor: source.monitor,
+                };
+                limits.entry(limit).or_default().insert(&port.name);
+            }
+        }
+    }
+    limits
+}
+
+/// Quarantined containers get nowhere. Containers over a limit get no new connections:
+/// a container opening connections without end would otherwise fill the host's connection
+/// tracking table, which every container shares, and new connections of all of them would
+/// fail. Both are matched by bridge port, which a container can't borrow, before its
+/// address is checked.
+fn render_limits(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+    let base = Chain::Base(Table::Bridge);
+    writeln!(out, "add rule {base} iifname @{QUARANTINED_SET} drop")?;
+    writeln!(
+        out,
+        "add rule {} iifname @{QUARANTINED_SET} drop",
+        Chain::BridgeInput
+    )?;
+    for (limit, ports) in limits(plan, options) {
+        let Some(ports) = set_literal(ports.iter().map(|port| Quoted(port))) else {
+            continue;
+        };
+        let check = if limit.rate {
+            format!("limit rate over {0}/second burst {0} packets", limit.value)
+        } else {
+            format!("ct count over {}", limit.value)
+        };
+        writeln!(
+            out,
+            "add rule {base} iifname {ports} ct state new add @{} {{ iifname {check} }} goto {}",
+            limit.set_name(),
+            ChainName(Chain::Limited {
+                rate: limit.rate,
+                monitor: limit.monitor
+            })
+        )?;
+    }
+    for rate in [false, true] {
+        for monitor in [false, true] {
+            let chain = Chain::Limited { rate, monitor };
+            let reason = if rate { "limit:rate" } else { "limit:open" };
+            decide(
+                out,
+                format_args!("add rule {chain}"),
+                Outcome::deny(options, monitor, reason).dropped(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Frames to the link-local group addresses (01:80:c2:00:00:00 to 0f, used by protocols
@@ -1670,6 +1820,7 @@ mod tests {
         log_allowed: LogAllowed::Never,
         dns_queue: None,
         source_queue: None,
+        connection_limit: None,
     };
 
     fn render_with(state: &RuntimeState, options: Options, monitor_all: bool) -> String {
@@ -1802,6 +1953,8 @@ add chain bridge portcullis input { type filter hook input priority -1; policy a
 flush chain bridge portcullis input
 add chain bridge portcullis forward { type filter hook forward priority -1; policy accept; }
 flush chain bridge portcullis forward
+add set bridge portcullis quarantined { type ifname; }
+flush set bridge portcullis quarantined
 add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis frames { type ifname . ether_addr . ether_type; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis announced { type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout 60s; size 65536; }
@@ -1810,6 +1963,8 @@ add chain inet portcullis egress0
 flush chain inet portcullis egress0
 add chain bridge portcullis icc0
 flush chain bridge portcullis icc0
+add chain bridge portcullis limit_open
+flush chain bridge portcullis limit_open
 ";
         assert!(
             script.starts_with(expected_head),
@@ -2043,6 +2198,66 @@ flush chain bridge portcullis icc0
     }
 
     #[test]
+    fn limits_and_quarantines_containers_by_port() {
+        let mut state = RuntimeState::default();
+        test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+        let limited = crate::model::ContainerPolicy {
+            connection_limit: ConnectionLimit::At(10),
+            new_connection_rate: Some(5),
+            ..crate::model::ContainerPolicy::default()
+        };
+        test_support::add_container(
+            &mut state,
+            "a",
+            "busy",
+            &[("net0", "172.18.0.2", &[])],
+            limited,
+        );
+        test_support::add_container(
+            &mut state,
+            "b",
+            "rogue",
+            &[("net0", "172.18.0.3", &[])],
+            crate::model::ContainerPolicy::default(),
+        );
+        let port = |name: &str, index| crate::model::BridgePort {
+            name: name.to_string(),
+            index,
+        };
+        state.set_ports(
+            [
+                (test_support::ip("172.18.0.2"), port("veth2", 2)),
+                (test_support::ip("172.18.0.3"), port("veth3", 3)),
+            ]
+            .into(),
+        );
+        assert!(state.quarantine(&"b".to_string().into()));
+        let options = Options {
+            connection_limit: Some(1000),
+            ..OPTIONS
+        };
+        let script = render_with(&state, options, false);
+        assert_lines(
+            &script,
+            &[
+                // Quarantined ports get nowhere, before anything else is checked.
+                "add element bridge portcullis quarantined { \"veth3\" }".into(),
+                "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept\nadd rule bridge portcullis prerouting iifname @quarantined drop".into(),
+                "add rule bridge portcullis input iifname @quarantined drop".into(),
+                // Open connections: the label's limit, or the default.
+                "add rule bridge portcullis prerouting iifname { \"veth2\" } ct state new add @conns10 { iifname ct count over 10 } goto limit_open".into(),
+                "add rule bridge portcullis prerouting iifname { \"veth3\" } ct state new add @conns1000 { iifname ct count over 1000 } goto limit_open".into(),
+                // New connections per second, only where a label asks for it.
+                "add rule bridge portcullis prerouting iifname { \"veth2\" } ct state new add @new5 { iifname limit rate over 5/second burst 5 packets } goto limit_rate".into(),
+                "add set bridge portcullis conns10 { type ifname; flags dynamic; size 65536; }".into(),
+                "add set bridge portcullis new5 { type ifname; flags dynamic,timeout; timeout 60s; size 65536; }".into(),
+                decided("add rule bridge portcullis limit_open", 'd', "limit:open", "drop"),
+                decided("add rule bridge portcullis limit_rate", 'd', "limit:rate", "drop"),
+            ],
+        );
+    }
+
+    #[test]
     fn renders_reject_as_deny_action() {
         let options = Options {
             deny: DenyAction::Reject,
@@ -2055,6 +2270,8 @@ flush chain bridge portcullis icc0
             assert!(
                 line.starts_with("add rule bridge portcullis prerouting ")
                     || line.starts_with("add rule bridge portcullis forward ")
+                    || line.starts_with("add rule bridge portcullis limit_")
+                    || line.contains("@quarantined")
                     || line.contains(LINK_LOCAL_GROUP),
                 "{line}"
             );
@@ -2078,7 +2295,17 @@ flush chain bridge portcullis icc0
     #[test]
     fn monitor_mode_reports_instead_of_denying() {
         let script = render_with(&test_support::hostname_state(), OPTIONS, true);
-        assert!(!script.contains(" drop\n"), "{script}");
+        // Only quarantined and limited containers' traffic is dropped, which monitor mode
+        // never does to anyone.
+        assert!(
+            script
+                .lines()
+                .filter(|line| line.ends_with(" drop"))
+                .all(|line| line.contains("@quarantined")
+                    || line.contains(" limit_open ")
+                    || line.contains(" limit_rate ")),
+            "{script}"
+        );
         assert!(!script.contains("iifname {"), "{script}");
         assert_lines(
             &script,

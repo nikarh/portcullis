@@ -12,6 +12,10 @@ services:
       - portcullis.egress.web=ip:198.51.100.3,tcp:80,udp:9001
       - portcullis.egress.api=host:api.test,tcp:80
       - portcullis.dns.rogue=ip:198.51.100.4
+      # Keeps trying after its first attempt (see the flood scenario for quarantine and
+      # limits).
+      - portcullis.quarantine=off
+      - portcullis.limit.connections=none
   # Has a policy worth borrowing, a published port, and an address on a second network.
   victim:
     image: portcullis-e2e-tester

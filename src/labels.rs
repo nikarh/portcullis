@@ -8,13 +8,17 @@ use thiserror::Error;
 
 use crate::events::WarningKind;
 use crate::model::{
-    ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode, PortSpec, Protocol,
+    ConnectionLimit, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
+    PortSpec, Protocol,
 };
 
 const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
 const ICC_ALLOW_PREFIX: &str = "portcullis.icc.allow.";
 const DNS_PREFIX: &str = "portcullis.dns.";
+const CONNECTION_LIMIT_LABEL: &str = "portcullis.limit.connections";
+const NEW_CONNECTIONS_LABEL: &str = "portcullis.limit.new-connections";
+const QUARANTINE_LABEL: &str = "portcullis.quarantine";
 /// Configuration warnings acknowledged for a container or network, comma-separated.
 pub const ACK_LABEL: &str = "portcullis.ack";
 
@@ -38,6 +42,8 @@ pub enum LabelParseError {
     MissingPorts(String),
     #[error("invalid dns target in {0}: {1}")]
     InvalidDnsTarget(String, String),
+    #[error("invalid {0} value {1:?}: {2}")]
+    InvalidValue(&'static str, String, &'static str),
     #[error("unknown warning in {ACK_LABEL}: {0} (expected one of {1})")]
     UnknownAcknowledgement(String, String),
 }
@@ -91,6 +97,9 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
     let mut icc_allow = Vec::new();
     let mut dns_targets = Vec::with_capacity(1);
     let mut has_dns_labels = false;
+    let mut connection_limit = ConnectionLimit::Default;
+    let mut new_connection_rate = None;
+    let mut quarantine = true;
 
     for (key, value) in labels {
         let result = if key.starts_with(EGRESS_PREFIX) {
@@ -100,6 +109,23 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
         } else if key.starts_with(DNS_PREFIX) {
             has_dns_labels = true;
             parse_dns_target(key, value).map(|target| dns_targets.push(target))
+        } else if key == CONNECTION_LIMIT_LABEL {
+            parse_connection_limit(value).map(|limit| connection_limit = limit)
+        } else if key == NEW_CONNECTIONS_LABEL {
+            parse_count(NEW_CONNECTIONS_LABEL, value).map(|rate| new_connection_rate = Some(rate))
+        } else if key == QUARANTINE_LABEL {
+            match value.as_str() {
+                "on" => Ok(()),
+                "off" => {
+                    quarantine = false;
+                    Ok(())
+                }
+                _ => Err(LabelParseError::InvalidValue(
+                    QUARANTINE_LABEL,
+                    value.clone(),
+                    "expected on or off",
+                )),
+            }
         } else {
             Ok(())
         };
@@ -120,6 +146,9 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
         icc_allow,
         dns_targets,
         acknowledged,
+        connection_limit,
+        new_connection_rate,
+        quarantine,
     };
     (policy, errors)
 }
@@ -142,6 +171,32 @@ fn parse_dns_target(key: &str, value: &str) -> Result<DnsTarget, LabelParseError
             ))
         }
     }
+}
+
+/// A positive number.
+fn parse_count(label: &'static str, value: &str) -> Result<u32, LabelParseError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| {
+            LabelParseError::InvalidValue(label, value.to_string(), "expected a positive number")
+        })
+}
+
+fn parse_connection_limit(value: &str) -> Result<ConnectionLimit, LabelParseError> {
+    if value == "none" {
+        return Ok(ConnectionLimit::Unlimited);
+    }
+    parse_count(CONNECTION_LIMIT_LABEL, value)
+        .map(ConnectionLimit::At)
+        .map_err(|_| {
+            LabelParseError::InvalidValue(
+                CONNECTION_LIMIT_LABEL,
+                value.to_string(),
+                "expected a positive number or none",
+            )
+        })
 }
 
 fn parse_icc_mode(value: &str) -> Result<IccMode, LabelParseError> {

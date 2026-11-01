@@ -5,6 +5,10 @@ services:
     pull_policy: never
     cap_add: [NET_ADMIN]
     networks: [net]
+    # Keeps trying after its first spoofed packet (see the flood scenario for quarantine).
+    labels:
+      - portcullis.quarantine=off
+      - portcullis.ack=net-admin
   victim:
     image: portcullis-e2e-tester
     pull_policy: never

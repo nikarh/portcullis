@@ -191,6 +191,22 @@ pub struct ContainerPolicy {
     pub dns_targets: Vec<DnsTarget>,
     /// Configuration warnings acknowledged with `portcullis.ack`, not reported.
     pub acknowledged: HashSet<crate::events::WarningKind>,
+    /// How many connections the container may have open at a time.
+    pub connection_limit: ConnectionLimit,
+    /// How many new connections the container may open per second, if limited.
+    pub new_connection_rate: Option<u32>,
+    /// Whether the container is cut off when it misbehaves (`portcullis.quarantine`).
+    pub quarantine: bool,
+}
+
+/// `portcullis.limit.connections`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConnectionLimit {
+    /// `--connection-limit`.
+    #[default]
+    Default,
+    Unlimited,
+    At(u32),
 }
 
 impl Default for ContainerPolicy {
@@ -201,6 +217,9 @@ impl Default for ContainerPolicy {
             icc_allow: Vec::new(),
             dns_targets: vec![DnsTarget::Docker],
             acknowledged: HashSet::new(),
+            connection_limit: ConnectionLimit::Default,
+            new_connection_rate: None,
+            quarantine: true,
         }
     }
 }
@@ -310,6 +329,8 @@ pub struct RuntimeState {
     daemon_dns: Vec<IpAddr>,
     /// Bridge port of each container address, where known.
     ports: HashMap<IpAddr, BridgePort>,
+    /// Containers cut off from their networks, see `quarantine`.
+    quarantined: HashSet<ContainerId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +392,21 @@ impl RuntimeState {
         self.ports = ports;
     }
 
+    /// Cut a container off from its networks. Returns whether it wasn't already.
+    pub fn quarantine(&mut self, container: &ContainerId) -> bool {
+        self.containers.contains_key(container) && self.quarantined.insert(container.clone())
+    }
+
+    /// Let a quarantined container back. Returns whether it was quarantined.
+    pub fn release(&mut self, container: &ContainerId) -> bool {
+        self.quarantined.remove(container)
+    }
+
+    #[must_use]
+    pub fn is_quarantined(&self, container: &ContainerId) -> bool {
+        self.quarantined.contains(container)
+    }
+
     fn remove_network(&mut self, network_id: &NetworkId) -> bool {
         let mut changed = self.networks.remove(network_id).is_some();
         for container in self.containers.values_mut() {
@@ -412,6 +448,7 @@ impl RuntimeState {
                 true
             }
             RuntimeStateAction::RemoveContainer { container_id } => {
+                self.quarantined.remove(&container_id);
                 if let Some(container) = self.containers.remove(&container_id) {
                     return !container.attachments.is_empty();
                 }

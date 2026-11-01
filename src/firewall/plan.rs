@@ -28,8 +28,8 @@ use tracing::{error, trace};
 
 use crate::dns::{HostResolver, normalize};
 use crate::model::{
-    BridgePort, Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule, IccMode,
-    MacAddress, NetworkAttachment, Protocol, RuntimeState,
+    BridgePort, ConnectionLimit, Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule,
+    IccMode, MacAddress, NetworkAttachment, Protocol, RuntimeState,
 };
 
 pub const DNS_PORT: u16 = 53;
@@ -99,6 +99,14 @@ pub struct Source {
     /// The container's port on the network's bridge. Packets from the address are only
     /// accepted from this port, so not even a copied MAC passes.
     pub port: Option<BridgePort>,
+    /// `portcullis.limit.connections`.
+    pub connection_limit: ConnectionLimit,
+    /// `portcullis.limit.new-connections`, per second.
+    pub new_connection_rate: Option<u32>,
+    /// The container may be quarantined (`portcullis.quarantine`).
+    pub quarantine: bool,
+    /// The container is quarantined: nothing it sends gets anywhere.
+    pub quarantined: bool,
     /// Range into [`Plan::rules`] of rules for traffic leaving the network.
     egress: Range<usize>,
     /// Range into [`Plan::rules`] of rules for traffic to containers on the same network.
@@ -191,6 +199,8 @@ pub struct ManagedBridge {
     pub subnet: IpNet,
     /// Monitor mode: denials are reported, not enforced.
     pub monitor: bool,
+    /// IPv6 is enabled on the network.
+    pub ipv6: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -247,6 +257,7 @@ impl Plan {
                 network: network.name.clone(),
                 subnet: network.subnet,
                 monitor: monitor_all || network.monitor,
+                ipv6: network.ipv6,
             }));
         planner
             .plan
@@ -387,6 +398,10 @@ where
             monitor: self.monitor_all || network.is_some_and(|network| network.monitor),
             mac: attachment.mac_address,
             port: self.state.port(source).cloned(),
+            connection_limit: policy.connection_limit,
+            new_connection_rate: policy.new_connection_rate,
+            quarantine: policy.quarantine,
+            quarantined: self.state.is_quarantined(&container.id),
             egress,
             icc,
         });

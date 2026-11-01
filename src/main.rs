@@ -15,6 +15,7 @@ mod logging;
 mod model;
 mod monitor;
 mod nfnetlink;
+mod quarantine;
 mod rtnetlink;
 mod source_hold;
 mod tools;
@@ -71,6 +72,20 @@ struct Config {
     log_level: LogLevel,
     log_format: LogFormat,
     on_exit: OnExit,
+    connection_limit: Option<u32>,
+    quarantine: QuarantineMode,
+    quarantine_denials: usize,
+}
+
+/// What happens to a container that misbehaves, see `quarantine`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum QuarantineMode {
+    /// Cut it off from its networks until it restarts.
+    #[default]
+    Isolate,
+    /// Only report that it would be.
+    Report,
+    Off,
 }
 
 /// What happens to the firewall rules when Portcullis stops.
@@ -99,6 +114,9 @@ impl Default for Config {
             log_level: LogLevel::Info,
             log_format: LogFormat::Text,
             on_exit: OnExit::Keep,
+            connection_limit: Some(firewall::DEFAULT_CONNECTION_LIMIT),
+            quarantine: QuarantineMode::Isolate,
+            quarantine_denials: 1000,
         }
     }
 }
@@ -113,6 +131,10 @@ enum MainError {
     InvalidLogAllowed(String),
     #[error("invalid --on-exit value: {0}")]
     InvalidOnExit(String),
+    #[error("invalid --connection-limit value: {0}, expected a positive number or none")]
+    InvalidConnectionLimit(String),
+    #[error("invalid --quarantine value: {0}, expected isolate, report or off")]
+    InvalidQuarantine(String),
     #[error("unexpected arguments: {0:?}")]
     UnexpectedArguments(Vec<OsString>),
     #[error("failed to initialize logging: {0}")]
@@ -231,6 +253,29 @@ fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
     if let Some(format) = args.opt_value_from_str::<_, String>("--log-format")? {
         config.log_format = LogFormat::from_str(&format)?;
     }
+    if let Some(value) = args.opt_value_from_str::<_, String>("--connection-limit")? {
+        config.connection_limit = match value.as_str() {
+            "none" => None,
+            _ => Some(
+                value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|limit| *limit > 0)
+                    .ok_or(MainError::InvalidConnectionLimit(value))?,
+            ),
+        };
+    }
+    if let Some(value) = args.opt_value_from_str::<_, String>("--quarantine")? {
+        config.quarantine = match value.as_str() {
+            "isolate" => QuarantineMode::Isolate,
+            "report" => QuarantineMode::Report,
+            "off" => QuarantineMode::Off,
+            _ => return Err(MainError::InvalidQuarantine(value)),
+        };
+    }
+    if let Some(count) = args.opt_value_from_str::<_, usize>("--quarantine-denials")? {
+        config.quarantine_denials = count;
+    }
     if let Some(value) = args.opt_value_from_str::<_, String>("--on-exit")? {
         config.on_exit = match value.as_str() {
             "keep" => OnExit::Keep,
@@ -277,6 +322,14 @@ OPTIONS:
   --log-format <text|json>     Format of events (stdout) and diagnostics (stderr)
                                (default: text)
   --log-level <level>          error, warn, info, debug or trace (default: info)
+  --connection-limit <n|none>  Open connections a container may have at a time, unless
+                               its labels say otherwise (default: 16384)
+  --quarantine <isolate|report|off>
+                               Cut off containers that send with someone else's address
+                               or MAC, or whose traffic is denied too often, until they
+                               restart; or only report it (default: isolate)
+  --quarantine-denials <n>     Denied connections per minute past which a container is
+                               quarantined (default: 1000)
   --on-exit <keep|remove>      Keep the firewall rules in place when stopping, or remove
                                them (default: keep; remove them later with
                                portcullis cleanup)
@@ -520,6 +573,49 @@ impl Applier {
     }
 }
 
+/// Cut a misbehaving container off from its networks, or report that it would be.
+fn quarantine_container(
+    mode: QuarantineMode,
+    misbehaviour: &quarantine::Misbehaviour,
+    state: &mut RuntimeState,
+    applier: &mut Applier,
+    bus: &EventBus,
+) {
+    let Some(id) = state
+        .containers()
+        .values()
+        .find(|container| *container.name == *misbehaviour.container)
+        .map(|container| container.id.clone())
+    else {
+        return;
+    };
+    let message = match mode {
+        QuarantineMode::Off => return,
+        QuarantineMode::Report => format!(
+            "would be cut off from its networks (--quarantine report): {}",
+            misbehaviour.reason
+        ),
+        QuarantineMode::Isolate => {
+            if !state.quarantine(&id) {
+                return;
+            }
+            if let Err(error) = applier.apply(state) {
+                error!(%error, "firewall apply failed; continuing");
+            }
+            format!(
+                "cut off from its networks: {}. Restart the container to let it back",
+                misbehaviour.reason
+            )
+        }
+    };
+    warn!(container = %misbehaviour.container, "{message}");
+    bus.publish(&Event::Warning(Warning {
+        kind: WarningKind::Quarantined,
+        container: Some(misbehaviour.container.clone()),
+        message,
+    }));
+}
+
 fn publish_warnings<A: docker::DockerApi>(monitor: &mut DockerMonitor<A>, bus: &EventBus) {
     for warning in monitor.take_warnings() {
         bus.publish(&Event::Warning(warning));
@@ -551,6 +647,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         log_allowed: config.log_allowed,
         dns_queue: Some(DNS_QUEUE),
         source_queue: Some(SOURCE_QUEUE),
+        connection_limit: config.connection_limit,
     })?);
 
     // The first update replaces whatever a previous run left, in the same step, so kept
@@ -565,11 +662,14 @@ fn run(config: &Config) -> Result<(), MainError> {
         SystemUpstreamResolver,
         config.hostname_hold,
     )));
+    let (misbehaviour_tx, misbehaviour_rx) = unbounded::<quarantine::Misbehaviour>();
     connection_log::spawn(
         NFLOG_GROUP,
         Arc::clone(&directory),
         Arc::clone(&hosts),
         bus.clone(),
+        (config.quarantine != QuarantineMode::Off)
+            .then(|| quarantine::Watch::new(misbehaviour_tx, config.quarantine_denials)),
     )
     .map_err(MainError::ConnectionLog)?;
     dns_inspect::spawn(
@@ -620,6 +720,17 @@ fn run(config: &Config) -> Result<(), MainError> {
                 info!("termination signal received; cleanup will start now");
                 break;
             }
+            recv(misbehaviour_rx) -> message => {
+                if let Ok(misbehaviour) = message {
+                    quarantine_container(
+                        config.quarantine,
+                        &misbehaviour,
+                        &mut runtime_state,
+                        &mut applier,
+                        &bus,
+                    );
+                }
+            }
             recv(docker_rx) -> message => {
                 let Ok(message) = message else {
                     break;
@@ -632,6 +743,13 @@ fn run(config: &Config) -> Result<(), MainError> {
                         {
                             monitor.check_container(&runtime_state, &event.id);
                             publish_warnings(&mut monitor, &bus);
+                            // A restart starts it over from a clean state.
+                            if runtime_state.release(&event.id.clone().into()) {
+                                info!(container = %event.id, "quarantined container restarted; letting it back");
+                                if let Err(error) = applier.apply(&mut runtime_state) {
+                                    error!(%error, "firewall apply failed; continuing");
+                                }
+                            }
                         }
                         if !event.is_relevant_for_policy_refresh() {
                             continue;
@@ -730,6 +848,12 @@ mod tests {
                 "json",
                 "--on-exit",
                 "remove",
+                "--connection-limit",
+                "100",
+                "--quarantine",
+                "report",
+                "--quarantine-denials",
+                "5",
             ]
             .into_iter()
             .map(OsString::from)
@@ -749,6 +873,9 @@ mod tests {
                 log_level: LogLevel::Debug,
                 log_format: LogFormat::Json,
                 on_exit: OnExit::Remove,
+                connection_limit: Some(100),
+                quarantine: QuarantineMode::Report,
+                quarantine_denials: 5,
             })
         );
     }

@@ -24,6 +24,7 @@ use crate::model::MacAddress;
 use crate::nfnetlink::{
     ArpPacket, Ipv4Packet, LoggedPacket, NflogSocket, PROTOCOL_TCP, PROTOCOL_UDP,
 };
+use crate::quarantine::Watch;
 
 /// Known hostname addresses, shared with planning and DNS inspection.
 pub type SharedHosts = Arc<Mutex<HostAddresses<SystemUpstreamResolver>>>;
@@ -39,6 +40,7 @@ pub fn spawn(
     directory: Arc<Directory>,
     hosts: SharedHosts,
     bus: EventBus,
+    mut quarantine: Option<Watch>,
 ) -> io::Result<JoinHandle<()>> {
     let mut socket = NflogSocket::bind(group)?;
     Ok(thread::spawn(move || {
@@ -48,6 +50,9 @@ pub fn spawn(
                 Ok(packets) => {
                     for packet in packets {
                         if let Some(event) = connection_event(&packet, &directory, &hosts) {
+                            if let Some(watch) = &mut quarantine {
+                                watch.observe(&event, &directory);
+                            }
                             bus.publish(&Event::Connection(event));
                         }
                     }
@@ -71,8 +76,8 @@ pub fn spawn(
     }))
 }
 
-/// Verdict and reason of a log prefix.
-fn parse_prefix(prefix: &str) -> Option<(Verdict, Reason)> {
+/// Verdict and reason of a log prefix, and what a `limit` was about.
+fn parse_prefix(prefix: &str) -> Option<(Verdict, Reason, Option<&str>)> {
     let mut parts = prefix.split(':');
     if parts.next()? != LOG_PREFIX {
         return None;
@@ -89,9 +94,10 @@ fn parse_prefix(prefix: &str) -> Option<(Verdict, Reason)> {
         "icc" => Reason::Icc,
         "source" => Reason::Source,
         "frame" => Reason::Frame,
+        "limit" => Reason::Limit,
         _ => return None,
     };
-    Some((verdict, reason))
+    Some((verdict, reason, parts.next()))
 }
 
 const ETHER_TYPE_IPV4: u16 = 0x0800;
@@ -131,7 +137,7 @@ fn connection_event(
     directory: &Directory,
     hosts: &SharedHosts,
 ) -> Option<Connection> {
-    let Some((verdict, reason)) = parse_prefix(&packet.prefix) else {
+    let Some((verdict, reason, limit)) = parse_prefix(&packet.prefix) else {
         debug!(prefix = %packet.prefix, "ignoring packet with an unknown log prefix");
         return None;
     };
@@ -184,6 +190,17 @@ fn connection_event(
     match reason {
         Reason::Source => attribute_spoofed(&mut event, packet, &payload, directory),
         Reason::Frame => attribute_frame(&mut event, packet, &payload, directory),
+        Reason::Limit => {
+            attribute_sender(&mut event, packet, directory);
+            event.detail = Some(
+                if limit == Some("rate") {
+                    "opens new connections faster than its limit"
+                } else {
+                    "has as many connections open as its limit allows"
+                }
+                .to_string(),
+            );
+        }
         _ => {
             if let Some(info) = event.source.and_then(|source| directory.source(source)) {
                 event.container = Some(info.container);
@@ -405,15 +422,19 @@ mod tests {
     fn parses_prefixes() {
         assert_eq!(
             parse_prefix("pc:d:egress"),
-            Some((Verdict::Denied, Reason::Egress))
+            Some((Verdict::Denied, Reason::Egress, None))
         );
         assert_eq!(
             parse_prefix("pc:w:icc"),
-            Some((Verdict::WouldDeny, Reason::Icc))
+            Some((Verdict::WouldDeny, Reason::Icc, None))
         );
         assert_eq!(
             parse_prefix("pc:a:dns"),
-            Some((Verdict::Allowed, Reason::Dns))
+            Some((Verdict::Allowed, Reason::Dns, None))
+        );
+        assert_eq!(
+            parse_prefix("pc:d:limit:rate"),
+            Some((Verdict::Denied, Reason::Limit, Some("rate")))
         );
         assert_eq!(parse_prefix("other:d:egress"), None);
         assert_eq!(parse_prefix("pc:x:egress"), None);

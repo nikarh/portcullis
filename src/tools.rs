@@ -136,7 +136,7 @@ impl Report {
             Reason::Dns => {
                 findings.dns.extend(connection.destination);
             }
-            Reason::Source | Reason::Frame => {
+            Reason::Source | Reason::Frame | Reason::Limit => {
                 let detail = connection.detail.clone().unwrap_or_else(|| {
                     format!("sent {} it isn't allowed to send", connection.protocol)
                 });
