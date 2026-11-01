@@ -9,10 +9,11 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use crossbeam_channel::Sender;
 use hickory_proto::op::Message;
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::directory::{Directory, SourceInfo};
 use crate::dns::{HostAddresses, SystemUpstreamResolver};
@@ -22,29 +23,27 @@ use crate::events::{
 use crate::firewall::LOG_PREFIX;
 use crate::model::MacAddress;
 use crate::nfnetlink::{
-    ArpPacket, Ipv4Packet, LoggedPacket, NflogSocket, PROTOCOL_TCP, PROTOCOL_UDP,
+    ArpPacket, Ipv4Packet, LoggedPacket, NflogSocket, Overruns, PROTOCOL_TCP, PROTOCOL_UDP,
+    is_overrun,
 };
 use crate::quarantine::Watch;
 
 /// Known hostname addresses, shared with planning and DNS inspection.
 pub type SharedHosts = Arc<Mutex<HostAddresses<SystemUpstreamResolver>>>;
 
-/// `ENOBUFS`: the kernel dropped messages because the socket's buffer was full.
-const ENOBUFS: i32 = 105;
-/// At most one "events lost" warning per interval.
-const LOST_WARNING_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Start reading logged decisions from NFLOG `group`.
+/// Start reading logged decisions from NFLOG `group`. If reading fails for good, the
+/// thread says why on `failed` and ends.
 pub fn spawn(
     group: u16,
     directory: Arc<Directory>,
     hosts: SharedHosts,
     bus: EventBus,
     mut quarantine: Option<Watch>,
+    failed: Sender<String>,
 ) -> io::Result<JoinHandle<()>> {
     let mut socket = NflogSocket::bind(group)?;
     Ok(thread::spawn(move || {
-        let mut last_lost: Option<Instant> = None;
+        let mut overruns = Overruns::default();
         loop {
             match socket.receive() {
                 Ok(packets) => {
@@ -57,9 +56,8 @@ pub fn spawn(
                         }
                     }
                 }
-                Err(error) if error.raw_os_error() == Some(ENOBUFS) => {
-                    if last_lost.is_none_or(|at| at.elapsed() >= LOST_WARNING_INTERVAL) {
-                        last_lost = Some(Instant::now());
+                Err(error) if is_overrun(&error) => {
+                    if overruns.report() {
                         bus.publish(&Event::Warning(Warning {
                             kind: WarningKind::EventsLost,
                             container: None,
@@ -68,7 +66,7 @@ pub fn spawn(
                     }
                 }
                 Err(error) => {
-                    error!(%error, "reading logged connections failed; connection events stop");
+                    let _ = failed.send(format!("reading logged connections failed: {error}"));
                     return;
                 }
             }

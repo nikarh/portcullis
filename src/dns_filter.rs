@@ -16,28 +16,46 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Sender;
 use hickory_proto::op::{Message, MessageType};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::directory::Directory;
 use crate::dns::{domain_matches, normalize};
 use crate::events::{Connection, Event, EventBus, Reason, Verdict};
 use crate::firewall::{DNS_ALLOWED_MARK, DNS_DENIED_MARK};
-use crate::nfnetlink::{Ipv4Packet, NfqueueSocket, PROTOCOL_TCP, PROTOCOL_UDP, QueueVerdict};
+use crate::nfnetlink::{
+    Ipv4Packet, NfqueueSocket, Overruns, PROTOCOL_TCP, PROTOCOL_UDP, QueueVerdict, is_overrun,
+};
 
 /// The same denied name of the same container is reported at most once per interval.
 const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Start checking DNS queries held in NFQUEUE `queue`.
-pub fn spawn(queue: u16, directory: Arc<Directory>, bus: EventBus) -> io::Result<JoinHandle<()>> {
+/// Start checking DNS queries held in NFQUEUE `queue`. If reading fails for good, the
+/// thread says why on `failed` and ends.
+pub fn spawn(
+    queue: u16,
+    directory: Arc<Directory>,
+    bus: EventBus,
+    failed: Sender<String>,
+) -> io::Result<JoinHandle<()>> {
     let mut socket = NfqueueSocket::bind(queue)?;
     Ok(thread::spawn(move || {
         let mut reported: HashMap<(IpAddr, String), Instant> = HashMap::new();
+        let mut overruns = Overruns::default();
         loop {
             let packets = match socket.receive() {
                 Ok(packets) => packets,
+                Err(error) if is_overrun(&error) => {
+                    if overruns.report() {
+                        warn!(
+                            "DNS queries came faster than they could be checked; the kernel dropped some, and those lookups are retried or fail"
+                        );
+                    }
+                    continue;
+                }
                 Err(error) => {
-                    error!(%error, "reading held DNS queries failed; lookups of containers with portcullis.domains labels fail from now on");
+                    let _ = failed.send(format!("reading held DNS queries failed: {error}"));
                     return;
                 }
             };

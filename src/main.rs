@@ -166,6 +166,8 @@ enum MainError {
     SourceHold(std::io::Error),
     #[error("{0}")]
     Tool(std::io::Error),
+    #[error("{0}; stopping, for the service manager to start Portcullis again")]
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -648,6 +650,7 @@ fn publish_warnings<A: docker::DockerApi>(monitor: &mut DockerMonitor<A>, bus: &
 #[allow(clippy::too_many_lines)]
 fn run(config: &Config) -> Result<(), MainError> {
     logging::init_logging(config.log_level, config.log_format)?;
+    exit_on_panic();
     info!(
         docker_socket = %config.docker_socket,
         monitor = config.monitor,
@@ -691,6 +694,8 @@ fn run(config: &Config) -> Result<(), MainError> {
         config.hostname_hold,
     )));
     let (misbehaviour_tx, misbehaviour_rx) = unbounded::<quarantine::Misbehaviour>();
+    // Threads that read the kernel's queues and logs say here when they can't go on.
+    let (failed_tx, failed_rx) = unbounded::<String>();
     connection_log::spawn(
         NFLOG_GROUP,
         Arc::clone(&directory),
@@ -698,10 +703,16 @@ fn run(config: &Config) -> Result<(), MainError> {
         bus.clone(),
         (config.quarantine != QuarantineMode::Off)
             .then(|| quarantine::Watch::new(misbehaviour_tx, config.quarantine_denials)),
+        failed_tx.clone(),
     )
     .map_err(MainError::ConnectionLog)?;
-    dns_filter::spawn(DNS_QUERY_QUEUE, Arc::clone(&directory), bus.clone())
-        .map_err(MainError::DnsInspection)?;
+    dns_filter::spawn(
+        DNS_QUERY_QUEUE,
+        Arc::clone(&directory),
+        bus.clone(),
+        failed_tx.clone(),
+    )
+    .map_err(MainError::DnsInspection)?;
     dns_inspect::spawn(
         DNS_QUEUE,
         config.log_allowed,
@@ -709,11 +720,17 @@ fn run(config: &Config) -> Result<(), MainError> {
         Arc::clone(&directory),
         Arc::clone(&hosts),
         bus.clone(),
+        failed_tx.clone(),
     )
     .map_err(MainError::DnsInspection)?;
 
-    let source_hold = source_hold::spawn(SOURCE_QUEUE, SOURCE_HOLD_GRACE, Arc::clone(&directory))
-        .map_err(MainError::SourceHold)?;
+    let source_hold = source_hold::spawn(
+        SOURCE_QUEUE,
+        SOURCE_HOLD_GRACE,
+        Arc::clone(&directory),
+        failed_tx,
+    )
+    .map_err(MainError::SourceHold)?;
 
     let mut applier = Applier {
         source_hold,
@@ -735,7 +752,9 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     // Ready: the rules are in place and their queues are read. Docker can start.
     systemd::notify("READY=1\nSTATUS=Waiting for Docker");
-    let Some((mut monitor, mut runtime_state)) = wait_for_docker(config, &terminate_rx) else {
+    let Some((mut monitor, mut runtime_state)) =
+        wait_for_docker(config, &terminate_rx, &failed_rx)?
+    else {
         return shut_down(config, &firewall);
     };
     systemd::notify("STATUS=Running");
@@ -749,12 +768,13 @@ fn run(config: &Config) -> Result<(), MainError> {
     let docker_thread =
         spawn_docker_event_worker(config.docker_socket.clone(), docker_tx, docker_stop_rx);
 
-    loop {
+    let outcome = loop {
         select! {
             recv(terminate_rx) -> _ => {
                 info!("termination signal received; cleanup will start now");
-                break;
+                break Ok(());
             }
+            recv(failed_rx) -> message => break Err(failure(message)),
             recv(misbehaviour_rx) -> message => {
                 if let Ok(misbehaviour) = message {
                     quarantine_container(
@@ -768,7 +788,7 @@ fn run(config: &Config) -> Result<(), MainError> {
             }
             recv(docker_rx) -> message => {
                 let Ok(message) = message else {
-                    break;
+                    break Ok(());
                 };
                 match message {
                     DockerWorkerEvent::Event(event) => {
@@ -830,11 +850,30 @@ fn run(config: &Config) -> Result<(), MainError> {
                 }
             }
         }
-    }
+    };
 
     let _ = docker_stop_tx.send(());
     let _ = docker_thread.join();
+    // A failure leaves the rules in place, whatever --on-exit says: Portcullis is about to
+    // be started again.
+    outcome?;
     shut_down(config, &firewall)
+}
+
+/// Why a thread Portcullis can't do without ended.
+fn failure(message: Result<String, crossbeam_channel::RecvError>) -> MainError {
+    MainError::Failed(
+        message.unwrap_or_else(|_| "the threads reading the kernel's queues ended".to_string()),
+    )
+}
+
+/// A panic anywhere stops Portcullis with an error, for its service manager to start it
+/// again: a thread that ended on its own would leave it running without part of its job.
+fn exit_on_panic() {
+    std::panic::set_hook(Box::new(|info| {
+        error!("{info}; stopping, for the service manager to start Portcullis again");
+        std::process::exit(101);
+    }));
 }
 
 /// Connect to Docker and read its state, retrying until it answers: Portcullis starts
@@ -842,7 +881,8 @@ fn run(config: &Config) -> Result<(), MainError> {
 fn wait_for_docker(
     config: &Config,
     terminate_rx: &Receiver<()>,
-) -> Option<(DockerMonitor<DockerClient>, RuntimeState)> {
+    failed_rx: &Receiver<String>,
+) -> Result<Option<(DockerMonitor<DockerClient>, RuntimeState)>, MainError> {
     const FIRST_RETRY: Duration = Duration::from_millis(250);
     const LAST_RETRY: Duration = Duration::from_secs(5);
     let mut retry = FIRST_RETRY;
@@ -859,7 +899,7 @@ fn wait_for_docker(
                 if waiting {
                     info!("Docker is up");
                 }
-                return Some(connected);
+                return Ok(Some(connected));
             }
             Err(error) if !waiting => {
                 waiting = true;
@@ -867,11 +907,10 @@ fn wait_for_docker(
             }
             Err(error) => debug!(%error, "Docker isn't up yet"),
         }
-        if !matches!(
-            terminate_rx.recv_timeout(retry),
-            Err(RecvTimeoutError::Timeout)
-        ) {
-            return None;
+        select! {
+            recv(terminate_rx) -> _ => return Ok(None),
+            recv(failed_rx) -> message => return Err(failure(message)),
+            default(retry) => {}
         }
         retry = (retry * 2).min(LAST_RETRY);
     }

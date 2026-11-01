@@ -17,16 +17,19 @@ use std::sync::{Arc, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Sender;
 use hickory_proto::op::{Message, MessageType};
 use hickory_proto::rr::RData;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
 use crate::dns::normalize;
 use crate::events::{Dns, Event, EventBus};
 use crate::firewall::{LogAllowed, NftablesFirewall};
-use crate::nfnetlink::{Ipv4Packet, NfqueueSocket, PROTOCOL_TCP, QueueVerdict};
+use crate::nfnetlink::{
+    Ipv4Packet, NfqueueSocket, Overruns, PROTOCOL_TCP, QueueVerdict, is_overrun,
+};
 
 /// Start inspecting DNS answers held in NFQUEUE `queue`. Answers are reported as events
 /// where allowed connections are (`log_allowed`).
@@ -37,14 +40,24 @@ pub fn spawn(
     directory: Arc<Directory>,
     hosts: SharedHosts,
     bus: EventBus,
+    failed: Sender<String>,
 ) -> io::Result<JoinHandle<()>> {
     let mut socket = NfqueueSocket::bind(queue)?;
     Ok(thread::spawn(move || {
+        let mut overruns = Overruns::default();
         loop {
             let packets = match socket.receive() {
                 Ok(packets) => packets,
+                Err(error) if is_overrun(&error) => {
+                    if overruns.report() {
+                        warn!(
+                            "DNS answers came faster than they could be inspected; the kernel dropped some, and those lookups are retried or fail"
+                        );
+                    }
+                    continue;
+                }
                 Err(error) => {
-                    error!(%error, "reading held DNS answers failed; DNS inspection stops");
+                    let _ = failed.send(format!("reading held DNS answers failed: {error}"));
                     return;
                 }
             };

@@ -573,6 +573,8 @@ fn accept(
             Ok(stream) => stream,
             Err(error) => {
                 warn!(%error, "failed to accept event stream client");
+                // Out of file descriptors, say: don't spin.
+                thread::sleep(Duration::from_millis(100));
                 continue;
             }
         };

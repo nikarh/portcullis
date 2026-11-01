@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
 
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_NETFILTER};
 use tracing::warn;
@@ -24,6 +25,8 @@ pub(crate) const NLMSG_ERROR: u16 = 2;
 pub(crate) const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLA_TYPE_MASK: u16 = 0x3fff;
+/// `ENOBUFS`: the kernel dropped messages because the socket's buffer was full.
+const ENOBUFS: i32 = 105;
 
 const NFNL_SUBSYS_QUEUE: u16 = 3;
 const NFNL_SUBSYS_ULOG: u16 = 4;
@@ -191,6 +194,36 @@ impl NetfilterSocket {
         self.buffer.clear();
         self.socket.recv(&mut self.buffer, 0)?;
         Ok(())
+    }
+}
+
+/// Whether a read failed only because the kernel dropped messages that weren't read fast
+/// enough (`ENOBUFS`). Reading can go on: for NFLOG, those reports are lost; for NFQUEUE,
+/// the kernel dropped the packets instead of holding them, as with a full queue.
+pub fn is_overrun(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ENOBUFS)
+}
+
+/// Reports overruns at most once a minute.
+#[derive(Debug, Default)]
+pub struct Overruns {
+    last: Option<Instant>,
+}
+
+impl Overruns {
+    const INTERVAL: Duration = Duration::from_secs(60);
+
+    /// An overrun happened: whether to report it.
+    pub fn report(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last
+            .is_some_and(|at| now.duration_since(at) < Self::INTERVAL)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
     }
 }
 

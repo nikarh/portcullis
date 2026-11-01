@@ -22,12 +22,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{RecvTimeoutError, Sender, unbounded};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::directory::Directory;
 use crate::firewall::HOLD_EXPIRED_MARK;
 use crate::model::MacAddress;
-use crate::nfnetlink::{ArpPacket, Ipv4Packet, NfqueueSocket, QueueVerdict};
+use crate::nfnetlink::{ArpPacket, Ipv4Packet, NfqueueSocket, Overruns, QueueVerdict, is_overrun};
 
 /// Longest wait when nothing is held.
 const IDLE_WAIT: Duration = Duration::from_secs(3600);
@@ -55,8 +55,14 @@ impl SourceHold {
     }
 }
 
-/// Start holding packets queued in NFQUEUE `queue`, for at most `grace` each.
-pub fn spawn(queue: u16, grace: Duration, directory: Arc<Directory>) -> io::Result<SourceHold> {
+/// Start holding packets queued in NFQUEUE `queue`, for at most `grace` each. If reading
+/// fails for good, the reading thread says why on `failed` and ends.
+pub fn spawn(
+    queue: u16,
+    grace: Duration,
+    directory: Arc<Directory>,
+    failed: Sender<String>,
+) -> io::Result<SourceHold> {
     let mut socket = NfqueueSocket::bind(queue)?;
     let writer = socket.verdict_writer()?;
     let pending = Arc::new(Mutex::new(Vec::<Held>::new()));
@@ -65,11 +71,22 @@ pub fn spawn(queue: u16, grace: Duration, directory: Arc<Directory>) -> io::Resu
     let receiving = Arc::clone(&pending);
     let wake_on_packet = wake.clone();
     thread::spawn(move || {
+        let mut overruns = Overruns::default();
         loop {
             let packets = match socket.receive() {
                 Ok(packets) => packets,
+                Err(error) if is_overrun(&error) => {
+                    if overruns.report() {
+                        warn!(
+                            "packets of new containers came faster than they could be held; the kernel dropped some"
+                        );
+                    }
+                    continue;
+                }
                 Err(error) => {
-                    error!(%error, "reading held packets failed; packets from unknown sources are dropped from now on");
+                    let _ = failed.send(format!(
+                        "reading held packets of new containers failed: {error}"
+                    ));
                     return;
                 }
             };
