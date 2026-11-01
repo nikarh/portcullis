@@ -290,14 +290,56 @@ DNS labels control:
 - which resolvers a container may query directly: the host's, specific addresses, any, or none;
 - which resolvers Docker's DNS may forward to, for a container with its own DNS servers (`dns:`).
 
-They can't control:
+On their own, they can't control:
 
-- lookups Docker's DNS forwards from the host, for a container with neither its own DNS servers nor daemon-wide ones (Docker 29). No container policy applies there, so such a container can always resolve outside names. To restrict name resolution, set `dns` daemon-wide or on the container, and allow only those servers.
-- names of other containers and services. Docker's DNS answers them inside the container, so they always resolve.
-- which names are looked up. Rules allow or deny resolvers by address, not by domain: a container that may use a resolver can resolve any name through it. A compromised container can use that to send data out, encoded in the names it looks up, to whoever runs the DNS servers of a domain it chose, through any resolver it may use, Docker's included. Portcullis reports the lookups it sees (`dns` events, with `--log-allowed`), but doesn't stop them.
+- which names are looked up. Rules allow or deny resolvers by address, not by name: a container that may use a resolver can resolve any name through it. [Limiting the names a container can look up](#limiting-the-names-a-container-can-look-up) closes this, and the two items after it.
 - what a container sends to port 53. The DNS labels allow traffic to that port, whether or not it is DNS. With `portcullis.dns.x=*`, a container can reach port 53 of any address on the internet, which works as a tunnel to anywhere.
 - what a resolver answers. A container that may use a resolver someone else controls (or `*`) can be told any address for any name, and its `host:` rules then allow that address. Only other containers' rules are safe from it.
+- lookups Docker's DNS forwards from the host, for a container with neither its own DNS servers nor daemon-wide ones (Docker 29). No container policy applies there, so such a container can always resolve outside names. To restrict name resolution, set `dns` daemon-wide or on the container, and allow only those servers.
+- names of other containers and services. Docker's DNS answers them inside the container, so they always resolve.
 - DNS over TLS or HTTPS. That's ordinary traffic on ports 853 and 443, controlled by egress labels, not DNS labels.
+
+#### How DNS gets abused
+
+A container may only connect where its labels allow, yet looking up a name works everywhere: the resolver it may use asks whoever is in charge of that name, on its behalf. That makes DNS a way out for a compromised container, even with no egress labels at all:
+
+- Sending data out. Someone registers `evil.example` and runs its DNS server. The container looks up `c2VjcmV0cw.0.evil.example`, `cGFzc3dvcmQ.1.evil.example` and so on: each name carries a few dozen bytes of whatever it wants to leak, encoded. The resolver dutifully asks the server of `evil.example`, which writes the names down. Nothing ever connects to `evil.example`, so no egress rule is involved.
+- Receiving commands. The answers come back: a `TXT` record holds text of the server's choosing, an `A` record four bytes. Tools such as `iodine` and `dnscat2` build a two-way tunnel, and with it a shell, out of nothing but lookups.
+- Tunnelling through port 53. With `portcullis.dns.x=*`, the container doesn't even need DNS: any server on the internet listening on port 53 is reachable, whatever is sent to it.
+- Steering `host:` rules. A resolver the container may use and someone else controls can answer `api.stripe.com` with any address, and the container's `host:` rule for `api.stripe.com` then allows that address.
+
+Every packet of this follows the network policy: the container only talks to a resolver it may use, on port 53. That's why only the names can tell it apart.
+
+#### Limiting the names a container can look up
+
+A container with `portcullis.domains` labels may only look up the names they list:
+
+```text
+portcullis.domains.<name>=<domain>[,<domain>...]
+```
+
+A domain is a name (`api.stripe.com`), or a name with `*.` in front for any name below it (`*.stripe.com` allows `api.stripe.com` and `a.b.stripe.com`, not `stripe.com`). Names of the container's `host:` rules are always allowed too.
+
+```yaml
+labels:
+  - portcullis.egress.stripe=host:api.stripe.com,tcp:443
+  - portcullis.domains.github=*.github.com,github.com
+```
+
+Lookups of any other name fail at once (Docker's DNS answers `SERVFAIL`), and are reported as denied `dns` events naming the query. So is anything sent to port 53 that isn't a DNS query.
+
+How it works: the firewall holds each DNS query of such a container until Portcullis has read the names it asks for. An allowed query continues to the resolver unchanged, and the resolver rules still apply to it; Portcullis never answers or changes queries. This closes all of [How DNS gets abused](#how-dns-gets-abused) for names outside the list, since a server for those names never hears from the container.
+
+What it costs, and what it needs:
+
+- Every lookup of the container waits for a round trip through Portcullis, a small delay next to the lookup itself. Containers without the labels aren't affected at all.
+- While Portcullis isn't running, the container's lookups fail, rather than go unchecked.
+- The list has to be complete. Applications look up more names than one might think: other services they call, CDNs behind them (`*.cloudfront.net`), telemetry, update checks, and the host's search domains (a lookup of `api` may first be tried as `api.corp.example`). Run with the labels on a monitor network first: queries outside the list are reported as `would_deny`, and nothing fails.
+- It only sees lookups that leave the container's network: Docker's DNS has to forward them from the container's address (see [DNS visibility](#dns-visibility)). Without a `dns` setting daemon-wide or on the container, Docker 29 resolves outside names from the host, where no limit applies.
+- It can't help with names you allow: a compromised container can still send data through lookups of names whose servers are controlled by someone else, such as a domain anyone can create records under. List exact names rather than wide patterns where you can.
+- A DNS message over TCP split across segments can't be read, and is denied.
+
+Without the labels, a compromised container can use DNS as described above, to anyone it wants, through any resolver it may use. That is the default, as it is without Portcullis.
 
 #### DNS visibility
 
@@ -465,7 +507,7 @@ labels:
 - If a hostname has no known addresses, its rules allow nothing until a container looks it up or Portcullis can resolve it. Everything else is applied as usual. Portcullis retries its own lookup every 30 seconds.
 - Domains on events are best effort. They are missing for containers whose DNS lookups Portcullis can't see, for connections to addresses obtained some other way, and for HTTPS hostnames (TLS SNI), which Portcullis doesn't look at.
 - DNS answers over TCP that span more than one packet aren't inspected; they still reach the container.
-- Portcullis uses NFLOG group 4242 and NFQUEUE 4242 and 4243. Other software on the host must not use the same numbers.
+- Portcullis uses NFLOG group 4242 and NFQUEUE 4242, 4243 and 4244, and packet marks 0x70630001 to 0x70630003. Other software on the host must not use the same numbers.
 - Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.enable` value on a network enforces it. An enforced network without a usable subnet is logged and not enforced.
 - While Portcullis isn't running, its last rules stay in force (by default) but nothing is updated or reported, see [Stopping and removing Portcullis](#stopping-and-removing-portcullis). With `--on-exit remove`, containers are unrestricted while it isn't running.
 
