@@ -34,6 +34,8 @@ pub struct SourceInfo {
 struct Snapshot {
     sources: HashMap<IpAddr, SourceInfo>,
     by_mac: HashMap<MacAddress, (IpAddr, SourceInfo)>,
+    /// Interface index of a bridge port to the container behind it.
+    by_port: HashMap<u32, (IpAddr, SourceInfo)>,
     /// Bridge name to network name.
     bridges: HashMap<String, String>,
     /// Hostnames of each source's `host:` rules.
@@ -62,6 +64,11 @@ impl Directory {
             };
             if let Some(mac) = source.mac {
                 snapshot.by_mac.insert(mac, (source.address, info.clone()));
+            }
+            if let Some(port) = info.port {
+                snapshot
+                    .by_port
+                    .insert(port, (source.address, info.clone()));
             }
             snapshot.sources.insert(source.address, info);
             let mut hosts: Vec<String> = plan
@@ -119,6 +126,13 @@ impl Directory {
     #[must_use]
     pub fn by_mac(&self, mac: MacAddress) -> Option<(IpAddr, SourceInfo)> {
         self.read().by_mac.get(&mac).cloned()
+    }
+
+    /// The container behind a bridge port, given the port's interface index, with its
+    /// address.
+    #[must_use]
+    pub fn by_port(&self, index: u32) -> Option<(IpAddr, SourceInfo)> {
+        self.read().by_port.get(&index).cloned()
     }
 
     /// The network served by the bridge a packet came in on, given the interface index of

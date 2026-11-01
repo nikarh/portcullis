@@ -54,8 +54,10 @@ pub enum Reason {
     Dns,
     /// Traffic to a container on the same network, decided by `portcullis.icc.*`.
     Icc,
-    /// A source address that doesn't belong to the container sending it.
+    /// A source address or MAC that doesn't belong to the container sending it.
     Source,
+    /// A kind of frame enforced networks don't carry: IPv6, VLAN-tagged, or not IP at all.
+    Frame,
 }
 
 /// Where a connection's domain comes from.
@@ -75,10 +77,13 @@ pub struct Connection {
     /// The container that sent the traffic, if known.
     pub container: Option<String>,
     pub network: Option<String>,
+    /// `tcp`, `udp`, `icmp` or another IP protocol number; for frames that aren't IPv4,
+    /// `arp`, `ipv6` or the ether type.
     pub protocol: String,
-    pub source: IpAddr,
+    /// The source address the packet claims; none for frames without one.
+    pub source: Option<IpAddr>,
     pub source_port: Option<u16>,
-    pub destination: IpAddr,
+    pub destination: Option<IpAddr>,
     pub destination_port: Option<u16>,
     /// The container at the destination, for traffic between containers.
     pub destination_container: Option<String>,
@@ -180,7 +185,8 @@ impl Event {
                     .clone()
                     .or_else(|| connection.domain.clone())
                     .or_else(|| connection.query.clone())
-                    .unwrap_or_else(|| connection.destination.to_string());
+                    .or_else(|| connection.destination.map(|address| address.to_string()))
+                    .unwrap_or_default();
                 Some(format!(
                     "connection {} {:?} {} {}/{}",
                     connection.container.as_deref().unwrap_or("?"),
@@ -368,20 +374,24 @@ fn write_connection(line: &mut String, connection: &Connection) -> std::fmt::Res
         Reason::Dns => "dns",
         Reason::Icc => "icc",
         Reason::Source => "source",
+        Reason::Frame => "frame",
     };
+    let address =
+        |address: Option<IpAddr>| address.map_or_else(|| "-".to_string(), |a| a.to_string());
+    let destination = address(connection.destination);
     write!(
         line,
         "{verdict} {reason} {} {}",
         connection.container.as_deref().unwrap_or("?"),
-        connection.source
+        address(connection.source)
     )?;
     write!(line, " -> ")?;
     if let Some(container) = &connection.destination_container {
-        write!(line, "{container} ({})", connection.destination)?;
+        write!(line, "{container} ({destination})")?;
     } else if let Some(domain) = &connection.domain {
-        write!(line, "{domain} ({})", connection.destination)?;
+        write!(line, "{domain} ({destination})")?;
     } else {
-        write!(line, "{}", connection.destination)?;
+        write!(line, "{destination}")?;
     }
     match connection.destination_port {
         Some(port) => write!(line, " {}/{port}", connection.protocol)?,
@@ -630,9 +640,9 @@ mod tests {
             container: Some("web".to_string()),
             network: Some("backend".to_string()),
             protocol: "tcp".to_string(),
-            source: "172.18.0.2".parse().expect("ip"),
+            source: Some("172.18.0.2".parse().expect("ip")),
             source_port: Some(40000),
-            destination: "104.18.3.4".parse().expect("ip"),
+            destination: Some("104.18.3.4".parse().expect("ip")),
             destination_port: Some(port),
             destination_container: None,
             domain: Some("api.stripe.com".to_string()),

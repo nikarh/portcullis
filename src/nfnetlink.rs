@@ -41,11 +41,14 @@ const NFULNL_CFG_CMD_BIND: u8 = 1;
 const NFULNL_CFG_CMD_PF_BIND: u8 = 3;
 const NFULNL_CFG_CMD_PF_UNBIND: u8 = 4;
 const NFULNL_COPY_PACKET: u8 = 2;
+const NFULA_PACKET_HDR: u16 = 1;
 const NFULA_IFINDEX_INDEV: u16 = 4;
 const NFULA_IFINDEX_PHYSINDEV: u16 = 6;
 const NFULA_HWADDR: u16 = 8;
 const NFULA_PAYLOAD: u16 = 9;
 const NFULA_PREFIX: u16 = 10;
+const NFULA_HWHEADER: u16 = 16;
+const NFULA_VLAN: u16 = 20;
 
 // nfnetlink_queue
 const NFQNL_MSG_PACKET: u16 = 0;
@@ -111,7 +114,13 @@ pub struct LoggedPacket {
     pub physindev: Option<u32>,
     /// Source MAC address of the frame.
     pub hwaddr: Option<MacAddress>,
-    /// The packet, starting at the IP header.
+    /// Destination MAC address of the frame, for traffic coming from a bridge port.
+    pub destination_mac: Option<MacAddress>,
+    /// Ether type of the packet, such as 0x0800 for IPv4 or 0x0806 for ARP.
+    pub protocol: Option<u16>,
+    /// The frame had a VLAN tag.
+    pub vlan: bool,
+    /// The packet, starting at the IP (or ARP) header.
     pub payload: Vec<u8>,
 }
 
@@ -311,6 +320,21 @@ fn parse_logged(buffer: &[u8]) -> Vec<LoggedPacket> {
                     NFULA_IFINDEX_PHYSINDEV => packet.physindev = be_u32(value),
                     NFULA_HWADDR => packet.hwaddr = hardware_address(value),
                     NFULA_PAYLOAD => packet.payload = value.to_vec(),
+                    // `struct nfulnl_msg_packet_hdr`: big-endian ether type, hook, padding.
+                    NFULA_PACKET_HDR => {
+                        packet.protocol = value
+                            .get(..2)
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .map(u16::from_be_bytes);
+                    }
+                    // The Ethernet header: destination MAC first.
+                    NFULA_HWHEADER => {
+                        packet.destination_mac = value
+                            .get(..6)
+                            .and_then(|bytes| <[u8; 6]>::try_from(bytes).ok())
+                            .map(MacAddress::from);
+                    }
+                    NFULA_VLAN => packet.vlan = true,
                     _ => {}
                 }
             }
@@ -636,6 +660,14 @@ pub mod tests {
         attributes.extend(attribute(NFULA_PREFIX, b"pc:d:egress\0"));
         attributes.extend(attribute(NFULA_IFINDEX_INDEV, &7_u32.to_be_bytes()));
         attributes.extend(attribute(NFULA_HWADDR, &hwaddr));
+        attributes.extend(attribute(NFULA_PACKET_HDR, &[0x08, 0x00, 1, 0]));
+        attributes.extend(attribute(
+            NFULA_HWHEADER,
+            &[
+                1, 0x80, 0xc2, 0, 0, 0x0e, 2, 0x42, 0xac, 0x12, 0, 2, 0x08, 0,
+            ],
+        ));
+        attributes.extend(attribute(NFULA_VLAN, &[]));
         attributes.extend(attribute(NFULA_PAYLOAD, &payload));
         let mut buffer = encode(
             (NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_PACKET,
@@ -665,10 +697,15 @@ pub mod tests {
             Some("02:42:ac:12:00:02")
         );
         assert_eq!(first.payload, payload);
+        assert_eq!(first.protocol, Some(0x0800));
         assert_eq!(
-            packets.get(1).map(|packet| packet.prefix.as_str()),
-            Some("pc:a:icc")
+            first.destination_mac.map(|mac| mac.to_string()).as_deref(),
+            Some("01:80:c2:00:00:0e")
         );
+        assert!(first.vlan);
+        let second = packets.get(1).expect("second");
+        assert_eq!(second.prefix, "pc:a:icc");
+        assert!(!second.vlan);
     }
 
     #[test]

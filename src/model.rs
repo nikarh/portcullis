@@ -233,6 +233,11 @@ impl MacAddress {
     pub const fn new(octets: [u8; 6]) -> Self {
         Self(octets)
     }
+
+    #[must_use]
+    pub const fn octets(self) -> [u8; 6] {
+        self.0
+    }
 }
 
 impl From<[u8; 6]> for MacAddress {

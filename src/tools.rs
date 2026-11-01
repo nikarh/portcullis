@@ -103,7 +103,10 @@ impl Report {
         let container = connection
             .container
             .clone()
-            .unwrap_or_else(|| format!("unknown container at {}", connection.source));
+            .unwrap_or_else(|| match connection.source {
+                Some(source) => format!("unknown container at {source}"),
+                None => "unknown container".to_string(),
+            });
         let findings = self.containers.entry(container).or_default();
         findings.count += 1;
         let port = || {
@@ -113,10 +116,11 @@ impl Report {
         };
         match connection.reason {
             Reason::Egress => {
-                let target = connection.domain.as_ref().map_or_else(
-                    || format!("ip:{}", connection.destination),
-                    |domain| format!("host:{domain}"),
-                );
+                let target = match (&connection.domain, connection.destination) {
+                    (Some(domain), _) => format!("host:{domain}"),
+                    (None, Some(destination)) => format!("ip:{destination}"),
+                    (None, None) => return,
+                };
                 findings.egress.entry(target).or_default().extend(port());
             }
             Reason::Icc => match &connection.destination_container {
@@ -126,19 +130,17 @@ impl Report {
                     .or_default()
                     .extend(port()),
                 None => {
-                    findings.icc_unknown.insert(connection.destination);
+                    findings.icc_unknown.extend(connection.destination);
                 }
             },
             Reason::Dns => {
-                findings.dns.insert(connection.destination);
+                findings.dns.extend(connection.destination);
             }
-            Reason::Source => {
-                findings.spoofed.insert(
-                    connection
-                        .detail
-                        .clone()
-                        .unwrap_or_else(|| format!("sent from {}", connection.source)),
-                );
+            Reason::Source | Reason::Frame => {
+                let detail = connection.detail.clone().unwrap_or_else(|| {
+                    format!("sent {} it isn't allowed to send", connection.protocol)
+                });
+                findings.spoofed.insert(detail);
             }
         }
     }
