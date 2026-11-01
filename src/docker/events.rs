@@ -69,22 +69,35 @@ impl DockerEvent {
 #[derive(Debug)]
 pub struct DockerEventClient {
     reader: BufReader<UnixStream>,
+    /// The part of a line read so far: a read can time out in the middle of one.
+    line: Vec<u8>,
 }
 
 impl DockerEventClient {
-    pub fn connect(socket: &str) -> Result<Self, DockerError> {
+    /// Subscribe to events from `since` (Unix time, in seconds) on, or from now on.
+    /// Docker replays the events since then that it still remembers.
+    pub fn connect(socket: &str, since: Option<i64>) -> Result<Self, DockerError> {
         let socket_path = normalize_socket_path(socket);
-        let reader = connect_subscribed_reader(&socket_path)?;
-        Ok(Self { reader })
+        let since = match since {
+            Some(since) => since,
+            None => current_unix_epoch_seconds()?,
+        };
+        let reader = connect_subscribed_reader(&socket_path, since)?;
+        Ok(Self {
+            reader,
+            line: Vec::new(),
+        })
     }
 
     pub fn next_event(&mut self) -> Result<Option<DockerEvent>, DockerError> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
+        match self.reader.read_until(b'\n', &mut self.line) {
             Ok(0) => Err(DockerError::ServiceState(
                 "docker event stream closed".to_string(),
             )),
-            Ok(_) => parse_event_line(&line),
+            Ok(_) => {
+                let line = std::mem::take(&mut self.line);
+                parse_event_line(&String::from_utf8_lossy(&line))
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -98,14 +111,16 @@ impl DockerEventClient {
     }
 }
 
-fn connect_subscribed_reader(socket_path: &str) -> Result<BufReader<UnixStream>, DockerError> {
+fn connect_subscribed_reader(
+    socket_path: &str,
+    since: i64,
+) -> Result<BufReader<UnixStream>, DockerError> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|error| DockerError::ServiceState(error.to_string()))?;
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|error| DockerError::ServiceState(error.to_string()))?;
 
-    let since = current_unix_epoch_seconds()?;
     let path = build_events_path(since)?;
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
@@ -137,7 +152,7 @@ fn connect_subscribed_reader(socket_path: &str) -> Result<BufReader<UnixStream>,
     Ok(reader)
 }
 
-fn current_unix_epoch_seconds() -> Result<i64, DockerError> {
+pub fn current_unix_epoch_seconds() -> Result<i64, DockerError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| DockerError::ServiceState(error.to_string()))?;
@@ -310,5 +325,24 @@ mod tests {
         assert!(path.contains("%22event%22"));
         assert!(path.contains("connect"));
         assert!(path.contains("disconnect"));
+    }
+
+    #[test]
+    fn keeps_a_line_that_arrives_in_parts() {
+        let (stream, mut docker) = UnixStream::pair().expect("pair");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("timeout");
+        let mut client = DockerEventClient {
+            reader: BufReader::new(stream),
+            line: Vec::new(),
+        };
+        let line = "{\"Type\":\"container\",\"Action\":\"start\",\"Actor\":{\"ID\":\"abc\"}}\n";
+        let (first, rest) = line.split_at(20);
+        docker.write_all(first.as_bytes()).expect("write");
+        assert!(matches!(client.next_event(), Ok(None)));
+        docker.write_all(rest.as_bytes()).expect("write");
+        let event = client.next_event().expect("event");
+        assert_eq!(event.map(|event| event.id), Some("abc".to_string()));
     }
 }

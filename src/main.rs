@@ -374,55 +374,55 @@ fn sleep_or_stop(stop_rx: &Receiver<()>, duration: Duration) -> bool {
     }
 }
 
+/// Read Docker's events from `since` on (when the state was read), and send them on
+/// `event_tx`. After the stream fails, events may have been missed: once it is back,
+/// `Reconnected` says the state has to be read again.
 fn spawn_docker_event_worker(
     docker_socket: String,
+    since: Option<i64>,
     event_tx: Sender<DockerWorkerEvent>,
     stop_rx: Receiver<()>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut event_client = loop {
-            if stop_requested(&stop_rx) {
-                return;
-            }
-            match DockerEventClient::connect(&docker_socket) {
-                Ok(client) => break client,
-                Err(error) => {
-                    error!(%error, "docker event stream connect failed; retrying");
-                    if sleep_or_stop(&stop_rx, Duration::from_secs(1)) {
-                        return;
-                    }
-                }
-            }
-        };
-
+        let mut since = since;
+        let mut missed = false;
         loop {
-            if stop_requested(&stop_rx) {
-                return;
-            }
-
-            match event_client.next_event() {
-                Ok(Some(event)) => {
-                    if event_tx.send(DockerWorkerEvent::Event(event)).is_err() {
-                        return;
-                    }
+            let mut event_client = loop {
+                if stop_requested(&stop_rx) {
+                    return;
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    error!(%error, "docker event stream failed");
-                    loop {
+                match DockerEventClient::connect(&docker_socket, since) {
+                    Ok(client) => break client,
+                    Err(error) => {
+                        error!(%error, "docker event stream connect failed; retrying");
+                        (since, missed) = (None, true);
                         if sleep_or_stop(&stop_rx, Duration::from_secs(1)) {
                             return;
                         }
-                        match DockerEventClient::connect(&docker_socket) {
-                            Ok(client) => {
-                                event_client = client;
-                                let _ = event_tx.send(DockerWorkerEvent::Reconnected);
-                                break;
-                            }
-                            Err(reconnect_error) => {
-                                error!(%reconnect_error, "docker event reconnect failed; retrying");
-                            }
+                    }
+                }
+            };
+            if missed && event_tx.send(DockerWorkerEvent::Reconnected).is_err() {
+                return;
+            }
+            loop {
+                if stop_requested(&stop_rx) {
+                    return;
+                }
+                match event_client.next_event() {
+                    Ok(Some(event)) => {
+                        if event_tx.send(DockerWorkerEvent::Event(event)).is_err() {
+                            return;
                         }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        error!(%error, "docker event stream failed");
+                        (since, missed) = (None, true);
+                        if sleep_or_stop(&stop_rx, Duration::from_secs(1)) {
+                            return;
+                        }
+                        break;
                     }
                 }
             }
@@ -752,7 +752,7 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     // Ready: the rules are in place and their queues are read. Docker can start.
     systemd::notify("READY=1\nSTATUS=Waiting for Docker");
-    let Some((mut monitor, mut runtime_state)) =
+    let Some((mut monitor, mut runtime_state, since)) =
         wait_for_docker(config, &terminate_rx, &failed_rx)?
     else {
         return shut_down(config, &firewall);
@@ -765,8 +765,14 @@ fn run(config: &Config) -> Result<(), MainError> {
     let (docker_tx, docker_rx) = unbounded::<DockerWorkerEvent>();
     let (docker_stop_tx, docker_stop_rx) = unbounded::<()>();
 
-    let docker_thread =
-        spawn_docker_event_worker(config.docker_socket.clone(), docker_tx, docker_stop_rx);
+    // Events from when the state was read on: a container started while the rules were
+    // being applied isn't missed.
+    let docker_thread = spawn_docker_event_worker(
+        config.docker_socket.clone(),
+        since,
+        docker_tx,
+        docker_stop_rx,
+    );
 
     let outcome = loop {
         select! {
@@ -876,23 +882,28 @@ fn exit_on_panic() {
     }));
 }
 
+/// Docker's state, and when it was read.
+type Connected = (DockerMonitor<DockerClient>, RuntimeState, Option<i64>);
+
 /// Connect to Docker and read its state, retrying until it answers: Portcullis starts
-/// before Docker when it runs as a service. `None` when Portcullis is asked to stop first.
+/// before Docker when it runs as a service. With the state, when it was read (see
+/// `DockerEventClient::connect`). `None` when Portcullis is asked to stop first.
 fn wait_for_docker(
     config: &Config,
     terminate_rx: &Receiver<()>,
     failed_rx: &Receiver<String>,
-) -> Result<Option<(DockerMonitor<DockerClient>, RuntimeState)>, MainError> {
+) -> Result<Option<Connected>, MainError> {
     const FIRST_RETRY: Duration = Duration::from_millis(250);
     const LAST_RETRY: Duration = Duration::from_secs(5);
     let mut retry = FIRST_RETRY;
     let mut waiting = false;
     loop {
+        let since = docker::events::current_unix_epoch_seconds().ok();
         let attempt = DockerClient::connect(&config.docker_socket)
             .map_err(MonitorError::from)
             .and_then(|client| {
                 let mut monitor = DockerMonitor::new(client);
-                monitor.initialize().map(|state| (monitor, state))
+                monitor.initialize().map(|state| (monitor, state, since))
             });
         match attempt {
             Ok(connected) => {
