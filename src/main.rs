@@ -67,6 +67,19 @@ struct Config {
     alert_interval: Duration,
     log_level: LogLevel,
     log_format: LogFormat,
+    on_exit: OnExit,
+}
+
+/// What happens to the firewall rules when Portcullis stops.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum OnExit {
+    /// Leave the last rules in place: containers stay restricted, and those that start
+    /// meanwhile on an enforced network can't send at all. `portcullis cleanup` removes
+    /// them.
+    #[default]
+    Keep,
+    /// Remove all rules: containers are unrestricted until Portcullis runs again.
+    Remove,
 }
 
 impl Default for Config {
@@ -82,6 +95,7 @@ impl Default for Config {
             alert_interval: Duration::from_secs(600),
             log_level: LogLevel::Info,
             log_format: LogFormat::Text,
+            on_exit: OnExit::Keep,
         }
     }
 }
@@ -94,6 +108,8 @@ enum MainError {
     InvalidDenyAction(String),
     #[error("invalid --log-allowed value: {0}")]
     InvalidLogAllowed(String),
+    #[error("invalid --on-exit value: {0}")]
+    InvalidOnExit(String),
     #[error("unexpected arguments: {0:?}")]
     UnexpectedArguments(Vec<OsString>),
     #[error("failed to initialize logging: {0}")]
@@ -134,6 +150,7 @@ fn main() {
     let result = match args.subcommand() {
         Ok(Some(command)) if command == "watch" => run_watch(args),
         Ok(Some(command)) if command == "audit" => run_audit(args),
+        Ok(Some(command)) if command == "cleanup" => run_cleanup(args),
         Ok(Some(command)) => Err(MainError::UnexpectedArguments(vec![command.into()])),
         Ok(None) => parse_config(args).and_then(|config| run(&config)),
         Err(error) => Err(error.into()),
@@ -156,6 +173,14 @@ fn run_audit(mut args: Arguments) -> Result<(), MainError> {
     let input = args.opt_free_from_str::<PathBuf>()?;
     finish(args)?;
     tools::audit(input.as_deref()).map_err(MainError::Tool)
+}
+
+/// Remove every rule Portcullis owns, for when it isn't going to run again.
+fn run_cleanup(args: Arguments) -> Result<(), MainError> {
+    finish(args)?;
+    NftablesFirewall::with_libnftables(Options::default())?.cleanup()?;
+    let _ = std::io::stdout().write_all(b"portcullis: firewall rules removed\n");
+    Ok(())
 }
 
 fn finish(args: Arguments) -> Result<(), MainError> {
@@ -203,6 +228,13 @@ fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
     if let Some(format) = args.opt_value_from_str::<_, String>("--log-format")? {
         config.log_format = LogFormat::from_str(&format)?;
     }
+    if let Some(value) = args.opt_value_from_str::<_, String>("--on-exit")? {
+        config.on_exit = match value.as_str() {
+            "keep" => OnExit::Keep,
+            "remove" => OnExit::Remove,
+            _ => return Err(MainError::InvalidOnExit(value)),
+        };
+    }
 
     finish(args)?;
     Ok(config)
@@ -219,6 +251,7 @@ USAGE:
                                        show live events of a running daemon
   portcullis audit [FILE]              summarize what containers tried that their labels
                                        don't allow, from JSON events (FILE or stdin)
+  portcullis cleanup                   remove all firewall rules Portcullis left in place
 
 OPTIONS:
   --docker-socket <path>       Docker API socket (default: /var/run/docker.sock)
@@ -241,6 +274,9 @@ OPTIONS:
   --log-format <text|json>     Format of events (stdout) and diagnostics (stderr)
                                (default: text)
   --log-level <level>          error, warn, info, debug or trace (default: info)
+  --on-exit <keep|remove>      Keep the firewall rules in place when stopping, or remove
+                               them (default: keep; remove them later with
+                               portcullis cleanup)
   -h, --help                   Show this help
 ";
     let _ = std::io::stdout().write_all(usage.as_bytes());
@@ -510,8 +546,12 @@ fn run(config: &Config) -> Result<(), MainError> {
         source_queue: Some(SOURCE_QUEUE),
     })?);
 
-    info!("performing startup firewall cleanup");
-    firewall.cleanup()?;
+    // The first update replaces whatever a previous run left, in the same step, so kept
+    // rules stay in force until then.
+    if config.on_exit == OnExit::Remove {
+        info!("performing startup firewall cleanup");
+        firewall.cleanup()?;
+    }
 
     let directory = Arc::new(Directory::default());
     let hosts: SharedHosts = Arc::new(Mutex::new(HostAddresses::new(
@@ -627,6 +667,10 @@ fn run(config: &Config) -> Result<(), MainError> {
     let _ = docker_stop_tx.send(());
     let _ = docker_thread.join();
 
+    if config.on_exit == OnExit::Keep {
+        info!("stopped; firewall rules stay in place (remove them with portcullis cleanup)");
+        return Ok(());
+    }
     info!("shutdown requested; cleaning up firewall rules");
     if let Err(error) = firewall.cleanup() {
         error!(%error, "shutdown cleanup failed");
@@ -669,6 +713,8 @@ mod tests {
                 "debug",
                 "--log-format",
                 "json",
+                "--on-exit",
+                "remove",
             ]
             .into_iter()
             .map(OsString::from)
@@ -687,6 +733,7 @@ mod tests {
                 alert_interval: Duration::from_secs(30),
                 log_level: LogLevel::Debug,
                 log_format: LogFormat::Json,
+                on_exit: OnExit::Remove,
             })
         );
     }

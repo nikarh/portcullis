@@ -64,15 +64,28 @@ teardown() {
   sed -i '/# portcullis-e2e$/d' /etc/hosts
 }
 
+# assert_cleaned_up <description>: neither table is left.
 assert_cleaned_up() {
   local leftovers=()
   nft list table inet portcullis >/dev/null 2>&1 && leftovers+=("inet table")
   nft list table bridge portcullis >/dev/null 2>&1 && leftovers+=("bridge table")
   if ((${#leftovers[@]})); then
-    fail "rules removed on shutdown (left behind: ${leftovers[*]})"
+    fail "$1 (left behind: ${leftovers[*]})"
   else
-    pass "rules removed on shutdown"
+    pass "$1"
   fi
+}
+
+# By default the rules stay when Portcullis stops, until `portcullis cleanup`.
+assert_kept_then_cleaned_up() {
+  if nft list table inet portcullis >/dev/null 2>&1 \
+    && nft list table bridge portcullis >/dev/null 2>&1; then
+    pass "rules kept on shutdown"
+  else
+    fail "rules kept on shutdown"
+  fi
+  "${PORTCULLIS_BIN}" cleanup >/dev/null || fail "portcullis cleanup failed"
+  assert_cleaned_up "portcullis cleanup removes the rules"
 }
 
 setup
@@ -83,17 +96,17 @@ if start_portcullis; then
     run_scenario "${scenario}"
   done
   stop_portcullis
-  assert_cleaned_up
+  assert_kept_then_cleaned_up
 fi
 
 log "deny action drop"
 DENY_ACTION=drop
-if start_portcullis; then
+if start_portcullis --on-exit remove; then
   for scenario in egress icc; do
     run_scenario "${scenario}"
   done
   stop_portcullis
-  assert_cleaned_up
+  assert_cleaned_up "rules removed on shutdown with --on-exit remove"
 fi
 DENY_ACTION=reject
 

@@ -16,7 +16,7 @@ The host needs `qemu-system-x86_64`, `genisoimage` (or `mkisofs`), `ssh`, `rsync
 
 ## How it works
 
-`suite.sh` runs inside the VM as root. It starts Portcullis (with an event socket, and an alert hook appending to a file), runs every scenario, stops Portcullis with SIGTERM and checks that no rules are left behind. Then it repeats two scenarios with `--deny-action drop`.
+`suite.sh` runs inside the VM as root. It starts Portcullis (with an event socket, and an alert hook appending to a file), runs every scenario, stops Portcullis with SIGTERM, checks that its rules stayed in place and that `portcullis cleanup` removes them. Then it repeats two scenarios with `--deny-action drop` and `--on-exit remove`, and checks that stopping removed the rules.
 
 Outbound targets live in a network namespace routed from the Docker host (`outside.sh`), so traffic to them is forwarded and filtered like traffic to the internet. It serves TCP 80, 443 and 8080 and UDP 9000 on `198.51.100.2` to `.5`, and a DNS server on `198.51.100.2` that resolves `api.test` to `.3`, `other.test` to `.4` and `dyn.test` to `.5`. The Docker host resolves `api.test` and `other.test` through `/etc/hosts`, but not `dyn.test`, so Portcullis can only learn its address from a container's lookup.
 
