@@ -29,6 +29,8 @@ const CTA_TUPLE_ORIG: u16 = 1;
 const CTA_TUPLE_REPLY: u16 = 2;
 const CTA_ZONE: u16 = 18;
 const CTA_TUPLE_IP: u16 = 1;
+const CTA_TUPLE_PROTO: u16 = 2;
+const CTA_PROTO_DST_PORT: u16 = 3;
 const CTA_IP_V4_SRC: u16 = 1;
 const CTA_IP_V4_DST: u16 = 2;
 const CTA_IP_V6_SRC: u16 = 3;
@@ -140,6 +142,19 @@ fn parse(body: &[u8]) -> Option<Tracked> {
     })
 }
 
+/// The destination address and port of a connection's original direction, from the
+/// attributes of a connection (as NFLOG attaches them to logged packets).
+pub fn original_destination(connection: &[u8]) -> Option<(IpAddr, Option<u16>)> {
+    let (_, tuple) = attributes(connection).find(|(kind, _)| *kind == CTA_TUPLE_ORIG)?;
+    let (_, destination) = addresses(tuple)?;
+    let port = attributes(tuple)
+        .find(|(kind, _)| *kind == CTA_TUPLE_PROTO)
+        .and_then(|(_, proto)| attributes(proto).find(|(kind, _)| *kind == CTA_PROTO_DST_PORT))
+        .and_then(|(_, port)| <[u8; 2]>::try_from(port).ok())
+        .map(u16::from_be_bytes);
+    Some((destination, port))
+}
+
 /// Source and destination of a tuple attribute.
 fn addresses(tuple: &[u8]) -> Option<(IpAddr, IpAddr)> {
     let (_, ip) = attributes(tuple).find(|(kind, _)| *kind == CTA_TUPLE_IP)?;
@@ -169,7 +184,10 @@ mod tests {
         ip.extend(attribute(CTA_IP_V4_DST, &destination));
         let mut tuple = attribute(CTA_TUPLE_IP | NLA_F_NESTED, &ip);
         // CTA_TUPLE_PROTO with CTA_PROTO_NUM UDP.
-        tuple.extend(attribute(2 | NLA_F_NESTED, &attribute(1, &[17])));
+        tuple.extend(attribute(
+            CTA_TUPLE_PROTO | NLA_F_NESTED,
+            &attribute(1, &[17]),
+        ));
         tuple
     }
 
@@ -194,6 +212,21 @@ mod tests {
         // container behind it.
         assert!(tracked.involves(&HashSet::from([ip("198.51.100.1")])));
         assert!(!tracked.involves(&HashSet::from([ip("172.18.0.4")])));
+    }
+
+    #[test]
+    fn finds_the_original_destination_of_logged_connections() {
+        let mut ip = attribute(CTA_IP_V4_SRC, &[172, 18, 0, 3]);
+        ip.extend(attribute(CTA_IP_V4_DST, &[198, 51, 100, 1]));
+        let mut proto = attribute(1, &[6]);
+        proto.extend(attribute(CTA_PROTO_DST_PORT, &18080_u16.to_be_bytes()));
+        let mut original = attribute(CTA_TUPLE_IP | NLA_F_NESTED, &ip);
+        original.extend(attribute(CTA_TUPLE_PROTO | NLA_F_NESTED, &proto));
+        let connection = attribute(CTA_TUPLE_ORIG | NLA_F_NESTED, &original);
+        assert_eq!(
+            original_destination(&connection),
+            Some(("198.51.100.1".parse().expect("ip"), Some(18080)))
+        );
     }
 
     #[test]

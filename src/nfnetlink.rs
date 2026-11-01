@@ -10,10 +10,11 @@
 
 use std::fs::File;
 use std::io::{self, Write as _};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsFd;
 
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_NETFILTER};
+use tracing::warn;
 
 use crate::model::MacAddress;
 
@@ -37,6 +38,8 @@ const NFULNL_MSG_CONFIG: u16 = 1;
 const NFULA_CFG_CMD: u16 = 1;
 const NFULA_CFG_MODE: u16 = 2;
 const NFULA_CFG_QTHRESH: u16 = 5;
+const NFULA_CFG_FLAGS: u16 = 6;
+const NFULNL_CFG_F_CONNTRACK: u16 = 0x0004;
 const NFULNL_CFG_CMD_BIND: u8 = 1;
 const NFULNL_CFG_CMD_PF_BIND: u8 = 3;
 const NFULNL_CFG_CMD_PF_UNBIND: u8 = 4;
@@ -48,6 +51,7 @@ const NFULA_HWADDR: u16 = 8;
 const NFULA_PAYLOAD: u16 = 9;
 const NFULA_PREFIX: u16 = 10;
 const NFULA_HWHEADER: u16 = 16;
+const NFULA_CT: u16 = 18;
 const NFULA_VLAN: u16 = 20;
 
 // nfnetlink_queue
@@ -120,6 +124,8 @@ pub struct LoggedPacket {
     pub protocol: Option<u16>,
     /// The frame had a VLAN tag.
     pub vlan: bool,
+    /// The destination address and port the packet's connection was opened to, before DNAT.
+    pub original_destination: Option<(IpAddr, Option<u16>)>,
     /// The packet, starting at the IP (or ARP) header.
     pub payload: Vec<u8>,
 }
@@ -226,6 +232,15 @@ impl NflogSocket {
             group,
             &attribute(NFULA_CFG_QTHRESH, &1_u32.to_be_bytes()),
         )?;
+        // With each packet, its connection: the destination before DNAT. Needs the kernel's
+        // nf_conntrack_netlink; without it, events show destinations after DNAT.
+        if let Err(error) = inner.request(
+            config,
+            group,
+            &attribute(NFULA_CFG_FLAGS, &NFULNL_CFG_F_CONNTRACK.to_be_bytes()),
+        ) {
+            warn!(%error, "logged packets come without their connections; events of published ports reached through the host show the container behind them");
+        }
         Ok(Self { inner })
     }
 
@@ -335,6 +350,9 @@ fn parse_logged(buffer: &[u8]) -> Vec<LoggedPacket> {
                             .map(MacAddress::from);
                     }
                     NFULA_VLAN => packet.vlan = true,
+                    NFULA_CT => {
+                        packet.original_destination = crate::conntrack::original_destination(value);
+                    }
                     _ => {}
                 }
             }

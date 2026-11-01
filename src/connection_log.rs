@@ -159,6 +159,14 @@ fn connection_event(
             event.destination = Some(IpAddr::V4(ip.destination));
             event.source_port = ip.ports.map(|(port, _)| port);
             event.destination_port = ip.ports.map(|(_, port)| port);
+            // What the container asked for, as the egress rules see it, not where DNAT
+            // sends it (a published port reached through the host).
+            if reason == Reason::Egress
+                && let Some((destination, port)) = packet.original_destination
+            {
+                event.destination = Some(destination);
+                event.destination_port = port.or(event.destination_port);
+            }
         }
         Payload::Arp(arp) => {
             event.protocol = "arp".to_string();
@@ -469,6 +477,16 @@ mod tests {
         let event = connection_event(&packet, &directory, &hosts).expect("event");
         assert_eq!(event.domain.as_deref(), Some(test_support::HOST));
         assert_eq!(event.domain_source, Some(DomainSource::Rule));
+    }
+
+    #[test]
+    fn reports_destinations_before_dnat() {
+        let (directory, hosts) = setup();
+        let mut packet = logged("pc:d:egress", tcp([172, 18, 0, 2], [172, 18, 0, 3], 8080));
+        packet.original_destination = Some((ip("198.51.100.1"), Some(18080)));
+        let event = connection_event(&packet, &directory, &hosts).expect("event");
+        assert_eq!(event.destination, Some(ip("198.51.100.1")));
+        assert_eq!(event.destination_port, Some(18080));
     }
 
     #[test]
