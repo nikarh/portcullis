@@ -432,8 +432,9 @@ fn set_literal<T: fmt::Display>(elements: impl Iterator<Item = T>) -> Option<Str
 
 /// Render the script of a rule update.
 ///
-/// Each table has a base chain that lets established traffic through and dispatches each
-/// managed source address through a verdict map to its own chain. A packet costs one hash
+/// Each table has a base chain that dispatches each managed source address through a
+/// verdict map to its own chain: the bridge table after checking where a frame came from,
+/// the inet table after letting established traffic through. A packet costs one hash
 /// lookup plus the rules of its own source, regardless of how many containers are managed.
 ///
 /// The tables, base chains and log sets are created once and kept: an update flushes and
@@ -508,6 +509,7 @@ fn render_apply_script(
     }
     for (index, source) in plan.sources.iter().enumerate() {
         let chain = Chain::Egress(index);
+        render_related(out, chain, source.address)?;
         for rule in plan.egress_rules(source) {
             render_rule(plan, source, chain, rule, options, out)?;
         }
@@ -519,18 +521,17 @@ fn render_apply_script(
     }
 
     // Everything entering a managed network's bridge from a container: source checks and
-    // traffic between containers on the same network.
-    writeln!(
-        out,
-        "add rule {} ct state established,related accept",
-        Chain::Base(Table::Bridge)
-    )?;
+    // traffic between containers on the same network. Established traffic only passes
+    // once its source checks out, in the ICC chains: a container could otherwise send with
+    // another container's address into that container's connections.
     if !plan.bridges.is_empty() {
         render_bridge_dispatch(out, plan, options)?;
     }
     for (index, source) in ipv4_sources() {
         if icc_chain_needed(plan, source, options) {
             let chain = Chain::Icc(index);
+            writeln!(out, "add rule {chain} ct state established accept")?;
+            render_related(out, chain, source.address)?;
             for rule in plan.icc_rules(source) {
                 render_rule(plan, source, chain, rule, options, out)?;
             }
@@ -546,7 +547,9 @@ fn render_egress_dispatch(
     options: Options,
     base: Chain,
 ) -> fmt::Result {
-    writeln!(out, "add rule {base} ct state established,related accept")?;
+    // The bridge table checked where established traffic comes from. Related traffic (ICMP
+    // errors about a connection) is checked in the source's chain, see `render_related`.
+    writeln!(out, "add rule {base} ct state established accept")?;
     for (family, is_family) in FAMILIES {
         let entries = plan
             .sources
@@ -572,6 +575,22 @@ fn render_egress_dispatch(
             .map(|bridge| Quoted(&bridge.name)),
         format_args!(" {}", options.deny),
     )
+}
+
+/// Accept related traffic (ICMP errors about a connection) from `address` only when it is
+/// one end of that connection. The kernel relates an ICMP error to a connection by the
+/// packet quoted inside it, whoever sends it: anyone could otherwise send ICMP errors, with
+/// data of their choice, to wherever any container has a connection. Other related traffic
+/// continues through the chain's rules.
+fn render_related(out: &mut String, chain: Chain, address: IpAddr) -> fmt::Result {
+    let f = family(address);
+    for direction in ["original", "reply"] {
+        writeln!(
+            out,
+            "add rule {chain} ct state related ct {direction} {f} saddr {address} accept"
+        )?;
+    }
+    Ok(())
 }
 
 /// Create or flush the chains and sets of `plan`, and remove those of `previous` it doesn't
@@ -1414,7 +1433,10 @@ flush chain bridge portcullis icc0
             &[
                 "add rule inet portcullis forward ip saddr vmap { 172.18.0.2 : goto egress0 }".into(),
                 // Traffic to the host follows the same rules.
-                "add rule inet portcullis input ct state established,related accept".into(),
+                "add rule inet portcullis input ct state established accept".into(),
+                // ICMP errors only from an end of the connection they are about.
+                "add rule inet portcullis egress0 ct state related ct original ip saddr 172.18.0.2 accept".into(),
+                "add rule inet portcullis egress0 ct state related ct reply ip saddr 172.18.0.2 accept".into(),
                 "add rule inet portcullis input ip saddr vmap { 172.18.0.2 : goto egress0 }".into(),
                 "add rule inet portcullis input iifname { \"br-net0\" } drop".into(),
                 // The gateway is the host: traffic to it follows the egress rules.
@@ -1422,14 +1444,14 @@ flush chain bridge portcullis icc0
                 // Reported by the bridge table already.
                 "add rule inet portcullis forward iifname { \"br-net0\" } drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
-                "add rule bridge portcullis prerouting ct state established,related accept".into(),
                 "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept".into(),
                 "add rule bridge portcullis prerouting ether type { arp, ip6 } accept".into(),
                 "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type != ip drop".into(),
                 "add rule bridge portcullis prerouting ether type != ip accept".into(),
                 "add rule bridge portcullis prerouting ip saddr . ether saddr vmap { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }".into(),
                 decided("add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type ip", 'd', "source", "drop"),
-                "add rule bridge portcullis icc0 ip daddr 172.18.0.1 accept".into(),
+                // Established traffic passes once its source checked out.
+                "add rule bridge portcullis icc0 ct state established accept\nadd rule bridge portcullis icc0 ct state related ct original ip saddr 172.18.0.2 accept\nadd rule bridge portcullis icc0 ct state related ct reply ip saddr 172.18.0.2 accept\nadd rule bridge portcullis icc0 ip daddr 172.18.0.1 accept".into(),
                 decided("add rule bridge portcullis icc0 ip daddr 172.18.0.0/16", 'd', "icc", "drop"),
                 // Broadcast and multicast reach every container on the bridge.
                 decided("add rule bridge portcullis icc0 ip daddr 255.255.255.255/32", 'd', "icc", "drop"),
@@ -1713,7 +1735,7 @@ flush chain bridge portcullis icc0
         };
         let script = render_with(&test_support::hostname_state(), options, false);
         let queue = "add rule inet portcullis forward oifname { \"br-net0\" } meta l4proto { tcp, udp } th sport 53 ct direction reply queue num 9 bypass";
-        let established = "add rule inet portcullis forward ct state established,related accept";
+        let established = "add rule inet portcullis forward ct state established accept";
         let position = |line: &str| script.lines().position(|candidate| candidate == line);
         assert!(
             position(queue).expect("queue rule") < position(established).expect("established rule")
