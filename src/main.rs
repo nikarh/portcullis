@@ -66,6 +66,9 @@ const DEFAULT_STATE_DIR: &str = "/var/lib/portcullis";
 const DNS_QUERY_QUEUE: u16 = 4244;
 /// How long such packets are held before they are denied.
 const SOURCE_HOLD_GRACE: Duration = Duration::from_secs(2);
+/// How soon a failed rule update is tried again; twice as long after each failure in a
+/// row, up to 64 times as long (about 5 minutes).
+const APPLY_RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -460,6 +463,14 @@ struct Applier {
     owners: HashMap<IpAddr, Owner>,
     /// Containers already reported as not having observable DNS.
     unobservable_reported: HashSet<String>,
+    /// Updates that failed in a row: the rules are those of an earlier state.
+    failures: u32,
+}
+
+/// When to try a failed update again, after `failures` in a row.
+fn apply_retry(failures: u32) -> Option<Duration> {
+    let doublings = failures.checked_sub(1)?.min(6);
+    Some(APPLY_RETRY * 2_u32.pow(doublings))
 }
 
 impl Applier {
@@ -482,6 +493,7 @@ impl Applier {
         };
         match result {
             Ok(plan) => {
+                self.failures = 0;
                 self.directory.update(&plan);
                 // "applied" closes an update: everything it caused comes before it.
                 self.report_changes(state, &plan);
@@ -494,6 +506,7 @@ impl Applier {
                 Ok(())
             }
             Err(error) => {
+                self.failures = self.failures.saturating_add(1);
                 self.bus.publish(&Event::ApplyFailed {
                     error: error.to_string(),
                 });
@@ -749,6 +762,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         managed: HashMap::new(),
         owners: HashMap::new(),
         unobservable_reported: HashSet::new(),
+        failures: 0,
     };
 
     let (terminate_tx, terminate_rx) = unbounded::<()>();
@@ -782,7 +796,15 @@ fn run(config: &Config) -> Result<(), MainError> {
     );
 
     let outcome = loop {
+        let retry = apply_retry(applier.failures)
+            .map_or_else(crossbeam_channel::never, crossbeam_channel::after);
         select! {
+            recv(retry) -> _ => {
+                info!("trying the failed rule update again");
+                if let Err(error) = applier.apply(&mut runtime_state) {
+                    error!(%error, "firewall apply failed again");
+                }
+            }
             recv(terminate_rx) -> _ => {
                 info!("termination signal received; cleanup will start now");
                 break Ok(());
@@ -952,6 +974,26 @@ fn shut_down(config: &Config, firewall: &NftablesFirewall) -> Result<(), MainErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_failed_updates_less_and_less_often() {
+        let delays: Vec<Option<u64>> = [0, 1, 2, 3, 7, 8, u32::MAX]
+            .into_iter()
+            .map(|failures| apply_retry(failures).map(|delay| delay.as_secs()))
+            .collect();
+        assert_eq!(
+            delays,
+            [
+                None,
+                Some(5),
+                Some(10),
+                Some(20),
+                Some(320),
+                Some(320),
+                Some(320)
+            ]
+        );
+    }
 
     #[test]
     fn parse_config_uses_defaults() {
