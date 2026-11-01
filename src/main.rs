@@ -52,6 +52,7 @@ use crate::model::{ContainerId, MacAddress, RuntimeState};
 use crate::monitor::{DockerMonitor, MonitorError};
 use crate::source_hold::SourceHold;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// NFLOG group the firewall rules log decisions to.
 const NFLOG_GROUP: u16 = 4242;
 /// NFQUEUE number DNS answers are held in for inspection.
@@ -180,6 +181,10 @@ fn main() {
     let mut args = Arguments::from_env();
     if args.contains(["-h", "--help"]) {
         print_help();
+        return;
+    }
+    if args.contains(["-V", "--version"]) {
+        let _ = std::io::stdout().write_all(format!("portcullis {VERSION}\n").as_bytes());
         return;
     }
 
@@ -358,6 +363,7 @@ OPTIONS:
   --on-exit <keep|remove>      Keep the firewall rules in place when stopping, or remove
                                them (default: keep; remove them later with
                                portcullis cleanup)
+  -V, --version                Show the version
   -h, --help                   Show this help
 ";
     let _ = std::io::stdout().write_all(usage.as_bytes());
@@ -652,6 +658,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     logging::init_logging(config.log_level, config.log_format)?;
     exit_on_panic();
     info!(
+        version = VERSION,
         docker_socket = %config.docker_socket,
         monitor = config.monitor,
         "portcullis started"
