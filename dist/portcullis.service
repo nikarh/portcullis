@@ -1,0 +1,17 @@
+[Unit]
+Description=Portcullis: network rules for Docker containers, from their labels
+Documentation=https://github.com/nikarh/portcullis
+# Portcullis puts the last rules back and reports itself ready before Docker starts, so
+# no container on an enforced network starts unrestricted, at boot or ever. It waits for
+# Docker on its own.
+Before=docker.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/portcullis --events-socket /run/portcullis.sock
+Restart=on-failure
+RestartSec=2s
+StateDirectory=portcullis
+
+[Install]
+WantedBy=multi-user.target docker.service

@@ -25,4 +25,6 @@ pub enum FirewallError {
     LibCommandFailure { code: i32, stderr: String },
     #[error("libnftables context lock poisoned")]
     LibContextLock,
+    #[error("saved rules: {0}")]
+    Saved(std::io::Error),
 }

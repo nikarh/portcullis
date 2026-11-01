@@ -1,0 +1,21 @@
+# A container Docker starts by itself, as at boot, that sends right away.
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    restart: always
+    networks: [net]
+    labels:
+      - portcullis.egress.web=ip:198.51.100.3,tcp:80
+    command:
+      - sh
+      - -c
+      - |
+        nc -w 10 198.51.100.3 80 </dev/null >/dev/null && echo listed-ok || echo listed-failed
+        nc -w 10 198.51.100.5 80 </dev/null >/dev/null && echo unlisted-leaked || echo unlisted-blocked
+        exec sleep infinity
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

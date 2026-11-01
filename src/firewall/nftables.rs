@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Write as _};
+use std::fs;
+use std::io::{self, Write as _};
 use std::net::IpAddr;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use super::FirewallError;
 use super::plan::{
@@ -216,6 +220,8 @@ pub struct NftablesFirewall<R = LibNftablesRunner> {
     /// What the last successful update installed; `None` before the first one and after a
     /// cleanup, when the tables may hold leftovers of another run.
     installed: Mutex<Option<Installed>>,
+    /// Where the rules of every update are saved, to be restored at the next start.
+    saved: Option<PathBuf>,
 }
 
 /// Chains and sets an update created besides the fixed base chains and log sets, as
@@ -237,7 +243,73 @@ where
             runner,
             options,
             installed: Mutex::new(None),
+            saved: None,
         }
+    }
+
+    /// Save the rules of every update to `path`, as a script that installs them from
+    /// scratch, so the next start can put them in place before anything else (see
+    /// [`Self::restore`]).
+    #[must_use]
+    pub fn saving_to(mut self, path: PathBuf) -> Self {
+        self.saved = Some(path);
+        self
+    }
+
+    /// Put the rules a previous run saved in place, replacing whatever is there. Returns
+    /// whether there were any.
+    pub fn restore(&self) -> Result<bool, FirewallError> {
+        let Some(path) = &self.saved else {
+            return Ok(false);
+        };
+        let script = match fs::read_to_string(path) {
+            Ok(script) => script,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(FirewallError::Saved(error)),
+        };
+        self.runner.run_script(script)?;
+        // The next update starts from empty tables again.
+        *self
+            .installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        Ok(true)
+    }
+
+    /// Forget the saved rules, so the next start doesn't restore them.
+    pub fn forget_saved(&self) -> Result<(), FirewallError> {
+        match self.saved.as_deref().map(fs::remove_file) {
+            Some(Err(error)) if error.kind() != io::ErrorKind::NotFound => {
+                Err(FirewallError::Saved(error))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Write the rules of `plan`, from scratch, where the next start finds them. Written
+    /// to a temporary file first and renamed, so a crash never leaves half a script.
+    fn save(&self, plan: &Plan) -> Result<(), FirewallError> {
+        let Some(path) = &self.saved else {
+            return Ok(());
+        };
+        let mut script = String::with_capacity(plan.rule_count() * 96);
+        render_apply_script(plan, self.options, None, &mut script)?;
+        let temporary = path.with_extension("tmp");
+        let write = || -> io::Result<()> {
+            if let Some(directory) = path.parent() {
+                fs::create_dir_all(directory)?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(script.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temporary, path)
+        };
+        write().map_err(FirewallError::Saved)
     }
 
     /// Apply rules for `state`. Returns the plan that was applied.
@@ -269,6 +341,10 @@ where
             render_apply_script(&plan, self.options, installed.as_ref(), &mut script)?;
         self.runner.run_script(script)?;
         *installed = Some(now_installed);
+        drop(installed);
+        if let Err(error) = self.save(&plan) {
+            warn!(%error, "can't save the rules; the next start begins without them");
+        }
         Ok(plan)
     }
 
@@ -2585,6 +2661,47 @@ flush chain bridge portcullis limit_open
                 "add element inet portcullis {name} {{ 198.51.100.3 timeout 2s }}\n"
             )]
         );
+    }
+
+    #[test]
+    fn saves_rules_to_restore_them_at_the_next_start() {
+        let path =
+            std::env::temp_dir().join(format!("portcullis-saved-{}/rules.nft", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let firewall =
+            NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
+        assert!(!firewall.restore().expect("restore"), "nothing saved yet");
+        let mut resolver = MockResolver::default();
+        for state in [test_support::icc_state(), test_support::hostname_state()] {
+            firewall
+                .apply(&state, &mut resolver, &[], false)
+                .expect("apply");
+        }
+        // The saved script installs the last update's rules from scratch, unlike the
+        // update itself.
+        let saved = fs::read_to_string(&path).expect("saved");
+        assert!(saved.starts_with("add table inet portcullis\ndelete table inet portcullis\n"));
+        // ...with nothing of the update before it.
+        assert!(saved.contains("ct original ip daddr @pc_h4_"));
+        assert!(!saved.contains("delete chain"), "{saved}");
+
+        // Restoring runs it, and the next update starts from empty tables again.
+        assert!(firewall.restore().expect("restore"));
+        firewall
+            .apply(&test_support::icc_state(), &mut resolver, &[], false)
+            .expect("apply");
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        assert_eq!(scripts.get(2), Some(&saved));
+        assert!(
+            scripts
+                .get(3)
+                .is_some_and(|script| script.contains("delete table"))
+        );
+        drop(scripts);
+
+        firewall.forget_saved().expect("forget");
+        assert!(!path.exists());
+        firewall.forget_saved().expect("forgetting twice");
     }
 
     #[test]

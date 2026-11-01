@@ -27,6 +27,7 @@ SCENARIOS=(
   checks
   flood
   domains
+  boot
 )
 
 # E2E_SCENARIOS="icc egress" runs only those.

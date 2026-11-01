@@ -19,6 +19,7 @@ mod nfnetlink;
 mod quarantine;
 mod rtnetlink;
 mod source_hold;
+mod systemd;
 mod tools;
 
 use std::collections::{HashMap, HashSet};
@@ -34,7 +35,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, select, unbounded};
 use pico_args::Arguments;
 use thiserror::Error;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
@@ -57,6 +58,9 @@ const NFLOG_GROUP: u16 = 4242;
 const DNS_QUEUE: u16 = 4242;
 /// NFQUEUE number packets of not yet known containers are held in.
 const SOURCE_QUEUE: u16 = 4243;
+/// File in the state directory the rules of every update are saved to.
+const SAVED_RULES: &str = "rules.nft";
+const DEFAULT_STATE_DIR: &str = "/var/lib/portcullis";
 /// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held in.
 const DNS_QUERY_QUEUE: u16 = 4244;
 /// How long such packets are held before they are denied.
@@ -78,6 +82,7 @@ struct Config {
     connection_limit: Option<u32>,
     quarantine: QuarantineMode,
     quarantine_denials: usize,
+    state_dir: PathBuf,
 }
 
 /// What happens to a container that misbehaves, see `quarantine`.
@@ -120,6 +125,7 @@ impl Default for Config {
             connection_limit: Some(firewall::DEFAULT_CONNECTION_LIMIT),
             quarantine: QuarantineMode::Isolate,
             quarantine_denials: 1000,
+            state_dir: PathBuf::from(DEFAULT_STATE_DIR),
         }
     }
 }
@@ -203,10 +209,17 @@ fn run_audit(mut args: Arguments) -> Result<(), MainError> {
     tools::audit(input.as_deref()).map_err(MainError::Tool)
 }
 
-/// Remove every rule Portcullis owns, for when it isn't going to run again.
-fn run_cleanup(args: Arguments) -> Result<(), MainError> {
+/// Remove every rule Portcullis owns, and the saved ones, for when it isn't going to run
+/// again.
+fn run_cleanup(mut args: Arguments) -> Result<(), MainError> {
+    let state_dir = args
+        .opt_value_from_str::<_, PathBuf>("--state-dir")?
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
     finish(args)?;
-    NftablesFirewall::with_libnftables(Options::default())?.cleanup()?;
+    let firewall = NftablesFirewall::with_libnftables(Options::default())?
+        .saving_to(state_dir.join(SAVED_RULES));
+    firewall.cleanup()?;
+    firewall.forget_saved()?;
     let _ = std::io::stdout().write_all(b"portcullis: firewall rules removed\n");
     Ok(())
 }
@@ -279,6 +292,9 @@ fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
     if let Some(count) = args.opt_value_from_str::<_, usize>("--quarantine-denials")? {
         config.quarantine_denials = count;
     }
+    if let Some(directory) = args.opt_value_from_str::<_, PathBuf>("--state-dir")? {
+        config.state_dir = directory;
+    }
     if let Some(value) = args.opt_value_from_str::<_, String>("--on-exit")? {
         config.on_exit = match value.as_str() {
             "keep" => OnExit::Keep,
@@ -302,7 +318,9 @@ USAGE:
                                        show live events of a running daemon
   portcullis audit [FILE]              summarize what containers tried that their labels
                                        don't allow, from JSON events (FILE or stdin)
-  portcullis cleanup                   remove all firewall rules Portcullis left in place
+  portcullis cleanup [--state-dir <path>]
+                                       remove all firewall rules Portcullis left in place,
+                                       and the saved ones
 
 OPTIONS:
   --docker-socket <path>       Docker API socket (default: /var/run/docker.sock)
@@ -333,6 +351,8 @@ OPTIONS:
                                restart; or only report it (default: isolate)
   --quarantine-denials <n>     Denied connections per minute past which a container is
                                quarantined (default: 1000)
+  --state-dir <path>           Where the rules are saved, to be put back first thing at
+                               the next start (default: /var/lib/portcullis)
   --on-exit <keep|remove>      Keep the firewall rules in place when stopping, or remove
                                them (default: keep; remove them later with
                                portcullis cleanup)
@@ -642,23 +662,27 @@ fn run(config: &Config) -> Result<(), MainError> {
     })
     .map_err(MainError::EventsSocket)?;
 
-    let monitor_client = DockerClient::connect(&config.docker_socket)?;
-    let mut monitor = DockerMonitor::new(monitor_client);
-    let firewall = Arc::new(NftablesFirewall::with_libnftables(Options {
-        deny: config.deny_action,
-        log_group: NFLOG_GROUP,
-        log_allowed: config.log_allowed,
-        dns_queue: Some(DNS_QUEUE),
-        source_queue: Some(SOURCE_QUEUE),
-        connection_limit: config.connection_limit,
-        dns_query_queue: Some(DNS_QUERY_QUEUE),
-    })?);
+    let firewall = Arc::new(
+        NftablesFirewall::with_libnftables(Options {
+            deny: config.deny_action,
+            log_group: NFLOG_GROUP,
+            log_allowed: config.log_allowed,
+            dns_queue: Some(DNS_QUEUE),
+            source_queue: Some(SOURCE_QUEUE),
+            connection_limit: config.connection_limit,
+            dns_query_queue: Some(DNS_QUERY_QUEUE),
+        })?
+        .saving_to(config.state_dir.join(SAVED_RULES)),
+    );
 
-    // The first update replaces whatever a previous run left, in the same step, so kept
-    // rules stay in force until then.
-    if config.on_exit == OnExit::Remove {
-        info!("performing startup firewall cleanup");
-        firewall.cleanup()?;
+    // Before anything else, put the last run's rules back: after a reboot there are none,
+    // and Docker may be about to start containers. Their bridge ports are new, so their
+    // packets are held until this run's first update has rules for them. That update
+    // replaces these rules in one step.
+    match firewall.restore() {
+        Ok(true) => info!("restored the rules of the last run"),
+        Ok(false) => info!("no rules of a last run to restore"),
+        Err(error) => warn!(%error, "can't restore the rules of the last run"),
     }
 
     let directory = Arc::new(Directory::default());
@@ -703,19 +727,24 @@ fn run(config: &Config) -> Result<(), MainError> {
         unobservable_reported: HashSet::new(),
     };
 
-    let mut runtime_state = monitor.initialize()?;
+    let (terminate_tx, terminate_rx) = unbounded::<()>();
+    ctrlc::set_handler(move || {
+        let _ = terminate_tx.send(());
+    })
+    .map_err(|error| MainError::SignalHandler(error.to_string()))?;
+
+    // Ready: the rules are in place and their queues are read. Docker can start.
+    systemd::notify("READY=1\nSTATUS=Waiting for Docker");
+    let Some((mut monitor, mut runtime_state)) = wait_for_docker(config, &terminate_rx) else {
+        return shut_down(config, &firewall);
+    };
+    systemd::notify("STATUS=Running");
     monitor.check_containers(&runtime_state);
     publish_warnings(&mut monitor, &bus);
     applier.apply(&mut runtime_state)?;
 
     let (docker_tx, docker_rx) = unbounded::<DockerWorkerEvent>();
     let (docker_stop_tx, docker_stop_rx) = unbounded::<()>();
-    let (terminate_tx, terminate_rx) = unbounded::<()>();
-
-    ctrlc::set_handler(move || {
-        let _ = terminate_tx.send(());
-    })
-    .map_err(|error| MainError::SignalHandler(error.to_string()))?;
 
     let docker_thread =
         spawn_docker_event_worker(config.docker_socket.clone(), docker_tx, docker_stop_rx);
@@ -805,16 +834,60 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let _ = docker_stop_tx.send(());
     let _ = docker_thread.join();
+    shut_down(config, &firewall)
+}
 
+/// Connect to Docker and read its state, retrying until it answers: Portcullis starts
+/// before Docker when it runs as a service. `None` when Portcullis is asked to stop first.
+fn wait_for_docker(
+    config: &Config,
+    terminate_rx: &Receiver<()>,
+) -> Option<(DockerMonitor<DockerClient>, RuntimeState)> {
+    const FIRST_RETRY: Duration = Duration::from_millis(250);
+    const LAST_RETRY: Duration = Duration::from_secs(5);
+    let mut retry = FIRST_RETRY;
+    let mut waiting = false;
+    loop {
+        let attempt = DockerClient::connect(&config.docker_socket)
+            .map_err(MonitorError::from)
+            .and_then(|client| {
+                let mut monitor = DockerMonitor::new(client);
+                monitor.initialize().map(|state| (monitor, state))
+            });
+        match attempt {
+            Ok(connected) => {
+                if waiting {
+                    info!("Docker is up");
+                }
+                return Some(connected);
+            }
+            Err(error) if !waiting => {
+                waiting = true;
+                warn!(%error, socket = %config.docker_socket, "waiting for Docker; the rules of the last run stay in place meanwhile");
+            }
+            Err(error) => debug!(%error, "Docker isn't up yet"),
+        }
+        if !matches!(
+            terminate_rx.recv_timeout(retry),
+            Err(RecvTimeoutError::Timeout)
+        ) {
+            return None;
+        }
+        retry = (retry * 2).min(LAST_RETRY);
+    }
+}
+
+/// Keep the rules in place when stopping, or remove them with `--on-exit remove` (and the
+/// saved ones, so the next start doesn't bring them back).
+fn shut_down(config: &Config, firewall: &NftablesFirewall) -> Result<(), MainError> {
+    systemd::notify("STOPPING=1");
     if config.on_exit == OnExit::Keep {
         info!("stopped; firewall rules stay in place (remove them with portcullis cleanup)");
         return Ok(());
     }
     info!("shutdown requested; cleaning up firewall rules");
-    if let Err(error) = firewall.cleanup() {
-        error!(%error, "shutdown cleanup failed");
-        return Err(MainError::Firewall(error));
-    }
+    firewall.cleanup()?;
+    firewall.forget_saved()?;
     info!("shutdown cleanup completed");
     Ok(())
 }
@@ -860,6 +933,8 @@ mod tests {
                 "report",
                 "--quarantine-denials",
                 "5",
+                "--state-dir",
+                "/tmp/portcullis",
             ]
             .into_iter()
             .map(OsString::from)
@@ -882,6 +957,7 @@ mod tests {
                 connection_limit: Some(100),
                 quarantine: QuarantineMode::Report,
                 quarantine_denials: 5,
+                state_dir: PathBuf::from("/tmp/portcullis"),
             })
         );
     }

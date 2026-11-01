@@ -363,6 +363,25 @@ start_portcullis() {
   return 1
 }
 
+# start_portcullis_before_docker: start Portcullis as systemd would before Docker (with a
+# notification socket), and wait until it reports itself ready, not for rules.
+start_portcullis_before_docker() {
+  local notify="/run/portcullis-e2e-notify.sock" line
+  : >"${PORTCULLIS_LOG}"
+  coproc READY_WATCH { exec python3 "${E2E_DIR}/wait-ready.py" "${notify}" 10; }
+  read -r line <&"${READY_WATCH[0]}"
+  NOTIFY_SOCKET="${notify}" "${PORTCULLIS_BIN}" --log-level debug \
+    --events-socket "${EVENTS_SOCKET}" --deny-action "${DENY_ACTION}" \
+    --alert-exec "cat >> ${ALERT_LOG}" >>"${PORTCULLIS_LOG}" 2>&1 &
+  PORTCULLIS_PID=$!
+  if read -r line <&"${READY_WATCH[0]}" && [[ "${line}" == ready ]]; then
+    return 0
+  fi
+  fail "portcullis did not report itself ready"
+  tail -20 "${PORTCULLIS_LOG}" >&2
+  return 1
+}
+
 stop_portcullis() {
   [[ -n "${PORTCULLIS_PID}" ]] || return 0
   if ! kill -0 "${PORTCULLIS_PID}" 2>/dev/null; then
