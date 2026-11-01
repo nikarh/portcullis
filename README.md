@@ -29,8 +29,22 @@ Every decision can be reported. The rules log what they allow and deny to Portcu
 
 - Linux, with Portcullis running as root (it needs to manage the firewall and read the Docker socket).
 - Docker with bridge networks.
-- `libnftables`, for both building and running.
+- `libnftables` (`libnftables1` on Debian and Ubuntu, `nftables` on Fedora and Arch), for both building and running.
 - Recommended: a `dns` setting in `/etc/docker/daemon.json` (see [DNS visibility](#dns-visibility)), so Portcullis can see containers' DNS lookups.
+
+### Installing
+
+Each [release](https://github.com/nikarh/portcullis/releases) has binaries for x86_64 and aarch64 Linux (glibc 2.35 or newer, i.e. Ubuntu 22.04, Debian 12 or later), with the systemd unit:
+
+```bash
+version=v0.1.0 arch=x86_64
+curl -fLO "https://github.com/nikarh/portcullis/releases/download/${version}/portcullis-${version}-${arch}-linux-gnu.tar.gz"
+curl -fLO "https://github.com/nikarh/portcullis/releases/download/${version}/portcullis-${version}-${arch}-linux-gnu.tar.gz.sha256"
+sha256sum -c "portcullis-${version}-${arch}-linux-gnu.tar.gz.sha256"
+tar -xzf "portcullis-${version}-${arch}-linux-gnu.tar.gz"
+```
+
+Then install it as a service, see [Running as a service](#running-as-a-service).
 
 ### Building
 
@@ -81,6 +95,8 @@ sudo systemctl enable --now portcullis
 
 Add your options to its `ExecStart` line (`systemctl edit portcullis`). That's all: the unit starts Portcullis before Docker, at boot and whenever Docker starts, and nothing else needs to be ordered.
 
+The unit keeps Portcullis from changing the system beyond its state directory and `/run`: `/usr`, `/boot` and `/etc` are read-only to it, and to `--alert-exec` commands, and `/home` and `/root` too. If an alert command needs to write somewhere else, add the path with `ReadWritePaths=` in `systemctl edit portcullis`.
+
 Why it matters: Docker starts containers with a restart policy as soon as it starts, and the kernel forgets every firewall rule at a reboot. If those containers started before Portcullis had put rules in place, they would be unrestricted until it did. So Portcullis saves the rules of every update (in `--state-dir`), and when it starts, before anything else:
 
 1. It puts the last saved rules back in place.
@@ -92,6 +108,24 @@ Between 1 and 3, containers on enforced networks are held back rather than let t
 Without systemd, start Portcullis before Docker the same way; it waits for Docker on its own. Started after Docker, it works too, but containers that Docker started before it are unrestricted until it has caught up.
 
 If Portcullis can't start at all, containers on enforced networks stay cut off (their packets are held for a Portcullis that isn't there), rather than run without their rules. `portcullis cleanup` removes the rules and the saved ones, if you need them gone.
+
+### When something fails
+
+Portcullis prefers stopping to running with part of its job undone. Whenever it stops, its rules stay in place (unless `--on-exit remove` and a clean stop), and systemd starts it again 2 seconds later, as often as it takes:
+
+- If Docker stops or restarts, Portcullis keeps the rules in place, waits for Docker to come back, and then reads its state again.
+- If Portcullis can't read the firewall's reports or held packets anymore, or anything in it fails unexpectedly (a panic), it logs why and exits with an error.
+- If containers send faster than Portcullis can keep up (a flood), the kernel drops what doesn't fit: reports are lost (an `events_lost` warning says so), and held packets (new containers' first packets, DNS queries and answers) are dropped, so those connections and lookups are retried or fail. Nothing gets through unchecked.
+- If a rule update fails (an `apply_failed` event), the previous rules stay in place, and Portcullis tries again after 5 seconds, then less and less often, down to every 5 minutes, until it succeeds.
+
+`systemctl status portcullis` and `journalctl -u portcullis` show what happened.
+
+To upgrade, replace the binary and restart the service. The rules stay in place while it restarts:
+
+```bash
+sudo install -m 0755 portcullis /usr/local/bin/
+sudo systemctl restart portcullis
+```
 
 ### Stopping and removing Portcullis
 
