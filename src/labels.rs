@@ -16,6 +16,7 @@ const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
 const ICC_ALLOW_PREFIX: &str = "portcullis.icc.allow.";
 const DNS_PREFIX: &str = "portcullis.dns.";
+const DOMAINS_PREFIX: &str = "portcullis.domains.";
 const CONNECTION_LIMIT_LABEL: &str = "portcullis.limit.connections";
 const NEW_CONNECTIONS_LABEL: &str = "portcullis.limit.new-connections";
 const QUARANTINE_LABEL: &str = "portcullis.quarantine";
@@ -100,6 +101,7 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
     let mut connection_limit = ConnectionLimit::Default;
     let mut new_connection_rate = None;
     let mut quarantine = true;
+    let mut domains: Option<Vec<String>> = None;
 
     for (key, value) in labels {
         let result = if key.starts_with(EGRESS_PREFIX) {
@@ -109,6 +111,11 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
         } else if key.starts_with(DNS_PREFIX) {
             has_dns_labels = true;
             parse_dns_target(key, value).map(|target| dns_targets.push(target))
+        } else if key.starts_with(DOMAINS_PREFIX) {
+            // Any domains label turns name filtering on, even an invalid one: a typo
+            // allows fewer names, never all of them.
+            let patterns = domains.get_or_insert_with(Vec::new);
+            parse_domains(key, value).map(|parsed| patterns.extend(parsed))
         } else if key == CONNECTION_LIMIT_LABEL {
             parse_connection_limit(value).map(|limit| connection_limit = limit)
         } else if key == NEW_CONNECTIONS_LABEL {
@@ -149,6 +156,7 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
         connection_limit,
         new_connection_rate,
         quarantine,
+        domains,
     };
     (policy, errors)
 }
@@ -171,6 +179,35 @@ fn parse_dns_target(key: &str, value: &str) -> Result<DnsTarget, LabelParseError
             ))
         }
     }
+}
+
+/// Comma-separated domain names, each either exact (`api.example.com`) or for any name
+/// below one (`*.example.com`). Normalized to lower case without a trailing dot.
+fn parse_domains(key: &str, value: &str) -> Result<Vec<String>, LabelParseError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|pattern| {
+            let normalized = crate::dns::normalize(pattern);
+            let name = normalized.strip_prefix("*.").unwrap_or(&normalized);
+            let valid = !name.is_empty()
+                && name.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                });
+            if valid {
+                Ok(normalized)
+            } else {
+                Err(LabelParseError::InvalidHostname(
+                    key.to_string(),
+                    pattern.to_string(),
+                ))
+            }
+        })
+        .collect()
 }
 
 /// A positive number.
@@ -389,6 +426,27 @@ mod tests {
 
     use crate::events::WarningKind;
     use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol};
+
+    #[test]
+    fn parses_domains() {
+        let (policy, errors) = parse_policy(&labels(&[
+            ("portcullis.domains.stripe", "API.stripe.com., *.github.com"),
+            ("portcullis.domains.bad", "*.bad*.com"),
+        ]));
+        assert_eq!(
+            policy.domains,
+            Some(vec![
+                "api.stripe.com".to_string(),
+                "*.github.com".to_string()
+            ])
+        );
+        assert_eq!(errors.len(), 1);
+        // Without domains labels, names aren't filtered.
+        assert_eq!(parse_policy(&IndexMap::new()).0.domains, None);
+        // An invalid label alone still turns filtering on.
+        let (policy, _) = parse_policy(&labels(&[("portcullis.domains.bad", "not a name")]));
+        assert_eq!(policy.domains, Some(Vec::new()));
+    }
 
     #[test]
     fn parses_acknowledged_warnings() {

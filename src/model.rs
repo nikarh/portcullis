@@ -197,6 +197,8 @@ pub struct ContainerPolicy {
     pub new_connection_rate: Option<u32>,
     /// Whether the container is cut off when it misbehaves (`portcullis.quarantine`).
     pub quarantine: bool,
+    /// The domain names the container may look up (`portcullis.domains.*`), if limited.
+    pub domains: Option<Vec<String>>,
 }
 
 /// `portcullis.limit.connections`.
@@ -220,6 +222,7 @@ impl Default for ContainerPolicy {
             connection_limit: ConnectionLimit::Default,
             new_connection_rate: None,
             quarantine: true,
+            domains: None,
         }
     }
 }

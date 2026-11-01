@@ -1,0 +1,26 @@
+# Containers whose DNS lookups are limited to some names (portcullis.domains).
+services:
+  # May look up api.test, and other.test through its host: rule; resolves through Docker's
+  # DNS, which forwards to 198.51.100.2 from the container's address.
+  filtered:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.domains.api=api.test
+      - portcullis.egress.other=host:other.test,tcp:80
+      - portcullis.dns.0=ip:198.51.100.2
+  # The same resolver, no names limited.
+  control:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.dns.0=ip:198.51.100.2
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

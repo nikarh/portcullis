@@ -5,6 +5,7 @@ mod connection_log;
 mod conntrack;
 mod directory;
 mod dns;
+mod dns_filter;
 mod dns_inspect;
 mod docker;
 mod events;
@@ -56,6 +57,8 @@ const NFLOG_GROUP: u16 = 4242;
 const DNS_QUEUE: u16 = 4242;
 /// NFQUEUE number packets of not yet known containers are held in.
 const SOURCE_QUEUE: u16 = 4243;
+/// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held in.
+const DNS_QUERY_QUEUE: u16 = 4244;
 /// How long such packets are held before they are denied.
 const SOURCE_HOLD_GRACE: Duration = Duration::from_secs(2);
 
@@ -648,6 +651,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         dns_queue: Some(DNS_QUEUE),
         source_queue: Some(SOURCE_QUEUE),
         connection_limit: config.connection_limit,
+        dns_query_queue: Some(DNS_QUERY_QUEUE),
     })?);
 
     // The first update replaces whatever a previous run left, in the same step, so kept
@@ -672,6 +676,8 @@ fn run(config: &Config) -> Result<(), MainError> {
             .then(|| quarantine::Watch::new(misbehaviour_tx, config.quarantine_denials)),
     )
     .map_err(MainError::ConnectionLog)?;
+    dns_filter::spawn(DNS_QUERY_QUEUE, Arc::clone(&directory), bus.clone())
+        .map_err(MainError::DnsInspection)?;
     dns_inspect::spawn(
         DNS_QUEUE,
         config.log_allowed,

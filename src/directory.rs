@@ -36,6 +36,8 @@ pub struct SourceInfo {
     pub quarantine: bool,
     /// IPv6 is enabled on the container's network.
     pub ipv6_network: bool,
+    /// The domain names the container may look up, if limited.
+    pub domains: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +85,7 @@ impl Directory {
                 monitor: source.monitor,
                 quarantine: source.quarantine,
                 ipv6_network: ipv6_networks.contains(source.network.as_str()),
+                domains: source.domains.clone(),
             };
             if let Some(mac) = source.mac {
                 snapshot.by_mac.insert(mac, (source.address, info.clone()));

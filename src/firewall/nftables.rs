@@ -148,6 +148,9 @@ pub struct Options {
     pub source_queue: Option<u16>,
     /// Open connections a container may have at a time, unless its labels say otherwise.
     pub connection_limit: Option<u32>,
+    /// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held
+    /// in until Portcullis has checked the name. See `dns_filter`.
+    pub dns_query_queue: Option<u16>,
 }
 
 impl Default for Options {
@@ -159,6 +162,7 @@ impl Default for Options {
             dns_queue: None,
             source_queue: None,
             connection_limit: Some(DEFAULT_CONNECTION_LIMIT),
+            dns_query_queue: None,
         }
     }
 }
@@ -167,6 +171,10 @@ impl Default for Options {
 /// need, and a fraction of the host's connection tracking table, which every container
 /// shares.
 pub const DEFAULT_CONNECTION_LIMIT: u32 = 16_384;
+
+/// Packet marks of DNS queries Portcullis checked: the name is allowed, or it isn't.
+pub const DNS_ALLOWED_MARK: u32 = 0x7063_0003;
+pub const DNS_DENIED_MARK: u32 = 0x7063_0002;
 
 /// Packet mark of held packets whose source stayed unknown: they are denied when they come
 /// back.
@@ -678,6 +686,7 @@ fn render_egress_dispatch(
     base: Chain,
 ) -> fmt::Result {
     render_link_local_ip(out, plan, options, base)?;
+    render_dns_names(out, plan, options, base)?;
     // The bridge table checked where established traffic comes from. Related traffic (ICMP
     // errors about a connection) is checked in the source's chain, see `render_related`.
     writeln!(out, "add rule {base} ct state established accept")?;
@@ -722,6 +731,40 @@ fn render_related(out: &mut String, chain: Chain, address: IpAddr) -> fmt::Resul
         )?;
     }
     Ok(())
+}
+
+/// DNS queries of containers whose names are limited are held until Portcullis has read the
+/// name, before established traffic is let through (a query over TCP comes after the
+/// handshake). A checked query comes back marked: an allowed one continues through the rules
+/// as any other, a denied one is rejected, so the lookup fails at once. The queue has no
+/// bypass: while Portcullis isn't reading it, such lookups fail.
+fn render_dns_names(out: &mut String, plan: &Plan, options: Options, base: Chain) -> fmt::Result {
+    let Some(queue) = options.dns_query_queue else {
+        return Ok(());
+    };
+    render_elements(
+        out,
+        format_args!("add rule {base} ip saddr"),
+        plan.sources
+            .iter()
+            .filter(|source| source.address.is_ipv4() && source.domains.is_some())
+            .map(|source| source.address),
+        format_args!(
+            " meta l4proto {{ tcp, udp }} th dport {DNS_PORT} ct direction original meta mark != {DNS_ALLOWED_MARK:#x} meta mark != {DNS_DENIED_MARK:#x} queue num {queue}"
+        ),
+    )?;
+    writeln!(
+        out,
+        "add rule {base} meta mark {DNS_DENIED_MARK:#x} meta l4proto tcp reject with tcp reset"
+    )?;
+    writeln!(
+        out,
+        "add rule {base} meta mark {DNS_DENIED_MARK:#x} reject with icmpx admin-prohibited"
+    )?;
+    writeln!(
+        out,
+        "add rule {base} meta mark {DNS_ALLOWED_MARK:#x} meta mark set 0x0"
+    )
 }
 
 /// Create or flush the chains and sets of `plan`, and remove those of `previous` it doesn't
@@ -1821,6 +1864,7 @@ mod tests {
         dns_queue: None,
         source_queue: None,
         connection_limit: None,
+        dns_query_queue: None,
     };
 
     fn render_with(state: &RuntimeState, options: Options, monitor_all: bool) -> String {
@@ -2255,6 +2299,47 @@ flush chain bridge portcullis limit_open
                 decided("add rule bridge portcullis limit_rate", 'd', "limit:rate", "drop"),
             ],
         );
+    }
+
+    #[test]
+    fn holds_dns_queries_of_containers_with_limited_names() {
+        let mut state = RuntimeState::default();
+        test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+        let limited = crate::model::ContainerPolicy {
+            domains: Some(vec!["api.test".to_string()]),
+            ..crate::model::ContainerPolicy::default()
+        };
+        test_support::add_container(
+            &mut state,
+            "a",
+            "named",
+            &[("net0", "172.18.0.2", &[])],
+            limited,
+        );
+        test_support::add_container(
+            &mut state,
+            "b",
+            "free",
+            &[("net0", "172.18.0.3", &[])],
+            crate::model::ContainerPolicy::default(),
+        );
+        let options = Options {
+            dns_query_queue: Some(9),
+            ..OPTIONS
+        };
+        let script = render_with(&state, options, false);
+        for base in ["forward", "input"] {
+            let head = format!("add rule inet portcullis {base}");
+            let expected = [
+                format!("{head} ip saddr {{ 172.18.0.2 }} meta l4proto {{ tcp, udp }} th dport 53 ct direction original meta mark != 0x70630003 meta mark != 0x70630002 queue num 9"),
+                format!("{head} meta mark 0x70630002 meta l4proto tcp reject with tcp reset"),
+                format!("{head} meta mark 0x70630002 reject with icmpx admin-prohibited"),
+                format!("{head} meta mark 0x70630003 meta mark set 0x0"),
+                format!("{head} ct state established accept"),
+            ]
+            .join("\n");
+            assert!(script.contains(&expected), "{script}");
+        }
     }
 
     #[test]

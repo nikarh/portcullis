@@ -26,6 +26,7 @@ SCENARIOS=(
   alerts
   checks
   flood
+  domains
 )
 
 # E2E_SCENARIOS="icc egress" runs only those.

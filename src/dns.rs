@@ -71,6 +71,18 @@ struct HostEntry {
     retry_at: Option<Instant>,
 }
 
+/// Whether `name` (normalized) matches a `portcullis.domains` pattern: the name itself, or
+/// with `*.`, any name below it.
+#[must_use]
+pub fn domain_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(parent) => name
+            .strip_suffix(parent)
+            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1),
+        None => pattern == name,
+    }
+}
+
 /// Addresses one container may learn for one hostname from DNS answers, while they are
 /// allowed. A container that may ask a resolver of its own could otherwise answer itself
 /// with millions of addresses, each held for at least `--hostname-hold`, and make every
@@ -363,6 +375,16 @@ mod tests {
                 .observe("rogue", "api.test", extra, HOLD, later)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn matches_domain_patterns() {
+        assert!(domain_matches("api.test", "api.test"));
+        assert!(!domain_matches("api.test", "x.api.test"));
+        assert!(domain_matches("*.api.test", "x.api.test"));
+        assert!(domain_matches("*.api.test", "a.b.api.test"));
+        assert!(!domain_matches("*.api.test", "api.test"));
+        assert!(!domain_matches("*.api.test", "evilapi.test"));
     }
 
     #[test]

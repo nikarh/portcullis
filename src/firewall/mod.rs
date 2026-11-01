@@ -6,8 +6,8 @@ pub mod test_support;
 use thiserror::Error;
 
 pub use nftables::{
-    DEFAULT_CONNECTION_LIMIT, DenyAction, HOLD_EXPIRED_MARK, LOG_PREFIX, LogAllowed,
-    NftablesFirewall, Options,
+    DEFAULT_CONNECTION_LIMIT, DNS_ALLOWED_MARK, DNS_DENIED_MARK, DenyAction, HOLD_EXPIRED_MARK,
+    LOG_PREFIX, LogAllowed, NftablesFirewall, Options,
 };
 pub use plan::{Destination, HostSet, Plan, Rule};
 

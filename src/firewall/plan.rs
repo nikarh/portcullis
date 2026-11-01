@@ -107,6 +107,9 @@ pub struct Source {
     pub quarantine: bool,
     /// The container is quarantined: nothing it sends gets anywhere.
     pub quarantined: bool,
+    /// The domain names the container may look up, if limited: its `portcullis.domains`
+    /// patterns and the hostnames of its `host:` rules.
+    pub domains: Option<Vec<String>>,
     /// Range into [`Plan::rules`] of rules for traffic leaving the network.
     egress: Range<usize>,
     /// Range into [`Plan::rules`] of rules for traffic to containers on the same network.
@@ -402,6 +405,16 @@ where
             new_connection_rate: policy.new_connection_rate,
             quarantine: policy.quarantine,
             quarantined: self.state.is_quarantined(&container.id),
+            domains: policy.domains.as_ref().map(|domains| {
+                let mut domains = domains.clone();
+                domains.extend(policy.egress.iter().filter_map(|rule| match &rule.target {
+                    EgressTarget::Hostname(host) => Some(crate::dns::normalize(host)),
+                    EgressTarget::IpCidr(_) => None,
+                }));
+                domains.sort_unstable();
+                domains.dedup();
+                domains
+            }),
             egress,
             icc,
         });

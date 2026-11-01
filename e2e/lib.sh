@@ -106,6 +106,7 @@ from_outside() {
 answered() {
   case "$1" in
     tcp | spoof_tcp | from_outside | fast_tcp) grep -q 'succeeded' <<<"$2" ;;
+    in_svc) grep -Eq '^[0-9a-f.:]+$' <<<"$2" ;;
     udp | fast_udp) grep -v 'socat\[' <<<"$2" | grep -q . ;;
     dns) grep -Eq '^[0-9a-f.:]+$' <<<"$2" ;;
     resolve | fast_dns) grep -A1 '^Name:' <<<"$2" | grep -q '^Address' ;;
