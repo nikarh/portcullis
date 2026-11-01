@@ -62,6 +62,9 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. See [Stopping
 | `--alert-interval <seconds>` | `600` | Raise the same alert at most once per interval. |
 | `--log-format <text\|json>` | `text` | Format of events (stdout) and diagnostic logs (stderr). |
 | `--log-level <error\|warn\|info\|debug\|trace>` | `info` | Level of diagnostic logs. `trace` logs every firewall script that gets applied. |
+| `--quarantine <isolate\|report\|off>` | `isolate` | What happens to a container that misbehaves, see [Quarantine and limits](#quarantine-and-limits). |
+| `--quarantine-denials <n>` | `1000` | Denied connections per minute past which a container is quarantined. |
+| `--connection-limit <n\|none>` | `16384` | Open connections a container may have at a time, unless its labels say otherwise. |
 | `--on-exit <keep\|remove>` | `keep` | What happens to the firewall rules when Portcullis stops, see [Stopping and removing Portcullis](#stopping-and-removing-portcullis). |
 
 ### Stopping and removing Portcullis
@@ -120,7 +123,7 @@ A connection event:
 | Field | Meaning |
 |---|---|
 | `verdict` | `allowed`, `denied`, or `would_deny` in monitor mode. |
-| `reason` | Which part of the policy decided: `egress`, `dns`, `icc` (traffic to a container on the same network), `source` (a container sending with an address or MAC that isn't its own, ARP included), or `frame` (a kind of frame enforced networks don't carry, such as IPv6 or VLAN-tagged frames). |
+| `reason` | Which part of the policy decided: `egress`, `dns`, `icc` (traffic to a container on the same network), `source` (a container sending with an address or MAC that isn't its own, ARP included), `frame` (a kind of frame enforced networks don't carry, such as IPv6 or VLAN-tagged frames), or `limit` (a container over its [connection limits](#quarantine-and-limits)). |
 | `protocol` | `tcp`, `udp`, `icmp` or another IP protocol number; for `source` and `frame`, also `arp`, `ipv6` or `ether type 0x....`. |
 | `source`, `destination` | The addresses the packet claims. For egress, the destination the container asked for, before Docker's DNAT of published ports. Both are `null` for frames without IP addresses. |
 | `container` | The container that sent it. For `source` and `frame`, this is the container behind the bridge port the frame came in on, whatever address or MAC it used. |
@@ -135,7 +138,7 @@ A flow (container, destination, protocol and port) is reported at most once a mi
 |---|---|
 | `dns` | A container received a DNS answer: the name, its CNAME aliases, the answer addresses and the resolver. Reported where allowed connections are (`--log-allowed`). |
 | `container` | A container address became managed (`action: managed`, with its `mode`) or stopped being managed (`released`). |
-| `warning` | `invalid_label`, `invalid_network`, `dns_not_observable` (see [DNS visibility](#dns-visibility)), `events_lost` (the kernel produced log entries faster than Portcullis read them), `alerts_suppressed` (see [Alerts](#alerts)), or one of the [configuration checks](#configuration-checks). |
+| `warning` | `invalid_label`, `invalid_network`, `dns_not_observable` (see [DNS visibility](#dns-visibility)), `events_lost` (the kernel produced log entries faster than Portcullis read them), `alerts_suppressed` (see [Alerts](#alerts)), `quarantined` (see [Quarantine and limits](#quarantine-and-limits)), or one of the [configuration checks](#configuration-checks). |
 | `applied` | Rules were updated: the managed container addresses, and hostnames of `host:` rules with no known addresses. It comes after everything else the update caused. |
 | `apply_failed` | Updating the rules failed; the previous rules stay in place. |
 
@@ -334,9 +337,33 @@ Portcullis assumes a container may be compromised and actively try to get past i
 
 Reports can't be flooded away either. A flood of new flows can fill the set Portcullis uses to report each flow once a minute; denials are then still reported, up to 10 a second per rule. A container's alerts are limited as described under [Alerts](#alerts).
 
-A well-behaved container never causes `source` or `frame` events: it sends with its own address and MAC, and Docker doesn't set it up to send IPv6 or VLAN frames on a network without IPv6. Such events are a strong sign that a container is compromised, or at least running tools that craft their own packets. They name the container behind the port the frame came from, whatever address or MAC it used, and raise alerts.
+A well-behaved container never causes `source` or `frame` events: it sends with its own address and MAC, and Docker doesn't set it up to send IPv6 or VLAN frames on a network without IPv6. Such events are a strong sign that a container is compromised, or at least running tools that craft their own packets. They name the container behind the port the frame came from, whatever address or MAC it used, raise alerts, and get the container [quarantined](#quarantine-and-limits).
 
 These are covered by the `bypass` end-to-end test scenario. What a firewall can't prevent is listed under [Limitations and details](#limitations-and-details).
+
+### Quarantine and limits
+
+A compromised container can try to flood its network or the host instead of getting past its rules. Portcullis cuts off containers that misbehave, and limits how many connections each container can have.
+
+A container is quarantined when:
+
+- it sends anything with an address or MAC that isn't its own, or a kind of frame enforced networks don't carry (a `source` or `frame` denial). A well-behaved container never does: it takes a raw socket and intent. IPv6 on a network with IPv6 enabled doesn't count.
+- more than `--quarantine-denials` (1000 by default) of its connections are denied within a minute: scanning, probing, or flooding destinations it may not reach.
+
+A quarantined container is cut off from its networks: nothing it sends gets anywhere, not even ARP, and the firewall drops it before looking at anything else. It is reported with a `quarantined` warning, which raises an alert. Restarting the container (`docker restart`, or recreating it) lets it back, starting from a clean state; if it misbehaves again, it is quarantined again. Quarantine is kept in memory: restarting Portcullis lets quarantined containers back too.
+
+With `--quarantine report`, Portcullis only reports what it would do; with `--quarantine off`, nothing. A container that has a reason to misbehave (a network tool that crafts its own packets, for example) can opt out with `portcullis.quarantine=off`.
+
+Two limits, by bridge port, protect what all containers share:
+
+```text
+portcullis.limit.connections=<n>|none     open connections at a time (default --connection-limit, 16384)
+portcullis.limit.new-connections=<n>      new connections per second (default: no limit)
+```
+
+The kernel tracks every open connection on the host in one table. A container opening connections without end would fill it, and then new connections of every container on the host fail. The open connections limit keeps one container from doing that; set it with `--connection-limit`, or per container with the label. The new connections limit is off unless a label sets it, since normal rates vary widely; it suits containers that only make a few connections. Connections over either limit are denied and reported with reason `limit`.
+
+Quarantine and limits only cover containers whose bridge port Portcullis knows. They can't stop a container from using up bandwidth or CPU with traffic its rules allow; give containers CPU limits, and, where bandwidth matters, limit it on the host (`tc`).
 
 ### Configuration checks
 
@@ -427,7 +454,7 @@ labels:
 
 - IPv6 is not supported, by design. Portcullis uses a network's IPv4 subnet and matches containers by their IPv4 address only. IPv6 traffic entering an enforced network's bridge is denied, so containers on an enforced network with IPv6 enabled can't use it at all.
 - Containers can't use addresses that aren't theirs: traffic entering an enforced network's bridge is only accepted with a known container's address and MAC, from that container's port on the bridge. Anything else from a known container's port is denied at once; from a port Portcullis doesn't know yet, it is held for up to 2 seconds, in case it comes from a container that just started, and then denied. If Portcullis can't find a container's port (it logs a warning), that container's traffic is only checked by address and MAC, which another container with a raw socket can copy.
-- `NET_RAW` (which Docker grants by default) and `NET_ADMIN` still let a container do things no firewall rule can stop, even though Portcullis keeps them from getting past its rules and reports their attempts. With a raw socket, a container can flood its network, or fill the kernel's connection tracking table, which affects every container on the host. It can also see broadcast and multicast traffic of its network, as any container can. With `NET_ADMIN` it can change its own interfaces and routes; Portcullis then denies whatever doesn't match the container's address and MAC, but the container can still disturb its own traffic. Drop `NET_RAW` from containers that don't need it (`cap_drop: [NET_RAW]` in Compose; `ping` is about the only common tool that needs it), and don't give `NET_ADMIN` to containers you don't trust.
+- `NET_RAW` (which Docker grants by default) and `NET_ADMIN` still let a container do things no firewall rule can stop, even though Portcullis keeps them from getting past its rules and reports their attempts. With a raw socket, a container can flood its network until it is [quarantined](#quarantine-and-limits), and use bandwidth and CPU with traffic its rules allow. It can also see broadcast and multicast traffic of its network, as any container can. With `NET_ADMIN` it can change its own interfaces and routes; Portcullis then denies whatever doesn't match the container's address and MAC, but the container can still disturb its own traffic. Drop `NET_RAW` from containers that don't need it (`cap_drop: [NET_RAW]` in Compose; `ping` is about the only common tool that needs it), and don't give `NET_ADMIN` to containers you don't trust.
 - A container with a published port can exchange data with anyone allowed to connect to it: replies to incoming connections are always allowed. Egress labels limit only the connections a container opens.
 - A network is enforced once Portcullis has seen it created, which usually takes milliseconds. Until then, its traffic isn't filtered at all. Containers that start on a brand-new network can get packets out in that window, for example when `docker compose up` creates the network and starts its containers right away. To close it, create enforced networks ahead of time (`docker network create`, or an `external` network in Compose) and start containers on them afterwards. Packets of containers that start on an already enforced network are held until their rules are in place, so nothing gets through there.
 - A container attached to both an enforced and a non-enforced network is only restricted for traffic it sends from its enforced-network address. Traffic leaving through the other network is not filtered.
