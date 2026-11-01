@@ -135,7 +135,7 @@ A flow (container, destination, protocol and port) is reported at most once a mi
 |---|---|
 | `dns` | A container received a DNS answer: the name, its CNAME aliases, the answer addresses and the resolver. Reported where allowed connections are (`--log-allowed`). |
 | `container` | A container address became managed (`action: managed`, with its `mode`) or stopped being managed (`released`). |
-| `warning` | `invalid_label`, `invalid_network`, `dns_not_observable` (see [DNS visibility](#dns-visibility)), `events_lost` (the kernel produced log entries faster than Portcullis read them), or `alerts_suppressed` (see [Alerts](#alerts)). |
+| `warning` | `invalid_label`, `invalid_network`, `dns_not_observable` (see [DNS visibility](#dns-visibility)), `events_lost` (the kernel produced log entries faster than Portcullis read them), `alerts_suppressed` (see [Alerts](#alerts)), or one of the [configuration checks](#configuration-checks). |
 | `applied` | Rules were updated: the managed container addresses, and hostnames of `host:` rules with no known addresses. It comes after everything else the update caused. |
 | `apply_failed` | Updating the rules failed; the previous rules stay in place. |
 
@@ -337,6 +337,32 @@ Reports can't be flooded away either. A flood of new flows can fill the set Port
 A well-behaved container never causes `source` or `frame` events: it sends with its own address and MAC, and Docker doesn't set it up to send IPv6 or VLAN frames on a network without IPv6. Such events are a strong sign that a container is compromised, or at least running tools that craft their own packets. They name the container behind the port the frame came from, whatever address or MAC it used, and raise alerts.
 
 These are covered by the `bypass` end-to-end test scenario. What a firewall can't prevent is listed under [Limitations and details](#limitations-and-details).
+
+### Configuration checks
+
+Some configurations get a container around its rules without sending a single packet Portcullis could deny. Portcullis looks for them when it starts and whenever a container starts, and reports each as a `warning` event (which raises an [alert](#alerts)):
+
+| Warning | When | Why it matters |
+|---|---|---|
+| `unenforced_network` | A container on an enforced network is also on a network that isn't enforced. | Its traffic through the other network isn't filtered at all. |
+| `unused_labels` | A container has `portcullis.*` labels but isn't on an enforced network, for example with `network_mode: host`. | The labels look like a policy, but nothing applies them. |
+| `shared_network` | A container uses another container's network (`network_mode: "service:x"` or `container:x`) and either container is restricted. | It shares the other container's addresses and rules; its own labels have no effect. |
+| `docker_socket` | A restricted container has the Docker socket mounted. | It can start containers outside the rules, or change its own. |
+| `privileged` | A restricted container is privileged. | It can change its network interfaces and get around the rules. |
+| `net_admin` | A restricted container has `NET_ADMIN`. | It can change its own interfaces and routes. Portcullis still denies what doesn't match its address and MAC, but this is rarely needed. |
+| `ipv6_network` | An enforced network has IPv6 enabled. | Portcullis denies all IPv6 on it, so its containers can't use IPv6. |
+| `dns_not_observable` | See [DNS visibility](#dns-visibility). | |
+
+When a configuration is intended, acknowledge it with a label, and its warning is no longer reported. Several names are separated by commas:
+
+```yaml
+services:
+  traefik:
+    labels:
+      - portcullis.ack=docker-socket
+```
+
+The names are `unenforced-network`, `unused-labels`, `shared-network`, `docker-socket`, `privileged`, `net-admin` and `dns-not-observable` on containers, and `ipv6-network` on networks (`portcullis.ack=ipv6-network` in the network's labels). An unknown name is reported as an invalid label.
 
 ### Examples
 
