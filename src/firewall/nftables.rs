@@ -46,6 +46,8 @@ enum Chain {
     Base(Table),
     /// Base chain of the inet table for traffic addressed to the host itself.
     Input,
+    /// Base chain of the bridge table for frames a bridge delivers to the host itself.
+    BridgeInput,
     /// Egress rules of the n-th source, in the inet table.
     Egress(usize),
     /// ICC rules of the n-th source, in the bridge table.
@@ -66,7 +68,7 @@ impl Chain {
         match self {
             Self::Base(table) => table,
             Self::Input | Self::Egress(_) => Table::Inet,
-            Self::Icc(_) => Table::Bridge,
+            Self::BridgeInput | Self::Icc(_) => Table::Bridge,
         }
     }
 }
@@ -84,7 +86,7 @@ impl fmt::Display for ChainName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Chain::Base(table) => f.write_str(table.hook()),
-            Chain::Input => f.write_str("input"),
+            Chain::Input | Chain::BridgeInput => f.write_str("input"),
             Chain::Egress(index) => write!(f, "egress{index}"),
             Chain::Icc(index) => write!(f, "icc{index}"),
         }
@@ -513,10 +515,12 @@ fn render_apply_script(
     for table in [Table::Inet, Table::Bridge] {
         writeln!(out, "add table {table}")?;
         render_base_chain(out, Chain::Base(table), table.hook())?;
-        if table == Table::Inet {
-            render_base_chain(out, Chain::Input, "input")?;
-            writeln!(out, "flush chain {}", Chain::Input)?;
-        }
+        let input = match table {
+            Table::Inet => Chain::Input,
+            Table::Bridge => Chain::BridgeInput,
+        };
+        render_base_chain(out, input, "input")?;
+        writeln!(out, "flush chain {input}")?;
         render_logged_sets(out, table, reassigned)?;
         writeln!(out, "flush chain {}", Chain::Base(table))?;
     }
@@ -569,6 +573,7 @@ fn render_apply_script(
     // another container's address into that container's connections.
     if !plan.bridges.is_empty() {
         render_bridge_dispatch(out, plan, options)?;
+        render_link_local(out, plan, options)?;
     }
     for (index, source) in ipv4_sources() {
         if icc_chain_needed(plan, source, options) {
@@ -590,6 +595,7 @@ fn render_egress_dispatch(
     options: Options,
     base: Chain,
 ) -> fmt::Result {
+    render_link_local_ip(out, plan, options, base)?;
     // The bridge table checked where established traffic comes from. Related traffic (ICMP
     // errors about a connection) is checked in the source's chain, see `render_related`.
     writeln!(out, "add rule {base} ct state established accept")?;
@@ -789,6 +795,64 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         )?;
     }
     render_denied_frames(out, options, false, &format!("meta ibrname {enforced}"))
+}
+
+/// Frames to the link-local group addresses (01:80:c2:00:00:00 to 0f, used by protocols
+/// such as STP and LLDP) skip the bridge's prerouting hook: the bridge hands them to the
+/// host directly, on the container's port instead of the bridge. With IP inside, they reach
+/// the host's IP stack without any of the bridge's checks, from any address the container
+/// likes. No container has a reason to send them; they are denied where the bridge hands
+/// them over. LLDP (and STP, where enabled) skips even that hook, see
+/// `render_link_local_ip`.
+fn render_link_local(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+    for monitor in [false, true] {
+        let Some(bridges) = set_literal(
+            plan.bridges
+                .iter()
+                .filter(|bridge| bridge.monitor == monitor)
+                .map(|bridge| Quoted(&bridge.name)),
+        ) else {
+            continue;
+        };
+        decide(
+            out,
+            format_args!(
+                "add rule {} meta ibrname {bridges} {LINK_LOCAL_GROUP}",
+                Chain::BridgeInput
+            ),
+            Outcome::deny(options, monitor, "frame").for_frame(),
+        )?;
+    }
+    Ok(())
+}
+
+/// The link-local group addresses: 01:80:c2:00:00:00 to 01:80:c2:00:00:0f.
+const LINK_LOCAL_GROUP: &str = "ether daddr & ff:ff:ff:ff:ff:f0 == 01:80:c2:00:00:00";
+
+/// IP in frames to link-local group addresses that the bridge passed to the host without any
+/// bridge hook (LLDP, and STP where enabled). Nothing legitimate sends IP that way, from
+/// anywhere, so it is denied on every interface. Reported as denied while any network is
+/// enforced, as would-be-denied while all are monitored.
+fn render_link_local_ip(
+    out: &mut String,
+    plan: &Plan,
+    options: Options,
+    base: Chain,
+) -> fmt::Result {
+    if plan.bridges.is_empty() {
+        return Ok(());
+    }
+    let monitor = plan.bridges.iter().all(|bridge| bridge.monitor);
+    for (family, key) in [("ipv4", LogKey::Ipv4), ("ipv6", LogKey::Ipv6)] {
+        let mut outcome = Outcome::deny(options, monitor, "frame").dropped();
+        outcome.key = key;
+        decide(
+            out,
+            format_args!("add rule {base} meta nfproto {family} {LINK_LOCAL_GROUP}"),
+            outcome,
+        )?;
+    }
+    Ok(())
 }
 
 /// Deny (or in monitor mode, report) frames of the bridge base chain matching `selector`:
@@ -1575,6 +1639,8 @@ add set inet portcullis logged6 { type ipv6_addr . ipv6_addr . inet_proto . inet
 flush chain inet portcullis forward
 add table bridge portcullis
 add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }
+add chain bridge portcullis input { type filter hook input priority -1; policy accept; }
+flush chain bridge portcullis input
 add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis frames { type ifname . ether_addr . ether_type; flags dynamic,timeout; timeout 60s; size 65536; }
 flush chain bridge portcullis prerouting
@@ -1619,7 +1685,7 @@ flush chain bridge portcullis icc0
             ],
         );
         // nothing for families without sources
-        assert!(!script.contains("ip6 saddr"));
+        assert!(!script.contains("ip6 saddr vmap"));
     }
 
     #[test]
@@ -1678,6 +1744,7 @@ flush chain bridge portcullis icc0
             assert!(!script.contains("delete chain inet portcullis forward"));
             assert!(!script.contains("delete chain inet portcullis input"));
             assert!(!script.contains("delete chain bridge portcullis prerouting"));
+            assert!(!script.contains("delete chain bridge portcullis input"));
         }
 
         // What the previous update created and this one doesn't need is removed; the rest
@@ -1823,7 +1890,8 @@ flush chain bridge portcullis icc0
         // Only traffic denied for what it is, not where it goes, is dropped.
         for line in script.lines().filter(|line| line.ends_with(" drop")) {
             assert!(
-                line.starts_with("add rule bridge portcullis prerouting "),
+                line.starts_with("add rule bridge portcullis prerouting ")
+                    || line.contains(LINK_LOCAL_GROUP),
                 "{line}"
             );
         }
