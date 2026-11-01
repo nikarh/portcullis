@@ -34,6 +34,8 @@ The scenario also tries ARP from another container's MAC or claiming the gateway
 
 The `checks` scenario starts containers with configurations that get around the rules (a second network that isn't enforced, host networking, a shared network namespace, the Docker socket, `NET_ADMIN`, IPv6) and checks their warnings in the alert log, and that acknowledged ones stay quiet. The `flood` scenario checks quarantine (for a spoofed packet, and for too many denials), release on restart, and the connection limits. The `domains` scenario checks that a container with `portcullis.domains` labels can only look up the names they list, through Docker's DNS, directly, and over TCP.
 
+The `boot` scenario plays a reboot: it stops Portcullis, deletes its tables (as a reboot would) and stops Docker, then starts Portcullis with a stand-in for systemd's notification socket (`wait-ready.py`), checks that the saved rules are back before Docker runs, and starts Docker, whose `restart: always` container tries a listed and an unlisted destination right away.
+
 To check what happens before Portcullis has applied rules for a container, the `fast-start` scenario stops Portcullis with SIGSTOP, starts a container that sends right away, and resumes Portcullis with SIGCONT.
 
 Probes (`tcp`, `udp`, `dns`, `resolve`, `from_outside`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname. The checks of a scenario run in parallel; a failed check prints the probe's output.

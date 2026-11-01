@@ -48,7 +48,7 @@ The binary is `target/release/portcullis`.
 sudo ./target/release/portcullis
 ```
 
-Portcullis runs in the foreground until it gets SIGINT or SIGTERM. See [Stopping and removing Portcullis](#stopping-and-removing-portcullis) for what happens to its rules then.
+Portcullis runs in the foreground until it gets SIGINT or SIGTERM. To run it for real, run it as a service, see [Running as a service](#running-as-a-service). See [Stopping and removing Portcullis](#stopping-and-removing-portcullis) for what happens to its rules when it stops.
 
 | Option | Default | Description |
 |---|---|---|
@@ -65,7 +65,33 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. See [Stopping
 | `--quarantine <isolate\|report\|off>` | `isolate` | What happens to a container that misbehaves, see [Quarantine and limits](#quarantine-and-limits). |
 | `--quarantine-denials <n>` | `1000` | Denied connections per minute past which a container is quarantined. |
 | `--connection-limit <n\|none>` | `16384` | Open connections a container may have at a time, unless its labels say otherwise. |
+| `--state-dir <path>` | `/var/lib/portcullis` | Where the rules are saved, to be put back first thing at the next start (see [Running as a service](#running-as-a-service)). |
 | `--on-exit <keep\|remove>` | `keep` | What happens to the firewall rules when Portcullis stops, see [Stopping and removing Portcullis](#stopping-and-removing-portcullis). |
+
+### Running as a service
+
+Install the binary as `/usr/local/bin/portcullis` and the systemd unit from [`dist/portcullis.service`](dist/portcullis.service), then enable it:
+
+```bash
+sudo install -m 0755 target/release/portcullis /usr/local/bin/
+sudo install -m 0644 dist/portcullis.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now portcullis
+```
+
+Add your options to its `ExecStart` line (`systemctl edit portcullis`). That's all: the unit starts Portcullis before Docker, at boot and whenever Docker starts, and nothing else needs to be ordered.
+
+Why it matters: Docker starts containers with a restart policy as soon as it starts, and the kernel forgets every firewall rule at a reboot. If those containers started before Portcullis had put rules in place, they would be unrestricted until it did. So Portcullis saves the rules of every update (in `--state-dir`), and when it starts, before anything else:
+
+1. It puts the last saved rules back in place.
+2. It reports itself ready to systemd, which only then starts Docker.
+3. It waits for Docker to answer, however long that takes, then puts the rules for what is running now in place.
+
+Between 1 and 3, containers on enforced networks are held back rather than let through: they come back with new bridge ports, which the restored rules don't know, so their first packets are held until Portcullis has their rules, and then go out (or are denied) as their labels say. Connections are delayed by a moment at boot, not lost. Containers on networks that aren't enforced aren't affected.
+
+Without systemd, start Portcullis before Docker the same way; it waits for Docker on its own. Started after Docker, it works too, but containers that Docker started before it are unrestricted until it has caught up.
+
+If Portcullis can't start at all, containers on enforced networks stay cut off (their packets are held for a Portcullis that isn't there), rather than run without their rules. `portcullis cleanup` removes the rules and the saved ones, if you need them gone.
 
 ### Stopping and removing Portcullis
 
@@ -75,17 +101,18 @@ By default (`--on-exit keep`), the firewall rules stay in place when Portcullis 
 - Containers that start on an enforced network in the meantime can't send anything: they have no rules yet, so their packets are held for Portcullis and then dropped by the kernel. They get their rules as soon as Portcullis is back.
 - DNS answers are let through without inspection, and nothing is reported.
 
-When Portcullis starts again, its first update replaces the old rules in one step.
+When Portcullis starts again, it puts its saved rules back, and its first update replaces them in one step (see [Running as a service](#running-as-a-service)).
 
-To remove the rules, for example after deciding not to use Portcullis anymore, run:
+To remove the rules, for example after deciding not to use Portcullis anymore, stop and disable the service and run:
 
 ```bash
+sudo systemctl disable --now portcullis
 sudo portcullis cleanup
 ```
 
-With `--on-exit remove`, Portcullis removes its rules itself, when it starts and when it stops cleanly. Containers are then unrestricted while it isn't running. After a crash the rules stay, as with `keep`.
+`cleanup` removes the saved rules too, so they don't come back.
 
-The rules live in the kernel only, so a reboot removes them either way.
+With `--on-exit remove`, Portcullis removes its rules, and the saved ones, when it stops cleanly. Containers are then unrestricted while it isn't running, including at the next boot until it starts. After a crash the rules stay, as with `keep`.
 
 ### Rolling out a policy
 
