@@ -12,11 +12,11 @@ services:
       - portcullis.egress.web=ip:198.51.100.3,tcp:80,udp:9001
       - portcullis.egress.api=host:api.test,tcp:80
       - portcullis.dns.rogue=ip:198.51.100.4
-  # Has a policy worth borrowing, and a published port.
+  # Has a policy worth borrowing, a published port, and an address on a second network.
   victim:
     image: portcullis-e2e-tester
     pull_policy: never
-    networks: [net]
+    networks: [net, other]
     labels:
       - portcullis.egress.udp=ip:198.51.100.4,udp:9000
       - portcullis.egress.api=host:api.test,tcp:80
@@ -29,8 +29,22 @@ services:
     networks: [net]
     labels:
       - portcullis.egress.host=ip:198.51.100.1,tcp:7777
+  # On the second network, where Docker reaches the victim's published port through DNAT.
+  outsider:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [other]
+    labels:
+      - portcullis.egress.published=ip:198.51.100.1,tcp:18080
 
 networks:
   net:
+    labels:
+      - portcullis.enable=true
+    # Fixed, so a new container can be given a removed container's address.
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+  other:
     labels:
       - portcullis.enable=true

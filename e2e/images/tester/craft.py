@@ -7,9 +7,16 @@ capabilities (NET_RAW), so every probe here is available to any container.
     craft udp --dst IP --dport N [options]     UDP datagram
     craft tcp --dst IP --dport N [options]     TCP SYN
     craft flood --count N                      N UDP datagrams from random unused sources
+    craft scan --dst IP --count N              N UDP datagrams to distinct ports, fast
+    craft icmp-error --dst IP --about IP:PORT --dport N
+                                               ICMP port unreachable to IP, quoting a UDP
+                                               datagram from IP:N to the --about address
+    craft arp [--src IP] [--src-mac MAC]       gratuitous ARP announcing IP at MAC
+    craft ipv6 [--src-mac MAC]                 IPv6 UDP datagram to all nodes
 
 Options:
     --src IP          source address (default: the container's own)
+    --sport N         source port (default: random)
     --src-mac MAC     source MAC (default: the container's own)
     --to-mac MAC      destination MAC (default: the gateway's for addresses outside the
                       subnet, the address's own otherwise, broadcast for broadcasts)
@@ -32,6 +39,7 @@ from scapy.all import (
     ARP,
     ICMP,
     IP,
+    IPv6,
     TCP,
     UDP,
     AsyncSniffer,
@@ -112,9 +120,60 @@ def frame(args, src, src_mac, to_mac, transport):
     return frames
 
 
+def send_only(args, subnet, src, src_mac, own_mac):
+    """Probes that expect no answer: the test looks for the event they cause."""
+    if args.mode == "arp":
+        sendp(
+            Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")
+            / ARP(op=2, psrc=src, hwsrc=src_mac, pdst=src, hwdst="ff:ff:ff:ff:ff:ff"),
+            iface=IFACE,
+        )
+    elif args.mode == "ipv6":
+        sendp(
+            Ether(src=src_mac, dst="33:33:00:00:00:01")
+            / IPv6(src="fe80::1", dst="ff02::1")
+            / UDP(sport=9000, dport=9000),
+            iface=IFACE,
+        )
+    elif args.mode == "icmp-error":
+        about, port = args.about.rsplit(":", 1)
+        quoted = IP(src=args.dst, dst=about) / UDP(sport=args.dport, dport=int(port))
+        sendp(
+            Ether(src=src_mac, dst=destination_mac(args.dst, subnet))
+            / IP(src=src, dst=args.dst)
+            / ICMP(type=3, code=3)
+            / bytes(quoted)
+            / Raw(b"data of my choice"),
+            iface=IFACE,
+        )
+    else:
+        # Raw bytes, to send tens of thousands of datagrams in about a second.
+        import socket
+
+        frame = bytearray(
+            bytes(
+                Ether(src=own_mac, dst=destination_mac(args.dst, subnet))
+                / IP(src=src, dst=args.dst)
+                / UDP(sport=40000, dport=1, chksum=0)
+                / Raw(b"x")
+            )
+        )
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        sock.bind((IFACE, 0))
+        for index in range(args.count):
+            frame[34:36] = (40000 + index // 65535).to_bytes(2, "big")
+            frame[36:38] = (1 + index % 65535).to_bytes(2, "big")
+            sock.send(frame)
+    print("sent")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["udp", "tcp", "flood"])
+    parser.add_argument(
+        "mode", choices=["udp", "tcp", "flood", "scan", "icmp-error", "arp", "ipv6"]
+    )
+    parser.add_argument("--sport", type=int)
+    parser.add_argument("--about")
     parser.add_argument("--dst")
     parser.add_argument("--dport", type=int)
     parser.add_argument("--src")
@@ -133,6 +192,10 @@ def main():
     src = args.src or own_ip
     src_mac = args.src_mac or own_mac
 
+    if args.mode in ("scan", "icmp-error", "arp", "ipv6"):
+        send_only(args, subnet, src, src_mac, own_mac)
+        return 0
+
     if args.mode == "flood":
         to_mac = destination_mac(args.dst, subnet)
         frames = []
@@ -149,7 +212,7 @@ def main():
         return 0
 
     to_mac = args.to_mac or destination_mac(args.dst, subnet)
-    sport = random.randint(20000, 60000)
+    sport = args.sport or random.randint(20000, 60000)
     if args.mode == "udp":
         transport = UDP(sport=sport, dport=args.dport) / Raw(b"ping")
     else:
