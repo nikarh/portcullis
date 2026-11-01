@@ -339,6 +339,8 @@ enum LogKey {
     OriginalV6,
     /// A frame that may not even be IP: the bridge port, source MAC and ether type.
     Frame,
+    /// ARP: the bridge port, and the MAC and address it announces.
+    Arp,
 }
 
 impl Outcome {
@@ -397,6 +399,12 @@ impl Outcome {
         self
     }
 
+    const fn for_arp(mut self) -> Self {
+        self.key = LogKey::Arp;
+        self.drop = true;
+        self
+    }
+
     const fn dropped(mut self) -> Self {
         self.drop = true;
         self
@@ -432,6 +440,8 @@ const LOGGED_SET_V4: &str = "logged4";
 const LOGGED_SET_V6: &str = "logged6";
 /// Recently reported frames: (bridge port, source MAC, ether type), in the bridge table.
 const LOGGED_SET_FRAMES: &str = "frames";
+/// Recently reported ARP: (bridge port, announced MAC, announced address).
+const LOGGED_SET_ARP: &str = "announced";
 const LOGGED_TIMEOUT: &str = "60s";
 const LOGGED_SIZE: u32 = 65_536;
 
@@ -440,9 +450,14 @@ fn render_logged_sets(out: &mut String, table: Table, flush: bool) -> fmt::Resul
     const FLOW_V4: &str = "ipv4_addr . ipv4_addr . inet_proto . inet_service";
     const FLOW_V6: &str = "ipv6_addr . ipv6_addr . inet_proto . inet_service";
     const FRAME: &str = "ifname . ether_addr . ether_type";
+    const ARP: &str = "ifname . ether_addr . ipv4_addr";
     let sets: &[(&str, &str)] = match table {
         Table::Inet => &[(LOGGED_SET_V4, FLOW_V4), (LOGGED_SET_V6, FLOW_V6)],
-        Table::Bridge => &[(LOGGED_SET_V4, FLOW_V4), (LOGGED_SET_FRAMES, FRAME)],
+        Table::Bridge => &[
+            (LOGGED_SET_V4, FLOW_V4),
+            (LOGGED_SET_FRAMES, FRAME),
+            (LOGGED_SET_ARP, ARP),
+        ],
     };
     for (name, key) in sets {
         writeln!(
@@ -479,6 +494,7 @@ fn decide(out: &mut String, head: fmt::Arguments<'_>, outcome: Outcome) -> fmt::
                 "ip6 saddr . ct original ip6 daddr . meta l4proto . ct original proto-dst",
             ),
             LogKey::Frame => (LOGGED_SET_FRAMES, "iifname . ether saddr . ether type"),
+            LogKey::Arp => (LOGGED_SET_ARP, "iifname . arp saddr ether . arp saddr ip"),
         };
         let log = format_args!(
             "log prefix \"{LOG_PREFIX}:{verdict}:{reason}\" group {} snaplen {}",
@@ -950,7 +966,7 @@ fn render_denied_frames(
     decide(
         out,
         format_args!("add rule {base} {selector} ether type arp"),
-        source.for_frame(),
+        source.for_arp(),
     )?;
     decide(
         out,
@@ -1699,6 +1715,13 @@ mod tests {
     }
 
     /// The de-duplicated log statement of a reported frame decision.
+    fn arp_log_rule(verdict: char) -> String {
+        let key = "iifname . arp saddr ether . arp saddr ip";
+        format!(
+            "{key} != @announced add @announced {{ {key} }} log prefix \"pc:{verdict}:source\" group 7 snaplen 128"
+        )
+    }
+
     fn frame_log_rule(verdict: char, reason: &str) -> String {
         let key = "iifname . ether saddr . ether type";
         format!(
@@ -1719,7 +1742,11 @@ mod tests {
         let action = if verdict == 'w' { "accept" } else { "drop" };
         [
             decided(&format!("{head} ether type ip"), verdict, "source", action),
-            framed(&format!("{head} ether type arp"), verdict, "source", action),
+            reported(
+                &format!("{head} ether type arp"),
+                &arp_log_rule(verdict),
+                action,
+            ),
             framed(&head, verdict, "frame", action),
         ]
         .join("\n")
@@ -1777,6 +1804,7 @@ add chain bridge portcullis forward { type filter hook forward priority -1; poli
 flush chain bridge portcullis forward
 add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis frames { type ifname . ether_addr . ether_type; flags dynamic,timeout; timeout 60s; size 65536; }
+add set bridge portcullis announced { type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout 60s; size 65536; }
 flush chain bridge portcullis prerouting
 add chain inet portcullis egress0
 flush chain inet portcullis egress0
