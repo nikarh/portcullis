@@ -12,6 +12,8 @@ KEEP_VM=1 e2e/run.sh                # leave the VM running for the next run
 
 The host needs `qemu-system-x86_64`, `genisoimage` (or `mkisofs`), `ssh`, `rsync` and read/write access to `/dev/kvm`. No root and no daemons. The first run downloads a Debian cloud image and provisions the VM with Docker and Rust, which takes a few minutes; later runs boot the existing disk. VM files live in `~/.cache/portcullis-e2e`.
 
+CI runs the suite the same way on every push (`.github/workflows/ci.yml`), on a GitHub runner with KVM.
+
 `e2e/vm.sh` manages the VM on its own: `up`, `sync` (copy the working tree and build), `ssh [command]`, `down`, and `destroy` (delete the disk).
 
 ## How it works
