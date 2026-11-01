@@ -457,7 +457,7 @@ fn render_logged_sets(out: &mut String, table: Table, flush: bool) -> fmt::Resul
 }
 
 /// Render a decision: `head` (`add rule <chain> <match>`) followed by the outcome. A
-/// reported outcome gets a rule before it that logs the packet, but only the first of its
+/// reported outcome gets rules before it that log the packet, but only the first of its
 /// flow within the de-duplication timeout; the verdict rule applies to every packet.
 fn decide(out: &mut String, head: fmt::Arguments<'_>, outcome: Outcome) -> fmt::Result {
     if let Some((verdict, reason)) = outcome.log_prefix() {
@@ -480,14 +480,25 @@ fn decide(out: &mut String, head: fmt::Arguments<'_>, outcome: Outcome) -> fmt::
             ),
             LogKey::Frame => (LOGGED_SET_FRAMES, "iifname . ether saddr . ether type"),
         };
+        let log = format_args!(
+            "log prefix \"{LOG_PREFIX}:{verdict}:{reason}\" group {} snaplen {}",
+            outcome.options.log_group, outcome.snaplen
+        );
+        writeln!(out, "{head} {key} != @{set} add @{set} {{ {key} }} {log}")?;
+        // Adding to a full set fails, and so would the log statement after it: anyone able
+        // to fill the set with flows of their own would make every denial after it go
+        // unreported. A flow the rule above didn't add is still logged, at a limited rate
+        // per rule, so one source can't drown out the others either.
         writeln!(
             out,
-            "{head} {key} != @{set} add @{set} {{ {key} }} log prefix \"{LOG_PREFIX}:{verdict}:{reason}\" group {} snaplen {}",
-            outcome.options.log_group, outcome.snaplen
+            "{head} {key} != @{set} limit rate {LOG_FULL_RATE} {log}"
         )?;
     }
     writeln!(out, "{head} {outcome}")
 }
+
+/// How often a rule reports flows once its de-duplication set is full.
+const LOG_FULL_RATE: &str = "10/second";
 
 /// `{ e1, e2, ... }`, or `None` without elements.
 fn set_literal<T: fmt::Display>(elements: impl Iterator<Item = T>) -> Option<String> {
@@ -1687,39 +1698,40 @@ mod tests {
         )
     }
 
+    /// The rules reporting and deciding a frame of `head`, for `reason`.
+    fn framed(head: &str, verdict: char, reason: &str, action: &str) -> String {
+        reported(head, &frame_log_rule(verdict, reason), action)
+    }
+
     /// The rules denying, or reporting, the frames of a selector in the bridge base chain.
     /// They drop whatever the deny action: a rejection would go to the address the sender
     /// claims, or can't be sent for frames that aren't IP.
     fn denied_frames(selector: &str, verdict: char) -> String {
         let head = format!("add rule bridge portcullis prerouting {selector}");
-        let frame_action = if verdict == 'w' { "accept" } else { "drop" };
+        let action = if verdict == 'w' { "accept" } else { "drop" };
         [
-            decided(
-                &format!("{head} ether type ip"),
-                verdict,
-                "source",
-                frame_action,
-            ),
-            format!(
-                "{head} ether type arp {}\n{head} ether type arp {frame_action}",
-                frame_log_rule(verdict, "source")
-            ),
-            format!(
-                "{head} {}\n{head} {frame_action}",
-                frame_log_rule(verdict, "frame")
-            ),
+            decided(&format!("{head} ether type ip"), verdict, "source", action),
+            framed(&format!("{head} ether type arp"), verdict, "source", action),
+            framed(&head, verdict, "frame", action),
         ]
         .join("\n")
     }
 
-    /// The two rules of a reported decision: the log rule, then the verdict rule.
+    /// The rules of a reported decision: the log rule, the log rule for when its
+    /// de-duplication set is full, then the verdict rule.
     fn decided(head: &str, verdict: char, reason: &str, action: &str) -> String {
         let log = if head.contains(" egress") {
             egress_log_rule(verdict, reason)
         } else {
             log_rule(verdict, reason)
         };
-        format!("{head} {log}\n{head} {action}")
+        reported(head, &log, action)
+    }
+
+    fn reported(head: &str, log: &str, action: &str) -> String {
+        let (key, rest) = log.split_once(" add @").expect("dedup rule");
+        let statement = rest.split_once("} ").expect("log statement").1;
+        format!("{head} {log}\n{head} {key} limit rate 10/second {statement}\n{head} {action}")
     }
 
     fn has_line(script: &str, expected: &str) -> bool {
