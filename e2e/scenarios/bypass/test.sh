@@ -35,6 +35,12 @@ event "ICMP errors about another container's connection" "event=connection verdi
 
 # The bridge itself: the victim's MAC in its forwarding table, or other containers' and
 # the gateway's addresses in their neighbours' ARP caches.
+event "ARP from another container's MAC" "event=connection verdict=denied reason=source container~attacker protocol=arp detail~MAC" \
+  craft attacker arp --src-mac "${victim_mac}"
+event "ARP claiming the gateway's address" "event=connection verdict=denied reason=source container~attacker protocol=arp source=${gateway} detail~instead" \
+  craft attacker arp --src "${gateway}"
+event "IPv6" "event=connection verdict=denied reason=frame container~attacker protocol=ipv6" craft attacker ipv6
+flush_checks
 # The bridge learns where a MAC is from the frames it gets; a frame from the victim's MAC
 # would send the victim's traffic to the attacker.
 hijack_then_reach() {
@@ -46,11 +52,7 @@ hijack_then_reach() {
   grep -q '^answered' <<<"${output}"
 }
 check "allowed: the victim's traffic after ARP from its MAC elsewhere" hijack_then_reach
-event "ARP from another container's MAC" "event=connection verdict=denied reason=source container~attacker protocol=arp detail~MAC" \
-  craft attacker arp --src-mac "${victim_mac}"
-event "ARP claiming the gateway's address" "event=connection verdict=denied reason=source container~attacker protocol=arp source=${gateway} detail~instead" \
-  craft attacker arp --src "${gateway}"
-event "IPv6" "event=connection verdict=denied reason=frame container~attacker protocol=ipv6" craft attacker ipv6
+flush_checks
 
 # The host itself.
 blocked "a host service through the gateway" tcp attacker "${gateway}" 7777
