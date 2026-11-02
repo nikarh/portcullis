@@ -1,0 +1,66 @@
+# nfpm config of the .deb and Arch Linux packages, built by scripts/package.sh from a
+# release binary. That script sets the variables and stages the files in target/package.
+name: portcullis
+arch: ${PORTCULLIS_ARCH}
+version: ${PORTCULLIS_VERSION}
+# Taken as is: scripts/package.sh makes it a valid deb or Arch version.
+version_schema: none
+release: 1
+section: net
+priority: optional
+maintainer: Nikolay Arhipov <nikarh@users.noreply.github.com>
+description: Limits what Docker containers can connect to, from labels on containers and networks, with nftables
+homepage: https://github.com/nikarh/portcullis
+license: MIT OR Apache-2.0
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+      - libnftables1
+    scripts:
+      postinstall: dist/packaging/deb/postinst
+      preremove: dist/packaging/deb/prerm
+      postremove: dist/packaging/deb/postrm
+  archlinux:
+    depends:
+      - glibc
+      - nftables
+    scripts:
+      postinstall: dist/packaging/arch/post_install.sh
+      preremove: dist/packaging/arch/pre_remove.sh
+      postremove: dist/packaging/arch/post_remove.sh
+
+contents:
+  - src: target/package/portcullis
+    dst: /usr/bin/portcullis
+    file_info:
+      mode: 0755
+  - src: target/package/portcullis.service
+    dst: /usr/lib/systemd/system/portcullis.service
+    file_info:
+      mode: 0644
+  # Debian's starts every network in monitor mode, since the package starts the service.
+  - src: target/package/config-deb.toml
+    dst: /etc/portcullis/config.toml
+    type: config|noreplace
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: dist/config.toml
+    dst: /etc/portcullis/config.toml
+    type: config|noreplace
+    packager: archlinux
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/portcullis/README.md
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/portcullis/LICENSE-MIT
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/portcullis/LICENSE-APACHE
+
+archlinux:
+  packager: Nikolay Arhipov <nikarh@users.noreply.github.com>
+  scripts:
+    postupgrade: dist/packaging/arch/post_upgrade.sh

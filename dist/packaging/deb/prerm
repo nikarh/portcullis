@@ -1,0 +1,12 @@
+#!/bin/sh
+# On removal, stop the service and remove its firewall rules: once the binary is gone,
+# nothing would remove them, and containers on enforced networks would stay cut off.
+# Upgrades leave the service running; postinst restarts it.
+set -e
+
+if [ "$1" = remove ]; then
+  if [ -d /run/systemd/system ]; then
+    deb-systemd-invoke stop portcullis.service >/dev/null || true
+  fi
+  /usr/bin/portcullis cleanup || true
+fi

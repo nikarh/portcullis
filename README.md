@@ -33,19 +33,39 @@ Every decision can be reported. The rules log what they allow and deny to Portcu
 
 ### Installing
 
-Each [release](https://github.com/nikarh/portcullis/releases) has the binary for x86_64 and aarch64 Linux (glibc 2.35 or newer, i.e. Ubuntu 22.04, Debian 12 or later), alone and in an archive with the systemd unit, the config file, the README and the licenses. `SHA256SUMS` lists their checksums, and `SHA256SUMS.asc` is its signature, made with the [release signing key](docs/signing-key.asc) (`33DD 9B9F B720 453D 4813  6F2E B90B 594E CF87 B58B`). To download the newest release and check it:
+Each [release](https://github.com/nikarh/portcullis/releases) has packages for Debian and Ubuntu (`.deb`) and Arch Linux (`.pkg.tar.zst`), and the bare binary, alone and in an archive with the systemd unit, the config file, the README and the licenses. All of them are for x86_64 and aarch64 Linux with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 or later). `SHA256SUMS` lists their checksums, and `SHA256SUMS.asc` is its signature, made with the [release signing key](docs/signing-key.asc) (`33DD 9B9F B720 453D 4813  6F2E B90B 594E CF87 B58B`). To download a file of the newest release and check it:
 
 ```bash
-arch=x86_64   # or aarch64
+file=portcullis_amd64.deb   # see below
 base=https://github.com/nikarh/portcullis/releases/latest/download
-curl -fL -O "${base}/portcullis-${arch}-linux-gnu.tar.gz" -O "${base}/SHA256SUMS" -O "${base}/SHA256SUMS.asc"
+curl -fL -O "${base}/${file}" -O "${base}/SHA256SUMS" -O "${base}/SHA256SUMS.asc"
 curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc | gpg --import
 gpg --verify SHA256SUMS.asc SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf "portcullis-${arch}-linux-gnu.tar.gz"
 ```
 
-Then install it as a service, see [Running as a service](#running-as-a-service). The [`latest`](https://github.com/nikarh/portcullis/releases/tag/latest) pre-release has the same files, built and signed from the newest commit of `main`; its version says so (`0.1.0-dev+abc1234`).
+On Debian and Ubuntu, `portcullis_amd64.deb` or `portcullis_arm64.deb`:
+
+```bash
+sudo apt install ./portcullis_amd64.deb
+```
+
+As Debian packages do, it enables and starts the service right away. So that this doesn't block anything you haven't reviewed, its config starts in monitor mode (`monitor = true` in `/etc/portcullis/config.toml`): enforced networks report what would be denied and deny nothing. Once the reports look right (see [Rolling out a policy](#rolling-out-a-policy)), set `monitor = false` and `sudo systemctl restart portcullis`.
+
+On Arch Linux, `portcullis-x86_64.pkg.tar.zst` or `portcullis-aarch64.pkg.tar.zst`:
+
+```bash
+sudo pacman -U portcullis-x86_64.pkg.tar.zst
+sudo systemctl enable --now portcullis
+```
+
+As Arch packages do, it leaves enabling the service to you, and its config enforces policies from the start.
+
+Both install the binary as `/usr/bin/portcullis`, the systemd unit and the config file (see [Configuration](#configuration)), and need libnftables. Upgrading restarts the service if it runs (the rules stay in place meanwhile), and leaves a changed config file alone. Removing the package stops the service and removes its rules (`portcullis cleanup`), since nothing could remove them once the binary is gone; `apt purge` also removes the config and the saved rules.
+
+Elsewhere, take `portcullis-x86_64-linux-gnu.tar.gz` or `portcullis-aarch64-linux-gnu.tar.gz`, unpack it (`tar -xzf`), and install it as a service, see [Running as a service](#running-as-a-service).
+
+The [`latest`](https://github.com/nikarh/portcullis/releases/tag/latest) pre-release has the same files, built and signed from the newest commit of `main`; its version says so (`0.1.0-dev+abc1234`). Its packages are versioned by commit time, and as newer than the release `0.1.0` once that is out, older before (`0.1.0+dev20261102101530.abc1234` or `0.1.0~dev…`), so a package manager upgrades from one to the next.
 
 ### Building
 
@@ -102,7 +122,7 @@ The same options can be given on the command line, and override the file. `--con
 
 ### Running as a service
 
-Install the binary as `/usr/local/bin/portcullis`, the systemd unit from [`dist/portcullis.service`](dist/portcullis.service) and the config file from [`dist/config.toml`](dist/config.toml), then enable the service. From a release archive (built from source, they are `target/release/portcullis` and in `dist/`):
+The packages do this for you, see [Installing](#installing). Otherwise, install the binary as `/usr/local/bin/portcullis`, the systemd unit from [`dist/portcullis.service`](dist/portcullis.service) and the config file from [`dist/config.toml`](dist/config.toml), then enable the service. From a release archive (built from source, they are `target/release/portcullis` and in `dist/`):
 
 ```bash
 sudo install -m 0755 portcullis/portcullis /usr/local/bin/
@@ -139,7 +159,7 @@ Portcullis prefers stopping to running with part of its job undone. Whenever it 
 
 `systemctl status portcullis` and `journalctl -u portcullis` show what happened.
 
-To upgrade, replace the binary and restart the service. The rules stay in place while it restarts:
+To upgrade, install the newer package, or replace the binary and restart the service. The rules stay in place while it restarts:
 
 ```bash
 sudo install -m 0755 portcullis/portcullis /usr/local/bin/

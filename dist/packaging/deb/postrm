@@ -1,0 +1,21 @@
+#!/bin/sh
+# As dh_installsystemd does it, and purge removes the saved rules too.
+set -e
+
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+  systemctl --system daemon-reload >/dev/null || true
+fi
+if [ -x /usr/bin/deb-systemd-helper ]; then
+  case "$1" in
+    remove)
+      deb-systemd-helper mask portcullis.service >/dev/null || true
+      ;;
+    purge)
+      deb-systemd-helper purge portcullis.service >/dev/null || true
+      deb-systemd-helper unmask portcullis.service >/dev/null || true
+      ;;
+  esac
+fi
+if [ "$1" = purge ]; then
+  rm -rf /var/lib/portcullis
+fi

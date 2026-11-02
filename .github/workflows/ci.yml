@@ -33,6 +33,25 @@ jobs:
       - run: cargo clippy --locked --all-targets
       - run: cargo test --locked
 
+  packages:
+    name: packages
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libnftables-dev clang libclang-dev
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+        with:
+          install_args: nfpm
+      # As in Publish, from a debug build: the scripts and the install are what's tested.
+      - run: cargo build --locked
+        env:
+          PORTCULLIS_VERSION_SUFFIX: -dev+${{ github.sha }}
+      - run: scripts/package.sh x86_64 target/debug/portcullis out
+      - run: scripts/check-deb.sh out/portcullis_amd64.deb
+
   deny:
     name: dependency audit
     runs-on: ubuntu-24.04

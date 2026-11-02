@@ -6,8 +6,10 @@
    version in `Cargo.toml`, regenerates `CHANGELOG.md` with git-cliff from the conventional commits, and opens a pull
    request titled `Release vX.Y.Z` with the release notes as its body.
 2. Review and merge it. The **Release** workflow tags the merge commit and creates the GitHub release with the notes.
-3. The **Publish** workflow builds Portcullis for x86_64 and aarch64 on Ubuntu 22.04, runs the tests, writes
-   `SHA256SUMS` and its GPG signature, and uploads everything to the release.
+3. The **Publish** workflow builds Portcullis for x86_64 and aarch64 on Ubuntu 22.04, runs the tests, packages the
+   binary as `.deb` and Arch Linux packages with [nfpm](https://nfpm.goreleaser.com/) (`scripts/package.sh`, config
+   in `dist/packaging/`), checks that the `.deb` installs, starts and purges, writes `SHA256SUMS` and its GPG signature, and
+   uploads everything to the release.
 
 Every push to `main` also updates the `latest` pre-release (the **Latest** workflow): the tag moves to the new
 commit, the notes list the unreleased changes, and Publish uploads the same files, signed the same way, with the
@@ -21,6 +23,8 @@ the newest file:
 | --- | --- |
 | `portcullis-x86_64-linux-gnu`, `portcullis-aarch64-linux-gnu` | The binary |
 | `portcullis-x86_64-linux-gnu.tar.gz`, `portcullis-aarch64-linux-gnu.tar.gz` | The binary, the systemd unit, the config file, the README and the licenses |
+| `portcullis_amd64.deb`, `portcullis_arm64.deb` | Debian / Ubuntu packages |
+| `portcullis-x86_64.pkg.tar.zst`, `portcullis-aarch64.pkg.tar.zst` | Arch Linux packages |
 | `portcullis.service` | The systemd unit |
 | `SHA256SUMS`, `SHA256SUMS.asc` | Checksums of all of the above and their detached GPG signature |
 

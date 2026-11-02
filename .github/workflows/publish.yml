@@ -55,18 +55,26 @@ jobs:
       - run: cargo build --locked --release
         env:
           PORTCULLIS_VERSION_SUFFIX: ${{ inputs.version-suffix }}
-      - name: Package
+      - name: Archive
         run: |
           set -euo pipefail
           target/release/portcullis --version
-          mkdir -p dist portcullis
-          cp target/release/portcullis dist/portcullis-${{ matrix.arch }}-linux-gnu
+          mkdir -p out portcullis
+          cp target/release/portcullis out/portcullis-${{ matrix.arch }}-linux-gnu
           cp target/release/portcullis dist/portcullis.service dist/config.toml README.md LICENSE-MIT LICENSE-APACHE portcullis/
-          tar -czf dist/portcullis-${{ matrix.arch }}-linux-gnu.tar.gz portcullis
+          tar -czf out/portcullis-${{ matrix.arch }}-linux-gnu.tar.gz portcullis
+      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+        with:
+          install_args: nfpm
+      - name: Packages
+        run: |
+          set -euo pipefail
+          scripts/package.sh ${{ matrix.arch }} target/release/portcullis out
+          scripts/check-deb.sh out/portcullis_*.deb
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.arch }}
-          path: dist/*
+          path: out/*
           if-no-files-found: error
 
   upload:
