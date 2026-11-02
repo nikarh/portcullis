@@ -1,3 +1,4 @@
+use std::io::IsTerminal as _;
 use std::str::FromStr;
 
 use thiserror::Error;
@@ -79,6 +80,8 @@ pub fn init_logging(level: LogLevel, format: LogFormat) -> Result<(), LoggingErr
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
+        // Colors only on a terminal: in the journal or a file they are escape codes.
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr);
     match format {
         LogFormat::Text => builder.try_init(),
