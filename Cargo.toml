@@ -47,4 +47,4 @@ print_stderr = "deny"
 undocumented_unsafe_blocks = "deny"
 
 [build-dependencies]
-bindgen = "0.72.1"
+bindgen = "0.73.2"
