@@ -421,7 +421,7 @@ mod tests {
     fn invalid_dns_labels_do_not_restore_the_default() {
         let (policy, errors) = parse_policy(&labels(&[("portcullis.dns.0", "bogus")]));
         assert_eq!(errors.len(), 1);
-        assert!(policy.dns_targets.is_empty());
+        assert_eq!(policy.dns_targets, [] as [crate::model::DnsTarget; 0]);
     }
 
     use crate::events::WarningKind;
@@ -514,7 +514,7 @@ mod tests {
             .expect("parser should not fail");
 
         assert_eq!(parsed.icc_mode, IccMode::Allow);
-        assert!(parsed.icc_allow.is_empty());
+        assert_eq!(parsed.icc_allow, [] as [crate::model::IccAllowRule; 0]);
     }
 
     #[test]

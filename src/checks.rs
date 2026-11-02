@@ -203,7 +203,10 @@ mod tests {
         assert!(warning.message.contains("open"));
         assert_eq!(warning.container.as_deref(), Some("app"));
         // Unrestricted containers on networks that aren't enforced are none of its business.
-        assert!(container_warnings(&inspect(&[("open", "open")], &[]), &state).is_empty());
+        assert_eq!(
+            container_warnings(&inspect(&[("open", "open")], &[]), &state),
+            [] as [crate::events::Warning; 0]
+        );
     }
 
     #[test]
@@ -276,6 +279,9 @@ mod tests {
             "portcullis.ack".to_string(),
             "docker-socket, net-admin".to_string(),
         );
-        assert!(container_warnings(&container, &state).is_empty());
+        assert_eq!(
+            container_warnings(&container, &state),
+            [] as [crate::events::Warning; 0]
+        );
     }
 }

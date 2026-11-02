@@ -2188,7 +2188,7 @@ flush chain bridge portcullis limit_open
         // What the previous update created and this one doesn't need is removed; the rest
         // is flushed and refilled.
         let removed: Vec<_> = chains(first).difference(&chains(second)).copied().collect();
-        assert!(!removed.is_empty());
+        assert_ne!(removed, [] as [&str; 0]);
         for chain in removed {
             assert!(
                 second.contains(&format!("flush chain {chain}\ndelete chain {chain}\n")),

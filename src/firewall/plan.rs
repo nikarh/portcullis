@@ -739,7 +739,10 @@ mod tests {
     #[test]
     fn none_dns_allows_nothing() {
         let state = with_dns(vec![DnsTarget::None], &["1.1.1.1"]);
-        assert!(dns_destinations(&state, &[ip("9.9.9.9")]).is_empty());
+        assert_eq!(
+            dns_destinations(&state, &[ip("9.9.9.9")]),
+            [] as [std::net::IpAddr; 0]
+        );
     }
 
     #[test]
@@ -892,7 +895,10 @@ mod tests {
         let (plan, _) = build(&test_support::unresolvable_state());
         assert_eq!(plan.unresolved_hosts, vec![test_support::UNRESOLVABLE_HOST]);
         let set = plan.host_set(0).expect("host set");
-        assert!(set.addresses.is_empty());
+        assert_eq!(
+            set.addresses,
+            [] as [(std::net::IpAddr, std::time::Duration); 0]
+        );
         assert!(set.used_v4);
         let rules = rules_of(&plan, "172.18.0.2");
         assert!(rules.contains(&Rule::AcceptPort {

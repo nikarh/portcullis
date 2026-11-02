@@ -298,11 +298,11 @@ mod tests {
         let mut hosts = HostAddresses::new(resolver.clone(), HOLD);
         let now = Instant::now();
         assert!(hosts.addresses_at("web", "missing.test", now).is_err());
-        assert!(
+        assert_eq!(
             hosts
                 .addresses_at("web", "missing.test", now)
-                .expect("cached")
-                .is_empty()
+                .expect("cached"),
+            [] as [(std::net::IpAddr, std::time::Duration); 0]
         );
         assert_eq!(*resolver.calls.lock().expect("lock"), 1);
         assert!(

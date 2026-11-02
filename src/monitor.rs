@@ -846,13 +846,13 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
+        assert_eq!(
             state
                 .containers()
                 .get("def")
                 .expect("def should be present")
-                .attachments
-                .is_empty()
+                .attachments,
+            [] as [crate::model::NetworkAttachment; 0]
         );
     }
 
@@ -924,7 +924,10 @@ mod tests {
 
         match action {
             Some(RuntimeStateAction::CreateContainer { container }) => {
-                assert!(container.attachments.is_empty());
+                assert_eq!(
+                    container.attachments,
+                    [] as [crate::model::NetworkAttachment; 0]
+                );
             }
             _ => panic!("expected create container action"),
         }

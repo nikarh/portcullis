@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(timestamp(time), "2026-10-30T19:51:11.123Z");
         assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
         assert_eq!(
-            timestamp(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            timestamp(UNIX_EPOCH + Duration::from_hours(264_384)),
             "2000-02-29T00:00:00.000Z"
         );
     }

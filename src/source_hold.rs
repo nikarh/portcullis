@@ -248,6 +248,6 @@ mod tests {
         };
         let verdicts = release(&mut pending, now, |_| false);
         assert_eq!(verdicts, vec![(1, expired), (2, expired)]);
-        assert!(pending.is_empty());
+        assert_eq!(pending, [] as [Held; 0]);
     }
 }

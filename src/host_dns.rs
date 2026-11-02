@@ -119,13 +119,13 @@ mod tests {
             daemon_dns_from(r#"{"dns": ["10.0.0.1", "bogus"], "log-driver": "local"}"#),
             vec![ip("10.0.0.1")]
         );
-        assert!(daemon_dns_from("{}").is_empty());
-        assert!(daemon_dns_from("not json").is_empty());
+        assert_eq!(daemon_dns_from("{}"), [] as [std::net::IpAddr; 0]);
+        assert_eq!(daemon_dns_from("not json"), [] as [std::net::IpAddr; 0]);
     }
 
     #[test]
     fn leaves_out_loopback_servers() {
         let servers = resolvers_from("nameserver 127.0.0.1\nnameserver ::1\n", || None);
-        assert!(servers.is_empty());
+        assert_eq!(servers, [] as [std::net::IpAddr; 0]);
     }
 }

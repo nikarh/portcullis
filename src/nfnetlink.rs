@@ -678,7 +678,7 @@ pub mod tests {
         assert_eq!(parsed.source, Ipv4Addr::new(172, 18, 0, 2));
         assert_eq!(parsed.destination, Ipv4Addr::new(1, 1, 1, 1));
         assert_eq!(parsed.ports, Some((40000, 443)));
-        assert!(parsed.data.is_empty());
+        assert_eq!(parsed.data, [] as [u8; 0]);
 
         let udp = ipv4(
             [10, 0, 0, 1],

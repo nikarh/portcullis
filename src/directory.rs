@@ -341,16 +341,14 @@ mod tests {
         directory.update(&plan);
         let sets = directory.host_sets_for("web", &[test_support::HOST.to_string()]);
         assert_eq!(sets.len(), 1);
-        assert!(
-            directory
-                .host_sets_for("web", &["other.test".to_string()])
-                .is_empty()
+        assert_eq!(
+            directory.host_sets_for("web", &["other.test".to_string()]),
+            [] as [crate::firewall::HostSet; 0]
         );
         // Another container's sets.
-        assert!(
-            directory
-                .host_sets_for("db", &[test_support::HOST.to_string()])
-                .is_empty()
+        assert_eq!(
+            directory.host_sets_for("db", &[test_support::HOST.to_string()]),
+            [] as [crate::firewall::HostSet; 0]
         );
     }
 }
