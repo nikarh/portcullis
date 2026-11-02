@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Limits what Docker containers can connect to, from labels on containers and networks, with nftables."
 license = "MIT OR Apache-2.0"
+# Not on crates.io: the portcullis crate there is another project.
+publish = false
 repository = "https://github.com/nikarh/portcullis"
 readme = "README.md"
 keywords = ["docker", "nftables", "egress", "firewall"]
