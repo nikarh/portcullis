@@ -346,9 +346,11 @@ start_portcullis() {
   # creates it under a temporary name and renames it into place.
   local line
   coproc SOCKET_WATCH {
-    exec inotifywait -q -t 10 -e moved_to --include "${EVENTS_SOCKET##*/}" \
+    exec inotifywait -t 10 -e moved_to --include "${EVENTS_SOCKET##*/}" \
       --format %f "${EVENTS_SOCKET%/*}" 2>&1
   }
+  # Start Portcullis only once the watch is in place.
+  while read -r line <&"${SOCKET_WATCH[0]}" && [[ "${line}" != "Watches established." ]]; do :; done
   "${PORTCULLIS_BIN}" --log-level debug --events-socket "${EVENTS_SOCKET}" \
     --deny-action "${DENY_ACTION}" --alert-exec "cat >> ${ALERT_LOG}" "$@" \
     >>"${PORTCULLIS_LOG}" 2>&1 &
@@ -360,6 +362,8 @@ start_portcullis() {
   fi
   fail "portcullis did not start"
   tail -20 "${PORTCULLIS_LOG}" >&2
+  # Don't leave it holding the kernel's queues for the next start.
+  kill "${PORTCULLIS_PID}" 2>/dev/null && wait "${PORTCULLIS_PID}" 2>/dev/null
   return 1
 }
 
