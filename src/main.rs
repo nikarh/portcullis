@@ -52,7 +52,8 @@ use crate::model::{ContainerId, MacAddress, RuntimeState};
 use crate::monitor::{DockerMonitor, MonitorError};
 use crate::source_hold::SourceHold;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Cargo.toml's version, with `PORTCULLIS_VERSION_SUFFIX` at build time (see build.rs).
+const VERSION: &str = env!("PORTCULLIS_VERSION");
 /// NFLOG group the firewall rules log decisions to.
 const NFLOG_GROUP: u16 = 4242;
 /// NFQUEUE number DNS answers are held in for inspection.
