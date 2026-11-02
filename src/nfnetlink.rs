@@ -15,6 +15,7 @@ use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_NETFILTER};
+use nix::sys::socket::{setsockopt, sockopt};
 use tracing::warn;
 
 use crate::model::MacAddress;
@@ -107,8 +108,10 @@ fn encode_verdict(queue: u16, id: u32, verdict: QueueVerdict) -> Vec<u8> {
     )
 }
 
-/// Receive buffer: large enough that bursts of logged packets aren't lost.
-const RECEIVE_BUFFER: i32 = 4 << 20;
+/// Receive buffer: large enough that bursts of logged packets aren't lost. A report takes
+/// about 1 KiB of it, so this holds a burst of some 16000, well past what gets a container
+/// quarantined. The kernel only takes the memory while reports wait to be read.
+const RECEIVE_BUFFER: usize = 16 << 20;
 
 /// A packet copied to userspace by an nftables `log group` rule.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -156,8 +159,7 @@ impl NetfilterSocket {
         let mut socket = Socket::new(NETLINK_NETFILTER)?;
         socket.bind_auto()?;
         socket.connect(&SocketAddr::new(0, 0))?;
-        // Best effort: the kernel caps it at net.core.rmem_max.
-        let _ = socket.set_rx_buf_sz(RECEIVE_BUFFER);
+        set_receive_buffer(&socket);
         Ok(Self {
             socket,
             buffer: Vec::with_capacity(1 << 16),
@@ -194,6 +196,21 @@ impl NetfilterSocket {
         self.buffer.clear();
         self.socket.recv(&mut self.buffer, 0)?;
         Ok(())
+    }
+}
+
+/// Make the socket's receive buffer `RECEIVE_BUFFER` large. `SO_RCVBUF` is capped at
+/// `net.core.rmem_max`, about 200 KiB by default, which a few hundred reports fill, so
+/// `SO_RCVBUFFORCE` (root, or `CAP_NET_ADMIN`) comes first.
+fn set_receive_buffer(socket: &Socket) {
+    if let Err(error) = setsockopt(socket, sockopt::RcvBufForce, &RECEIVE_BUFFER) {
+        warn!(
+            %error,
+            "can't enlarge the netfilter socket's receive buffer past net.core.rmem_max; \
+             bursts of reports or held packets may be lost"
+        );
+        // Best effort: the kernel caps it at net.core.rmem_max.
+        let _ = setsockopt(socket, sockopt::RcvBuf, &RECEIVE_BUFFER);
     }
 }
 
