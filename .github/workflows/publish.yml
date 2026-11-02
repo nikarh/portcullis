@@ -1,0 +1,115 @@
+name: Publish
+
+# Builds, signs and uploads the release files when a release is published, and for the `latest` pre-release when the
+# Latest workflow calls it.
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      version-suffix:
+        description: Appended to the version from Cargo.toml, e.g. -dev+abc1234
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to (re)publish, e.g. v0.2.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.event.release.tag_name }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    # The Latest workflow creates the `latest` pre-release once and publishes it itself.
+    if: github.repository_owner == 'nikarh' && github.event.release.tag_name != 'latest'
+    strategy:
+      matrix:
+        include:
+          # The oldest supported Ubuntu: the binary needs at least its glibc (2.35), and libnftables.so.1 at run time.
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libnftables-dev clang libclang-dev
+      - run: rustup toolchain install
+      - name: Check the tag matches the version
+        if: startsWith(env.TAG, 'v')
+        run: test "$TAG" = "v$(cargo pkgid | sed 's/.*[#@]//')"
+      - run: cargo test --locked --release
+      - run: cargo build --locked --release
+        env:
+          PORTCULLIS_VERSION_SUFFIX: ${{ inputs.version-suffix }}
+      - name: Package
+        run: |
+          set -euo pipefail
+          target/release/portcullis --version
+          mkdir -p dist portcullis
+          cp target/release/portcullis dist/portcullis-${{ matrix.arch }}-linux-gnu
+          cp target/release/portcullis dist/portcullis.service README.md LICENSE-MIT LICENSE-APACHE portcullis/
+          tar -czf dist/portcullis-${{ matrix.arch }}-linux-gnu.tar.gz portcullis
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  upload:
+    name: Sign and upload
+    needs: [build]
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          sparse-checkout: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: release
+      - run: cp dist/portcullis.service release/
+      - name: Import the signing key
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Checksums and signature
+        working-directory: release
+        run: |
+          sha256sum -- * > SHA256SUMS
+          gpg --batch --yes --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
+          cat SHA256SUMS
+      - name: Generate GitHub token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: generate-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" release/* --clobber
+          # Files a newer build no longer has (on `latest`, which is uploaded to again and again).
+          gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
+            [[ -e release/$name ]] || gh release delete-asset "$TAG" "$name" --yes
+          done

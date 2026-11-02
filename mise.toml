@@ -1,0 +1,3 @@
+# Tools for the release workflows (Rust itself comes from rust-toolchain.toml).
+[tools]
+git-cliff = "2.14.2"
