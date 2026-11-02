@@ -1,6 +1,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 mod checks;
+mod config;
 mod connection_log;
 mod conntrack;
 mod directory;
@@ -23,11 +24,9 @@ mod systemd;
 mod tools;
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,6 +36,7 @@ use pico_args::Arguments;
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::config::{Config, ConfigError, OnExit, QuarantineMode};
 use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
 use crate::dns::{HostAddresses, SystemUpstreamResolver};
@@ -46,8 +46,8 @@ use crate::docker::{
 use crate::events::{
     ContainerAction, ContainerChange, Event, EventBus, Mode, Sinks, Warning, WarningKind,
 };
-use crate::firewall::{DenyAction, FirewallError, LogAllowed, NftablesFirewall, Options, Plan};
-use crate::logging::{LogFormat, LogLevel, LoggingError};
+use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan};
+use crate::logging::LoggingError;
 use crate::model::{ContainerId, MacAddress, RuntimeState};
 use crate::monitor::{DockerMonitor, MonitorError};
 use crate::source_hold::SourceHold;
@@ -62,7 +62,6 @@ const DNS_QUEUE: u16 = 4242;
 const SOURCE_QUEUE: u16 = 4243;
 /// File in the state directory the rules of every update are saved to.
 const SAVED_RULES: &str = "rules.nft";
-const DEFAULT_STATE_DIR: &str = "/var/lib/portcullis";
 /// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held in.
 const DNS_QUERY_QUEUE: u16 = 4244;
 /// How long such packets are held before they are denied.
@@ -71,86 +70,12 @@ const SOURCE_HOLD_GRACE: Duration = Duration::from_secs(2);
 /// row, up to 64 times as long (about 5 minutes).
 const APPLY_RETRY: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Config {
-    docker_socket: String,
-    events_socket: Option<PathBuf>,
-    deny_action: DenyAction,
-    monitor: bool,
-    log_allowed: LogAllowed,
-    hostname_hold: Duration,
-    alert_exec: Option<String>,
-    alert_interval: Duration,
-    log_level: LogLevel,
-    log_format: LogFormat,
-    on_exit: OnExit,
-    connection_limit: Option<u32>,
-    quarantine: QuarantineMode,
-    quarantine_denials: usize,
-    state_dir: PathBuf,
-}
-
-/// What happens to a container that misbehaves, see `quarantine`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum QuarantineMode {
-    /// Cut it off from its networks until it restarts.
-    #[default]
-    Isolate,
-    /// Only report that it would be.
-    Report,
-    Off,
-}
-
-/// What happens to the firewall rules when Portcullis stops.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum OnExit {
-    /// Leave the last rules in place: containers stay restricted, and those that start
-    /// meanwhile on an enforced network can't send at all. `portcullis cleanup` removes
-    /// them.
-    #[default]
-    Keep,
-    /// Remove all rules: containers are unrestricted until Portcullis runs again.
-    Remove,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            docker_socket: "/var/run/docker.sock".to_string(),
-            events_socket: None,
-            deny_action: DenyAction::Reject,
-            monitor: false,
-            log_allowed: LogAllowed::Monitor,
-            hostname_hold: Duration::from_secs(3600),
-            alert_exec: None,
-            alert_interval: Duration::from_secs(600),
-            log_level: LogLevel::Info,
-            log_format: LogFormat::Text,
-            on_exit: OnExit::Keep,
-            connection_limit: Some(firewall::DEFAULT_CONNECTION_LIMIT),
-            quarantine: QuarantineMode::Isolate,
-            quarantine_denials: 1000,
-            state_dir: PathBuf::from(DEFAULT_STATE_DIR),
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 enum MainError {
     #[error("argument parsing failed: {0}")]
     Args(#[from] pico_args::Error),
-    #[error("invalid deny action: {0}")]
-    InvalidDenyAction(String),
-    #[error("invalid --log-allowed value: {0}")]
-    InvalidLogAllowed(String),
-    #[error("invalid --on-exit value: {0}")]
-    InvalidOnExit(String),
-    #[error("invalid --connection-limit value: {0}, expected a positive number or none")]
-    InvalidConnectionLimit(String),
-    #[error("invalid --quarantine value: {0}, expected isolate, report or off")]
-    InvalidQuarantine(String),
-    #[error("unexpected arguments: {0:?}")]
-    UnexpectedArguments(Vec<OsString>),
+    #[error("{0}")]
+    Config(#[from] ConfigError),
     #[error("failed to initialize logging: {0}")]
     Logging(#[from] LoggingError),
     #[error("monitoring failed: {0}")]
@@ -196,8 +121,10 @@ fn main() {
         Ok(Some(command)) if command == "watch" => run_watch(args),
         Ok(Some(command)) if command == "audit" => run_audit(args),
         Ok(Some(command)) if command == "cleanup" => run_cleanup(args),
-        Ok(Some(command)) => Err(MainError::UnexpectedArguments(vec![command.into()])),
-        Ok(None) => parse_config(args).and_then(|config| run(&config)),
+        Ok(Some(command)) => Err(ConfigError::UnexpectedArguments(vec![command.into()]).into()),
+        Ok(None) => config::load(args)
+            .map_err(MainError::from)
+            .and_then(|config| run(&config)),
         Err(error) => Err(error.into()),
     };
     if let Err(error) = result {
@@ -206,116 +133,27 @@ fn main() {
     }
 }
 
-fn run_watch(mut args: Arguments) -> Result<(), MainError> {
-    let socket = args
-        .opt_value_from_str::<_, PathBuf>("--events-socket")?
-        .unwrap_or_else(|| PathBuf::from(tools::DEFAULT_EVENTS_SOCKET));
-    finish(args)?;
+fn run_watch(args: Arguments) -> Result<(), MainError> {
+    let socket = config::watch_socket(args)?;
     tools::watch(&socket).map_err(MainError::Tool)
 }
 
 fn run_audit(mut args: Arguments) -> Result<(), MainError> {
     let input = args.opt_free_from_str::<PathBuf>()?;
-    finish(args)?;
+    config::finish(args)?;
     tools::audit(input.as_deref()).map_err(MainError::Tool)
 }
 
 /// Remove every rule Portcullis owns, and the saved ones, for when it isn't going to run
 /// again.
-fn run_cleanup(mut args: Arguments) -> Result<(), MainError> {
-    let state_dir = args
-        .opt_value_from_str::<_, PathBuf>("--state-dir")?
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
-    finish(args)?;
+fn run_cleanup(args: Arguments) -> Result<(), MainError> {
+    let state_dir = config::cleanup_state_dir(args)?;
     let firewall = NftablesFirewall::with_libnftables(Options::default())?
         .saving_to(state_dir.join(SAVED_RULES));
     firewall.cleanup()?;
     firewall.forget_saved()?;
     let _ = std::io::stdout().write_all(b"portcullis: firewall rules removed\n");
     Ok(())
-}
-
-fn finish(args: Arguments) -> Result<(), MainError> {
-    let remaining = args.finish();
-    if remaining.is_empty() {
-        Ok(())
-    } else {
-        Err(MainError::UnexpectedArguments(remaining))
-    }
-}
-
-fn parse_config(mut args: Arguments) -> Result<Config, MainError> {
-    let mut config = Config::default();
-
-    if let Some(socket) = args.opt_value_from_str::<_, String>("--docker-socket")? {
-        config.docker_socket = socket;
-    }
-    config.events_socket = args.opt_value_from_str::<_, PathBuf>("--events-socket")?;
-    if let Some(action) = args.opt_value_from_str::<_, String>("--deny-action")? {
-        config.deny_action = match action.as_str() {
-            "reject" => DenyAction::Reject,
-            "drop" => DenyAction::Drop,
-            _ => return Err(MainError::InvalidDenyAction(action)),
-        };
-    }
-    config.monitor = args.contains("--monitor");
-    if let Some(value) = args.opt_value_from_str::<_, String>("--log-allowed")? {
-        config.log_allowed = match value.as_str() {
-            "always" => LogAllowed::Always,
-            "monitor" => LogAllowed::Monitor,
-            "never" => LogAllowed::Never,
-            _ => return Err(MainError::InvalidLogAllowed(value)),
-        };
-    }
-    if let Some(seconds) = args.opt_value_from_str::<_, u64>("--hostname-hold")? {
-        config.hostname_hold = Duration::from_secs(seconds);
-    }
-    config.alert_exec = args.opt_value_from_str::<_, String>("--alert-exec")?;
-    if let Some(seconds) = args.opt_value_from_str::<_, u64>("--alert-interval")? {
-        config.alert_interval = Duration::from_secs(seconds);
-    }
-    if let Some(level) = args.opt_value_from_str::<_, String>("--log-level")? {
-        config.log_level = LogLevel::from_str(&level)?;
-    }
-    if let Some(format) = args.opt_value_from_str::<_, String>("--log-format")? {
-        config.log_format = LogFormat::from_str(&format)?;
-    }
-    if let Some(value) = args.opt_value_from_str::<_, String>("--connection-limit")? {
-        config.connection_limit = match value.as_str() {
-            "none" => None,
-            _ => Some(
-                value
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|limit| *limit > 0)
-                    .ok_or(MainError::InvalidConnectionLimit(value))?,
-            ),
-        };
-    }
-    if let Some(value) = args.opt_value_from_str::<_, String>("--quarantine")? {
-        config.quarantine = match value.as_str() {
-            "isolate" => QuarantineMode::Isolate,
-            "report" => QuarantineMode::Report,
-            "off" => QuarantineMode::Off,
-            _ => return Err(MainError::InvalidQuarantine(value)),
-        };
-    }
-    if let Some(count) = args.opt_value_from_str::<_, usize>("--quarantine-denials")? {
-        config.quarantine_denials = count;
-    }
-    if let Some(directory) = args.opt_value_from_str::<_, PathBuf>("--state-dir")? {
-        config.state_dir = directory;
-    }
-    if let Some(value) = args.opt_value_from_str::<_, String>("--on-exit")? {
-        config.on_exit = match value.as_str() {
-            "keep" => OnExit::Keep,
-            "remove" => OnExit::Remove,
-            _ => return Err(MainError::InvalidOnExit(value)),
-        };
-    }
-
-    finish(args)?;
-    Ok(config)
 }
 
 fn print_help() {
@@ -333,7 +171,12 @@ USAGE:
                                        remove all firewall rules Portcullis left in place,
                                        and the saved ones
 
+Settings are read from /etc/portcullis/config.toml if it exists, where each option below
+is a key without its --, e.g. monitor = true or deny-action = \"drop\". Options given on
+the command line override it. watch and cleanup read it too.
+
 OPTIONS:
+  --config <path>              Config file to read instead (it must exist)
   --docker-socket <path>       Docker API socket (default: /var/run/docker.sock)
   --monitor                    Monitor mode everywhere: report what would be denied, deny
                                nothing
@@ -994,93 +837,5 @@ mod tests {
                 Some(320)
             ]
         );
-    }
-
-    #[test]
-    fn parse_config_uses_defaults() {
-        let config = parse_config(Arguments::from_vec(Vec::new())).ok();
-        assert_eq!(config, Some(Config::default()));
-    }
-
-    #[test]
-    fn parse_config_reads_all_values() {
-        let args = Arguments::from_vec(
-            [
-                "--docker-socket",
-                "/tmp/docker.sock",
-                "--events-socket",
-                "/run/portcullis.sock",
-                "--deny-action",
-                "drop",
-                "--monitor",
-                "--log-allowed",
-                "always",
-                "--hostname-hold",
-                "60",
-                "--alert-exec",
-                "notify-send",
-                "--alert-interval",
-                "30",
-                "--log-level",
-                "debug",
-                "--log-format",
-                "json",
-                "--on-exit",
-                "remove",
-                "--connection-limit",
-                "100",
-                "--quarantine",
-                "report",
-                "--quarantine-denials",
-                "5",
-                "--state-dir",
-                "/tmp/portcullis",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect(),
-        );
-        assert_eq!(
-            parse_config(args).ok(),
-            Some(Config {
-                docker_socket: "/tmp/docker.sock".to_string(),
-                events_socket: Some(PathBuf::from("/run/portcullis.sock")),
-                deny_action: DenyAction::Drop,
-                monitor: true,
-                log_allowed: LogAllowed::Always,
-                hostname_hold: Duration::from_secs(60),
-                alert_exec: Some("notify-send".to_string()),
-                alert_interval: Duration::from_secs(30),
-                log_level: LogLevel::Debug,
-                log_format: LogFormat::Json,
-                on_exit: OnExit::Remove,
-                connection_limit: Some(100),
-                quarantine: QuarantineMode::Report,
-                quarantine_denials: 5,
-                state_dir: PathBuf::from("/tmp/portcullis"),
-            })
-        );
-    }
-
-    #[test]
-    fn parse_config_rejects_invalid_values() {
-        for (flag, value) in [
-            ("--deny-action", "bad"),
-            ("--log-allowed", "bad"),
-            ("--log-format", "bad"),
-            ("--hostname-hold", "soon"),
-        ] {
-            let args = Arguments::from_vec(vec![flag.into(), value.into()]);
-            assert!(parse_config(args).is_err(), "{flag} {value}");
-        }
-    }
-
-    #[test]
-    fn parse_config_rejects_unknown_arguments() {
-        let args = Arguments::from_vec(vec!["--bogus".into()]);
-        assert!(matches!(
-            parse_config(args),
-            Err(MainError::UnexpectedArguments(_))
-        ));
     }
 }

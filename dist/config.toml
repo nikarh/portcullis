@@ -1,0 +1,54 @@
+# Portcullis configuration. The settings are the command line flags without their "--";
+# a flag given on the command line overrides the setting here. Apply changes with:
+#
+#   sudo systemctl restart portcullis
+#
+# The rules stay in place while it restarts. Commented out settings show the defaults.
+# See https://github.com/nikarh/portcullis#configuration for what each one does.
+
+# Monitor mode on every network: report what would be denied, deny nothing. Networks
+# can also be put in monitor mode one at a time, with portcullis.enable=monitor.
+#monitor = false
+
+# reject: answer denied traffic with an ICMP error, so applications fail at once.
+# drop: discard it silently, so applications wait for their own timeout.
+#deny-action = "reject"
+
+# Which allowed connections and DNS lookups are reported: always, monitor (on networks
+# in monitor mode only) or never. Denied ones always are.
+#log-allowed = "monitor"
+
+# Seconds an address of a host: rule stays allowed after it was last seen.
+#hostname-hold = 3600
+
+# Serve events as JSON lines on this Unix socket, for portcullis watch.
+events-socket = "/run/portcullis.sock"
+
+# Run this command with sh -c for every denial and warning, the event as JSON on stdin,
+# and raise the same alert at most once per interval (seconds).
+#alert-exec = "logger -t portcullis-alert"
+#alert-interval = 600
+
+# Events (stdout) and diagnostic logs (stderr): text or json. Level of diagnostic logs:
+# error, warn, info, debug or trace.
+#log-format = "text"
+#log-level = "info"
+
+# What happens to a container that misbehaves: isolate, report or off; and how many
+# denied connections per minute count as misbehaving.
+#quarantine = "isolate"
+#quarantine-denials = 1000
+
+# Open connections a container may have at a time, unless its labels say otherwise: a
+# number, or "none".
+#connection-limit = 16384
+
+# Docker API socket.
+#docker-socket = "/var/run/docker.sock"
+
+# Where the rules are saved, to be put back first thing at the next start.
+#state-dir = "/var/lib/portcullis"
+
+# keep: leave the firewall rules in place when Portcullis stops.
+# remove: remove them, leaving containers unrestricted until it runs again.
+#on-exit = "keep"

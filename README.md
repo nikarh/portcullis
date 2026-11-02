@@ -33,7 +33,7 @@ Every decision can be reported. The rules log what they allow and deny to Portcu
 
 ### Installing
 
-Each [release](https://github.com/nikarh/portcullis/releases) has the binary for x86_64 and aarch64 Linux (glibc 2.35 or newer, i.e. Ubuntu 22.04, Debian 12 or later), alone and in an archive with the systemd unit, the README and the licenses. `SHA256SUMS` lists their checksums, and `SHA256SUMS.asc` is its signature, made with the [release signing key](docs/signing-key.asc) (`33DD 9B9F B720 453D 4813  6F2E B90B 594E CF87 B58B`). To download the newest release and check it:
+Each [release](https://github.com/nikarh/portcullis/releases) has the binary for x86_64 and aarch64 Linux (glibc 2.35 or newer, i.e. Ubuntu 22.04, Debian 12 or later), alone and in an archive with the systemd unit, the config file, the README and the licenses. `SHA256SUMS` lists their checksums, and `SHA256SUMS.asc` is its signature, made with the [release signing key](docs/signing-key.asc) (`33DD 9B9F B720 453D 4813  6F2E B90B 594E CF87 B58B`). To download the newest release and check it:
 
 ```bash
 arch=x86_64   # or aarch64
@@ -65,10 +65,27 @@ sudo ./target/release/portcullis
 
 Portcullis runs in the foreground until it gets SIGINT or SIGTERM. To run it for real, run it as a service, see [Running as a service](#running-as-a-service). See [Stopping and removing Portcullis](#stopping-and-removing-portcullis) for what happens to its rules when it stops.
 
+### Configuration
+
+Portcullis reads its settings from `/etc/portcullis/config.toml`, if it exists. Each option in the table below is a key there, without its `--`:
+
+```toml
+monitor = true
+deny-action = "drop"
+events-socket = "/run/portcullis.sock"
+alert-exec = "logger -t portcullis-alert"
+connection-limit = "none"
+```
+
+[`dist/config.toml`](dist/config.toml) lists every setting with its default; the packages install it, and the service reads it. To change a setting, edit the file and restart Portcullis (`sudo systemctl restart portcullis`). The rules stay in place while it restarts. Unknown keys and invalid values are errors, and Portcullis doesn't start with them.
+
+The same options can be given on the command line, and override the file. `--config <path>` reads another file instead (and that one must exist). `portcullis watch` and `portcullis cleanup` read the file too, for the events socket and the state directory.
+
 | Option | Default | Description |
 |---|---|---|
+| `--config <path>` | `/etc/portcullis/config.toml` | Config file. Command line only. |
 | `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
-| `--monitor` | off | Monitor mode on every network: report what would be denied, deny nothing. |
+| `--monitor` | off | Monitor mode on every network: report what would be denied, deny nothing. In the file, `monitor = true` or `false`. |
 | `--deny-action <reject\|drop>` | `reject` | `reject` answers denied traffic with an ICMP "administratively prohibited" error, so applications fail immediately with "Host is unreachable". `drop` discards it silently, and applications wait for their own timeout. Traffic denied for its source or kind (reasons `source` and `frame`) is always dropped: a rejection would go to an address the sender only claims. |
 | `--log-allowed <always\|monitor\|never>` | `monitor` | Which allowed connections and successful DNS lookups are reported. Denied ones always are. `monitor` reports them on networks in monitor mode only. |
 | `--hostname-hold <seconds>` | `3600` | How long an address of a `host:` rule stays allowed after it was last seen, see [Hostname rules](#hostname-rules). |
@@ -85,16 +102,17 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. To run it for
 
 ### Running as a service
 
-Install the binary as `/usr/local/bin/portcullis` and the systemd unit from [`dist/portcullis.service`](dist/portcullis.service), then enable it. From a release archive (built from source, they are `target/release/portcullis` and `dist/portcullis.service`):
+Install the binary as `/usr/local/bin/portcullis`, the systemd unit from [`dist/portcullis.service`](dist/portcullis.service) and the config file from [`dist/config.toml`](dist/config.toml), then enable the service. From a release archive (built from source, they are `target/release/portcullis` and in `dist/`):
 
 ```bash
 sudo install -m 0755 portcullis/portcullis /usr/local/bin/
 sudo install -m 0644 portcullis/portcullis.service /etc/systemd/system/
+sudo install -D -m 0644 portcullis/config.toml /etc/portcullis/config.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now portcullis
 ```
 
-Add your options to its `ExecStart` line (`systemctl edit portcullis`). That's all: the unit starts Portcullis before Docker, at boot and whenever Docker starts, and nothing else needs to be ordered.
+Change settings in `/etc/portcullis/config.toml` (see [Configuration](#configuration)). That's all: the unit starts Portcullis before Docker, at boot and whenever Docker starts, and nothing else needs to be ordered.
 
 The unit keeps Portcullis from changing the system beyond its state directory and `/run`: `/usr`, `/boot` and `/etc` are read-only to it, and to `--alert-exec` commands, and `/home` and `/root` too. If an alert command needs to write somewhere else, add the path with `ReadWritePaths=` in `systemctl edit portcullis`.
 

@@ -20,7 +20,7 @@ the newest file:
 | Asset | Contents |
 | --- | --- |
 | `portcullis-x86_64-linux-gnu`, `portcullis-aarch64-linux-gnu` | The binary |
-| `portcullis-x86_64-linux-gnu.tar.gz`, `portcullis-aarch64-linux-gnu.tar.gz` | The binary, the systemd unit, the README and the licenses |
+| `portcullis-x86_64-linux-gnu.tar.gz`, `portcullis-aarch64-linux-gnu.tar.gz` | The binary, the systemd unit, the config file, the README and the licenses |
 | `portcullis.service` | The systemd unit |
 | `SHA256SUMS`, `SHA256SUMS.asc` | Checksums of all of the above and their detached GPG signature |
 

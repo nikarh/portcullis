@@ -11,7 +11,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/portcullis --events-socket /run/portcullis.sock
+# Settings are in /etc/portcullis/config.toml: change them there, then restart.
+ExecStart=/usr/local/bin/portcullis
 Restart=on-failure
 RestartSec=2s
 StateDirectory=portcullis
