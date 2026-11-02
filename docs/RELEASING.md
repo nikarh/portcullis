@@ -38,13 +38,13 @@ only allows the `main` and `release` branches and `v*` tags, and holds these sec
 
 | Secret | Value |
 | --- | --- |
-| `APP_ID` | The app's ID |
+| `APP_CLIENT_ID` | The app's client ID (`Iv…`, on the app's settings page) |
 | `APP_PRIVATE_KEY` | A private key of the app (PEM) |
 | `GPG_PRIVATE_KEY` | ASCII armored private key that signs `SHA256SUMS` |
 | `GPG_PASSPHRASE` | Its passphrase |
 
 ```sh
-gh secret set APP_ID --env release --repo nikarh/portcullis --body <app id>
+gh secret set APP_CLIENT_ID --env release --repo nikarh/portcullis --body <client id>
 gh secret set APP_PRIVATE_KEY --env release --repo nikarh/portcullis < release-bot.private-key.pem
 ```
 
