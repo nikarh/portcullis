@@ -34,17 +34,19 @@ Every decision can be reported. The rules log what they allow and deny to Portcu
 
 ### Installing
 
-Each [release](https://github.com/nikarh/portcullis/releases) has binaries for x86_64 and aarch64 Linux (glibc 2.35 or newer, i.e. Ubuntu 22.04, Debian 12 or later), with the systemd unit:
+Each [release](https://github.com/nikarh/portcullis/releases) has the binary for x86_64 and aarch64 Linux (glibc 2.35 or newer, i.e. Ubuntu 22.04, Debian 12 or later), alone and in an archive with the systemd unit, the README and the licenses. `SHA256SUMS` lists their checksums, and `SHA256SUMS.asc` is its signature, made with the [release signing key](docs/signing-key.asc) (`33DD 9B9F B720 453D 4813  6F2E B90B 594E CF87 B58B`). To download the newest release and check it:
 
 ```bash
-version=v0.1.0 arch=x86_64
-curl -fLO "https://github.com/nikarh/portcullis/releases/download/${version}/portcullis-${version}-${arch}-linux-gnu.tar.gz"
-curl -fLO "https://github.com/nikarh/portcullis/releases/download/${version}/portcullis-${version}-${arch}-linux-gnu.tar.gz.sha256"
-sha256sum -c "portcullis-${version}-${arch}-linux-gnu.tar.gz.sha256"
-tar -xzf "portcullis-${version}-${arch}-linux-gnu.tar.gz"
+arch=x86_64   # or aarch64
+base=https://github.com/nikarh/portcullis/releases/latest/download
+curl -fL -O "${base}/portcullis-${arch}-linux-gnu.tar.gz" -O "${base}/SHA256SUMS" -O "${base}/SHA256SUMS.asc"
+curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc | gpg --import
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf "portcullis-${arch}-linux-gnu.tar.gz"
 ```
 
-Then install it as a service, see [Running as a service](#running-as-a-service).
+Then install it as a service, see [Running as a service](#running-as-a-service). The [`latest`](https://github.com/nikarh/portcullis/releases/tag/latest) pre-release has the same files, built and signed from the newest commit of `main`; its version says so (`0.1.0-dev+abc1234`).
 
 ### Building
 
@@ -84,11 +86,11 @@ Portcullis runs in the foreground until it gets SIGINT or SIGTERM. To run it for
 
 ### Running as a service
 
-Install the binary as `/usr/local/bin/portcullis` and the systemd unit from [`dist/portcullis.service`](dist/portcullis.service), then enable it:
+Install the binary as `/usr/local/bin/portcullis` and the systemd unit from [`dist/portcullis.service`](dist/portcullis.service), then enable it. From a release archive (built from source, they are `target/release/portcullis` and `dist/portcullis.service`):
 
 ```bash
-sudo install -m 0755 target/release/portcullis /usr/local/bin/
-sudo install -m 0644 dist/portcullis.service /etc/systemd/system/
+sudo install -m 0755 portcullis/portcullis /usr/local/bin/
+sudo install -m 0644 portcullis/portcullis.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now portcullis
 ```
@@ -123,7 +125,7 @@ Portcullis prefers stopping to running with part of its job undone. Whenever it 
 To upgrade, replace the binary and restart the service. The rules stay in place while it restarts:
 
 ```bash
-sudo install -m 0755 portcullis /usr/local/bin/
+sudo install -m 0755 portcullis/portcullis /usr/local/bin/
 sudo systemctl restart portcullis
 ```
 
