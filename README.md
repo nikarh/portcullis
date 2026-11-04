@@ -65,7 +65,7 @@ Both install the binary as `/usr/bin/portcullis`, the systemd unit and the confi
 
 Elsewhere, take `portcullis-x86_64-linux-gnu.tar.gz` or `portcullis-aarch64-linux-gnu.tar.gz`, unpack it (`tar -xzf`), and install it as a service, see [Running as a service](#running-as-a-service).
 
-The [`latest`](https://github.com/nikarh/portcullis/releases/tag/latest) pre-release has the same files, built and signed from the newest commit of `main`; its version says so (`0.1.0-dev+abc1234`). Its packages are versioned by commit time, and as newer than the release `0.1.0` once that is out, older before (`0.1.0+dev20261102101530.abc1234` or `0.1.0~dev…`), so a package manager upgrades from one to the next.
+The [`latest`](https://github.com/nikarh/portcullis/releases/tag/latest) pre-release has the same files, built and signed from the newest commit of `main`; its version says so (`0.1.0-dev+abc1234`). Its packages are versioned by the number of commits on `main`, and as newer than the release `0.1.0` once that is out, older before (`0.1.0+dev205.abc1234` or `0.1.0~dev205.abc1234`), so a package manager upgrades from one to the next.
 
 ### Building
 

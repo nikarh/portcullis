@@ -4,14 +4,16 @@
 #   scripts/package.sh <x86_64|aarch64> <binary> <output dir>
 #
 # The version is the binary's own (portcullis --version). A build of main (0.1.0-dev+abc1234)
-# is packaged as a version that sorts by commit time, and after the release of its base
-# version if that is out already (Cargo.toml keeps it until the next release PR), or before:
+# is packaged with the number of commits up to it, so each build of main is newer than the
+# one before, and after the release of its base version if that is out already (Cargo.toml
+# keeps it until the next release PR), or before:
 #
-#                released v0.1.0                       no v0.1.0 yet
-#   deb    0.1.0+dev20261102101530.abc1234     0.1.0~dev20261102101530.abc1234
-#   Arch   0.1.0.dev20261102101530.abc1234     0.1.0dev20261102101530.abc1234
+#              released v0.1.0          no v0.1.0 yet
+#   deb    0.1.0+dev205.abc1234     0.1.0~dev205.abc1234
+#   Arch   0.1.0.dev205.abc1234     0.1.0dev205.abc1234
 #
-# (Arch versions can't have + or -.)
+# (Arch versions can't have + or -.) Counting the commits needs the whole history, not a
+# shallow clone.
 # Outputs portcullis_<amd64|arm64>.deb and portcullis-<arch>.pkg.tar.zst, names that
 # don't change between versions, like the other release files.
 set -euo pipefail
@@ -52,7 +54,11 @@ awk '
 version=$("${stage}/portcullis" --version | awk '{print $2}')
 if [[ "${version}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-dev\+([0-9a-f]+)$ ]]; then
   base=${BASH_REMATCH[1]} commit=${BASH_REMATCH[2]}
-  build="dev$(date -u -d "@$(git log -1 --format=%ct HEAD)" +%Y%m%d%H%M%S).${commit}"
+  if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+    echo "can't count the commits of ${commit} in a shallow clone (fetch-depth: 0)" >&2
+    exit 1
+  fi
+  build="dev$(git rev-list --count "${commit}").${commit}"
   if git ls-remote --exit-code --tags origin "refs/tags/v${base}" >/dev/null; then
     deb_version="${base}+${build}" arch_version="${base}.${build}"
   else
