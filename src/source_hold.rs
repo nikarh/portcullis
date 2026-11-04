@@ -27,7 +27,9 @@ use tracing::{debug, warn};
 use crate::directory::Directory;
 use crate::firewall::HOLD_EXPIRED_MARK;
 use crate::model::MacAddress;
-use crate::nfnetlink::{ArpPacket, Ipv4Packet, NfqueueSocket, Overruns, QueueVerdict, is_overrun};
+use crate::nfnetlink::{
+    ArpPacket, Ipv4Packet, NfqueueSocket, Overruns, QueueOverflow, QueueVerdict, is_overrun,
+};
 
 /// Longest wait when nothing is held.
 const IDLE_WAIT: Duration = Duration::from_secs(3600);
@@ -63,7 +65,7 @@ pub fn spawn(
     directory: Arc<Directory>,
     failed: Sender<String>,
 ) -> io::Result<SourceHold> {
-    let mut socket = NfqueueSocket::bind(queue)?;
+    let mut socket = NfqueueSocket::bind(queue, QueueOverflow::Drop)?;
     let writer = socket.verdict_writer()?;
     let pending = Arc::new(Mutex::new(Vec::<Held>::new()));
     let (wake, woken) = unbounded::<()>();

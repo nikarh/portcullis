@@ -28,7 +28,7 @@ use crate::dns::normalize;
 use crate::events::{Dns, Event, EventBus};
 use crate::firewall::{LogAllowed, NftablesFirewall};
 use crate::nfnetlink::{
-    Ipv4Packet, NfqueueSocket, Overruns, PROTOCOL_TCP, QueueVerdict, is_overrun,
+    Ipv4Packet, NfqueueSocket, Overruns, PROTOCOL_TCP, QueueOverflow, QueueVerdict, is_overrun,
 };
 
 /// Start inspecting DNS answers held in NFQUEUE `queue`. Answers are reported as events
@@ -42,7 +42,7 @@ pub fn spawn(
     bus: EventBus,
     failed: Sender<String>,
 ) -> io::Result<JoinHandle<()>> {
-    let mut socket = NfqueueSocket::bind(queue)?;
+    let mut socket = NfqueueSocket::bind(queue, QueueOverflow::Accept)?;
     Ok(thread::spawn(move || {
         let mut overruns = Overruns::default();
         loop {
@@ -51,7 +51,7 @@ pub fn spawn(
                 Err(error) if is_overrun(&error) => {
                     if overruns.report() {
                         warn!(
-                            "DNS answers came faster than they could be inspected; the kernel dropped some, and those lookups are retried or fail"
+                            "DNS answers came faster than they could be inspected; the kernel let some through uninspected, so their names may be missing from events and their addresses from host: rules"
                         );
                     }
                     continue;

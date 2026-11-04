@@ -25,7 +25,8 @@ use crate::dns::{domain_matches, normalize};
 use crate::events::{Connection, Event, EventBus, Reason, Verdict};
 use crate::firewall::{DNS_ALLOWED_MARK, DNS_DENIED_MARK};
 use crate::nfnetlink::{
-    Ipv4Packet, NfqueueSocket, Overruns, PROTOCOL_TCP, PROTOCOL_UDP, QueueVerdict, is_overrun,
+    Ipv4Packet, NfqueueSocket, Overruns, PROTOCOL_TCP, PROTOCOL_UDP, QueueOverflow, QueueVerdict,
+    is_overrun,
 };
 
 /// The same denied name of the same container is reported at most once per interval.
@@ -39,7 +40,7 @@ pub fn spawn(
     bus: EventBus,
     failed: Sender<String>,
 ) -> io::Result<JoinHandle<()>> {
-    let mut socket = NfqueueSocket::bind(queue)?;
+    let mut socket = NfqueueSocket::bind(queue, QueueOverflow::Drop)?;
     Ok(thread::spawn(move || {
         let mut reported: HashMap<(IpAddr, String), Instant> = HashMap::new();
         let mut overruns = Overruns::default();

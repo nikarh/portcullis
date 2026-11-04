@@ -64,6 +64,9 @@ const NFQNL_MSG_VERDICT: u16 = 1;
 const NFQNL_MSG_CONFIG: u16 = 2;
 const NFQA_CFG_CMD: u16 = 1;
 const NFQA_CFG_PARAMS: u16 = 2;
+const NFQA_CFG_MASK: u16 = 4;
+const NFQA_CFG_FLAGS: u16 = 5;
+const NFQA_CFG_F_FAIL_OPEN: u32 = 0x0001;
 const NFQNL_CFG_CMD_BIND: u8 = 1;
 const NFQNL_COPY_PACKET: u8 = 2;
 const NFQA_PACKET_HDR: u16 = 1;
@@ -308,8 +311,18 @@ pub struct NfqueueSocket {
     queue: u16,
 }
 
+/// What the kernel does with a packet for a queue that is full, or whose packet it couldn't
+/// hand to Portcullis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueOverflow {
+    /// Drop it: for queues that enforce something, so nothing gets past unchecked.
+    Drop,
+    /// Let it through: for queues that only inspect, so falling behind never breaks traffic.
+    Accept,
+}
+
 impl NfqueueSocket {
-    pub fn bind(queue: u16) -> io::Result<Self> {
+    pub fn bind(queue: u16, overflow: QueueOverflow) -> io::Result<Self> {
         let mut inner = NetfilterSocket::open()?;
         let config = (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG;
         let mut command = vec![NFQNL_CFG_CMD_BIND, 0];
@@ -319,6 +332,9 @@ impl NfqueueSocket {
         params.extend_from_slice(&0xffff_u32.to_be_bytes());
         params.push(NFQNL_COPY_PACKET);
         inner.request(config, queue, &attribute(NFQA_CFG_PARAMS, &params))?;
+        if overflow == QueueOverflow::Accept {
+            inner.request(config, queue, &fail_open_flags())?;
+        }
         Ok(Self { inner, queue })
     }
 
@@ -489,6 +505,16 @@ fn encode(
     message
 }
 
+/// The queue configuration that lets packets through when they can't be queued (Linux 3.6+).
+fn fail_open_flags() -> Vec<u8> {
+    let mut attributes = attribute(NFQA_CFG_MASK, &NFQA_CFG_F_FAIL_OPEN.to_be_bytes());
+    attributes.extend(attribute(
+        NFQA_CFG_FLAGS,
+        &NFQA_CFG_F_FAIL_OPEN.to_be_bytes(),
+    ));
+    attributes
+}
+
 pub(crate) fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
     let length = 4 + value.len();
     let mut attribute = Vec::with_capacity(align4(length));
@@ -622,6 +648,17 @@ impl ArpPacket {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn fail_open_sets_only_the_fail_open_flag() {
+        let mut expected = Vec::new();
+        for kind in [NFQA_CFG_MASK, NFQA_CFG_FLAGS] {
+            expected.extend_from_slice(&8_u16.to_ne_bytes());
+            expected.extend_from_slice(&kind.to_ne_bytes());
+            expected.extend_from_slice(&[0, 0, 0, 1]);
+        }
+        assert_eq!(fail_open_flags(), expected);
+    }
 
     /// An ARP request from `sender` for `target`.
     pub fn arp(sender_mac: [u8; 6], sender: [u8; 4], target: [u8; 4]) -> Vec<u8> {
