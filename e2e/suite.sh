@@ -20,6 +20,7 @@ SCENARIOS=(
   spoofing
   bypass
   fast-start
+  monitor-start
   dns-inspection
   monitor
   events

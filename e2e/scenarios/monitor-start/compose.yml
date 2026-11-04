@@ -1,0 +1,54 @@
+# Containers that start while Docker's API doesn't answer Portcullis: Portcullis has to find
+# them from their bridge ports, the kernel and Docker's files (see "Finding new containers"
+# in the README). One network is in monitor mode, the other enforced.
+services:
+  # Keep both networks managed, and serve ICC.
+  peer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [watched]
+  anchor:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [enforced]
+  spoofer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [watched]
+    cap_add: [NET_ADMIN]
+  # One probe after the other, the last one marking the end.
+  fast-watched:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    profiles: [late]
+    networks: [watched]
+    command:
+      - sh
+      - -c
+      - |
+        nc -v -w 10 peer 5432 </dev/null 2>&1 | sed 's/^/icc: /'
+        nc -v -w 10 198.51.100.3 80 </dev/null 2>&1 | sed 's/^/egress: /'
+        nc -v -w 10 198.51.100.5 443 </dev/null 2>&1 | sed 's/^/marker: /'
+  # Its labels can only come from Docker's files while Docker's API doesn't answer.
+  fast-enforced:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    profiles: [late]
+    networks: [enforced]
+    labels:
+      - portcullis.egress.tcp=ip:198.51.100.3,tcp:80
+    command:
+      - sh
+      - -c
+      - |
+        nc -v -w 10 198.51.100.3 80 </dev/null 2>&1 | sed 's/^/allowed: /' &
+        nc -v -w 10 198.51.100.4 80 </dev/null 2>&1 | sed 's/^/denied: /' &
+        wait
+
+networks:
+  watched:
+    labels:
+      - portcullis.enable=monitor
+  enforced:
+    labels:
+      - portcullis.enable=true
