@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.5] - 2026-11-04
+
+### Fixes
+
+- Give containers found before Docker reported them their DNS servers by @nikarh
+
+### Documentation
+
+- When Portcullis can't find containers without Docker, and what monitor mode's hold does by @nikarh
+
 ## [0.1.4] - 2026-11-04
 
 ### Features
@@ -179,6 +189,7 @@ All notable changes to this project are documented in this file. The format is b
 - Verifying signed releases, and how releasing works by @nikarh
 - Remove the crates.io badge; portcullis on crates.io is another project by @nikarh
 
+[0.1.5]: https://github.com/nikarh/portcullis/compare/v0.1.4..v0.1.5
 [0.1.4]: https://github.com/nikarh/portcullis/compare/v0.1.3..v0.1.4
 [0.1.3]: https://github.com/nikarh/portcullis/compare/v0.1.2..v0.1.3
 [0.1.2]: https://github.com/nikarh/portcullis/compare/v0.1.1..v0.1.2
