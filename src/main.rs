@@ -518,6 +518,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         version = VERSION,
         docker_socket = %config.docker_socket,
         monitor = config.monitor,
+        monitor_networks = ?config.monitor_networks,
         "portcullis started"
     );
 
@@ -706,7 +707,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                         info!("docker event stream reconnected; reinitializing monitor state");
                         match DockerClient::connect(&config.docker_socket) {
                             Ok(client) => {
-                                monitor = DockerMonitor::new(client);
+                                monitor = DockerMonitor::new(client).with_monitored_networks(config.monitor_networks.clone());
                                 match monitor.initialize() {
                                     Ok(state) => {
                                         runtime_state = state;
@@ -775,7 +776,8 @@ fn wait_for_docker(
         let attempt = DockerClient::connect(&config.docker_socket)
             .map_err(MonitorError::from)
             .and_then(|client| {
-                let mut monitor = DockerMonitor::new(client);
+                let mut monitor = DockerMonitor::new(client)
+                    .with_monitored_networks(config.monitor_networks.clone());
                 monitor.initialize().map(|state| (monitor, state, since))
             });
         match attempt {

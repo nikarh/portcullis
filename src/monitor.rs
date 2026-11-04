@@ -63,6 +63,7 @@ fn network_warning(warnings: &mut Vec<Warning>, network: &DockerNetworkInspect, 
 /// configuration is logged rather than failing the caller.
 fn network_from_inspect(
     network: &DockerNetworkInspect,
+    monitored: &[String],
     warnings: &mut Vec<Warning>,
 ) -> Option<Network> {
     // Ignore non-bridge networks
@@ -77,7 +78,7 @@ fn network_from_inspect(
     }
 
     // Ignore non-portcullis networks
-    let Some(monitor) = portcullis_mode(network, warnings) else {
+    let Some(monitor) = portcullis_mode(network, monitored, warnings) else {
         debug!(
             network_id = %network.id,
             network_name = %network.name,
@@ -148,6 +149,8 @@ fn parse_mac(value: Option<&str>) -> Option<MacAddress> {
 
 pub struct DockerMonitor<A> {
     api: A,
+    /// Networks managed in monitor mode without a label, see `Config::monitor_networks`.
+    monitored: Vec<String>,
     /// Configuration problems found since the last `take_warnings`.
     warnings: Vec<Warning>,
 }
@@ -159,8 +162,17 @@ where
     pub const fn new(api: A) -> Self {
         Self {
             api,
+            monitored: Vec::new(),
             warnings: Vec::new(),
         }
+    }
+
+    /// Manage the networks named in `monitored` (`*` for all) in monitor mode, unless
+    /// their `portcullis.enable` label says otherwise.
+    #[must_use]
+    pub fn with_monitored_networks(mut self, monitored: Vec<String>) -> Self {
+        self.monitored = monitored;
+        self
     }
 
     /// Configuration problems found since the last call.
@@ -194,7 +206,8 @@ where
 
         let mut networks_by_id = HashMap::new();
         for network in networks {
-            if let Some(data) = network_from_inspect(&network, &mut self.warnings) {
+            if let Some(data) = network_from_inspect(&network, &self.monitored, &mut self.warnings)
+            {
                 networks_by_id.insert(data.id.clone(), data);
             }
         }
@@ -414,7 +427,9 @@ where
         debug!(%network_id, "resolving network runtime state action");
         match self.api.inspect_network(network_id) {
             Ok(network) => {
-                if let Some(network) = network_from_inspect(&network, &mut self.warnings) {
+                if let Some(network) =
+                    network_from_inspect(&network, &self.monitored, &mut self.warnings)
+                {
                     Ok(Some(RuntimeStateAction::UpsertNetwork { network }))
                 } else {
                     Ok(Some(RuntimeStateAction::RemoveNetwork {
@@ -523,10 +538,24 @@ fn network_primary_config(
 
 /// Whether the network opted in, and in which mode: `Some(false)` for `true` (enforce),
 /// `Some(true)` for `monitor`. An invalid value is reported and treated as enforced, so a
-/// typo restricts containers instead of silently leaving them open.
-fn portcullis_mode(network: &DockerNetworkInspect, warnings: &mut Vec<Warning>) -> Option<bool> {
+/// typo restricts containers instead of silently leaving them open. A network without the
+/// label is monitored when `monitored` names it, or is `*`.
+fn portcullis_mode(
+    network: &DockerNetworkInspect,
+    monitored: &[String],
+    warnings: &mut Vec<Warning>,
+) -> Option<bool> {
     const LABEL_KEY: &str = "portcullis.enable";
-    let value = network.labels.as_ref()?.get(LABEL_KEY)?;
+    let Some(value) = network
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_KEY))
+    else {
+        return monitored
+            .iter()
+            .any(|name| name == "*" || *name == network.name)
+            .then_some(true);
+    };
     match value.as_str() {
         "true" => Some(false),
         "monitor" => Some(true),
@@ -1221,6 +1250,73 @@ mod tests {
         assert_eq!(state.containers().len(), 2);
         let web = state.containers().get("abc").expect("web should be kept");
         assert_eq!(web.policy.egress.len(), 1);
+    }
+
+    #[test]
+    fn monitors_configured_networks_without_labels() {
+        let networks = vec![
+            network_inspect(
+                "n0",
+                "plain",
+                "172.20.0.0/16",
+                None,
+                DockerNetworkDriver::Bridge,
+                None,
+            ),
+            network_inspect(
+                "n1",
+                "other",
+                "172.21.0.0/16",
+                None,
+                DockerNetworkDriver::Bridge,
+                None,
+            ),
+            network_inspect(
+                "n2",
+                "enforced",
+                "172.22.0.0/16",
+                None,
+                DockerNetworkDriver::Bridge,
+                Some("true"),
+            ),
+            network_inspect(
+                "n3",
+                "opted-out",
+                "172.23.0.0/16",
+                None,
+                DockerNetworkDriver::Bridge,
+                Some("false"),
+            ),
+        ];
+        let managed = |names: &[&str]| {
+            let mut monitor = DockerMonitor::new(MockDockerApi {
+                networks_list: networks.clone(),
+                ..MockDockerApi::default()
+            })
+            .with_monitored_networks(names.iter().map(ToString::to_string).collect());
+            let state = monitor.initialize().expect("initialize should succeed");
+            let mut networks: Vec<(String, bool)> = state
+                .networks()
+                .values()
+                .map(|network| (network.name.clone(), network.monitor))
+                .collect();
+            networks.sort();
+            networks
+        };
+
+        assert_eq!(managed(&[]), [("enforced".to_string(), false)]);
+        assert_eq!(
+            managed(&["plain", "enforced"]),
+            [("enforced".to_string(), false), ("plain".to_string(), true)]
+        );
+        assert_eq!(
+            managed(&["*"]),
+            [
+                ("enforced".to_string(), false),
+                ("other".to_string(), true),
+                ("plain".to_string(), true),
+            ]
+        );
     }
 
     #[test]

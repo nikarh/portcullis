@@ -10,6 +10,11 @@
 # can also be put in monitor mode one at a time, with portcullis.enable=monitor.
 #monitor = false
 
+# Networks to watch in monitor mode without a portcullis.enable label, by name, or "*"
+# for every bridge network. Docker only sets labels when a network is created; this
+# watches existing networks without recreating them. A label, if there is one, wins.
+#monitor-networks = []
+
 # reject: answer denied traffic with an ICMP error, so applications fail at once.
 # drop: discard it silently, so applications wait for their own timeout.
 #deny-action = "reject"

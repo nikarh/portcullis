@@ -24,6 +24,9 @@ pub struct Config {
     pub events_socket: Option<PathBuf>,
     pub deny_action: DenyAction,
     pub monitor: bool,
+    /// Networks managed in monitor mode without a `portcullis.enable` label, by name; `*`
+    /// is every bridge network.
+    pub monitor_networks: Vec<String>,
     pub log_allowed: LogAllowed,
     pub hostname_hold: Duration,
     pub alert_exec: Option<String>,
@@ -67,6 +70,7 @@ impl Default for Config {
             events_socket: None,
             deny_action: DenyAction::Reject,
             monitor: false,
+            monitor_networks: Vec::new(),
             log_allowed: LogAllowed::Monitor,
             hostname_hold: Duration::from_secs(3600),
             alert_exec: None,
@@ -115,6 +119,7 @@ struct Settings {
     events_socket: Option<PathBuf>,
     deny_action: Option<String>,
     monitor: Option<bool>,
+    monitor_networks: Option<Vec<String>>,
     log_allowed: Option<String>,
     hostname_hold: Option<u64>,
     alert_exec: Option<String>,
@@ -245,6 +250,8 @@ fn flags(args: &mut Arguments) -> Result<Settings, ConfigError> {
         events_socket: args.opt_value_from_str("--events-socket")?,
         deny_action: args.opt_value_from_str("--deny-action")?,
         monitor: args.contains("--monitor").then_some(true),
+        monitor_networks: Some(args.values_from_str::<_, String>("--monitor-network")?)
+            .filter(|names| !names.is_empty()),
         log_allowed: args.opt_value_from_str("--log-allowed")?,
         hostname_hold: args.opt_value_from_str("--hostname-hold")?,
         alert_exec: args.opt_value_from_str("--alert-exec")?,
@@ -282,6 +289,9 @@ impl Config {
         }
         if let Some(monitor) = settings.monitor {
             self.monitor = monitor;
+        }
+        if let Some(names) = settings.monitor_networks {
+            self.monitor_networks = network_names(names, origin)?;
         }
         if let Some(value) = settings.log_allowed {
             self.log_allowed = match value.as_str() {
@@ -357,6 +367,21 @@ impl Config {
     }
 }
 
+/// The names of `monitor-networks`, none of them empty.
+fn network_names(names: Vec<String>, origin: &Origin<'_>) -> Result<Vec<String>, ConfigError> {
+    match names.iter().find(|name| name.trim().is_empty()) {
+        Some(name) => Err(ConfigError::Invalid {
+            setting: origin.setting(match origin {
+                Origin::Flags => "monitor-network",
+                Origin::File(_) => "monitor-networks",
+            }),
+            value: format!("{name:?}"),
+            expected: "a network name or *",
+        }),
+        None => Ok(names),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +396,7 @@ mod tests {
             events_socket: Some(PathBuf::from("/run/portcullis.sock")),
             deny_action: DenyAction::Drop,
             monitor: true,
+            monitor_networks: vec!["backend".to_string(), "frontend".to_string()],
             log_allowed: LogAllowed::Always,
             hostname_hold: Duration::from_secs(60),
             alert_exec: Some("notify-send".to_string()),
@@ -420,6 +446,10 @@ mod tests {
             "--deny-action",
             "drop",
             "--monitor",
+            "--monitor-network",
+            "backend",
+            "--monitor-network",
+            "frontend",
             "--log-allowed",
             "always",
             "--hostname-hold",
@@ -454,6 +484,7 @@ mod tests {
             events-socket = "/run/portcullis.sock"
             deny-action = "drop"
             monitor = true
+            monitor-networks = ["backend", "frontend"]
             log-allowed = "always"
             hostname-hold = 60
             alert-exec = "notify-send"
@@ -509,6 +540,7 @@ mod tests {
             ("--hostname-hold", "soon"),
             ("--connection-limit", "0"),
             ("--connection-limit", "many"),
+            ("--monitor-network", ""),
         ] {
             assert!(from_flags(&[flag, value]).is_err(), "{flag} {value}");
         }

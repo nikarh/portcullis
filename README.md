@@ -131,6 +131,7 @@ The same options can be given on the command line, and override the file. `--con
 | `--config <path>` | `/etc/portcullis/config.toml` | Config file. Command line only. |
 | `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
 | `--monitor` | off | Monitor mode on every network: report what would be denied, deny nothing. In the file, `monitor = true` or `false`. |
+| `--monitor-network <name>` | none | Watch this network in monitor mode without a `portcullis.enable` label; `*` watches every bridge network. Repeat the flag for more networks. In the file, `monitor-networks = ["backend", "frontend"]`. A network's label, if it has one, wins, so `portcullis.enable=false` keeps a network out of `*`. See [Enforcing a network](#enforcing-a-network). |
 | `--deny-action <reject\|drop>` | `reject` | `reject` answers denied traffic with an ICMP "administratively prohibited" error, so applications fail immediately with "Host is unreachable". `drop` discards it silently, and applications wait for their own timeout. Traffic denied for its source or kind (reasons `source` and `frame`) is always dropped: a rejection would go to an address the sender only claims. |
 | `--log-allowed <always\|monitor\|never>` | `monitor` | Which allowed connections and successful DNS lookups are reported. Denied ones always are. `monitor` reports them on networks in monitor mode only. |
 | `--hostname-hold <seconds>` | `3600` | How long an address of a `host:` rule stays allowed after it was last seen, see [Hostname rules](#hostname-rules). |
@@ -307,7 +308,9 @@ docker network create --label portcullis.enable=true backend
 
 Every container attached to an enforced network is then restricted (or, in monitor mode, watched), whether or not it has Portcullis labels of its own. `portcullis.enable` only has an effect on networks; on a container it is ignored. A container without labels can talk to other containers on the same network and resolve names through Docker's DNS, and nothing else. Labels on the container open up more.
 
-Only bridge networks can be enforced. The default `bridge` network can't be, because it can't be given labels.
+To watch networks that already exist without recreating them, and so without restarting their containers, name them in the config instead: `monitor-networks = ["backend"]`, or `["*"]` for all of them. This only puts them in monitor mode; enforcing a network takes its label.
+
+Only bridge networks can be enforced. The default `bridge` network can't be, because it can't be given labels, but `monitor-networks` can watch it.
 
 ### Allowing outbound connections
 
