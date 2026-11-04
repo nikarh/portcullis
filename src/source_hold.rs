@@ -159,15 +159,8 @@ pub fn spawn(
                                 && (info.port.is_none() || info.port == held.port)
                         })
                 });
-                asked.retain(|_, when| now.duration_since(*when) < DISCOVER_RETRY * 10);
-                for port in pending.iter().filter_map(|held| held.port) {
-                    let due = asked
-                        .get(&port)
-                        .is_none_or(|when| now.duration_since(*when) >= DISCOVER_RETRY);
-                    if due {
-                        asked.insert(port, now);
-                        let _ = discover.send(port);
-                    }
+                for port in ports_to_discover(&pending, &mut asked, now) {
+                    let _ = discover.send(port);
                 }
                 verdicts
             };
@@ -181,6 +174,28 @@ pub fn spawn(
     });
 
     Ok(SourceHold { wakes: vec![wake] })
+}
+
+/// The bridge ports of `pending` packets whose containers are to be looked for now: once
+/// per port, and again only after [`DISCOVER_RETRY`]. `asked` remembers when each port
+/// was last asked for, and forgets ports that haven't been for a while.
+fn ports_to_discover(
+    pending: &[Held],
+    asked: &mut HashMap<u32, Instant>,
+    now: Instant,
+) -> Vec<u32> {
+    asked.retain(|_, when| now.saturating_duration_since(*when) < DISCOVER_RETRY * 10);
+    let mut ports = Vec::new();
+    for port in pending.iter().filter_map(|held| held.port) {
+        let due = asked
+            .get(&port)
+            .is_none_or(|when| now.saturating_duration_since(*when) >= DISCOVER_RETRY);
+        if due {
+            asked.insert(port, now);
+            ports.push(port);
+        }
+    }
+    ports
 }
 
 /// The source address of a held IPv4 packet, or the address an ARP packet announces.
@@ -249,6 +264,42 @@ mod tests {
         assert_eq!(verdicts, vec![(1, QueueVerdict::Repeat { mark: None })]);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.first().map(|held| held.id), Some(2));
+    }
+
+    #[test]
+    fn asks_for_each_port_once_until_the_retry_is_due() {
+        let start = Instant::now();
+        let held = |id, port| Held {
+            id,
+            source: Some(ip("172.18.0.2")),
+            mac: None,
+            port,
+            deadline: start + Duration::from_secs(2),
+        };
+        let pending = vec![
+            held(1, Some(7)),
+            held(2, Some(7)),
+            held(3, Some(8)),
+            held(4, None),
+        ];
+        let mut asked = HashMap::new();
+        assert_eq!(ports_to_discover(&pending, &mut asked, start), vec![7, 8]);
+        // Asked already, not yet due.
+        let soon = start + DISCOVER_RETRY / 2;
+        assert_eq!(
+            ports_to_discover(&pending, &mut asked, soon),
+            Vec::<u32>::new()
+        );
+        // Due again.
+        let later = start + DISCOVER_RETRY;
+        assert_eq!(ports_to_discover(&pending, &mut asked, later), vec![7, 8]);
+        // Ports nothing is held from anymore are forgotten.
+        let much_later = later + DISCOVER_RETRY * 10;
+        assert_eq!(
+            ports_to_discover(&[], &mut asked, much_later),
+            Vec::<u32>::new()
+        );
+        assert!(asked.is_empty());
     }
 
     #[test]
