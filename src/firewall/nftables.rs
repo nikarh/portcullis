@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use tracing::{info, trace, warn};
+use tracing::{info, trace};
 
 use super::FirewallError;
 use super::plan::{
@@ -292,7 +292,10 @@ where
 
     /// Write the rules of `plan`, from scratch, where the next start finds them. Written
     /// to a temporary file first and renamed, so a crash never leaves half a script.
-    fn save(&self, plan: &Plan) -> Result<(), FirewallError> {
+    /// Save the rules of `plan`, just applied, for `restore` at the next start. Not part of
+    /// `apply`: writing them can take a while, and what the new rules report should be
+    /// attributed (`Directory::update`) as soon as they are in place.
+    pub fn save(&self, plan: &Plan) -> Result<(), FirewallError> {
         let Some(path) = &self.saved else {
             return Ok(());
         };
@@ -317,12 +320,28 @@ where
     }
 
     /// Apply rules for `state`. Returns the plan that was applied.
+    #[cfg(test)]
     pub fn apply<Hosts>(
         &self,
         state: &RuntimeState,
         hosts: &mut Hosts,
         host_resolvers: &[IpAddr],
         monitor_all: bool,
+    ) -> Result<Plan, FirewallError>
+    where
+        Hosts: HostResolver,
+    {
+        self.apply_with(state, hosts, host_resolvers, monitor_all, |_| {})
+    }
+
+    /// `apply`, calling `before` with the plan just before its rules are put in place.
+    pub fn apply_with<Hosts>(
+        &self,
+        state: &RuntimeState,
+        hosts: &mut Hosts,
+        host_resolvers: &[IpAddr],
+        monitor_all: bool,
+        before: impl FnOnce(&Plan),
     ) -> Result<Plan, FirewallError>
     where
         Hosts: HostResolver,
@@ -343,12 +362,10 @@ where
         let mut script = String::with_capacity(plan.rule_count() * 96);
         let now_installed =
             render_apply_script(&plan, self.options, installed.as_ref(), &mut script)?;
+        before(&plan);
         self.runner.run_script(script)?;
         *installed = Some(now_installed);
         drop(installed);
-        if let Err(error) = self.save(&plan) {
-            warn!(%error, "can't save the rules; the next start begins without them");
-        }
         Ok(plan)
     }
 
@@ -2717,9 +2734,10 @@ flush chain bridge portcullis limit_open
         assert!(!firewall.restore().expect("restore"), "nothing saved yet");
         let mut resolver = MockResolver::default();
         for state in [test_support::icc_state(), test_support::hostname_state()] {
-            firewall
+            let plan = firewall
                 .apply(&state, &mut resolver, &[], false)
                 .expect("apply");
+            firewall.save(&plan).expect("save");
         }
         // The saved script installs the last update's rules from scratch, unlike the
         // update itself.

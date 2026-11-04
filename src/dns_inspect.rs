@@ -138,7 +138,7 @@ impl Answer {
     }
 
     fn event(&self, directory: &Directory) -> Dns {
-        let info = directory.source(self.container);
+        let info = directory.attributed(self.container);
         Dns {
             container: info.as_ref().map(|info| info.container.clone()),
             network: info.map(|info| info.network),
@@ -163,7 +163,7 @@ fn allow_addresses(
         return;
     }
     // Only the receiving container's rules learn from its answers.
-    let Some(owner) = directory.source(answer.container) else {
+    let Some(owner) = directory.attributed(answer.container) else {
         return;
     };
     let now = Instant::now();

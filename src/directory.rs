@@ -56,7 +56,18 @@ struct Snapshot {
 #[derive(Debug, Default)]
 pub struct Directory {
     snapshot: RwLock<Snapshot>,
+    /// The sources of a plan about to be applied, by bridge port and by MAC, from just
+    /// before its rules are in place until `update`: what they report right away is
+    /// attributed (see `expect`).
+    incoming: RwLock<Incoming>,
     observations: Mutex<Observations>,
+}
+
+#[derive(Debug, Default)]
+struct Incoming {
+    sources: HashMap<IpAddr, SourceInfo>,
+    by_port: HashMap<u32, (IpAddr, SourceInfo)>,
+    by_mac: HashMap<MacAddress, (IpAddr, SourceInfo)>,
 }
 
 #[derive(Debug, Default)]
@@ -67,26 +78,31 @@ struct Observations {
 }
 
 impl Directory {
+    /// Attribute what the sources of `plan` send by their port and MAC from now on,
+    /// before its rules are applied: the kernel logs packets of the new rules as soon as
+    /// they are in place, before `update`. The packet hold still waits for `update`.
+    pub fn expect(&self, plan: &Plan) {
+        let mut incoming = Incoming::default();
+        for (address, info) in source_infos(plan) {
+            if let Some(mac) = info.mac {
+                incoming.by_mac.insert(mac, (address, info.clone()));
+            }
+            if let Some(port) = info.port {
+                incoming.by_port.insert(port, (address, info.clone()));
+            }
+            incoming.sources.insert(address, info);
+        }
+        *self
+            .incoming
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = incoming;
+    }
+
     /// Take over the containers, bridges and hostname sets of the applied plan.
     pub fn update(&self, plan: &Plan) {
         let mut snapshot = Snapshot::default();
-        let ipv6_networks: std::collections::HashSet<&str> = plan
-            .bridges
-            .iter()
-            .filter(|bridge| bridge.ipv6)
-            .map(|bridge| bridge.network.as_str())
-            .collect();
-        for source in &plan.sources {
-            let info = SourceInfo {
-                container: source.container.to_string(),
-                network: source.network.clone(),
-                mac: source.mac,
-                port: source.port.as_ref().map(|port| port.index),
-                monitor: source.monitor,
-                quarantine: source.quarantine,
-                ipv6_network: ipv6_networks.contains(source.network.as_str()),
-                domains: source.domains.clone(),
-            };
+        for (source, (address, info)) in plan.sources.iter().zip(source_infos(plan)) {
+            debug_assert_eq!(source.address, address);
             if let Some(mac) = source.mac {
                 snapshot.by_mac.insert(mac, (source.address, info.clone()));
             }
@@ -134,6 +150,10 @@ impl Directory {
             .collect();
         *current = snapshot;
         drop(current);
+        *self
+            .incoming
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Incoming::default();
         if !reassigned.is_empty() {
             self.observations
                 .lock()
@@ -143,15 +163,25 @@ impl Directory {
         }
     }
 
+    /// The source with `address` in the rules applied.
     #[must_use]
     pub fn source(&self, address: IpAddr) -> Option<SourceInfo> {
         self.read().sources.get(&address).cloned()
     }
 
+    /// The container to attribute a packet from or to `address` to: a source of the rules
+    /// applied, or of those being applied (see `expect`).
+    #[must_use]
+    pub fn attributed(&self, address: IpAddr) -> Option<SourceInfo> {
+        let known = self.source(address);
+        known.or_else(|| self.incoming().sources.get(&address).cloned())
+    }
+
     /// The container a MAC belongs to, with its address.
     #[must_use]
     pub fn by_mac(&self, mac: MacAddress) -> Option<(IpAddr, SourceInfo)> {
-        self.read().by_mac.get(&mac).cloned()
+        let known = self.read().by_mac.get(&mac).cloned();
+        known.or_else(|| self.incoming().by_mac.get(&mac).cloned())
     }
 
     /// One of a container's addresses, by the container's name.
@@ -168,7 +198,12 @@ impl Directory {
     /// address.
     #[must_use]
     pub fn by_port(&self, index: u32) -> Option<(IpAddr, SourceInfo)> {
-        self.read().by_port.get(&index).cloned()
+        let known = self.read().by_port.get(&index).cloned();
+        known.or_else(|| self.incoming().by_port.get(&index).cloned())
+    }
+
+    fn incoming(&self) -> std::sync::RwLockReadGuard<'_, Incoming> {
+        self.incoming.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The network served by the bridge a packet came in on, given the interface index of
@@ -249,6 +284,34 @@ impl Directory {
 }
 
 /// The name of the network interface with this index.
+/// What events say about each source of `plan`, in the plan's order.
+fn source_infos(plan: &Plan) -> Vec<(IpAddr, SourceInfo)> {
+    let ipv6_networks: std::collections::HashSet<&str> = plan
+        .bridges
+        .iter()
+        .filter(|bridge| bridge.ipv6)
+        .map(|bridge| bridge.network.as_str())
+        .collect();
+    plan.sources
+        .iter()
+        .map(|source| {
+            (
+                source.address,
+                SourceInfo {
+                    container: source.container.to_string(),
+                    network: source.network.clone(),
+                    mac: source.mac,
+                    port: source.port.as_ref().map(|port| port.index),
+                    monitor: source.monitor,
+                    quarantine: source.quarantine,
+                    ipv6_network: ipv6_networks.contains(source.network.as_str()),
+                    domains: source.domains.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
 fn interface_name(index: u32) -> Option<String> {
     fs::read_dir("/sys/class/net")
         .ok()?
@@ -288,6 +351,37 @@ mod tests {
         assert_eq!(address, ip("172.18.0.2"));
         assert_eq!(info.container, "web");
         assert!(directory.source(ip("172.18.0.99")).is_none());
+    }
+
+    #[test]
+    fn attributes_expected_sources_until_the_update() {
+        let directory = Directory::default();
+        let plan = Plan::build(
+            &test_support::icc_state(),
+            &mut MockResolver::default(),
+            &[],
+            false,
+        );
+        let mac = test_support::mac_of("172.18.0.2").expect("mac");
+        directory.expect(&plan);
+        // Attributed by MAC, but not a known source for the packet hold yet.
+        assert_eq!(
+            directory.by_mac(mac).map(|(_, info)| info.container),
+            Some("web".to_string())
+        );
+        assert!(directory.source(ip("172.18.0.2")).is_none());
+        assert_eq!(
+            directory
+                .attributed(ip("172.18.0.2"))
+                .map(|info| info.container),
+            Some("web".to_string())
+        );
+        directory.update(&plan);
+        assert!(directory.source(ip("172.18.0.2")).is_some());
+        // An update without it forgets it, expected or not.
+        directory.expect(&plan);
+        directory.update(&Plan::default());
+        assert!(directory.by_mac(mac).is_none());
     }
 
     #[test]

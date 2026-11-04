@@ -200,7 +200,7 @@ fn connection_event(
             );
         }
         _ => {
-            if let Some(info) = event.source.and_then(|source| directory.source(source)) {
+            if let Some(info) = event.source.and_then(|source| directory.attributed(source)) {
                 event.container = Some(info.container);
                 event.network = Some(info.network);
             }
@@ -211,7 +211,8 @@ fn connection_event(
     };
     match (reason, &payload) {
         (Reason::Icc, _) => {
-            event.destination_container = directory.source(destination).map(|info| info.container);
+            event.destination_container =
+                directory.attributed(destination).map(|info| info.container);
         }
         (Reason::Dns, Payload::Ipv4(ip)) => event.query = query_name(ip),
         (Reason::Egress, _) => {
@@ -235,7 +236,7 @@ fn rule_domain(
     source: IpAddr,
     destination: IpAddr,
 ) -> Option<String> {
-    let container = directory.source(source)?.container;
+    let container = directory.attributed(source)?.container;
     let rule_hosts = directory.rule_hosts(source);
     let hosts = hosts.lock().unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
@@ -297,7 +298,7 @@ fn attribute_spoofed(
         }
         _ => packet.hwaddr,
     };
-    let owner = claimed.and_then(|address| directory.source(address));
+    let owner = claimed.and_then(|address| directory.attributed(address));
     let detail = match (&sender, claimed, &owner) {
         (None, _, _) => "unknown source address".to_string(),
         (Some((_, sender)), _, Some(owner)) if owner.container != sender.container => {

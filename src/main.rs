@@ -339,8 +339,14 @@ impl Applier {
         let result = {
             let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
             hosts.prune(Instant::now());
-            self.firewall
-                .apply(state, &mut *hosts, &host_resolvers, self.monitor_all)
+            let directory = &self.directory;
+            self.firewall.apply_with(
+                state,
+                &mut *hosts,
+                &host_resolvers,
+                self.monitor_all,
+                |plan| directory.expect(plan),
+            )
         };
         match result {
             Ok(plan) => {
@@ -354,6 +360,9 @@ impl Applier {
                 );
                 self.source_hold.rules_applied();
                 info!("firewall rules applied");
+                if let Err(error) = self.firewall.save(&plan) {
+                    warn!(%error, "can't save the rules; the next start begins without them");
+                }
                 Ok(())
             }
             Err(error) => {
