@@ -1,10 +1,13 @@
 wait_managed "$(svc_ip anchor net)"
 
 # Portcullis can't apply rules while it's stopped, so the container's first packets are
-# certainly sent before its rules exist.
-kill -STOP "${PORTCULLIS_PID}"
-FAST_OUTPUT="$(dc --profile late up -d fast 2>&1)"
+# certainly sent before its rules exist. It's created first, so that Portcullis is stopped
+# only while the container starts: Docker's DNS server gives up on a query after a few
+# seconds, however long Portcullis would have held it.
+FAST_OUTPUT="$(dc --profile late create fast 2>&1)"
 fast_id="$(dc --profile late ps -aq fast)"
+kill -STOP "${PORTCULLIS_PID}"
+[[ -n "${fast_id}" ]] && FAST_OUTPUT="$(docker start "${fast_id}" 2>&1)"
 kill -CONT "${PORTCULLIS_PID}"
 if [[ -n "${fast_id}" ]]; then
   docker wait "${fast_id}" >/dev/null

@@ -123,8 +123,7 @@ impl Discovery {
         };
         let directory = self.docker_root.join("containers").join(&id);
         let file: ContainerFile = read_json(&directory.join("config.v2.json"))?;
-        let host_config: DockerHostConfig =
-            read_json(&directory.join("hostconfig.json")).unwrap_or_default();
+        let host_config: DockerHostConfig = read_json(&directory.join("hostconfig.json"))?;
         let aliases = file
             .network_settings
             .and_then(|settings| settings.networks)

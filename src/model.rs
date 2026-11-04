@@ -360,8 +360,9 @@ pub enum RuntimeStateAction {
         network: Network,
     },
     /// A container found behind a bridge port before Docker reported it (see
-    /// `discovery`): its attachment to that network, and its namespace, replace those
-    /// known; the rest of a known container stays as Docker reported it.
+    /// `discovery`): its attachment to that network, its namespace and its DNS servers
+    /// replace those known; the rest of a known container stays as Docker reported it.
+    /// (Docker's create event, which comes first, has no DNS servers.)
     DiscoverContainer {
         container: Box<Container>,
     },
@@ -492,6 +493,7 @@ impl RuntimeState {
                     known.attachments.push(attachment);
                 }
                 known.sandbox = container.sandbox;
+                known.runtime_dns_servers = container.runtime_dns_servers;
                 *known != before
             }
             RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
@@ -534,10 +536,14 @@ mod tests {
         assert!(state.apply_action(RuntimeStateAction::CreateContainer {
             container: Box::new(known),
         }));
-        // Restarted with a new namespace, and a new address on n1.
-        assert!(state.apply_action(discovered(container("a", "n1", "172.19.0.9", "/new"))));
+        // Restarted with a new namespace, and a new address on n1. Its DNS servers are
+        // those of its settings, which Docker's create event doesn't have.
+        let mut restarted = container("a", "n1", "172.19.0.9", "/new");
+        restarted.runtime_dns_servers = HashSet::from(["198.51.100.2".parse().expect("dns")]);
+        assert!(state.apply_action(discovered(restarted.clone())));
         let a = state.containers().get("a").expect("a");
         assert_eq!(a.sandbox.as_deref(), Some("/new"));
+        assert_eq!(a.runtime_dns_servers, restarted.runtime_dns_servers);
         let addresses: Vec<String> = a
             .attachments
             .iter()
@@ -545,7 +551,7 @@ mod tests {
             .collect();
         assert_eq!(addresses, ["n0 172.18.0.2", "n1 172.19.0.9"]);
         // Nothing new.
-        assert!(!state.apply_action(discovered(container("a", "n1", "172.19.0.9", "/new"))));
+        assert!(!state.apply_action(discovered(restarted)));
     }
 
     #[test]
