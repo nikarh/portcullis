@@ -1,7 +1,8 @@
 name: Publish
 
 # Builds, signs and uploads the release files when a release is published, and for the `latest` pre-release when the
-# Latest workflow calls it.
+# Latest workflow calls it. Then adds the Arch Linux packages to the pacman repositories: pacman-<arch> has the
+# releases, pacman-latest-<arch> the builds of main.
 on:
   release:
     types: [published]
@@ -30,8 +31,11 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.arch }})
-    # The Latest workflow creates the `latest` pre-release once and publishes it itself.
-    if: github.repository_owner == 'nikarh' && github.event.release.tag_name != 'latest'
+    # Only releases are built when published: the Latest workflow creates the `latest` pre-release once and publishes
+    # it itself, and the pacman repository releases have no files of their own.
+    if: >-
+      github.repository_owner == 'nikarh'
+      && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v'))
     strategy:
       matrix:
         include:
@@ -123,3 +127,53 @@ jobs:
           gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
             [[ -e release/$name ]] || gh release delete-asset "$TAG" "$name" --yes
           done
+
+  pacman:
+    name: pacman repository (${{ matrix.arch }})
+    needs: [upload]
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    runs-on: ubuntu-24.04
+    # repo-add only reads the packages, so the x86_64 image does both architectures.
+    container: archlinux:base
+    environment: release
+    defaults:
+      run:
+        shell: bash
+    # The database is downloaded, changed and uploaded again.
+    concurrency:
+      group: pacman-${{ (inputs.tag || github.event.release.tag_name) == 'latest' && 'latest-' || '' }}${{ matrix.arch }}
+      cancel-in-progress: false
+    steps:
+      - run: pacman -Syu --noconfirm --needed git github-cli
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          sparse-checkout: scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: release
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: gpg --batch --import <<<"$GPG_PRIVATE_KEY"
+      - name: Generate GitHub token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: generate-token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      # Releases are kept for good; of the builds of main, the newest 100.
+      - name: Add the package to the repository
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          if [[ "$TAG" == latest ]]; then
+            scripts/pacman-repo.sh pacman-latest-${{ matrix.arch }} 100 release/portcullis-${{ matrix.arch }}.pkg.tar.zst
+          else
+            scripts/pacman-repo.sh pacman-${{ matrix.arch }} 0 release/portcullis-${{ matrix.arch }}.pkg.tar.zst
+          fi

@@ -16,6 +16,13 @@ commit, the notes list the unreleased changes, and Publish uploads the same file
 version marked as a build of main (`0.1.1-dev+abc1234`, from `PORTCULLIS_VERSION_SUFFIX`). It is never marked as
 GitHub's latest release, so `releases/latest` keeps pointing at the newest `vX.Y.Z`.
 
+Publish then adds the Arch Linux packages to the `portcullis` pacman repositories (`scripts/pacman-repo.sh`), kept in
+pre-releases of their own: `pacman-x86_64` and `pacman-aarch64` for releases, `pacman-latest-x86_64` and
+`pacman-latest-aarch64` for builds of main. Each holds the repository database (`portcullis.db`, `portcullis.files`)
+and the packages under versioned names (`portcullis-0.1.0-1-x86_64.pkg.tar.zst`), all signed with the release signing
+key. Older packages stay: every release, and the newest 100 builds of main. A version that is there already is never
+replaced, since pacman caches packages by name. The pre-releases are created on the first publish.
+
 Asset names never change, so `https://github.com/nikarh/portcullis/releases/latest/download/<name>` always points at
 the newest file:
 
@@ -40,7 +47,7 @@ only allows the `main` and `release` branches and `v*` tags, and holds these sec
 | --- | --- |
 | `APP_CLIENT_ID` | The app's client ID (`Iv…`, on the app's settings page) |
 | `APP_PRIVATE_KEY` | A private key of the app (PEM) |
-| `GPG_PRIVATE_KEY` | ASCII armored private key that signs `SHA256SUMS` |
+| `GPG_PRIVATE_KEY` | ASCII armored private key that signs `SHA256SUMS`, the Arch Linux packages and their repository |
 | `GPG_PASSPHRASE` | Its passphrase |
 
 ```sh

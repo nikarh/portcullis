@@ -52,12 +52,26 @@ sudo apt install ./portcullis_amd64.deb
 
 As Debian packages do, it enables and starts the service right away. So that this doesn't block anything you haven't reviewed, its config starts in monitor mode (`monitor = true` in `/etc/portcullis/config.toml`): enforced networks report what would be denied and deny nothing. Once the reports look right (see [Rolling out a policy](#rolling-out-a-policy)), set `monitor = false` and `sudo systemctl restart portcullis`.
 
-On Arch Linux, `portcullis-x86_64.pkg.tar.zst` or `portcullis-aarch64.pkg.tar.zst`:
+On Arch Linux, add the `portcullis` repository, so that `pacman -Syu` keeps it up to date. Trust the release signing key, which signs the packages and the repository:
 
 ```bash
-sudo pacman -U portcullis-x86_64.pkg.tar.zst
+curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key 33DD9B9FB720453D48136F2EB90B594ECF87B58B
+```
+
+Add it to `/etc/pacman.conf`, then install:
+
+```ini
+[portcullis]
+Server = https://github.com/nikarh/portcullis/releases/download/pacman-$arch
+```
+
+```bash
+sudo pacman -Syu portcullis
 sudo systemctl enable --now portcullis
 ```
+
+For the builds of `main` (see below), use `pacman-latest-$arch` instead of `pacman-$arch`. The repository has the newest version; older ones stay in it (releases all of them, `main` its last 100 builds) and install with `sudo pacman -U https://github.com/nikarh/portcullis/releases/download/pacman-x86_64/portcullis-0.1.0-1-x86_64.pkg.tar.zst`. Without the repository, take `portcullis-x86_64.pkg.tar.zst` or `portcullis-aarch64.pkg.tar.zst` from a release and `sudo pacman -U` it.
 
 As Arch packages do, it leaves enabling the service to you, and its config enforces policies from the start.
 
