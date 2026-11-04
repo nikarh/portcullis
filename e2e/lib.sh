@@ -262,7 +262,7 @@ blocked() {
 
 # event <description> <filters> <probe...>: the probe's traffic must produce an event matching
 # all filters (`key=value` or `key~text`, see expect-event.py). With EVENT_SAVE set, every
-# event seen is also appended to that file.
+# event seen is also appended to that file. It waits EVENT_TIMEOUT seconds (10) at most.
 event() {
   local description="$1" filters="$2"
   shift 2
@@ -275,7 +275,7 @@ expect_event() {
   local save=()
   [[ -n "${EVENT_SAVE:-}" ]] && save=(--save "${EVENT_SAVE}")
   # shellcheck disable=SC2086 # filters are separate words
-  coproc WATCH { exec python3 "${E2E_DIR}/expect-event.py" "${EVENTS_SOCKET}" 10 "${save[@]}" ${filters} 2>&1; }
+  coproc WATCH { exec python3 "${E2E_DIR}/expect-event.py" "${EVENTS_SOCKET}" "${EVENT_TIMEOUT:-10}" "${save[@]}" ${filters} 2>&1; }
   local pid="${WATCH_PID}" fd ready
   exec {fd}<&"${WATCH[0]}"
   # Subscribed before the traffic happens, so the event can't be missed.
@@ -408,7 +408,8 @@ run_scenario() {
   COMPOSE_FILE="${dir}/compose.yml"
   log "scenario ${name}"
 
-  dc down -v --remove-orphans >/dev/null 2>&1 || true
+  # Every profile: containers a scenario starts later (profile late) too.
+  dc --profile '*' down -v --remove-orphans >/dev/null 2>&1 || true
   if ! dc up -d --quiet-pull >/dev/null 2>&1; then
     fail "${name}: compose up failed"
     dc up -d
@@ -417,5 +418,5 @@ run_scenario() {
   # shellcheck source=/dev/null
   source "${dir}/test.sh"
   flush_checks
-  dc down -v --remove-orphans >/dev/null 2>&1 || true
+  dc --profile '*' down -v --remove-orphans >/dev/null 2>&1 || true
 }
