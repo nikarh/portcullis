@@ -21,6 +21,8 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/portcullis";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub docker_socket: String,
+    /// Docker's data directory, where it keeps each container's settings.
+    pub docker_root: PathBuf,
     pub events_socket: Option<PathBuf>,
     pub deny_action: DenyAction,
     pub monitor: bool,
@@ -67,6 +69,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             docker_socket: "/var/run/docker.sock".to_string(),
+            docker_root: PathBuf::from("/var/lib/docker"),
             events_socket: None,
             deny_action: DenyAction::Reject,
             monitor: false,
@@ -116,6 +119,7 @@ pub enum ConfigError {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct Settings {
     docker_socket: Option<String>,
+    docker_root: Option<PathBuf>,
     events_socket: Option<PathBuf>,
     deny_action: Option<String>,
     monitor: Option<bool>,
@@ -247,6 +251,7 @@ fn parse_file(text: &str) -> Result<Settings, toml::de::Error> {
 fn flags(args: &mut Arguments) -> Result<Settings, ConfigError> {
     Ok(Settings {
         docker_socket: args.opt_value_from_str("--docker-socket")?,
+        docker_root: args.opt_value_from_str("--docker-root")?,
         events_socket: args.opt_value_from_str("--events-socket")?,
         deny_action: args.opt_value_from_str("--deny-action")?,
         monitor: args.contains("--monitor").then_some(true),
@@ -276,6 +281,9 @@ impl Config {
 
         if let Some(socket) = settings.docker_socket {
             self.docker_socket = socket;
+        }
+        if let Some(directory) = settings.docker_root {
+            self.docker_root = directory;
         }
         if let Some(socket) = settings.events_socket {
             self.events_socket = Some(socket);
@@ -393,6 +401,7 @@ mod tests {
     fn all_set() -> Config {
         Config {
             docker_socket: "/tmp/docker.sock".to_string(),
+            docker_root: PathBuf::from("/srv/docker"),
             events_socket: Some(PathBuf::from("/run/portcullis.sock")),
             deny_action: DenyAction::Drop,
             monitor: true,
@@ -441,6 +450,8 @@ mod tests {
         let config = from_flags(&[
             "--docker-socket",
             "/tmp/docker.sock",
+            "--docker-root",
+            "/srv/docker",
             "--events-socket",
             "/run/portcullis.sock",
             "--deny-action",
@@ -481,6 +492,7 @@ mod tests {
         let config = from_file(
             r#"
             docker-socket = "/tmp/docker.sock"
+            docker-root = "/srv/docker"
             events-socket = "/run/portcullis.sock"
             deny-action = "drop"
             monitor = true

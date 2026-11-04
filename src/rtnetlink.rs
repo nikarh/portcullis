@@ -11,14 +11,14 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
 use tracing::warn;
 
-use crate::model::{BridgePort, RuntimeState};
+use crate::model::{BridgePort, MacAddress, RuntimeState};
 
 use crate::nfnetlink::{
     NLM_F_REQUEST, NLMSG_ERROR, NLMSG_HDRLEN, ack_error, align4, attribute, attributes, messages,
@@ -29,15 +29,28 @@ const NLM_F_DUMP: u16 = 0x300;
 
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const RTM_NEWADDR: u16 = 20;
+const RTM_GETADDR: u16 = 22;
 const RTM_NEWNSID: u16 = 88;
 const RTM_GETNSID: u16 = 90;
 
 const IFINFOMSG_LEN: usize = 16;
+const IFADDRMSG_LEN: usize = 8;
 const RTGENMSG_LEN: usize = 4;
 
+const AF_INET: u8 = 2;
+
+const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
+const IFLA_LINK: u16 = 5;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINK_NETNSID: u16 = 37;
+const IFLA_TARGET_NETNSID: u16 = 46;
+
+const IFA_LOCAL: u16 = 2;
+const IFA_TARGET_NETNSID: u16 = 10;
+
+const ENODEV: i32 = 19;
 
 const NETNSA_NSID: u16 = 1;
 const NETNSA_FD: u16 = 3;
@@ -51,6 +64,9 @@ pub struct Link {
     pub master: Option<u32>,
     /// For a veth, the namespace of its peer.
     pub peer_namespace: Option<i32>,
+    /// For a veth, the interface index of its peer, in the peer's namespace.
+    pub peer_index: Option<u32>,
+    pub mac: Option<MacAddress>,
 }
 
 /// A netlink socket for requests and dumps: `NETLINK_ROUTE` here, `NETLINK_NETFILTER` for
@@ -92,6 +108,54 @@ impl RouteSocket {
             },
         )?;
         Ok(links)
+    }
+
+    /// The interface with `index`, in the namespace with ID `namespace` (as this namespace
+    /// knows it) or in this one. `None` when there is no such interface.
+    pub fn link(&mut self, index: u32, namespace: Option<i32>) -> io::Result<Option<Link>> {
+        let mut request = vec![0; IFINFOMSG_LEN];
+        request.splice(4..8, index.to_ne_bytes());
+        if let Some(namespace) = namespace {
+            request.extend(attribute(IFLA_TARGET_NETNSID, &namespace.to_ne_bytes()));
+        }
+        let mut link = None;
+        let result = self.exchange(RTM_GETLINK, 0, &request, |message_type, body| {
+            if message_type == RTM_NEWLINK {
+                link = parse_link(body);
+                return true;
+            }
+            false
+        });
+        match result {
+            Err(error) if error.raw_os_error() == Some(ENODEV) => Ok(None),
+            Err(error) => Err(error),
+            Ok(()) => Ok(link),
+        }
+    }
+
+    /// The IPv4 addresses of interface `index` in the namespace with ID `namespace`. Needs
+    /// a socket opened with `open_strict`: without strict checking, the kernel ignores the
+    /// target namespace of a dump and answers for this one.
+    pub fn ipv4_addresses(&mut self, namespace: i32, index: u32) -> io::Result<Vec<Ipv4Addr>> {
+        let mut request = vec![AF_INET];
+        request.extend([0; 3]);
+        request.extend(index.to_ne_bytes());
+        request.extend(attribute(IFA_TARGET_NETNSID, &namespace.to_ne_bytes()));
+        let mut addresses = Vec::new();
+        self.exchange(RTM_GETADDR, NLM_F_DUMP, &request, |message_type, body| {
+            if message_type == RTM_NEWADDR {
+                addresses.extend(parse_ipv4_address(body, index));
+            }
+            false
+        })?;
+        Ok(addresses)
+    }
+
+    /// A `NETLINK_ROUTE` socket with strict checking of requests, see `ipv4_addresses`.
+    pub fn open_strict() -> io::Result<Self> {
+        let socket = Self::open()?;
+        socket.socket.set_netlink_get_strict_chk(true)?;
+        Ok(socket)
     }
 
     /// The ID the network namespace at `path` has in this namespace, if it has one.
@@ -220,6 +284,8 @@ fn parse_link(body: &[u8]) -> Option<Link> {
         name: String::new(),
         master: None,
         peer_namespace: None,
+        peer_index: None,
+        mac: None,
     };
     for (kind, value) in attributes(body.get(IFINFOMSG_LEN..)?) {
         match kind {
@@ -229,10 +295,25 @@ fn parse_link(body: &[u8]) -> Option<Link> {
             }
             IFLA_MASTER => link.master = ne_u32(value),
             IFLA_LINK_NETNSID => link.peer_namespace = ne_u32(value).map(u32::cast_signed),
+            IFLA_LINK => link.peer_index = ne_u32(value),
+            IFLA_ADDRESS => {
+                link.mac = <[u8; 6]>::try_from(value).ok().map(MacAddress::from);
+            }
             _ => {}
         }
     }
     Some(link)
+}
+
+/// The address of an `RTM_NEWADDR` message, if it is an IPv4 address of interface `index`.
+fn parse_ipv4_address(body: &[u8], index: u32) -> Option<Ipv4Addr> {
+    if *body.first()? != AF_INET || u32::from_ne_bytes(body.get(4..8)?.try_into().ok()?) != index {
+        return None;
+    }
+    attributes(body.get(IFADDRMSG_LEN..)?)
+        .find(|(kind, _)| *kind == IFA_LOCAL)
+        .and_then(|(_, value)| <[u8; 4]>::try_from(value).ok())
+        .map(Ipv4Addr::from)
 }
 
 fn parse_namespace_id(body: &[u8]) -> Option<i32> {
@@ -257,6 +338,8 @@ mod tests {
         body.extend(attribute(IFLA_IFNAME, b"veth1234\0"));
         body.extend(attribute(IFLA_MASTER, &3_u32.to_ne_bytes()));
         body.extend(attribute(IFLA_LINK_NETNSID, &2_i32.to_ne_bytes()));
+        body.extend(attribute(IFLA_LINK, &12_u32.to_ne_bytes()));
+        body.extend(attribute(IFLA_ADDRESS, &[2, 0x42, 0xac, 0x12, 0, 2]));
         assert_eq!(
             parse_link(&body),
             Some(Link {
@@ -264,8 +347,26 @@ mod tests {
                 name: "veth1234".to_string(),
                 master: Some(3),
                 peer_namespace: Some(2),
+                peer_index: Some(12),
+                mac: Some(MacAddress::new([2, 0x42, 0xac, 0x12, 0, 2])),
             })
         );
+    }
+
+    #[test]
+    fn parses_ipv4_addresses_of_one_interface() {
+        let message = |family: u8, index: u32| {
+            let mut body = vec![family, 0, 0, 0];
+            body.extend(index.to_ne_bytes());
+            body.extend(attribute(IFA_LOCAL, &[172, 18, 0, 2]));
+            body
+        };
+        assert_eq!(
+            parse_ipv4_address(&message(AF_INET, 5), 5),
+            Some(Ipv4Addr::new(172, 18, 0, 2))
+        );
+        assert_eq!(parse_ipv4_address(&message(AF_INET, 6), 5), None);
+        assert_eq!(parse_ipv4_address(&message(10, 5), 5), None);
     }
 
     #[test]

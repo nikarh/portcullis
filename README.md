@@ -16,7 +16,7 @@ Portcullis is a daemon that runs on the Docker host. It watches the Docker API f
 
 The rules are nftables rules, kept in two tables of its own: an `inet` table for traffic leaving a container's network or addressed to the Docker host, and a `bridge` table for everything entering a network's bridge from a container. A Linux bridge passes traffic between containers directly, without the IP-level hooks Docker's own rules use, so only the bridge table can see it. The bridge table is also where Portcullis checks that each frame really comes from the container it claims to come from. Both work next to Docker's rules whether Docker itself uses iptables or nftables.
 
-A container can start sending before Portcullis has seen it start. Its first packets then come from an address the rules don't know yet. Portcullis doesn't deny them: the firewall holds them until the container's rules are in place and then runs them through those rules, so they are allowed or denied as if the rules had been there all along. TCP and UDP are only delayed, not lost. Packets whose source is still unknown after 2 seconds are denied as spoofed (see [Limitations and details](#limitations-and-details)).
+A container can start sending before Portcullis has seen it start. Its first packets then come from an address the rules don't know yet. Portcullis doesn't deny them: the firewall holds them until the container's rules are in place and then runs them through those rules, so they are allowed or denied as if the rules had been there all along. TCP and UDP are only delayed, not lost. Portcullis doesn't wait for Docker to report the container: it finds it from the packet's bridge port, through the kernel and the files Docker keeps for each container, usually within milliseconds (see [Finding new containers](#finding-new-containers)). Packets whose source is still unknown after 2 seconds belong to no container, and are denied as spoofed (see [Limitations and details](#limitations-and-details)). On networks in monitor mode such packets are held the same way, so that they are reported with their container, but never denied or dropped.
 
 Portcullis only removes access. Traffic that a policy allows still goes through Docker's own rules afterwards, so things Docker blocks (internal networks, isolation between networks) stay blocked.
 
@@ -130,6 +130,7 @@ The same options can be given on the command line, and override the file. `--con
 |---|---|---|
 | `--config <path>` | `/etc/portcullis/config.toml` | Config file. Command line only. |
 | `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
+| `--docker-root <path>` | `/var/lib/docker` | Docker's data directory (`docker info -f '{{.DockerRootDir}}'`), where Portcullis reads the settings of containers that just started, see [Finding new containers](#finding-new-containers). |
 | `--monitor` | off | Monitor mode on every network: report what would be denied, deny nothing. In the file, `monitor = true` or `false`. |
 | `--monitor-network <name>` | none | Watch this network in monitor mode without a `portcullis.enable` label; `*` watches every bridge network. Repeat the flag for more networks. In the file, `monitor-networks = ["backend", "frontend"]`. A network's label, if it has one, wins, so `portcullis.enable=false` keeps a network out of `*`. See [Enforcing a network](#enforcing-a-network). |
 | `--deny-action <reject\|drop>` | `reject` | `reject` answers denied traffic with an ICMP "administratively prohibited" error, so applications fail immediately with "Host is unreachable". `drop` discards it silently, and applications wait for their own timeout. Traffic denied for its source or kind (reasons `source` and `frame`) is always dropped: a rejection would go to an address the sender only claims. |
@@ -501,7 +502,7 @@ Portcullis assumes a container may be compromised and actively try to get past i
 - Traffic to the Docker host follows the egress labels, and rules see the destination the container asked for, before Docker's DNAT of published ports.
 - When Docker gives a removed container's address to a new container, Portcullis deletes the old container's tracked connections first, so the new container can't keep using them.
 - Fragmented packets are put back together before the rules look at them, so fragments can't hide or rewrite ports.
-- Packets from a port Portcullis doesn't know yet (a container that just started) are held for at most 2 seconds and then denied. Flooding that queue makes the kernel drop them, it never lets them through.
+- Packets from a port Portcullis doesn't know yet (a container that just started) are held for at most 2 seconds and then denied. Flooding that queue makes the kernel drop them, it never lets them through. On networks in monitor mode the same queue lets them through instead.
 - Addresses a container learns from DNS answers only count for its own `host:` rules, so a container that may ask a resolver of its choice can't widen anyone else's (see [Hostname rules](#hostname-rules)). What it learns is bounded too: at most 4096 addresses per hostname at a time.
 - Traffic denied for using someone else's address or MAC is dropped, not rejected, whatever `--deny-action` says: a rejection would only go back to the sender, addressed to someone else.
 
@@ -620,10 +621,23 @@ labels:
   - portcullis.dns.1=ip:9.9.9.9
 ```
 
+## Finding new containers
+
+Docker reports a container that started through its events and API, which can take a second, or much longer when the host is busy. Meanwhile, the container's packets are held (see [How it works](#how-it-works)). Portcullis doesn't wait for Docker: for the bridge port a held packet came in on, it finds the container behind it, and applies its rules right away:
+
+1. The kernel tells which bridge the port is on, and which network namespace the other end of the veth pair is in (rtnetlink).
+2. The container's interface in that namespace has its MAC and address, as Docker set them up before the container's process ran. Nothing is run inside the container.
+3. The container whose processes are in that namespace is found by its cgroup (`docker-<id>.scope`); a container that uses another one's network (`network_mode: container:...`) isn't the namespace's owner and is skipped.
+4. Its name and labels come from the files Docker keeps for it, `config.v2.json` and `hostconfig.json` under `--docker-root`.
+
+This takes a few milliseconds. Until the container's process exists (its interface comes up a moment before), the packets stay held, and Portcullis looks again every 100 milliseconds. Docker's own report of the container, when it comes, replaces what was found.
+
+The address and MAC are those of the container's own interface. A container with `NET_ADMIN` can change them, as it can do much else (see [Limitations and details](#limitations-and-details)).
+
 ## Limitations and details
 
 - IPv6 is not supported, by design. Portcullis uses a network's IPv4 subnet and matches containers by their IPv4 address only. IPv6 traffic entering an enforced network's bridge is denied, so containers on an enforced network with IPv6 enabled can't use it at all.
-- Containers can't use addresses that aren't theirs: traffic entering an enforced network's bridge is only accepted with a known container's address and MAC, from that container's port on the bridge. Anything else from a known container's port is denied at once; from a port Portcullis doesn't know yet, it is held for up to 2 seconds, in case it comes from a container that just started, and then denied. If Portcullis can't find a container's port (it logs a warning), that container's traffic is only checked by address and MAC, which another container with a raw socket can copy.
+- Containers can't use addresses that aren't theirs: traffic entering an enforced network's bridge is only accepted with a known container's address and MAC, from that container's port on the bridge. Anything else from a known container's port is denied at once; from a port Portcullis doesn't know yet, it is held until Portcullis has found the container behind the port, and denied if none is found within 2 seconds. If Portcullis can't find a container's port (it logs a warning), that container's traffic is only checked by address and MAC, which another container with a raw socket can copy.
 - `NET_RAW` (which Docker grants by default) and `NET_ADMIN` still let a container do things no firewall rule can stop, even though Portcullis keeps them from getting past its rules and reports their attempts. With a raw socket, a container can flood its network until it is [quarantined](#quarantine-and-limits), and use bandwidth and CPU with traffic its rules allow. It can also see broadcast and multicast traffic of its network, as any container can. With `NET_ADMIN` it can change its own interfaces and routes; Portcullis then denies whatever doesn't match the container's address and MAC, but the container can still disturb its own traffic. Drop `NET_RAW` from containers that don't need it (`cap_drop: [NET_RAW]` in Compose; `ping` is about the only common tool that needs it), and don't give `NET_ADMIN` to containers you don't trust.
 - A container with a published port can exchange data with anyone allowed to connect to it: replies to incoming connections are always allowed. Egress labels limit only the connections a container opens.
 - A network is enforced once Portcullis has seen it created, which usually takes milliseconds. Until then, its traffic isn't filtered at all. Containers that start on a brand-new network can get packets out in that window, for example when `docker compose up` creates the network and starts its containers right away. To close it, create enforced networks ahead of time (`docker network create`, or an `external` network in Compose) and start containers on them afterwards. Packets of containers that start on an already enforced network are held until their rules are in place, so nothing gets through there.
@@ -635,7 +649,7 @@ labels:
 - If a hostname has no known addresses, its rules allow nothing until a container looks it up or Portcullis can resolve it. Everything else is applied as usual. Portcullis retries its own lookup every 30 seconds.
 - Domains on events are best effort. They are missing for containers whose DNS lookups Portcullis can't see, for connections to addresses obtained some other way, and for HTTPS hostnames (TLS SNI), which Portcullis doesn't look at.
 - DNS answers over TCP that span more than one packet aren't inspected; they still reach the container.
-- Portcullis uses NFLOG group 4242 and NFQUEUE 4242, 4243 and 4244, and packet marks 0x70630001 to 0x70630003. Other software on the host must not use the same numbers.
+- Portcullis uses NFLOG group 4242 and NFQUEUE 4242, 4243, 4244 and 4245, and packet marks 0x70630001 to 0x70630003. Other software on the host must not use the same numbers.
 - Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.enable` value on a network enforces it. An enforced network without a usable subnet is logged and not enforced.
 - While Portcullis isn't running, its last rules stay in force (by default) but nothing is updated or reported, see [Stopping and removing Portcullis](#stopping-and-removing-portcullis). With `--on-exit remove`, containers are unrestricted while it isn't running.
 

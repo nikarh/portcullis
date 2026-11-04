@@ -359,6 +359,12 @@ pub enum RuntimeStateAction {
     UpsertNetwork {
         network: Network,
     },
+    /// A container found behind a bridge port before Docker reported it (see
+    /// `discovery`): its attachment to that network, and its namespace, replace those
+    /// known; the rest of a known container stays as Docker reported it.
+    DiscoverContainer {
+        container: Box<Container>,
+    },
     RemoveNetwork {
         network_id: NetworkId,
     },
@@ -472,6 +478,22 @@ impl RuntimeState {
                 self.networks.insert(network.id.clone(), network);
                 true
             }
+            RuntimeStateAction::DiscoverContainer { container } => {
+                let Some(known) = self.containers.get_mut(&container.id) else {
+                    let has_networks = !container.attachments.is_empty();
+                    self.containers.insert(container.id.clone(), *container);
+                    return has_networks;
+                };
+                let before = known.clone();
+                for attachment in container.attachments {
+                    known
+                        .attachments
+                        .retain(|existing| existing.network_id != attachment.network_id);
+                    known.attachments.push(attachment);
+                }
+                known.sandbox = container.sandbox;
+                *known != before
+            }
             RuntimeStateAction::RemoveNetwork { network_id } => self.remove_network(&network_id),
         }
     }
@@ -480,6 +502,51 @@ impl RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn container(id: &str, network: &str, address: &str, sandbox: &str) -> Container {
+        Container {
+            id: id.to_string().into(),
+            name: id.to_string().into(),
+            attachments: vec![NetworkAttachment {
+                network_id: network.into(),
+                ip_address: address.parse().expect("address"),
+                mac_address: None,
+                aliases: Vec::new(),
+            }],
+            runtime_dns_servers: HashSet::new(),
+            policy: ContainerPolicy::default(),
+            sandbox: Some(sandbox.to_string()),
+        }
+    }
+
+    #[test]
+    fn discovered_containers_update_one_attachment() {
+        let mut state = RuntimeState::default();
+        let discovered = |container| RuntimeStateAction::DiscoverContainer {
+            container: Box::new(container),
+        };
+        assert!(state.apply_action(discovered(container("a", "n0", "172.18.0.2", "/old"))));
+
+        let mut known = container("a", "n0", "172.18.0.2", "/old");
+        known
+            .attachments
+            .extend(container("a", "n1", "172.19.0.2", "/old").attachments);
+        assert!(state.apply_action(RuntimeStateAction::CreateContainer {
+            container: Box::new(known),
+        }));
+        // Restarted with a new namespace, and a new address on n1.
+        assert!(state.apply_action(discovered(container("a", "n1", "172.19.0.9", "/new"))));
+        let a = state.containers().get("a").expect("a");
+        assert_eq!(a.sandbox.as_deref(), Some("/new"));
+        let addresses: Vec<String> = a
+            .attachments
+            .iter()
+            .map(|attachment| format!("{} {}", attachment.network_id, attachment.ip_address))
+            .collect();
+        assert_eq!(addresses, ["n0 172.18.0.2", "n1 172.19.0.9"]);
+        // Nothing new.
+        assert!(!state.apply_action(discovered(container("a", "n1", "172.19.0.9", "/new"))));
+    }
 
     #[test]
     fn parses_and_formats_mac_addresses() {

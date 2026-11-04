@@ -32,7 +32,7 @@ pub enum MonitorError {
 }
 
 /// Policy from a container's labels. Invalid labels are logged, reported and skipped.
-fn policy_from_labels(
+pub fn policy_from_labels(
     container: &str,
     labels: &IndexMap<String, String>,
     warnings: &mut Vec<Warning>,
@@ -573,7 +573,7 @@ fn portcullis_mode(
     }
 }
 
-fn runtime_dns_servers(host_config: Option<&DockerHostConfig>) -> HashSet<IpAddr> {
+pub fn runtime_dns_servers(host_config: Option<&DockerHostConfig>) -> HashSet<IpAddr> {
     host_config
         .and_then(|config| config.dns.as_ref())
         .into_iter()

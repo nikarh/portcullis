@@ -5,6 +5,7 @@ mod config;
 mod connection_log;
 mod conntrack;
 mod directory;
+mod discovery;
 mod dns;
 mod dns_filter;
 mod dns_inspect;
@@ -39,6 +40,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::config::{Config, ConfigError, OnExit, QuarantineMode};
 use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
+use crate::discovery::Discovery;
 use crate::dns::{HostAddresses, SystemUpstreamResolver};
 use crate::docker::{
     DockerClient, DockerError, DockerEvent, DockerEventAction, DockerEventClient, DockerEventKind,
@@ -48,8 +50,9 @@ use crate::events::{
 };
 use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan};
 use crate::logging::LoggingError;
-use crate::model::{ContainerId, MacAddress, RuntimeState};
+use crate::model::{ContainerId, MacAddress, RuntimeState, RuntimeStateAction};
 use crate::monitor::{DockerMonitor, MonitorError};
+use crate::nfnetlink::QueueOverflow;
 use crate::source_hold::SourceHold;
 
 /// Cargo.toml's version, with `PORTCULLIS_VERSION_SUFFIX` at build time (see build.rs).
@@ -64,7 +67,11 @@ const SOURCE_QUEUE: u16 = 4243;
 const SAVED_RULES: &str = "rules.nft";
 /// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held in.
 const DNS_QUERY_QUEUE: u16 = 4244;
-/// How long such packets are held before they are denied.
+/// NFQUEUE number the same packets are held in on networks in monitor mode.
+const MONITOR_SOURCE_QUEUE: u16 = 4245;
+/// How long such packets are held before they are denied. Containers are found within
+/// milliseconds without Docker (see `discovery`); this only runs out for sources that
+/// aren't a container's.
 const SOURCE_HOLD_GRACE: Duration = Duration::from_secs(2);
 /// How soon a failed rule update is tried again; twice as long after each failure in a
 /// row, up to 64 times as long (about 5 minutes).
@@ -461,6 +468,36 @@ impl Applier {
     }
 }
 
+/// Find the containers behind bridge ports packets are held from, without waiting for
+/// Docker (see `discovery`), and apply rules for them.
+fn discover(
+    discovery: &mut Discovery,
+    ports: HashSet<u32>,
+    state: &mut RuntimeState,
+    applier: &mut Applier,
+) {
+    let mut changed = false;
+    for port in ports {
+        if applier.directory.by_port(port).is_some() {
+            continue;
+        }
+        let started = Instant::now();
+        match discovery.container(port, state.networks()) {
+            Ok(Some(container)) => {
+                info!(container = %container.name, port, took = ?started.elapsed(), "found a container behind a bridge port before Docker reported it");
+                changed |= state.apply_action(RuntimeStateAction::DiscoverContainer {
+                    container: Box::new(container),
+                });
+            }
+            Ok(None) => trace!(port, "no container behind the port yet"),
+            Err(error) => debug!(port, %error, "can't find the container behind a port"),
+        }
+    }
+    if changed && let Err(error) = applier.apply(state) {
+        error!(%error, "firewall apply failed; continuing");
+    }
+}
+
 /// Cut a misbehaving container off from its networks, or report that it would be.
 fn quarantine_container(
     mode: QuarantineMode,
@@ -537,6 +574,7 @@ fn run(config: &Config) -> Result<(), MainError> {
             log_allowed: config.log_allowed,
             dns_queue: Some(DNS_QUEUE),
             source_queue: Some(SOURCE_QUEUE),
+            monitor_source_queue: Some(MONITOR_SOURCE_QUEUE),
             connection_limit: config.connection_limit,
             dns_query_queue: Some(DNS_QUERY_QUEUE),
         })?
@@ -589,11 +627,30 @@ fn run(config: &Config) -> Result<(), MainError> {
     )
     .map_err(MainError::DnsInspection)?;
 
+    let (discover_tx, discover_rx) = unbounded::<u32>();
     let source_hold = source_hold::spawn(
         SOURCE_QUEUE,
+        QueueOverflow::Drop,
         SOURCE_HOLD_GRACE,
         Arc::clone(&directory),
-        failed_tx,
+        discover_tx.clone(),
+        failed_tx.clone(),
+    )
+    .map_err(MainError::SourceHold)?
+    .and(
+        source_hold::spawn(
+            MONITOR_SOURCE_QUEUE,
+            QueueOverflow::Accept,
+            SOURCE_HOLD_GRACE,
+            Arc::clone(&directory),
+            discover_tx,
+            failed_tx,
+        )
+        .map_err(MainError::SourceHold)?,
+    );
+    let mut discovery = Discovery::new(
+        config.docker_root.clone(),
+        discovery::DEFAULT_CGROUP_ROOT.into(),
     )
     .map_err(MainError::SourceHold)?;
 
@@ -655,6 +712,14 @@ fn run(config: &Config) -> Result<(), MainError> {
                 break Ok(());
             }
             recv(failed_rx) -> message => break Err(failure(message)),
+            recv(discover_rx) -> port => {
+                if let Ok(port) = port {
+                    // Asked for by every held packet: once for each port.
+                    let ports: HashSet<u32> =
+                        std::iter::once(port).chain(discover_rx.try_iter()).collect();
+                    discover(&mut discovery, ports, &mut runtime_state, &mut applier);
+                }
+            }
             recv(misbehaviour_rx) -> message => {
                 if let Ok(misbehaviour) = message {
                     quarantine_container(

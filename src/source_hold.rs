@@ -12,9 +12,19 @@
 //! - if the source is still unknown after a grace period, the packet is replayed with a
 //!   mark that the bridge table denies, and reports, like any spoofed source.
 //!
-//! The queue has no bypass: while Portcullis isn't reading it, such packets are held until
-//! the kernel's queue is full and then dropped, so the hold fails closed.
+//! While a packet is held, the main loop is asked to find its sender from the kernel and
+//! Docker's files (`discovery`), without waiting for Docker's events and API; until the
+//! container has a process, it is asked again every [`DISCOVER_RETRY`]. A container that
+//! just started is then known within milliseconds, so the grace period only runs out for
+//! a source that belongs to no container.
+//!
+//! On enforced networks the queue has no bypass: while Portcullis isn't reading it, such
+//! packets are held until the kernel's queue is full and then dropped, so the hold fails
+//! closed. Networks in monitor mode use a queue of their own that fails open
+//! (`QueueOverflow::Accept`, and a bypass in the rule): a packet past its grace period is
+//! replayed with the mark that reports it, and is let through.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,6 +43,8 @@ use crate::nfnetlink::{
 
 /// Longest wait when nothing is held.
 const IDLE_WAIT: Duration = Duration::from_secs(3600);
+/// How often to ask again for the sender of a held packet to be found.
+const DISCOVER_RETRY: Duration = Duration::from_millis(100);
 
 /// A held packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,25 +59,37 @@ struct Held {
 
 /// Releases held packets after rule updates.
 pub struct SourceHold {
-    wake: Sender<()>,
+    wakes: Vec<Sender<()>>,
 }
 
 impl SourceHold {
     /// Rules were updated: release packets whose source is now known.
     pub fn rules_applied(&self) {
-        let _ = self.wake.send(());
+        for wake in &self.wakes {
+            let _ = wake.send(());
+        }
+    }
+
+    /// Both holds, released together.
+    #[must_use]
+    pub fn and(mut self, other: Self) -> Self {
+        self.wakes.extend(other.wakes);
+        self
     }
 }
 
-/// Start holding packets queued in NFQUEUE `queue`, for at most `grace` each. If reading
-/// fails for good, the reading thread says why on `failed` and ends.
+/// Start holding packets queued in NFQUEUE `queue`, for at most `grace` each, asking on
+/// `discover` for the containers behind their bridge ports to be found. If reading fails
+/// for good, the reading thread says why on `failed` and ends.
 pub fn spawn(
     queue: u16,
+    overflow: QueueOverflow,
     grace: Duration,
     directory: Arc<Directory>,
+    discover: Sender<u32>,
     failed: Sender<String>,
 ) -> io::Result<SourceHold> {
-    let mut socket = NfqueueSocket::bind(queue, QueueOverflow::Drop)?;
+    let mut socket = NfqueueSocket::bind(queue, overflow)?;
     let writer = socket.verdict_writer()?;
     let pending = Arc::new(Mutex::new(Vec::<Held>::new()));
     let (wake, woken) = unbounded::<()>();
@@ -109,6 +133,8 @@ pub fn spawn(
     });
 
     thread::spawn(move || {
+        // When each port's container was last asked to be found.
+        let mut asked: HashMap<u32, Instant> = HashMap::new();
         loop {
             let wait = pending
                 .lock()
@@ -116,13 +142,14 @@ pub fn spawn(
                 .iter()
                 .map(|held| held.deadline.saturating_duration_since(Instant::now()))
                 .min()
-                .unwrap_or(IDLE_WAIT);
+                .map_or(IDLE_WAIT, |wait| wait.min(DISCOVER_RETRY));
             if let Err(RecvTimeoutError::Disconnected) = woken.recv_timeout(wait) {
                 return;
             }
+            let now = Instant::now();
             let verdicts = {
                 let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
-                release(&mut pending, Instant::now(), |held| {
+                let verdicts = release(&mut pending, now, |held| {
                     // The rules check the MAC only when Docker reported one, and the port
                     // only where Portcullis found it.
                     held.source
@@ -131,7 +158,18 @@ pub fn spawn(
                             (info.mac.is_none() || info.mac == held.mac)
                                 && (info.port.is_none() || info.port == held.port)
                         })
-                })
+                });
+                asked.retain(|_, when| now.duration_since(*when) < DISCOVER_RETRY * 10);
+                for port in pending.iter().filter_map(|held| held.port) {
+                    let due = asked
+                        .get(&port)
+                        .is_none_or(|when| now.duration_since(*when) >= DISCOVER_RETRY);
+                    if due {
+                        asked.insert(port, now);
+                        let _ = discover.send(port);
+                    }
+                }
+                verdicts
             };
             for (id, verdict) in verdicts {
                 debug!(id, ?verdict, "releasing held packet");
@@ -142,7 +180,7 @@ pub fn spawn(
         }
     });
 
-    Ok(SourceHold { wake })
+    Ok(SourceHold { wakes: vec![wake] })
 }
 
 /// The source address of a held IPv4 packet, or the address an ARP packet announces.

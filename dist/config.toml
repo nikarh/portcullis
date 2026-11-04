@@ -51,6 +51,9 @@ events-socket = "/run/portcullis.sock"
 # Docker API socket.
 #docker-socket = "/var/run/docker.sock"
 
+# Docker's data directory, where the settings of containers that just started are read.
+#docker-root = "/var/lib/docker"
+
 # Where the rules are saved, to be put back first thing at the next start.
 #state-dir = "/var/lib/portcullis"
 

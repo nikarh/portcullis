@@ -150,6 +150,9 @@ pub struct Options {
     /// NFQUEUE number packets from not yet known sources on enforced networks are held in
     /// until the next rule update, instead of being denied. See `source_hold`.
     pub source_queue: Option<u16>,
+    /// The same for networks in monitor mode. This queue fails open: while nothing reads
+    /// it, packets pass.
+    pub monitor_source_queue: Option<u16>,
     /// Open connections a container may have at a time, unless its labels say otherwise.
     pub connection_limit: Option<u32>,
     /// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held
@@ -165,6 +168,7 @@ impl Default for Options {
             log_allowed: LogAllowed::Monitor,
             dns_queue: None,
             source_queue: None,
+            monitor_source_queue: None,
             connection_limit: Some(DEFAULT_CONNECTION_LIMIT),
             dns_query_queue: None,
         }
@@ -970,51 +974,72 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
                 .map(|bridge| Quoted(&bridge.name)),
         )
     };
-    if let Some(monitored) = bridges(true) {
-        render_denied_frames(out, options, true, &format!("meta ibrname {monitored}"))?;
+    for monitor in [true, false] {
+        let Some(selected) = bridges(monitor) else {
+            continue;
+        };
+        let queue = if monitor {
+            options.monitor_source_queue
+        } else {
+            options.source_queue
+        };
+        render_unknown_sources(out, plan, options, monitor, &selected, queue)?;
     }
-    let Some(enforced) = bridges(false) else {
-        return Ok(());
-    };
+    Ok(())
+}
+
+/// Frames entering `bridges` (all enforced, or all in monitor mode) that no rule above
+/// accepted: their source isn't a managed container's own address, MAC and port.
+fn render_unknown_sources(
+    out: &mut String,
+    plan: &Plan,
+    options: Options,
+    monitor: bool,
+    bridges: &str,
+    queue: Option<u16>,
+) -> fmt::Result {
+    let base = Chain::Base(Table::Bridge);
     // From a managed container's port, but not with its own address and MAC: denied at once.
-    let enforced_bridges: BTreeSet<&str> = plan
+    let networks: BTreeSet<&str> = plan
         .bridges
         .iter()
-        .filter(|bridge| !bridge.monitor)
+        .filter(|bridge| bridge.monitor == monitor)
         .map(|bridge| bridge.network.as_str())
         .collect();
     if let Some(ports) = set_literal(
         plan.sources
             .iter()
-            .filter(|source| enforced_bridges.contains(source.network.as_str()))
+            .filter(|source| networks.contains(source.network.as_str()))
             .filter_map(|source| source.port.as_ref())
             .map(|port| Quoted(&port.name)),
     ) {
         render_denied_frames(
             out,
             options,
-            false,
-            &format!("meta ibrname {enforced} iifname {ports}"),
+            monitor,
+            &format!("meta ibrname {bridges} iifname {ports}"),
         )?;
     }
-    if let Some(queue) = options.source_queue {
+    if let Some(queue) = queue {
         // Held before, and the source stayed unknown.
         render_denied_frames(
             out,
             options,
-            false,
-            &format!("meta ibrname {enforced} meta mark {HOLD_EXPIRED_MARK:#x}"),
+            monitor,
+            &format!("meta ibrname {bridges} meta mark {HOLD_EXPIRED_MARK:#x}"),
         )?;
         // A port no managed container has (yet): most likely a container that just started,
         // or that got the address of a removed one, and that Portcullis hasn't applied rules
-        // for. Hold the packet until the next update; if the source stays unknown, it is
-        // denied above once the hold expires.
+        // for. Hold the packet until Portcullis knows the container; if the source stays
+        // unknown, it is denied (or in monitor mode reported) above once the hold expires.
+        // In monitor mode the queue fails open.
         writeln!(
             out,
-            "add rule {base} meta ibrname {enforced} ether type {{ ip, arp }} queue num {queue}"
+            "add rule {base} meta ibrname {bridges} ether type {{ ip, arp }} queue num {queue}{}",
+            if monitor { " bypass" } else { "" }
         )?;
     }
-    render_denied_frames(out, options, false, &format!("meta ibrname {enforced}"))
+    render_denied_frames(out, options, monitor, &format!("meta ibrname {bridges}"))
 }
 
 /// The set of quarantined containers' bridge ports, refilled on every update.
@@ -1939,6 +1964,7 @@ mod tests {
         log_allowed: LogAllowed::Never,
         dns_queue: None,
         source_queue: None,
+        monitor_source_queue: None,
         connection_limit: None,
         dns_query_queue: None,
     };
@@ -2145,6 +2171,24 @@ flush chain bridge portcullis limit_open
         // Monitor mode lets them through, reported.
         let monitored = render_with(&test_support::hostname_state(), options, true);
         assert!(!monitored.contains("queue num 9"), "{monitored}");
+    }
+
+    #[test]
+    fn holds_unknown_sources_of_monitored_networks_failing_open() {
+        let options = Options {
+            source_queue: Some(9),
+            monitor_source_queue: Some(10),
+            ..OPTIONS
+        };
+        let script = render_with(&test_support::hostname_state(), options, true);
+        let expected = [
+            denied_frames("meta ibrname { \"br-net0\" } meta mark 0x70630001", 'w'),
+            "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type { ip, arp } queue num 10 bypass".to_string(),
+            denied_frames("meta ibrname { \"br-net0\" }", 'w'),
+        ]
+        .join("\n");
+        assert!(script.contains(&format!("{expected}\n")), "{script}");
+        assert!(!script.contains("queue num 9"), "{script}");
     }
 
     /// The chains a script creates or keeps, without the base chains.
