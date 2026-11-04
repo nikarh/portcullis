@@ -44,11 +44,22 @@ gpg --verify SHA256SUMS.asc SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 ```
 
-On Debian and Ubuntu, `portcullis_amd64.deb` or `portcullis_arm64.deb`:
+On Debian and Ubuntu, add the Portcullis apt repository, so that `apt upgrade` keeps it up to date. Its index is signed with the release signing key:
 
 ```bash
-sudo apt install ./portcullis_amd64.deb
+sudo install -d /etc/apt/keyrings
+curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc | sudo tee /etc/apt/keyrings/portcullis.asc >/dev/null
+sudo tee /etc/apt/sources.list.d/portcullis.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://github.com/nikarh/portcullis/releases/download/apt/
+Suites: ./
+Signed-By: /etc/apt/keyrings/portcullis.asc
+EOF
+sudo apt update
+sudo apt install portcullis
 ```
+
+For the builds of `main` (see below), use `apt-latest` instead of `apt` in the URI. The repository lists every version it has (releases all of them, `main` its last 100 builds), so `apt list -a portcullis` shows them and `sudo apt install portcullis=0.1.0-1` installs one. Without the repository, take `portcullis_amd64.deb` or `portcullis_arm64.deb` from a release and `sudo apt install ./portcullis_amd64.deb` it.
 
 As Debian packages do, it enables and starts the service right away. So that this doesn't block anything you haven't reviewed, its config starts in monitor mode (`monitor = true` in `/etc/portcullis/config.toml`): enforced networks report what would be denied and deny nothing. Once the reports look right (see [Rolling out a policy](#rolling-out-a-policy)), set `monitor = false` and `sudo systemctl restart portcullis`.
 

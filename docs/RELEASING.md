@@ -23,6 +23,13 @@ and the packages under versioned names (`portcullis-0.1.0-1-x86_64.pkg.tar.zst`)
 key. Older packages stay: every release, and the newest 100 builds of main. A version that is there already is never
 replaced, since pacman caches packages by name. The pre-releases are created on the first publish.
 
+Likewise the Debian packages go to the apt repositories (`scripts/apt-repo.sh`), one pre-release each with both
+architectures: `apt` for releases and `apt-latest` for builds of main. They are flat repositories (`Suites: ./`, no
+`dists/` and `pool/`, which a release can't have): the index (`Packages`, `Packages.gz`, `Release`, signed as
+`InRelease` and `Release.gpg`) lists every package in the release, so older versions install with
+`apt install portcullis=<version>`. The packages are named so that GitHub keeps the name (`~` and `+` in the version
+become `-` and `.`). After an update the job checks that apt, set up as in the README, sees the new version.
+
 Asset names never change, so `https://github.com/nikarh/portcullis/releases/latest/download/<name>` always points at
 the newest file:
 
@@ -47,7 +54,7 @@ only allows the `main` and `release` branches and `v*` tags, and holds these sec
 | --- | --- |
 | `APP_CLIENT_ID` | The app's client ID (`Iv…`, on the app's settings page) |
 | `APP_PRIVATE_KEY` | A private key of the app (PEM) |
-| `GPG_PRIVATE_KEY` | ASCII armored private key that signs `SHA256SUMS`, the Arch Linux packages and their repository |
+| `GPG_PRIVATE_KEY` | ASCII armored private key that signs `SHA256SUMS` and the apt and pacman repositories |
 | `GPG_PASSPHRASE` | Its passphrase |
 
 ```sh
