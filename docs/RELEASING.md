@@ -30,6 +30,11 @@ architectures: `apt` for releases and `apt-latest` for builds of main. They are 
 `apt install portcullis=<version>`. The packages are named so that GitHub keeps the name (`~` and `+` in the version
 become `-` and `.`). After an update the job checks that apt, set up as in the README, sees the new version.
 
+Both take the packages from the release itself, checked against its `SHA256SUMS`. To add a release to them again
+without building it again (say a repository job failed), run Publish by hand with its tag and *repositories-only*:
+`gh workflow run publish.yml -f tag=v0.1.1 -f repositories-only=true`. Versions the repositories have already are left
+as they are.
+
 Asset names never change, so `https://github.com/nikarh/portcullis/releases/latest/download/<name>` always points at
 the newest file:
 
