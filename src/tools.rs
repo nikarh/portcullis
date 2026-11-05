@@ -224,6 +224,9 @@ impl Report {
                 if let Some(note) = note {
                     let _ = writeln!(out, "    ({note})");
                 }
+                if services.iter().any(|(protocol, _)| protocol == "igmp") {
+                    out.push_str("    (IGMP: the container joins multicast groups; only needed when the host relays multicast, such as with igmpproxy)\n");
+                }
             }
             for (destination, services) in &findings.icc {
                 let _ = writeln!(
@@ -514,6 +517,7 @@ Warnings
 jellyfin (3 denied or would-be-denied connections)
   portcullis.egress.1-1-1-1=ip:1.1.1.1,icmp
   portcullis.egress.224-0-0-22=ip:224.0.0.22,igmp
+    (IGMP: the container joins multicast groups; only needed when the host relays multicast, such as with igmpproxy)
   IP protocol 41 to 192.0.2.1, which labels can't allow
 "
         );

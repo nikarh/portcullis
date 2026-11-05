@@ -350,7 +350,9 @@ labels:
   - portcullis.egress.stun=ip:public,udp:3478-3479
 ```
 
-Replies, and ICMP errors about a connection, always pass: `icmp` is only needed to send ICMP of the container's own, such as `ping`. A process that joins a multicast group makes the kernel report it to the host with IGMP (`ip:224.0.0.0/4,igmp`).
+Replies, and ICMP errors about a connection, always pass: `icmp` is only needed to send ICMP of the container's own, such as `ping`.
+
+When a process in a container joins a multicast group (SSDP for DLNA, mDNS, IPTV), the container's kernel announces it with IGMP membership reports, to `224.0.0.22` or the group's address. The bridge delivers them to the Docker host too, where they are denied and reported unless a label allows them, which tells you which containers join multicast groups. Denying them breaks nothing unless something on the host acts on them: a multicast relay such as `igmpproxy` or `smcroute` that forwards the LAN's multicast into Docker networks learns from them which groups a container wants. Allow them for such containers with `ip:224.0.0.0/4,igmp`.
 
 The Docker host counts as a destination too. Traffic to any of its addresses (the network's gateway, its other interfaces) follows the egress labels, so a container can't reach services on the host, or other containers' published ports through the host, unless a label allows it:
 
