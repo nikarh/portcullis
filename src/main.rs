@@ -344,17 +344,15 @@ impl Applier {
         // Re-read on every update, so changes to the host's DNS configuration are picked up.
         let host_resolvers = host_dns::host_resolvers();
         state.set_daemon_dns(host_dns::docker_daemon_dns());
-        let ports = match rtnetlink::container_ports(state) {
-            Ok((ports, problems)) => {
-                self.report_port_problems(state, problems);
-                ports
-            }
+        let found = match rtnetlink::container_ports(state) {
+            Ok(found) => found,
             Err(error) => {
                 warn!(%error, "can't find containers' bridge ports; checking their traffic by address and MAC only");
-                HashMap::new()
+                rtnetlink::Ports::default()
             }
         };
-        state.set_ports(ports);
+        self.report_port_problems(state, found.problems);
+        state.set_ports(found.ports, found.absent);
         let state = &*state;
         self.forget_reassigned_connections(state);
         let result = {

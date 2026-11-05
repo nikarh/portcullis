@@ -8,7 +8,7 @@
 //! whose peer is in the container's namespace. Nothing runs inside the container's
 //! namespace, so nothing the container controls is consulted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
@@ -246,12 +246,20 @@ impl std::fmt::Display for PortProblem {
     }
 }
 
-/// Bridge ports by container address, and the containers whose port can't be found.
-pub type Ports = (HashMap<IpAddr, BridgePort>, Vec<(ContainerId, PortProblem)>);
+/// What a look for containers' bridge ports found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Ports {
+    /// Bridge ports by container address.
+    pub ports: HashMap<IpAddr, BridgePort>,
+    /// Addresses whose container has no port on the address's bridge, and so can't send
+    /// anything there: it is stopping, or not attached yet.
+    pub absent: HashSet<IpAddr>,
+    /// Containers whose port can't be found, and why: their traffic can only be checked by
+    /// address and MAC.
+    pub problems: Vec<(ContainerId, PortProblem)>,
+}
 
-/// The bridge port of every address of a running container on a managed network, and
-/// what kept others from being found; their traffic is then only checked by address and
-/// MAC.
+/// The bridge port of every address of a running container on a managed network.
 pub fn container_ports(state: &RuntimeState) -> io::Result<Ports> {
     let mut socket = RouteSocket::open()?;
     let links = socket.links()?;
@@ -261,19 +269,17 @@ pub fn container_ports(state: &RuntimeState) -> io::Result<Ports> {
 /// `container_ports` for the host's `links`, with `namespace_id` telling the ID of a
 /// namespace file.
 ///
-/// A container that is stopping isn't a problem: Docker takes its interfaces back to the
-/// host and removes them, and its namespace, before it reports the container gone, and a
-/// container without a port on a bridge can't send anything there. The kernel names the
-/// peer's namespace of every veth whose peer is in another one (giving the namespace an ID
-/// if it has none), so a container that has a port is always found by it. Only a
-/// container whose namespace can't be identified is a problem.
+/// A container that is stopping has no port: Docker takes its interfaces back to the host
+/// and removes them, and its namespace, before it reports the container gone. The kernel
+/// names the peer's namespace of every veth whose peer is in another one (giving the
+/// namespace an ID if it has none), so a container that has a port is always found by it.
+/// Only a container whose namespace can't be identified is a problem.
 fn match_ports(
     state: &RuntimeState,
     links: &[Link],
     mut namespace_id: impl FnMut(&Path) -> io::Result<Option<i32>>,
 ) -> Ports {
-    let mut ports = HashMap::new();
-    let mut problems = Vec::new();
+    let mut found = Ports::default();
     for container in state.containers().values() {
         if container.attachments.is_empty() {
             continue;
@@ -284,15 +290,23 @@ fn match_ports(
         let namespace = match namespace_id(Path::new(sandbox)) {
             Ok(Some(namespace)) => namespace,
             Ok(None) => {
-                problems.push((container.id.clone(), PortProblem::NoNamespaceId));
+                found
+                    .problems
+                    .push((container.id.clone(), PortProblem::NoNamespaceId));
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 debug!(container = %container.name, "the container's network namespace is gone; it is stopping");
+                found.absent.extend(
+                    container
+                        .attachments
+                        .iter()
+                        .map(|attachment| attachment.ip_address),
+                );
                 continue;
             }
             Err(error) => {
-                problems.push((
+                found.problems.push((
                     container.id.clone(),
                     PortProblem::Namespace(error.to_string()),
                 ));
@@ -309,7 +323,7 @@ fn match_ports(
             if let Some(port) = links.iter().find(|link| {
                 link.master == Some(bridge.index) && link.peer_namespace == Some(namespace)
             }) {
-                ports.insert(
+                found.ports.insert(
                     attachment.ip_address,
                     BridgePort {
                         name: port.name.clone(),
@@ -318,10 +332,11 @@ fn match_ports(
                 );
             } else {
                 debug!(container = %container.name, bridge = %network.bridge, "the container has no port on the bridge; it is stopping, or not attached yet");
+                found.absent.insert(attachment.ip_address);
             }
         }
     }
-    (ports, problems)
+    found
 }
 
 fn parse_link(body: &[u8]) -> Option<Link> {
@@ -425,47 +440,55 @@ mod tests {
                 link(7, "veth-other", Some(1), Some(4)),
                 link(8, "veth-app", Some(1), Some(5)),
             ]);
-            let (ports, problems) = match_ports(&state(), &links, |_| Ok(Some(5)));
+            let found = match_ports(&state(), &links, |_| Ok(Some(5)));
             assert_eq!(
-                ports
+                found
+                    .ports
                     .get(&test_support::ip("172.18.0.2"))
                     .map(|port| port.name.as_str()),
                 Some("veth-app")
             );
-            assert_eq!(problems, []);
+            assert!(found.absent.is_empty());
+            assert_eq!(found.problems, []);
         }
 
         #[test]
-        fn a_stopping_container_is_no_problem() {
+        fn a_stopping_container_has_no_port_and_is_no_problem() {
+            let address = test_support::ip("172.18.0.2");
             // Its namespace is gone...
             let links = bridge_with(&[link(8, "veth-app", Some(1), Some(5))]);
             let gone = |_: &Path| Err(io::Error::from(io::ErrorKind::NotFound));
-            let (ports, problems) = match_ports(&state(), &links, gone);
-            assert!(ports.is_empty());
-            assert_eq!(problems, []);
+            let found = match_ports(&state(), &links, gone);
+            assert!(found.ports.is_empty());
+            assert_eq!(found.absent, HashSet::from([address]));
+            assert_eq!(found.problems, []);
             // ...or still there, its interface taken back to the host: its port's peer is
             // on the host, and no port's peer is in its namespace.
             let links = bridge_with(&[
                 link(7, "veth-other", Some(1), Some(4)),
                 link(8, "veth-app", Some(1), None),
             ]);
-            let (ports, problems) = match_ports(&state(), &links, |_| Ok(Some(5)));
-            assert!(ports.is_empty());
-            assert_eq!(problems, []);
+            let found = match_ports(&state(), &links, |_| Ok(Some(5)));
+            assert!(found.ports.is_empty());
+            assert_eq!(found.absent, HashSet::from([address]));
+            assert_eq!(found.problems, []);
         }
 
         #[test]
         fn reports_what_keeps_a_port_from_being_found() {
             let id = ContainerId::from("a".to_string());
             let links = bridge_with(&[link(8, "veth-app", Some(1), Some(5))]);
-            let (_, problems) = match_ports(&state(), &links, |_| Ok(None));
-            assert_eq!(problems, [(id.clone(), PortProblem::NoNamespaceId)]);
+            let found = match_ports(&state(), &links, |_| Ok(None));
+            assert_eq!(found.problems, [(id.clone(), PortProblem::NoNamespaceId)]);
+            // Not known to be absent: it may send, checked by address and MAC.
+            assert!(found.absent.is_empty());
             let denied = |_: &Path| Err(io::Error::from(io::ErrorKind::PermissionDenied));
-            let (_, problems) = match_ports(&state(), &links, denied);
+            let found = match_ports(&state(), &links, denied);
             assert!(matches!(
-                problems.as_slice(),
+                found.problems.as_slice(),
                 [(container, PortProblem::Namespace(_))] if *container == id
             ));
+            assert!(found.absent.is_empty());
         }
     }
 

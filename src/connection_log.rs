@@ -21,7 +21,7 @@ use crate::events::{
     Connection, DomainSource, Event, EventBus, Reason, Verdict, Warning, WarningKind,
 };
 use crate::firewall::LOG_PREFIX;
-use crate::model::{MacAddress, Protocol};
+use crate::model::{MacAddress, PortState, Protocol};
 use crate::nfnetlink::{
     ArpPacket, Ipv4Packet, LoggedPacket, NflogSocket, Overruns, PROTOCOL_TCP, is_overrun,
 };
@@ -264,7 +264,7 @@ fn sender(packet: &LoggedPacket, directory: &Directory) -> Option<(IpAddr, Sourc
     packet
         .hwaddr
         .and_then(|mac| directory.by_mac(mac))
-        .filter(|(_, info)| info.port.is_none())
+        .filter(|(_, info)| info.port == PortState::Unknown)
 }
 
 /// Name the container a denied frame came from, or else the network.
@@ -615,11 +615,35 @@ mod tests {
                 (ip("172.18.0.3"), port("veth13", 13)),
             ]
             .into(),
+            std::collections::HashSet::new(),
         );
         let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
         let (directory, hosts) = setup();
         directory.update(&plan);
         (directory, hosts)
+    }
+
+    #[test]
+    fn doesnt_blame_containers_without_a_port_by_their_mac() {
+        // web is stopping, without a port; a frame with its MAC came from somewhere else.
+        let mut state = test_support::icc_state();
+        state.set_ports(
+            std::collections::HashMap::new(),
+            std::collections::HashSet::from([ip("172.18.0.2")]),
+        );
+        let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
+        let (directory, hosts) = setup();
+        directory.update(&plan);
+        let mut packet = logged("pc:d:source", tcp([172, 18, 0, 2], [1, 1, 1, 1], 80));
+        packet.indev = Some(99);
+        packet.hwaddr = test_support::mac_of("172.18.0.2");
+        let event = connection_event(&packet, &directory, &hosts).expect("event");
+        assert_ne!(event.container.as_deref(), Some("web"));
+        // other's port isn't known: its MAC still names it.
+        let mut packet = logged("pc:d:source", tcp([172, 18, 0, 2], [1, 1, 1, 1], 80));
+        packet.hwaddr = test_support::mac_of("172.18.0.3");
+        let event = connection_event(&packet, &directory, &hosts).expect("event");
+        assert_eq!(event.container.as_deref(), Some("other"));
     }
 
     #[test]

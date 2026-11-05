@@ -155,3 +155,18 @@ flush_checks
 docker rm -f "${heir}" >/dev/null
 kill "${host_udp_service}"
 stop_host_service
+
+# A container that has no port on its bridge anymore can't send anything there (it is
+# stopping: Docker removes its interface before it reports it gone). Its address and MAC
+# then belong to nobody: another container that uses them doesn't get its rules.
+leaving_ip="$(svc_ip leaving net)"
+leaving_mac="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${PROJECT}_net\").MacAddress}}" "${PROJECT}-leaving-1")"
+wait_managed "${leaving_ip}"
+in_svc leaving ip link del eth0 >/dev/null 2>&1
+# Any update afterwards notices; a container starting makes one.
+docker run -d --rm --name "${PROJECT}-nudge" --network "${PROJECT}_net" "${TESTER_IMAGE}" >/dev/null
+wait_managed "$(docker inspect -f "{{(index .NetworkSettings.Networks \"${PROJECT}_net\").IPAddress}}" "${PROJECT}-nudge")"
+event "a portless container's address and MAC, from another port" "event=connection verdict=denied reason=source container~attacker source=${leaving_ip}" \
+  craft attacker udp --dst 198.51.100.2 --dport 9000 --src "${leaving_ip}" --src-mac "${leaving_mac}" --wait 1
+flush_checks
+docker rm -f "${PROJECT}-nudge" >/dev/null

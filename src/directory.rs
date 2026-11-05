@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::dns::normalize;
 use crate::firewall::{Destination, HostSet, Plan, Rule};
-use crate::model::MacAddress;
+use crate::model::{MacAddress, PortState};
 use crate::pattern::NamePattern;
 
 /// Observations kept before expired ones are pruned, at most once per [`PRUNE_EVERY`].
@@ -30,7 +30,7 @@ pub struct SourceInfo {
     pub network: String,
     pub mac: Option<MacAddress>,
     /// Interface index of the container's bridge port, where known.
-    pub port: Option<u32>,
+    pub port: PortState<u32>,
     /// The container's network is in monitor mode.
     pub monitor: bool,
     /// The container may be quarantined when it misbehaves.
@@ -88,7 +88,7 @@ impl Directory {
             if let Some(mac) = info.mac {
                 incoming.by_mac.insert(mac, (address, info.clone()));
             }
-            if let Some(port) = info.port {
+            if let PortState::Known(port) = info.port {
                 incoming.by_port.insert(port, (address, info.clone()));
             }
             incoming.sources.insert(address, info);
@@ -107,7 +107,7 @@ impl Directory {
             if let Some(mac) = source.mac {
                 snapshot.by_mac.insert(mac, (source.address, info.clone()));
             }
-            if let Some(port) = info.port {
+            if let PortState::Known(port) = info.port {
                 snapshot
                     .by_port
                     .insert(port, (source.address, info.clone()));
@@ -306,7 +306,7 @@ fn source_infos(plan: &Plan) -> Vec<(IpAddr, SourceInfo)> {
                     container: source.container.to_string(),
                     network: source.network.clone(),
                     mac: source.mac,
-                    port: source.port.as_ref().map(|port| port.index),
+                    port: source.port.map(|port| port.index),
                     monitor: source.monitor,
                     quarantine: source.quarantine,
                     ipv6_network: ipv6_networks.contains(source.network.as_str()),

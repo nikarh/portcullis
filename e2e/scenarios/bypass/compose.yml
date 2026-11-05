@@ -33,6 +33,16 @@ services:
     networks: [net]
     labels:
       - portcullis.egress.host=ip:198.51.100.1,tcp:7777
+  # Leaves its network on its own (it deletes its interface), while Docker still reports
+  # it there. Its policy allows what nobody else's does.
+  leaving:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    cap_add: [NET_ADMIN]
+    labels:
+      - portcullis.ack=net-admin
+      - portcullis.egress.only=ip:198.51.100.2,udp:9000
   # On the second network, where Docker reaches the victim's published port through DNAT.
   outsider:
     image: portcullis-e2e-tester

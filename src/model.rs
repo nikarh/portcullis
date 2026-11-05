@@ -445,6 +445,35 @@ pub struct Container {
     pub sandbox: Option<String>,
 }
 
+/// What is known of a container's port on a bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PortState<T> {
+    Known(T),
+    /// It has none: the container is stopping, or not attached yet, and can't send.
+    Absent,
+    /// It couldn't be found: the container's traffic can only be told by address and MAC.
+    Unknown,
+}
+
+impl<T> PortState<T> {
+    #[must_use]
+    pub const fn known(&self) -> Option<&T> {
+        match self {
+            Self::Known(port) => Some(port),
+            Self::Absent | Self::Unknown => None,
+        }
+    }
+
+    #[must_use]
+    pub fn map<U>(&self, f: impl FnOnce(&T) -> U) -> PortState<U> {
+        match self {
+            Self::Known(port) => PortState::Known(f(port)),
+            Self::Absent => PortState::Absent,
+            Self::Unknown => PortState::Unknown,
+        }
+    }
+}
+
 /// A container's port on a bridge: the host side of its veth pair.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BridgePort {
@@ -460,6 +489,8 @@ pub struct RuntimeState {
     daemon_dns: Vec<IpAddr>,
     /// Bridge port of each container address, where known.
     ports: HashMap<IpAddr, BridgePort>,
+    /// Container addresses known to have no bridge port: their container can't send.
+    portless: HashSet<IpAddr>,
     /// Containers cut off from their networks, see `quarantine`.
     quarantined: HashSet<ContainerId>,
 }
@@ -520,14 +551,19 @@ impl RuntimeState {
         self.daemon_dns = servers;
     }
 
-    /// The bridge port the container with `address` sends from, where known.
+    /// The bridge port the container with `address` sends from.
     #[must_use]
-    pub fn port(&self, address: IpAddr) -> Option<&BridgePort> {
-        self.ports.get(&address)
+    pub fn port(&self, address: IpAddr) -> PortState<&BridgePort> {
+        match self.ports.get(&address) {
+            Some(port) => PortState::Known(port),
+            None if self.portless.contains(&address) => PortState::Absent,
+            None => PortState::Unknown,
+        }
     }
 
-    pub fn set_ports(&mut self, ports: HashMap<IpAddr, BridgePort>) {
+    pub fn set_ports(&mut self, ports: HashMap<IpAddr, BridgePort>, portless: HashSet<IpAddr>) {
         self.ports = ports;
+        self.portless = portless;
     }
 
     /// Cut a container off from its networks. Returns whether it wasn't already.

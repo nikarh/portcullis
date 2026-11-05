@@ -34,9 +34,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{RecvTimeoutError, Sender, unbounded};
 use tracing::{debug, warn};
 
-use crate::directory::Directory;
+use crate::directory::{Directory, SourceInfo};
 use crate::firewall::HOLD_EXPIRED_MARK;
-use crate::model::MacAddress;
+use crate::model::{MacAddress, PortState};
 use crate::nfnetlink::{
     ArpPacket, Ipv4Packet, NfqueueSocket, Overruns, QueueOverflow, QueueVerdict, is_overrun,
 };
@@ -150,14 +150,9 @@ pub fn spawn(
             let verdicts = {
                 let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
                 let verdicts = release(&mut pending, now, |held| {
-                    // The rules check the MAC only when Docker reported one, and the port
-                    // only where Portcullis found it.
                     held.source
                         .and_then(|source| directory.source(source))
-                        .is_some_and(|info| {
-                            (info.mac.is_none() || info.mac == held.mac)
-                                && (info.port.is_none() || info.port == held.port)
-                        })
+                        .is_some_and(|info| sent_by(held, &info))
                 });
                 for port in ports_to_discover(&pending, &mut asked, now) {
                     let _ = discover.send(port);
@@ -208,6 +203,18 @@ fn source_address(payload: &[u8]) -> Option<IpAddr> {
 
 /// Take the packets that can be released from `pending`: replay those whose source is now
 /// known, and those past their deadline with the mark that denies them.
+/// Whether `held` matches the source it claims, as the rules check it: the MAC only when
+/// Docker reported one, and the port only where Portcullis found it. A container without a
+/// port can't have sent anything.
+fn sent_by(held: &Held, info: &SourceInfo) -> bool {
+    (info.mac.is_none() || info.mac == held.mac)
+        && match info.port {
+            PortState::Known(port) => Some(port) == held.port,
+            PortState::Unknown => true,
+            PortState::Absent => false,
+        }
+}
+
 fn release(
     pending: &mut Vec<Held>,
     now: Instant,
@@ -313,6 +320,41 @@ mod tests {
             source_address(&ipv4([172, 18, 0, 6], [1; 4], 17, &udp(1, 2, b""))),
             Some(ip("172.18.0.6"))
         );
+    }
+
+    #[test]
+    fn matches_packets_to_their_source_as_the_rules_do() {
+        let mac = Some(MacAddress::new([2, 0, 0, 0, 0, 1]));
+        let held = |port| Held {
+            id: 1,
+            source: Some(ip("172.18.0.2")),
+            mac,
+            port,
+            deadline: Instant::now(),
+        };
+        let info = |port| SourceInfo {
+            container: "web".to_string(),
+            network: "net0".to_string(),
+            mac,
+            port,
+            monitor: false,
+            quarantine: true,
+            ipv6_network: false,
+            domains: None,
+        };
+        assert!(sent_by(&held(Some(7)), &info(PortState::Known(7))));
+        assert!(!sent_by(&held(Some(8)), &info(PortState::Known(7))));
+        // Where its port couldn't be found, by address and MAC.
+        assert!(sent_by(&held(Some(8)), &info(PortState::Unknown)));
+        assert!(!sent_by(
+            &Held {
+                mac: None,
+                ..held(Some(8))
+            },
+            &info(PortState::Unknown)
+        ));
+        // A container without a port (stopping) sent nothing: whoever did borrowed it.
+        assert!(!sent_by(&held(Some(8)), &info(PortState::Absent)));
     }
 
     #[test]

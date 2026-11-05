@@ -29,7 +29,7 @@ use tracing::{error, trace};
 use crate::dns::{HostResolver, normalize};
 use crate::model::{
     BridgePort, ConnectionLimit, Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule,
-    IccMode, IccTarget, MacAddress, NetworkAttachment, Protocol, RuntimeState, Service,
+    IccMode, IccTarget, MacAddress, NetworkAttachment, PortState, Protocol, RuntimeState, Service,
 };
 use crate::pattern::NamePattern;
 
@@ -139,7 +139,7 @@ pub struct Source {
     pub mac: Option<MacAddress>,
     /// The container's port on the network's bridge. Packets from the address are only
     /// accepted from this port, so not even a copied MAC passes.
-    pub port: Option<BridgePort>,
+    pub port: PortState<BridgePort>,
     /// `portcullis.limit.connections`.
     pub connection_limit: ConnectionLimit,
     /// `portcullis.limit.new-connections`, per second.
@@ -444,7 +444,7 @@ where
                 .unwrap_or_default(),
             monitor: self.monitor_all || network.is_some_and(|network| network.monitor),
             mac: attachment.mac_address,
-            port: self.state.port(source).cloned(),
+            port: self.state.port(source).map(|port| (*port).clone()),
             connection_limit: policy.connection_limit,
             new_connection_rate: policy.new_connection_rate,
             quarantine: policy.quarantine,

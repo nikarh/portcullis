@@ -18,7 +18,9 @@ use super::plan::{
     SET_PREFIX_V4, SET_PREFIX_V6, Source,
 };
 use crate::dns::{HostResolver, MAX_ADDRESSES_PER_HOST};
-use crate::model::{ConnectionLimit, ContainerName, MacAddress, Protocol, RuntimeState, Service};
+use crate::model::{
+    ConnectionLimit, ContainerName, MacAddress, PortState, Protocol, RuntimeState, Service,
+};
 
 /// Name of both managed tables.
 const TABLE_NAME: &str = "portcullis";
@@ -1146,7 +1148,7 @@ fn render_unknown_sources(
         .sources
         .iter()
         .filter(|source| networks.contains(source.network.as_str()))
-        .filter_map(|source| source.port.as_ref())
+        .filter_map(|source| source.port.known())
         .map(|port| Quoted(&port.name))
         .peekable();
     if known.peek().is_some() {
@@ -1195,7 +1197,7 @@ fn render_quarantined_set(out: &mut String, plan: &Plan) -> fmt::Result {
         plan.sources
             .iter()
             .filter(|source| source.quarantined && !source.monitor)
-            .filter_map(|source| source.port.as_ref())
+            .filter_map(|source| source.port.known())
             .map(|port| port.name.as_str())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -1233,7 +1235,7 @@ impl Limit {
 fn limits(plan: &Plan, options: Options) -> BTreeMap<Limit, BTreeSet<&str>> {
     let mut limits: BTreeMap<Limit, BTreeSet<&str>> = BTreeMap::new();
     for source in &plan.sources {
-        let Some(port) = &source.port else {
+        let Some(port) = source.port.known() else {
             continue;
         };
         let open = match source.connection_limit {
@@ -1424,11 +1426,16 @@ enum SourceKey<'a> {
 }
 
 impl<'a> SourceKey<'a> {
-    fn of(source: &'a Source) -> Self {
+    /// None for a container with no port, which can't send: whatever comes with its
+    /// address or MAC is someone else's, from another port, and is denied as such.
+    fn of(source: &'a Source) -> Option<Self> {
         match (source.mac, &source.port) {
-            (Some(mac), Some(port)) => Self::Port(&port.name, mac, source.address),
-            (Some(mac), None) => Self::Mac(mac, source.address),
-            (None, _) => Self::Address(source.address),
+            (Some(mac), PortState::Known(port)) => {
+                Some(Self::Port(&port.name, mac, source.address))
+            }
+            (_, PortState::Absent) => None,
+            (Some(mac), _) => Some(Self::Mac(mac, source.address)),
+            (None, _) => Some(Self::Address(source.address)),
         }
     }
 }
@@ -1453,7 +1460,7 @@ fn render_known_sources(
             .iter()
             .enumerate()
             .filter(|(_, source)| source.address.is_ipv4())
-            .map(|(index, source)| (index, source, SourceKey::of(source)))
+            .filter_map(|(index, source)| Some((index, source, SourceKey::of(source)?)))
     };
     // A raw socket is enough to send with another container's address and MAC, but not
     // from its port.
@@ -2764,6 +2771,7 @@ flush chain bridge portcullis limit_open
                 },
             )]
             .into(),
+            std::collections::HashSet::new(),
         );
         let script = render(&state);
         let line = |prefix: &str| {
@@ -2816,6 +2824,31 @@ flush chain bridge portcullis limit_open
     }
 
     #[test]
+    fn doesnt_recognise_containers_without_a_port() {
+        // web is stopping: its port and namespace are gone. Anything with its address and
+        // MAC comes from someone else's port, and is denied as from an unknown source.
+        let mut state = test_support::icc_state();
+        state.set_ports(
+            std::collections::HashMap::new(),
+            std::collections::HashSet::from([test_support::ip("172.18.0.2")]),
+        );
+        let script = render(&state);
+        for line in script
+            .lines()
+            .filter(|line| line.starts_with("add element bridge portcullis"))
+        {
+            assert!(!line.contains("172.18.0.2 "), "{line}");
+        }
+        // Others are still recognised by address and MAC, where their port isn't known.
+        assert!(
+            script.contains("172.18.0.3 . 02:42:ac:12:00:03 : accept"),
+            "{script}"
+        );
+        // Its rules stay, for traffic the bridge table already let through.
+        assert!(script.contains("172.18.0.2 : goto egress"), "{script}");
+    }
+
+    #[test]
     fn limits_and_quarantines_containers_by_port() {
         let mut state = RuntimeState::default();
         test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
@@ -2848,6 +2881,7 @@ flush chain bridge portcullis limit_open
                 (test_support::ip("172.18.0.3"), port("veth3", 3)),
             ]
             .into(),
+            std::collections::HashSet::new(),
         );
         assert!(state.quarantine(&"b".to_string().into()));
         let options = Options {
