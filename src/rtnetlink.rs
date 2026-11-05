@@ -16,9 +16,9 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
-use tracing::warn;
+use tracing::debug;
 
-use crate::model::{BridgePort, MacAddress, RuntimeState};
+use crate::model::{BridgePort, ContainerId, MacAddress, RuntimeState};
 
 use crate::nfnetlink::{
     NLM_F_REQUEST, NLMSG_ERROR, NLMSG_HDRLEN, ack_error, align4, attribute, attributes, messages,
@@ -222,13 +222,58 @@ impl RouteSocket {
     }
 }
 
-/// The bridge port of every address of a running container on a managed network. Addresses
-/// whose port can't be found are left out; their traffic is then only checked by address
-/// and MAC.
-pub fn container_ports(state: &RuntimeState) -> io::Result<HashMap<IpAddr, BridgePort>> {
+/// Why a container's traffic can't be bound to its bridge port, and is only checked by
+/// address and MAC.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PortProblem {
+    /// The container's namespace has no ID here, so no port can name it as the peer's.
+    NoNamespaceId,
+    /// Its namespace couldn't be looked up.
+    Namespace(String),
+}
+
+impl std::fmt::Display for PortProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoNamespaceId => f.write_str("the container's network namespace has no ID here"),
+            Self::Namespace(error) => {
+                write!(
+                    f,
+                    "can't identify the container's network namespace: {error}"
+                )
+            }
+        }
+    }
+}
+
+/// Bridge ports by container address, and the containers whose port can't be found.
+pub type Ports = (HashMap<IpAddr, BridgePort>, Vec<(ContainerId, PortProblem)>);
+
+/// The bridge port of every address of a running container on a managed network, and
+/// what kept others from being found; their traffic is then only checked by address and
+/// MAC.
+pub fn container_ports(state: &RuntimeState) -> io::Result<Ports> {
     let mut socket = RouteSocket::open()?;
     let links = socket.links()?;
+    Ok(match_ports(state, &links, |path| socket.namespace_id(path)))
+}
+
+/// `container_ports` for the host's `links`, with `namespace_id` telling the ID of a
+/// namespace file.
+///
+/// A container that is stopping isn't a problem: Docker takes its interfaces back to the
+/// host and removes them, and its namespace, before it reports the container gone, and a
+/// container without a port on a bridge can't send anything there. The kernel names the
+/// peer's namespace of every veth whose peer is in another one (giving the namespace an ID
+/// if it has none), so a container that has a port is always found by it. Only a
+/// container whose namespace can't be identified is a problem.
+fn match_ports(
+    state: &RuntimeState,
+    links: &[Link],
+    mut namespace_id: impl FnMut(&Path) -> io::Result<Option<i32>>,
+) -> Ports {
     let mut ports = HashMap::new();
+    let mut problems = Vec::new();
     for container in state.containers().values() {
         if container.attachments.is_empty() {
             continue;
@@ -236,14 +281,21 @@ pub fn container_ports(state: &RuntimeState) -> io::Result<HashMap<IpAddr, Bridg
         let Some(sandbox) = &container.sandbox else {
             continue;
         };
-        let namespace = match socket.namespace_id(Path::new(sandbox)) {
+        let namespace = match namespace_id(Path::new(sandbox)) {
             Ok(Some(namespace)) => namespace,
             Ok(None) => {
-                warn!(container = %container.name, "the container's network namespace has no ID here; checking its traffic by address and MAC only");
+                problems.push((container.id.clone(), PortProblem::NoNamespaceId));
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                debug!(container = %container.name, "the container's network namespace is gone; it is stopping");
                 continue;
             }
             Err(error) => {
-                warn!(container = %container.name, %error, "can't identify the container's network namespace; checking its traffic by address and MAC only");
+                problems.push((
+                    container.id.clone(),
+                    PortProblem::Namespace(error.to_string()),
+                ));
                 continue;
             }
         };
@@ -254,10 +306,9 @@ pub fn container_ports(state: &RuntimeState) -> io::Result<HashMap<IpAddr, Bridg
             let Some(bridge) = links.iter().find(|link| link.name == network.bridge) else {
                 continue;
             };
-            let port = links.iter().find(|link| {
+            if let Some(port) = links.iter().find(|link| {
                 link.master == Some(bridge.index) && link.peer_namespace == Some(namespace)
-            });
-            if let Some(port) = port {
+            }) {
                 ports.insert(
                     attachment.ip_address,
                     BridgePort {
@@ -266,15 +317,11 @@ pub fn container_ports(state: &RuntimeState) -> io::Result<HashMap<IpAddr, Bridg
                     },
                 );
             } else {
-                warn!(
-                    container = %container.name,
-                    bridge = %network.bridge,
-                    "can't find the container's port on the bridge; checking its traffic by address and MAC only"
-                );
+                debug!(container = %container.name, bridge = %network.bridge, "the container has no port on the bridge; it is stopping, or not attached yet");
             }
         }
     }
-    Ok(ports)
+    (ports, problems)
 }
 
 fn parse_link(body: &[u8]) -> Option<Link> {
@@ -330,6 +377,97 @@ fn ne_u32(value: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod ports {
+        use super::super::*;
+        use crate::firewall::test_support;
+        use crate::model::{ContainerPolicy, RuntimeStateAction};
+
+        /// `app` (172.18.0.2, namespace file `/ns/app`) on `net0` (bridge `br-net0`, index 1).
+        fn state() -> RuntimeState {
+            let mut state = RuntimeState::default();
+            test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+            test_support::add_container(
+                &mut state,
+                "a",
+                "app",
+                &[("net0", "172.18.0.2", &[])],
+                ContainerPolicy::default(),
+            );
+            let mut app = state.containers().get("a").cloned().expect("app");
+            app.sandbox = Some("/ns/app".to_string());
+            state.apply_action(RuntimeStateAction::CreateContainer {
+                container: Box::new(app),
+            });
+            state
+        }
+
+        fn link(index: u32, name: &str, master: Option<u32>, peer: Option<i32>) -> Link {
+            Link {
+                index,
+                name: name.to_string(),
+                master,
+                peer_namespace: peer,
+                peer_index: None,
+                mac: None,
+            }
+        }
+
+        fn bridge_with(ports: &[Link]) -> Vec<Link> {
+            let mut links = vec![link(1, "br-net0", None, None)];
+            links.extend_from_slice(ports);
+            links
+        }
+
+        #[test]
+        fn finds_the_port_whose_peer_is_in_the_containers_namespace() {
+            let links = bridge_with(&[
+                link(7, "veth-other", Some(1), Some(4)),
+                link(8, "veth-app", Some(1), Some(5)),
+            ]);
+            let (ports, problems) = match_ports(&state(), &links, |_| Ok(Some(5)));
+            assert_eq!(
+                ports
+                    .get(&test_support::ip("172.18.0.2"))
+                    .map(|port| port.name.as_str()),
+                Some("veth-app")
+            );
+            assert_eq!(problems, []);
+        }
+
+        #[test]
+        fn a_stopping_container_is_no_problem() {
+            // Its namespace is gone...
+            let links = bridge_with(&[link(8, "veth-app", Some(1), Some(5))]);
+            let gone = |_: &Path| Err(io::Error::from(io::ErrorKind::NotFound));
+            let (ports, problems) = match_ports(&state(), &links, gone);
+            assert!(ports.is_empty());
+            assert_eq!(problems, []);
+            // ...or still there, its interface taken back to the host: its port's peer is
+            // on the host, and no port's peer is in its namespace.
+            let links = bridge_with(&[
+                link(7, "veth-other", Some(1), Some(4)),
+                link(8, "veth-app", Some(1), None),
+            ]);
+            let (ports, problems) = match_ports(&state(), &links, |_| Ok(Some(5)));
+            assert!(ports.is_empty());
+            assert_eq!(problems, []);
+        }
+
+        #[test]
+        fn reports_what_keeps_a_port_from_being_found() {
+            let id = ContainerId::from("a".to_string());
+            let links = bridge_with(&[link(8, "veth-app", Some(1), Some(5))]);
+            let (_, problems) = match_ports(&state(), &links, |_| Ok(None));
+            assert_eq!(problems, [(id.clone(), PortProblem::NoNamespaceId)]);
+            let denied = |_: &Path| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            let (_, problems) = match_ports(&state(), &links, denied);
+            assert!(matches!(
+                problems.as_slice(),
+                [(container, PortProblem::Namespace(_))] if *container == id
+            ));
+        }
+    }
 
     #[test]
     fn parses_links() {

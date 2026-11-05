@@ -38,6 +38,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
 PY
 }
 
+log_start="$(wc -l <"${PORTCULLIS_LOG}")"
 unwanted_events
 watcher=$!
 sleep 1
@@ -71,5 +72,27 @@ nothing_reported() {
   [[ ! -s "${updates_log}" ]]
 }
 check "nothing of theirs reported as denied" nothing_reported
+# Containers stopping lose their ports before Docker reports them gone; that isn't worth a
+# warning. Stopped together, each one's stop updates the rules while the others are in
+# the middle of theirs.
+batch=()
+for index in $(seq 12); do
+  batch+=("${PROJECT}-batch-${index}")
+  docker run -d --name "${PROJECT}-batch-${index}" --network "${PROJECT}_net" \
+    -l portcullis.icc.mode=deny "${TESTER_IMAGE}" >/dev/null
+done
+wait_managed "$(docker inspect -f "{{(index .NetworkSettings.Networks \"${PROJECT}_net\").IPAddress}}" "${batch[-1]}")"
+stops=()
+for name in "${batch[@]}"; do
+  docker stop -t 1 "${name}" >/dev/null &
+  stops+=($!)
+done
+wait "${stops[@]}"
+docker rm -f "${batch[@]}" >/dev/null
+no_port_warnings() {
+  ! tail -n "+$((log_start + 1))" "${PORTCULLIS_LOG}" | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -E 'WARN.*(port on|network namespace)'
+}
+check "no warnings about the ports of containers that stop" no_port_warnings
 flush_checks
 rm -f "${updates_log}" "${to_server}" "${outside}"

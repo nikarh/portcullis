@@ -315,8 +315,22 @@ struct Applier {
     owners: HashMap<IpAddr, Owner>,
     /// Containers already reported as not having observable DNS.
     unobservable_reported: HashSet<String>,
+    /// Containers whose bridge port can't be found, and why, as last reported.
+    port_problems: HashSet<(ContainerId, rtnetlink::PortProblem)>,
     /// Updates that failed in a row: the rules are those of an earlier state.
     failures: u32,
+}
+
+/// Of `current`, what `previous` didn't have; `previous` becomes `current`. What goes away
+/// and comes back is new again.
+fn new_since<T: Clone + Eq + std::hash::Hash>(
+    previous: &mut HashSet<T>,
+    current: Vec<T>,
+) -> Vec<T> {
+    let current: HashSet<T> = current.into_iter().collect();
+    let new = current.difference(previous).cloned().collect();
+    *previous = current;
+    new
 }
 
 /// When to try a failed update again, after `failures` in a row.
@@ -330,10 +344,16 @@ impl Applier {
         // Re-read on every update, so changes to the host's DNS configuration are picked up.
         let host_resolvers = host_dns::host_resolvers();
         state.set_daemon_dns(host_dns::docker_daemon_dns());
-        let ports = rtnetlink::container_ports(state).unwrap_or_else(|error| {
-            warn!(%error, "can't find containers' bridge ports; checking their traffic by address and MAC only");
-            HashMap::new()
-        });
+        let ports = match rtnetlink::container_ports(state) {
+            Ok((ports, problems)) => {
+                self.report_port_problems(state, problems);
+                ports
+            }
+            Err(error) => {
+                warn!(%error, "can't find containers' bridge ports; checking their traffic by address and MAC only");
+                HashMap::new()
+            }
+        };
         state.set_ports(ports);
         let state = &*state;
         self.forget_reassigned_connections(state);
@@ -373,6 +393,22 @@ impl Applier {
                 });
                 Err(MainError::Firewall(error))
             }
+        }
+    }
+
+    /// Warn about each container whose port can't be found, once until that changes:
+    /// updates come many at a time, and each would say the same.
+    fn report_port_problems(
+        &mut self,
+        state: &RuntimeState,
+        problems: Vec<(ContainerId, rtnetlink::PortProblem)>,
+    ) {
+        for (container, problem) in new_since(&mut self.port_problems, problems) {
+            let name = state
+                .containers()
+                .get(&container)
+                .map_or_else(|| container.to_string(), |known| known.name.to_string());
+            warn!(container = %name, "{problem}; checking its traffic by address and MAC only");
         }
     }
 
@@ -675,6 +711,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         managed: HashMap::new(),
         owners: HashMap::new(),
         unobservable_reported: HashSet::new(),
+        port_problems: HashSet::new(),
         failures: 0,
     };
 
@@ -895,6 +932,17 @@ fn shut_down(config: &Config, firewall: &NftablesFirewall) -> Result<(), MainErr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tells_what_is_new_since_last_time() {
+        let mut previous = HashSet::new();
+        assert_eq!(super::new_since(&mut previous, vec![1, 2]).len(), 2);
+        // The same again: nothing new, however often.
+        assert_eq!(super::new_since(&mut previous, vec![2, 1]), [] as [i32; 0]);
+        assert_eq!(super::new_since(&mut previous, vec![1]), [] as [i32; 0]);
+        // Gone and back: new again.
+        assert_eq!(super::new_since(&mut previous, vec![1, 2]), [2]);
+    }
+
     use super::*;
 
     #[test]
