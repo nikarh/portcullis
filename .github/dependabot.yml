@@ -19,3 +19,11 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+  - package-ecosystem: "npm"
+    directory: "/site"
+    rebase-strategy: "auto"
+    schedule:
+      interval: "weekly"
+    groups:
+      docs:
+        patterns: ["*"]
