@@ -113,23 +113,46 @@ impl Answer {
             return None;
         }
         let query = message.queries.first()?;
+        let name = normalize(&query.name().to_utf8());
 
-        let mut aliases = Vec::new();
-        let mut addresses = Vec::new();
-        for record in message.answers {
-            let ttl = Duration::from_secs(u64::from(record.ttl));
-            match &record.data {
-                RData::A(address) => addresses.push((IpAddr::V4(address.0), ttl)),
-                RData::AAAA(address) => addresses.push((IpAddr::V6(address.0), ttl)),
-                RData::CNAME(target) => aliases.push(normalize(&target.0.to_utf8())),
-                _ => {}
+        // The name's CNAME chain, then the addresses of the names in it. Records of other
+        // names don't say anything about this one: they mustn't count for host: rules that
+        // match it.
+        let records: Vec<(String, &RData, u32)> = message
+            .answers
+            .iter()
+            .map(|record| (normalize(&record.name.to_utf8()), &record.data, record.ttl))
+            .collect();
+        let mut aliases: Vec<String> = Vec::new();
+        let mut current = name.clone();
+        while let Some(target) = records.iter().find_map(|(owner, data, _)| match data {
+            RData::CNAME(target) if *owner == current => Some(normalize(&target.0.to_utf8())),
+            _ => None,
+        }) {
+            if target == name || aliases.contains(&target) {
+                break;
             }
+            aliases.push(target.clone());
+            current = target;
         }
+        let in_chain = |owner: &String| *owner == name || aliases.contains(owner);
+        let addresses = records
+            .iter()
+            .filter(|(owner, _, _)| in_chain(owner))
+            .filter_map(|(_, data, ttl)| {
+                let ttl = Duration::from_secs(u64::from(*ttl));
+                match data {
+                    RData::A(address) => Some((IpAddr::V4(address.0), ttl)),
+                    RData::AAAA(address) => Some((IpAddr::V6(address.0), ttl)),
+                    _ => None,
+                }
+            })
+            .collect();
 
         Some(Self {
             container: IpAddr::V4(packet.destination),
             resolver: IpAddr::V4(packet.source),
-            name: normalize(&query.name().to_utf8()),
+            name,
             record_type: query.query_type().to_string(),
             response_code: message.metadata.response_code.to_string(),
             aliases,
@@ -254,6 +277,73 @@ mod tests {
         assert_eq!(
             answer.addresses,
             vec![("198.51.100.3".parse().expect("ip"), Duration::from_secs(60))]
+        );
+    }
+
+    #[test]
+    fn only_counts_addresses_of_the_name_and_its_aliases() {
+        let name = Name::from_str("x.api.test.").expect("name");
+        let alias = Name::from_str("edge.cdn.test.").expect("name");
+        let other = Name::from_str("evil.test.").expect("name");
+        let a = |name: &Name, address: &str| {
+            Record::from_rdata(name.clone(), 60, RData::A(A(address.parse().expect("ip"))))
+        };
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message.add_query(Query::query(name.clone(), RecordType::A));
+        message.add_answer(a(&other, "6.6.6.6"));
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            60,
+            RData::CNAME(CNAME(alias.clone())),
+        ));
+        // A CNAME of another name doesn't make it an alias of this one.
+        message.add_answer(Record::from_rdata(
+            other.clone(),
+            60,
+            RData::CNAME(CNAME(Name::from_str("y.api.test.").expect("name"))),
+        ));
+        message.add_answer(a(&alias, "198.51.100.7"));
+        message.add_answer(a(&name, "198.51.100.8"));
+        let payload = ipv4(
+            [198, 51, 100, 2],
+            [172, 18, 0, 2],
+            PROTOCOL_UDP,
+            &udp(53, 5000, &message.to_vec().expect("dns")),
+        );
+        let answer = Answer::parse(&payload).expect("answer");
+        assert_eq!(answer.aliases, vec!["edge.cdn.test"]);
+        let addresses: Vec<_> = answer
+            .addresses
+            .iter()
+            .map(|(address, _)| *address)
+            .collect();
+        assert_eq!(
+            addresses,
+            ["198.51.100.7", "198.51.100.8"].map(|address| address.parse::<IpAddr>().expect("ip"))
+        );
+    }
+
+    #[test]
+    fn stops_at_cname_loops() {
+        let name = Name::from_str("a.test.").expect("name");
+        let other = Name::from_str("b.test.").expect("name");
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message.add_query(Query::query(name.clone(), RecordType::A));
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            60,
+            RData::CNAME(CNAME(other.clone())),
+        ));
+        message.add_answer(Record::from_rdata(other, 60, RData::CNAME(CNAME(name))));
+        let payload = ipv4(
+            [198, 51, 100, 2],
+            [172, 18, 0, 2],
+            PROTOCOL_UDP,
+            &udp(53, 5000, &message.to_vec().expect("dns")),
+        );
+        assert_eq!(
+            Answer::parse(&payload).expect("answer").aliases,
+            vec!["b.test"]
         );
     }
 
