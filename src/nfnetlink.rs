@@ -572,6 +572,8 @@ pub struct Ipv4Packet<'a> {
     pub protocol: u8,
     /// Ports, for TCP and UDP.
     pub ports: Option<(u16, u16)>,
+    /// Flags, for TCP.
+    pub tcp_flags: Option<u8>,
     /// What follows the TCP or UDP header (DNS messages, for example).
     pub data: &'a [u8],
 }
@@ -607,11 +609,17 @@ impl<'a> Ipv4Packet<'a> {
             }
             _ => (None, transport),
         };
+        let tcp_flags = if protocol == PROTOCOL_TCP {
+            transport.get(13).copied()
+        } else {
+            None
+        };
         Some(Self {
             source,
             destination,
             protocol,
             ports,
+            tcp_flags,
             data,
         })
     }

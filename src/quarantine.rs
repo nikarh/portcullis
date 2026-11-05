@@ -152,6 +152,7 @@ mod tests {
             domain_source: None,
             query: None,
             detail: Some("uses the address of other".to_string()),
+            mid_stream: false,
         }
     }
 

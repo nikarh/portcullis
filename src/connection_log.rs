@@ -98,6 +98,8 @@ fn parse_prefix(prefix: &str) -> Option<(Verdict, Reason, Option<&str>)> {
 }
 
 const ETHER_TYPE_IPV4: u16 = 0x0800;
+const TCP_SYN: u8 = 0x02;
+const TCP_ACK: u8 = 0x10;
 const ETHER_TYPE_ARP: u16 = 0x0806;
 const ETHER_TYPE_IPV6: u16 = 0x86dd;
 
@@ -154,6 +156,7 @@ fn connection_event(
         domain_source: None,
         query: None,
         detail: None,
+        mid_stream: false,
     };
     match &payload {
         Payload::Ipv4(ip) => {
@@ -162,6 +165,10 @@ fn connection_event(
             event.destination = Some(IpAddr::V4(ip.destination));
             event.source_port = ip.ports.map(|(port, _)| port);
             event.destination_port = ip.ports.map(|(_, port)| port);
+            // Only a SYN without ACK opens a connection.
+            event.mid_stream = ip
+                .tcp_flags
+                .is_some_and(|flags| flags & TCP_SYN == 0 || flags & TCP_ACK != 0);
             // What the container asked for, as the egress rules see it, not where DNAT
             // sends it (a published port reached through the host).
             if reason == Reason::Egress
@@ -408,11 +415,46 @@ mod tests {
     }
 
     fn tcp(source: [u8; 4], destination: [u8; 4], port: u16) -> Vec<u8> {
+        tcp_flagged(source, destination, port, TCP_SYN)
+    }
+
+    fn tcp_flagged(source: [u8; 4], destination: [u8; 4], port: u16, flags: u8) -> Vec<u8> {
         let mut header = 40000_u16.to_be_bytes().to_vec();
         header.extend_from_slice(&port.to_be_bytes());
         header.extend_from_slice(&[0; 8]);
-        header.extend_from_slice(&[0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+        header.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
         ipv4(source, destination, PROTOCOL_TCP, &header)
+    }
+
+    #[test]
+    fn tells_packets_that_dont_start_a_connection() {
+        let (directory, hosts) = setup();
+        let event = |flags| {
+            connection_event(
+                &logged(
+                    "pc:d:icc",
+                    tcp_flagged([172, 18, 0, 2], [172, 18, 0, 3], 5432, flags),
+                ),
+                &directory,
+                &hosts,
+            )
+            .expect("event")
+        };
+        assert!(!event(TCP_SYN).mid_stream);
+        assert!(event(TCP_ACK).mid_stream);
+        assert!(event(TCP_SYN | TCP_ACK).mid_stream);
+        // A reset or FIN without ACK doesn't start one either.
+        assert!(event(0x04).mid_stream);
+        let udp = connection_event(
+            &logged(
+                "pc:d:icc",
+                ipv4([172, 18, 0, 2], [172, 18, 0, 3], 17, &udp(1, 2, b"x")),
+            ),
+            &directory,
+            &hosts,
+        )
+        .expect("event");
+        assert!(!udp.mid_stream);
     }
 
     #[test]

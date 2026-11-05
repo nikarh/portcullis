@@ -95,6 +95,11 @@ pub struct Connection {
     pub query: Option<String>,
     /// Extra explanation, e.g. why a source is considered spoofed.
     pub detail: Option<String>,
+    /// A TCP packet that doesn't start a connection, of a connection the firewall doesn't
+    /// track (it lost track, or the packet doesn't fit the connection). Rules are written
+    /// for new connections; what they decide about these says little about the policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mid_stream: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -767,6 +772,7 @@ mod tests {
             domain_source: Some(DomainSource::Dns),
             query: None,
             detail: None,
+            mid_stream: false,
         })
     }
 

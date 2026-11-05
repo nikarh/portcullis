@@ -205,6 +205,7 @@ fn denied(
         domain_source: None,
         query,
         detail: Some(detail.to_string()),
+        mid_stream: false,
     };
     Decision::Denied {
         monitor,
