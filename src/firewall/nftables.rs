@@ -640,20 +640,6 @@ fn decide(out: &mut String, head: fmt::Arguments<'_>, outcome: Outcome) -> fmt::
 /// How often a rule reports flows once its de-duplication set is full.
 const LOG_FULL_RATE: &str = "10/second";
 
-/// `{ e1, e2, ... }`, or `None` without elements.
-fn set_literal<T: fmt::Display>(elements: impl Iterator<Item = T>) -> Option<String> {
-    let mut literal = String::new();
-    for (index, element) in elements.enumerate() {
-        literal.push_str(if index == 0 { "{ " } else { ", " });
-        let _ = write!(literal, "{element}");
-    }
-    if literal.is_empty() {
-        return None;
-    }
-    literal.push_str(" }");
-    Some(literal)
-}
-
 /// Render the script of a rule update.
 ///
 /// Each table has a base chain that dispatches each managed source address through a
@@ -707,6 +693,10 @@ fn render_apply_script(
         }
         render_logged_sets(out, table, reassigned)?;
         writeln!(out, "flush chain {}", Chain::Base(table))?;
+        // Emptied before the chains their maps point to are deleted, refilled below.
+        for set in NamedSet::ALL.iter().filter(|set| set.table() == table) {
+            set.render_empty(out)?;
+        }
     }
 
     let mut installed = render_objects(out, plan, options, previous)?;
@@ -720,17 +710,29 @@ fn render_apply_script(
 
     // Routed traffic.
     let base = Chain::Base(Table::Inet);
-    if let Some(queue) = options.dns_queue {
+    let bridges = |mode: Option<bool>| {
+        plan.bridges
+            .iter()
+            .filter(move |bridge| mode.is_none_or(|monitor| bridge.monitor == monitor))
+            .map(|bridge| Quoted(&bridge.name))
+    };
+    NamedSet::InetBridges.fill(out, bridges(None))?;
+    NamedSet::InetEnforcedBridges.fill(out, bridges(Some(false)))?;
+    NamedSet::BridgeBridges.fill(out, bridges(None))?;
+    NamedSet::MonitoredBridges.fill(out, bridges(Some(true)))?;
+    NamedSet::EnforcedBridges.fill(out, bridges(Some(false)))?;
+    if let Some(queue) = options.dns_queue
+        && !plan.bridges.is_empty()
+    {
         // Hold DNS answers to managed containers until the addresses they contain are
         // allowed. `bypass` lets them through when Portcullis isn't listening.
-        render_elements(
-            out,
-            format_args!("add rule {base} oifname"),
-            plan.bridges.iter().map(|bridge| Quoted(&bridge.name)),
-            format_args!(
-                " meta l4proto {{ tcp, udp }} th sport {DNS_PORT} ct direction reply queue num {queue} bypass"
-            ),
-        )?;
+        for protocol in ["tcp", "udp"] {
+            writeln!(
+                out,
+                "add rule {base} oifname @{} meta l4proto {protocol} th sport {DNS_PORT} ct direction reply queue num {queue} bypass",
+                NamedSet::InetBridges.name()
+            )?;
+        }
     }
     // Traffic to the host itself (services on the host, and other containers' published
     // ports through Docker's userland proxy) leaves the container's network as much as
@@ -787,31 +789,41 @@ fn render_egress_dispatch(
     // The bridge table checked where established traffic comes from. Related traffic (ICMP
     // errors about a connection) is checked in the source's chain, see `render_related`.
     writeln!(out, "add rule {base} ct state established accept")?;
-    for (family, is_family) in FAMILIES {
-        let entries = plan
+    for (family, is_family, map) in [
+        (
+            "ip",
+            IpAddr::is_ipv4 as fn(&IpAddr) -> bool,
+            NamedSet::Egress4,
+        ),
+        ("ip6", IpAddr::is_ipv6, NamedSet::Egress6),
+    ] {
+        let mut entries = plan
             .sources
             .iter()
             .enumerate()
             .filter(|(_, source)| is_family(&source.address))
-            .map(|(index, source)| Dispatch(source.address, Verdict::Goto(Chain::Egress(index))));
-        render_elements(
-            out,
-            format_args!("add rule {base} {family} saddr vmap"),
-            entries,
-            "",
-        )?;
+            .map(|(index, source)| Dispatch(source.address, Verdict::Goto(Chain::Egress(index))))
+            .peekable();
+        if entries.peek().is_none() {
+            continue;
+        }
+        // Filled once, from the forward chain; the input chain uses the same map.
+        if base == Chain::Base(Table::Inet) {
+            map.fill(out, entries)?;
+        }
+        writeln!(out, "add rule {base} {family} saddr vmap @{}", map.name())?;
     }
     // Unknown or spoofed sources of enforced networks; the bridge table already reported
     // them.
-    render_elements(
-        out,
-        format_args!("add rule {base} iifname"),
-        plan.bridges
-            .iter()
-            .filter(|bridge| !bridge.monitor)
-            .map(|bridge| Quoted(&bridge.name)),
-        format_args!(" {}", options.deny),
-    )
+    if plan.bridges.iter().any(|bridge| !bridge.monitor) {
+        writeln!(
+            out,
+            "add rule {base} iifname @{} {}",
+            NamedSet::InetEnforcedBridges.name(),
+            options.deny
+        )?;
+    }
+    Ok(())
 }
 
 /// Accept related traffic (ICMP errors about a connection) from `address` only when it is
@@ -839,17 +851,24 @@ fn render_dns_names(out: &mut String, plan: &Plan, options: Options, base: Chain
     let Some(queue) = options.dns_query_queue else {
         return Ok(());
     };
-    render_elements(
-        out,
-        format_args!("add rule {base} ip saddr"),
-        plan.sources
-            .iter()
-            .filter(|source| source.address.is_ipv4() && source.domains.is_some())
-            .map(|source| source.address),
-        format_args!(
-            " meta l4proto {{ tcp, udp }} th dport {DNS_PORT} ct direction original meta mark != {DNS_ALLOWED_MARK:#x} meta mark != {DNS_DENIED_MARK:#x} queue num {queue}"
-        ),
-    )?;
+    let mut limited = plan
+        .sources
+        .iter()
+        .filter(|source| source.address.is_ipv4() && source.domains.is_some())
+        .map(|source| source.address)
+        .peekable();
+    if limited.peek().is_some() {
+        if base == Chain::Base(Table::Inet) {
+            NamedSet::NameLimited.fill(out, limited)?;
+        }
+        for protocol in ["tcp", "udp"] {
+            writeln!(
+                out,
+                "add rule {base} ip saddr @{} meta l4proto {protocol} th dport {DNS_PORT} ct direction original meta mark != {DNS_ALLOWED_MARK:#x} meta mark != {DNS_DENIED_MARK:#x} queue num {queue}",
+                NamedSet::NameLimited.name()
+            )?;
+        }
+    }
     writeln!(
         out,
         "add rule {base} meta mark {DNS_DENIED_MARK:#x} meta l4proto tcp reject with tcp reset"
@@ -914,6 +933,18 @@ fn render_objects(
         )?;
         installed.sets.insert(name);
     }
+    for (limit, ports) in limits(plan, options) {
+        let name = format!("{} {}", Table::Bridge, limit.ports_name());
+        writeln!(out, "add set {name} {{ type ifname; }}")?;
+        writeln!(out, "flush set {name}")?;
+        render_elements(
+            out,
+            format_args!("add element {name}"),
+            ports.into_iter().map(Quoted),
+            "",
+        )?;
+        installed.sets.insert(name);
+    }
     for set in &plan.host_sets {
         if set.used_v4 {
             installed
@@ -948,11 +979,6 @@ fn icc_chain_needed(plan: &Plan, source: &Source, options: Options) -> bool {
             .any(|rule| !matches!(rule, Rule::AcceptHost(_) | Rule::AcceptNet(_)))
 }
 
-/// nftables keyword of an address family, and whether an address belongs to it.
-type Family = (&'static str, fn(&IpAddr) -> bool);
-
-const FAMILIES: [Family; 2] = [("ip", IpAddr::is_ipv4), ("ip6", IpAddr::is_ipv6)];
-
 fn render_base_chain(out: &mut String, chain: Chain, hook: &str) -> fmt::Result {
     writeln!(
         out,
@@ -975,32 +1001,23 @@ fn render_base_chain(out: &mut String, chain: Chain, hook: &str) -> fmt::Result 
 /// doesn't manage IPv6.
 fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
-    render_elements(
+    writeln!(
         out,
-        format_args!("add rule {base} meta ibrname !="),
-        plan.bridges.iter().map(|bridge| Quoted(&bridge.name)),
-        " accept",
+        "add rule {base} meta ibrname != @{} accept",
+        NamedSet::BridgeBridges.name()
     )?;
     render_limits(out, plan, options)?;
     render_known_sources(out, plan, options, base)?;
-    let bridges = |monitor: bool| {
-        set_literal(
-            plan.bridges
-                .iter()
-                .filter(move |bridge| bridge.monitor == monitor)
-                .map(|bridge| Quoted(&bridge.name)),
-        )
-    };
     for monitor in [true, false] {
-        let Some(selected) = bridges(monitor) else {
+        if !plan.bridges.iter().any(|bridge| bridge.monitor == monitor) {
             continue;
-        };
+        }
         let queue = if monitor {
             options.monitor_source_queue
         } else {
             options.source_queue
         };
-        render_unknown_sources(out, plan, options, monitor, &selected, queue)?;
+        render_unknown_sources(out, plan, options, monitor, queue)?;
     }
     Ok(())
 }
@@ -1012,10 +1029,15 @@ fn render_unknown_sources(
     plan: &Plan,
     options: Options,
     monitor: bool,
-    bridges: &str,
     queue: Option<u16>,
 ) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
+    let (bridges, ports) = if monitor {
+        (NamedSet::MonitoredBridges, NamedSet::MonitoredPorts)
+    } else {
+        (NamedSet::EnforcedBridges, NamedSet::EnforcedPorts)
+    };
+    let bridges = format!("@{}", bridges.name());
     // From a managed container's port, but not with its own address and MAC: denied at once.
     let networks: BTreeSet<&str> = plan
         .bridges
@@ -1023,18 +1045,20 @@ fn render_unknown_sources(
         .filter(|bridge| bridge.monitor == monitor)
         .map(|bridge| bridge.network.as_str())
         .collect();
-    if let Some(ports) = set_literal(
-        plan.sources
-            .iter()
-            .filter(|source| networks.contains(source.network.as_str()))
-            .filter_map(|source| source.port.as_ref())
-            .map(|port| Quoted(&port.name)),
-    ) {
+    let mut known = plan
+        .sources
+        .iter()
+        .filter(|source| networks.contains(source.network.as_str()))
+        .filter_map(|source| source.port.as_ref())
+        .map(|port| Quoted(&port.name))
+        .peekable();
+    if known.peek().is_some() {
+        ports.fill(out, known)?;
         render_denied_frames(
             out,
             options,
             monitor,
-            &format!("meta ibrname {bridges} iifname {ports}"),
+            &format!("meta ibrname {bridges} iifname @{}", ports.name()),
         )?;
     }
     if let Some(queue) = queue {
@@ -1050,11 +1074,13 @@ fn render_unknown_sources(
         // for. Hold the packet until Portcullis knows the container; if the source stays
         // unknown, it is denied (or in monitor mode reported) above once the hold expires.
         // In monitor mode the queue fails open.
-        writeln!(
-            out,
-            "add rule {base} meta ibrname {bridges} ether type {{ ip, arp }} queue num {queue}{}",
-            if monitor { " bypass" } else { "" }
-        )?;
+        for ether_type in ["ip", "arp"] {
+            writeln!(
+                out,
+                "add rule {base} meta ibrname {bridges} ether type {ether_type} queue num {queue}{}",
+                if monitor { " bypass" } else { "" }
+            )?;
+        }
     }
     render_denied_frames(out, options, monitor, &format!("meta ibrname {bridges}"))
 }
@@ -1093,6 +1119,15 @@ impl Limit {
     /// The set counting each port's connections, or new connections, under this limit.
     fn set_name(self) -> String {
         format!("{}{}", if self.rate { "new" } else { "conns" }, self.value)
+    }
+
+    /// The set of the ports under this limit.
+    fn ports_name(self) -> String {
+        format!(
+            "ports_{}{}",
+            self.set_name(),
+            if self.monitor { "_monitor" } else { "" }
+        )
     }
 }
 
@@ -1137,10 +1172,7 @@ fn render_limits(out: &mut String, plan: &Plan, options: Options) -> fmt::Result
         "add rule {} iifname @{QUARANTINED_SET} drop",
         Chain::BridgeInput
     )?;
-    for (limit, ports) in limits(plan, options) {
-        let Some(ports) = set_literal(ports.iter().map(|port| Quoted(port))) else {
-            continue;
-        };
+    for limit in limits(plan, options).into_keys() {
         let check = if limit.rate {
             format!("limit rate over {0}/second burst {0} packets", limit.value)
         } else {
@@ -1148,7 +1180,8 @@ fn render_limits(out: &mut String, plan: &Plan, options: Options) -> fmt::Result
         };
         writeln!(
             out,
-            "add rule {base} iifname {ports} ct state new add @{} {{ iifname {check} }} goto {}",
+            "add rule {base} iifname @{} ct state new add @{} {{ iifname {check} }} goto {}",
+            limit.ports_name(),
             limit.set_name(),
             ChainName(Chain::Limited {
                 rate: limit.rate,
@@ -1178,20 +1211,19 @@ fn render_limits(out: &mut String, plan: &Plan, options: Options) -> fmt::Result
 /// them over. LLDP (and STP, where enabled) skips even that hook, see
 /// `render_link_local_ip`.
 fn render_link_local(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
-    for monitor in [false, true] {
-        let Some(bridges) = set_literal(
-            plan.bridges
-                .iter()
-                .filter(|bridge| bridge.monitor == monitor)
-                .map(|bridge| Quoted(&bridge.name)),
-        ) else {
+    for (monitor, bridges) in [
+        (false, NamedSet::EnforcedBridges),
+        (true, NamedSet::MonitoredBridges),
+    ] {
+        if !plan.bridges.iter().any(|bridge| bridge.monitor == monitor) {
             continue;
-        };
+        }
         decide(
             out,
             format_args!(
-                "add rule {} meta ibrname {bridges} {LINK_LOCAL_GROUP}",
-                Chain::BridgeInput
+                "add rule {} meta ibrname @{} {LINK_LOCAL_GROUP}",
+                Chain::BridgeInput,
+                bridges.name()
             ),
             Outcome::deny(options, monitor, "frame").for_frame(),
         )?;
@@ -1206,23 +1238,22 @@ fn render_link_local(out: &mut String, plan: &Plan, options: Options) -> fmt::Re
 /// addressed to the network itself, or be broadcast or multicast (which the ICC rules
 /// check). The bridge's forward hook can only drop.
 fn render_bridged_destinations(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+    let chain = Chain::BridgeForward;
     for bridge in plan
         .bridges
         .iter()
         .filter(|bridge| bridge.subnet.addr().is_ipv4())
     {
-        let Some(destinations) =
-            set_literal(std::iter::once(&bridge.subnet).chain(&ICC_BROADCAST_V4))
-        else {
-            continue;
-        };
+        let name = Quoted(&bridge.name);
+        for destination in std::iter::once(&bridge.subnet).chain(&ICC_BROADCAST_V4) {
+            writeln!(
+                out,
+                "add rule {chain} meta ibrname {name} ip daddr {destination} accept"
+            )?;
+        }
         decide(
             out,
-            format_args!(
-                "add rule {} meta ibrname {} ip daddr != {destinations}",
-                Chain::BridgeForward,
-                Quoted(&bridge.name),
-            ),
+            format_args!("add rule {chain} meta ibrname {name} ether type ip"),
             Outcome::deny(options, bridge.monitor, "icc").dropped(),
         )?;
     }
@@ -1329,9 +1360,11 @@ fn render_known_sources(
     };
     // A raw socket is enough to send with another container's address and MAC, but not
     // from its port.
-    render_elements(
+    render_dispatch(
         out,
-        format_args!("add rule {base} iifname . ip saddr . ether saddr vmap"),
+        base,
+        "iifname . ip saddr . ether saddr",
+        NamedSet::SourcesByPort,
         keys().filter_map(|(index, source, key)| match key {
             SourceKey::Port(port, mac, address) => Some(Dispatch(
                 format!("{} . {address} . {mac}", Quoted(port)),
@@ -1339,11 +1372,12 @@ fn render_known_sources(
             )),
             _ => None,
         }),
-        "",
     )?;
-    render_elements(
+    render_dispatch(
         out,
-        format_args!("add rule {base} ip saddr . ether saddr vmap"),
+        base,
+        "ip saddr . ether saddr",
+        NamedSet::SourcesByMac,
         keys().filter_map(|(index, source, key)| match key {
             SourceKey::Mac(mac, address) => Some(Dispatch(
                 format!("{address} . {mac}"),
@@ -1351,23 +1385,25 @@ fn render_known_sources(
             )),
             _ => None,
         }),
-        "",
     )?;
-    render_elements(
+    render_dispatch(
         out,
-        format_args!("add rule {base} ip saddr vmap"),
+        base,
+        "ip saddr",
+        NamedSet::SourcesByAddress,
         keys().filter_map(|(index, source, key)| match key {
             SourceKey::Address(address) => Some(Dispatch(address, verdict(index, source))),
             _ => None,
         }),
-        "",
     )?;
     // ARP may only announce the container's own address and MAC, or no address at all
     // (0.0.0.0, a probe for whether an address is in use).
     let unspecified = IpAddr::from([0, 0, 0, 0]);
-    render_elements(
+    render_dispatch(
         out,
-        format_args!("add rule {base} iifname . ether saddr . arp saddr ether . arp saddr ip"),
+        base,
+        "iifname . ether saddr . arp saddr ether . arp saddr ip",
+        NamedSet::ArpByPort,
         keys()
             .flat_map(|(_, _, key)| match key {
                 SourceKey::Port(port, mac, address) => [address, unspecified]
@@ -1375,11 +1411,12 @@ fn render_known_sources(
                 _ => [None, None],
             })
             .flatten(),
-        " accept",
     )?;
-    render_elements(
+    render_dispatch(
         out,
-        format_args!("add rule {base} ether saddr . arp saddr ether . arp saddr ip"),
+        base,
+        "ether saddr . arp saddr ether . arp saddr ip",
+        NamedSet::ArpByMac,
         keys()
             .flat_map(|(_, _, key)| match key {
                 SourceKey::Mac(mac, address) => {
@@ -1388,17 +1425,191 @@ fn render_known_sources(
                 _ => [None, None],
             })
             .flatten(),
-        " accept",
     )?;
-    render_elements(
+    render_dispatch(
         out,
-        format_args!("add rule {base} arp saddr ip"),
+        base,
+        "arp saddr ip",
+        NamedSet::ArpByAddress,
         keys().filter_map(|(_, _, key)| match key {
             SourceKey::Address(address) => Some(address),
             _ => None,
         }),
-        " accept",
     )
+}
+
+/// Fill `set` with `elements` and match `key` against it in `chain`: through it, for a
+/// verdict map, or accepting what it holds. Nothing is matched without elements.
+fn render_dispatch<T: fmt::Display>(
+    out: &mut String,
+    chain: Chain,
+    key: &str,
+    set: NamedSet,
+    elements: impl Iterator<Item = T>,
+) -> fmt::Result {
+    let mut elements = elements.peekable();
+    if elements.peek().is_none() {
+        return Ok(());
+    }
+    set.fill(out, elements)?;
+    if set.is_map() {
+        writeln!(out, "add rule {chain} {key} vmap @{}", set.name())
+    } else {
+        writeln!(out, "add rule {chain} {key} @{} accept", set.name())
+    }
+}
+
+/// The sets and verdict maps rules match against, besides those of hostnames, limits and
+/// reports. Rules never carry anonymous sets (`{ a, b }`): an update replaces such a set
+/// along with its rule, and while the kernel commits the update, lookups in it can miss.
+/// That briefly lets packets through checks, or denies established connections as from an
+/// unknown source. A named set lives on: it is emptied and refilled in the same update,
+/// which lookups don't notice. Sets of ranges (`flags interval`) can miss as well, so rules
+/// match ranges one prefix at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedSet {
+    /// Bridges of managed networks, for the inet table.
+    InetBridges,
+    /// Bridges of enforced networks, for the inet table.
+    InetEnforcedBridges,
+    /// Egress chains of IPv4 sources.
+    Egress4,
+    /// Egress chains of IPv6 sources.
+    Egress6,
+    /// Sources whose DNS lookups are limited to some names.
+    NameLimited,
+    /// Bridges of managed networks.
+    BridgeBridges,
+    MonitoredBridges,
+    EnforcedBridges,
+    /// Ports of managed containers on monitored networks.
+    MonitoredPorts,
+    /// Ports of managed containers on enforced networks.
+    EnforcedPorts,
+    /// ICC chains of sources, by port, address and MAC.
+    SourcesByPort,
+    /// The same, by address and MAC, for sources whose port isn't known.
+    SourcesByMac,
+    /// The same, by address, for sources without a MAC.
+    SourcesByAddress,
+    /// ARP sources may send, by port.
+    ArpByPort,
+    ArpByMac,
+    ArpByAddress,
+}
+
+impl NamedSet {
+    const ALL: [Self; 16] = [
+        Self::InetBridges,
+        Self::InetEnforcedBridges,
+        Self::Egress4,
+        Self::Egress6,
+        Self::NameLimited,
+        Self::BridgeBridges,
+        Self::MonitoredBridges,
+        Self::EnforcedBridges,
+        Self::MonitoredPorts,
+        Self::EnforcedPorts,
+        Self::SourcesByPort,
+        Self::SourcesByMac,
+        Self::SourcesByAddress,
+        Self::ArpByPort,
+        Self::ArpByMac,
+        Self::ArpByAddress,
+    ];
+
+    const fn table(self) -> Table {
+        match self {
+            Self::InetBridges
+            | Self::InetEnforcedBridges
+            | Self::Egress4
+            | Self::Egress6
+            | Self::NameLimited => Table::Inet,
+            _ => Table::Bridge,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::InetBridges | Self::BridgeBridges => "bridges",
+            Self::InetEnforcedBridges | Self::EnforcedBridges => "enforced_bridges",
+            Self::MonitoredBridges => "monitored_bridges",
+            Self::Egress4 => "egress4",
+            Self::Egress6 => "egress6",
+            Self::NameLimited => "name_limited",
+            Self::MonitoredPorts => "monitored_ports",
+            Self::EnforcedPorts => "enforced_ports",
+            Self::SourcesByPort => "sources_by_port",
+            Self::SourcesByMac => "sources_by_mac",
+            Self::SourcesByAddress => "sources_by_address",
+            Self::ArpByPort => "arp_by_port",
+            Self::ArpByMac => "arp_by_mac",
+            Self::ArpByAddress => "arp_by_address",
+        }
+    }
+
+    /// The type of its elements, or keys.
+    const fn key_type(self) -> &'static str {
+        match self {
+            Self::InetBridges
+            | Self::InetEnforcedBridges
+            | Self::BridgeBridges
+            | Self::MonitoredBridges
+            | Self::EnforcedBridges
+            | Self::MonitoredPorts
+            | Self::EnforcedPorts => "ifname",
+            Self::Egress4 | Self::NameLimited | Self::SourcesByAddress | Self::ArpByAddress => {
+                "ipv4_addr"
+            }
+            Self::Egress6 => "ipv6_addr",
+            Self::SourcesByPort => "ifname . ipv4_addr . ether_addr",
+            Self::SourcesByMac => "ipv4_addr . ether_addr",
+            Self::ArpByPort => "ifname . ether_addr . ether_addr . ipv4_addr",
+            Self::ArpByMac => "ether_addr . ether_addr . ipv4_addr",
+        }
+    }
+
+    const fn is_map(self) -> bool {
+        matches!(
+            self,
+            Self::Egress4
+                | Self::Egress6
+                | Self::SourcesByPort
+                | Self::SourcesByMac
+                | Self::SourcesByAddress
+        )
+    }
+
+    /// Create the set if needed, and empty it.
+    fn render_empty(self, out: &mut String) -> fmt::Result {
+        let (kind, value) = if self.is_map() {
+            ("map", " : verdict")
+        } else {
+            ("set", "")
+        };
+        let name = self.name();
+        let table = self.table();
+        writeln!(
+            out,
+            "add {kind} {table} {name} {{ type {}{value}; }}",
+            self.key_type()
+        )?;
+        writeln!(out, "flush {kind} {table} {name}")
+    }
+
+    /// Add `elements` to the set, emptied before.
+    fn fill<T: fmt::Display>(
+        self,
+        out: &mut String,
+        elements: impl Iterator<Item = T>,
+    ) -> fmt::Result {
+        render_elements(
+            out,
+            format_args!("add element {} {}", self.table(), self.name()),
+            elements,
+            "",
+        )
+    }
 }
 
 /// Write `{head} { e1, e2, ... }{tail}` and a newline; writes nothing without elements.
@@ -2110,6 +2321,16 @@ flush chain inet portcullis input
 add set inet portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set inet portcullis logged6 { type ipv6_addr . ipv6_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 flush chain inet portcullis forward
+add set inet portcullis bridges { type ifname; }
+flush set inet portcullis bridges
+add set inet portcullis enforced_bridges { type ifname; }
+flush set inet portcullis enforced_bridges
+add map inet portcullis egress4 { type ipv4_addr : verdict; }
+flush map inet portcullis egress4
+add map inet portcullis egress6 { type ipv6_addr : verdict; }
+flush map inet portcullis egress6
+add set inet portcullis name_limited { type ipv4_addr; }
+flush set inet portcullis name_limited
 add table bridge portcullis
 add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }
 add chain bridge portcullis input { type filter hook input priority -1; policy accept; }
@@ -2122,6 +2343,28 @@ add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . in
 add set bridge portcullis frames { type ifname . ether_addr . ether_type; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis announced { type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout 60s; size 65536; }
 flush chain bridge portcullis prerouting
+add set bridge portcullis bridges { type ifname; }
+flush set bridge portcullis bridges
+add set bridge portcullis monitored_bridges { type ifname; }
+flush set bridge portcullis monitored_bridges
+add set bridge portcullis enforced_bridges { type ifname; }
+flush set bridge portcullis enforced_bridges
+add set bridge portcullis monitored_ports { type ifname; }
+flush set bridge portcullis monitored_ports
+add set bridge portcullis enforced_ports { type ifname; }
+flush set bridge portcullis enforced_ports
+add map bridge portcullis sources_by_port { type ifname . ipv4_addr . ether_addr : verdict; }
+flush map bridge portcullis sources_by_port
+add map bridge portcullis sources_by_mac { type ipv4_addr . ether_addr : verdict; }
+flush map bridge portcullis sources_by_mac
+add map bridge portcullis sources_by_address { type ipv4_addr : verdict; }
+flush map bridge portcullis sources_by_address
+add set bridge portcullis arp_by_port { type ifname . ether_addr . ether_addr . ipv4_addr; }
+flush set bridge portcullis arp_by_port
+add set bridge portcullis arp_by_mac { type ether_addr . ether_addr . ipv4_addr; }
+flush set bridge portcullis arp_by_mac
+add set bridge portcullis arp_by_address { type ipv4_addr; }
+flush set bridge portcullis arp_by_address
 add chain inet portcullis egress0
 flush chain inet portcullis egress0
 add chain bridge portcullis icc0
@@ -2136,26 +2379,32 @@ flush chain bridge portcullis limit_open
         assert_lines(
             &script,
             &[
-                "add rule inet portcullis forward ip saddr vmap { 172.18.0.2 : goto egress0 }".into(),
+                "add element inet portcullis egress4 { 172.18.0.2 : goto egress0 }\nadd rule inet portcullis forward ip saddr vmap @egress4".into(),
                 // Traffic to the host follows the same rules.
                 "add rule inet portcullis input ct state established accept".into(),
                 // ICMP errors only from an end of the connection they are about.
                 "add rule inet portcullis egress0 ct state related ct original ip saddr 172.18.0.2 accept".into(),
                 "add rule inet portcullis egress0 ct state related ct reply ip saddr 172.18.0.2 accept".into(),
-                "add rule inet portcullis input ip saddr vmap { 172.18.0.2 : goto egress0 }".into(),
-                "add rule inet portcullis input iifname { \"br-net0\" } drop".into(),
+                "add rule inet portcullis input ip saddr vmap @egress4".into(),
+                "add rule inet portcullis input iifname @enforced_bridges drop".into(),
+                "add element inet portcullis enforced_bridges { \"br-net0\" }".into(),
                 // The gateway is the host: traffic to it follows the egress rules.
                 "add rule inet portcullis egress0 ct original ip daddr 172.18.0.0/16 ct original ip daddr != 172.18.0.1 accept".into(),
                 // Reported by the bridge table already.
-                "add rule inet portcullis forward iifname { \"br-net0\" } drop".into(),
+                "add rule inet portcullis forward iifname @enforced_bridges drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
-                "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept".into(),
-                "add rule bridge portcullis prerouting ip saddr . ether saddr vmap { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }".into(),
+                "add element bridge portcullis bridges { \"br-net0\" }".into(),
+                "add rule bridge portcullis prerouting meta ibrname != @bridges accept".into(),
+                "add element bridge portcullis sources_by_mac { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }\nadd rule bridge portcullis prerouting ip saddr . ether saddr vmap @sources_by_mac".into(),
                 // ARP may only announce the container's own address and MAC.
-                "add rule bridge portcullis prerouting ether saddr . arp saddr ether . arp saddr ip { 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 } accept".into(),
+                "add element bridge portcullis arp_by_mac { 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 }\nadd rule bridge portcullis prerouting ether saddr . arp saddr ether . arp saddr ip @arp_by_mac accept".into(),
                 // Everything else is denied: IPv4 and ARP as a source that isn't the
                 // sender's, other frames (IPv6, VLAN tags) as frames.
-                denied_frames("meta ibrname { \"br-net0\" }", 'd'),
+                denied_frames("meta ibrname @enforced_bridges", 'd'),
+                // Traffic from one container to another must be addressed to their
+                // network, one prefix at a time.
+                "add rule bridge portcullis forward meta ibrname \"br-net0\" ip daddr 172.18.0.0/16 accept\nadd rule bridge portcullis forward meta ibrname \"br-net0\" ip daddr 255.255.255.255/32 accept\nadd rule bridge portcullis forward meta ibrname \"br-net0\" ip daddr 224.0.0.0/4 accept".into(),
+                decided("add rule bridge portcullis forward meta ibrname \"br-net0\" ether type ip", 'd', "icc", "drop"),
                 // Established traffic passes once its source checked out.
                 "add rule bridge portcullis icc0 ct state established accept\nadd rule bridge portcullis icc0 ct state related ct original ip saddr 172.18.0.2 accept\nadd rule bridge portcullis icc0 ct state related ct reply ip saddr 172.18.0.2 accept\nadd rule bridge portcullis icc0 ip daddr 172.18.0.1 accept".into(),
                 decided("add rule bridge portcullis icc0 ip daddr 172.18.0.0/16", 'd', "icc", "drop"),
@@ -2166,6 +2415,12 @@ flush chain bridge portcullis limit_open
         );
         // nothing for families without sources
         assert!(!script.contains("ip6 saddr vmap"));
+        // No anonymous sets, nor sets of ranges: lookups in them can miss while an update
+        // is committed.
+        for line in script.lines().filter(|line| line.starts_with("add rule")) {
+            assert!(!line.contains(" { ") || line.contains(" add @"), "{line}");
+        }
+        assert!(!script.contains("interval"), "{script}");
     }
 
     #[test]
@@ -2176,9 +2431,10 @@ flush chain bridge portcullis limit_open
         };
         let script = render_with(&test_support::hostname_state(), options, false);
         let expected = [
-            denied_frames("meta ibrname { \"br-net0\" } meta mark 0x70630001", 'd'),
-            "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type { ip, arp } queue num 9".to_string(),
-            denied_frames("meta ibrname { \"br-net0\" }", 'd'),
+            denied_frames("meta ibrname @enforced_bridges meta mark 0x70630001", 'd'),
+            "add rule bridge portcullis prerouting meta ibrname @enforced_bridges ether type ip queue num 9".to_string(),
+            "add rule bridge portcullis prerouting meta ibrname @enforced_bridges ether type arp queue num 9".to_string(),
+            denied_frames("meta ibrname @enforced_bridges", 'd'),
         ]
         .join("\n");
         assert!(script.contains(&format!("{expected}\n")), "{script}");
@@ -2199,9 +2455,10 @@ flush chain bridge portcullis limit_open
         };
         let script = render_with(&test_support::hostname_state(), options, true);
         let expected = [
-            denied_frames("meta ibrname { \"br-net0\" } meta mark 0x70630001", 'w'),
-            "add rule bridge portcullis prerouting meta ibrname { \"br-net0\" } ether type { ip, arp } queue num 10 bypass".to_string(),
-            denied_frames("meta ibrname { \"br-net0\" }", 'w'),
+            denied_frames("meta ibrname @monitored_bridges meta mark 0x70630001", 'w'),
+            "add rule bridge portcullis prerouting meta ibrname @monitored_bridges ether type ip queue num 10 bypass".to_string(),
+            "add rule bridge portcullis prerouting meta ibrname @monitored_bridges ether type arp queue num 10 bypass".to_string(),
+            denied_frames("meta ibrname @monitored_bridges", 'w'),
         ]
         .join("\n");
         assert!(script.contains(&format!("{expected}\n")), "{script}");
@@ -2346,34 +2603,42 @@ flush chain bridge portcullis limit_open
         };
         // web's address and MAC only count from its own port...
         assert!(
-            line("add rule bridge portcullis prerouting iifname . ip saddr . ether saddr vmap")
+            line("add element bridge portcullis sources_by_port")
                 .contains("\"veth0a1b2c3\" . 172.18.0.2 . 02:42:ac:12:00:02 : goto icc"),
             "{script}"
         );
+        assert!(has_line(
+            &script,
+            "add rule bridge portcullis prerouting iifname . ip saddr . ether saddr vmap @sources_by_port"
+        ));
         // ...and not without it; containers whose port isn't known are checked by address
         // and MAC.
-        let by_mac = line("add rule bridge portcullis prerouting ip saddr . ether saddr vmap");
+        let by_mac = line("add element bridge portcullis sources_by_mac");
         assert!(!by_mac.contains("172.18.0.2 "), "{script}");
         assert!(
             by_mac.contains("172.18.0.3 . 02:42:ac:12:00:03"),
             "{script}"
         );
         // ARP may only announce web's own address and MAC, from its port.
-        assert!(has_line(
+        assert_lines(
             &script,
-            "add rule bridge portcullis prerouting iifname . ether saddr . arp saddr ether . arp saddr ip { \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 } accept"
-        ));
+            &["add element bridge portcullis arp_by_port { \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 }\nadd rule bridge portcullis prerouting iifname . ether saddr . arp saddr ether . arp saddr ip @arp_by_port accept".into()],
+        );
         // Anything else from web's port is denied at once, not held.
         let options = Options {
             source_queue: Some(9),
             ..OPTIONS
         };
         let script = render_with(&state, options, false);
+        assert_lines(
+            &script,
+            &["add element bridge portcullis enforced_ports { \"veth0a1b2c3\" }".into()],
+        );
         let known_port = denied_frames(
-            "meta ibrname { \"br-net0\", \"br-net1\" } iifname { \"veth0a1b2c3\" }",
+            "meta ibrname @enforced_bridges iifname @enforced_ports",
             'd',
         );
-        let held = "add rule bridge portcullis prerouting meta ibrname { \"br-net0\", \"br-net1\" } ether type { ip, arp } queue num 9";
+        let held = "add rule bridge portcullis prerouting meta ibrname @enforced_bridges ether type ip queue num 9";
         let position = |text: &str| script.find(text).unwrap_or(usize::MAX);
         assert!(position(&known_port) < position(held), "{script}");
     }
@@ -2423,13 +2688,16 @@ flush chain bridge portcullis limit_open
             &[
                 // Quarantined ports get nowhere, before anything else is checked.
                 "add element bridge portcullis quarantined { \"veth3\" }".into(),
-                "add rule bridge portcullis prerouting meta ibrname != { \"br-net0\" } accept\nadd rule bridge portcullis prerouting iifname @quarantined drop".into(),
+                "add rule bridge portcullis prerouting meta ibrname != @bridges accept\nadd rule bridge portcullis prerouting iifname @quarantined drop".into(),
                 "add rule bridge portcullis input iifname @quarantined drop".into(),
                 // Open connections: the label's limit, or the default.
-                "add rule bridge portcullis prerouting iifname { \"veth2\" } ct state new add @conns10 { iifname ct count over 10 } goto limit_open".into(),
-                "add rule bridge portcullis prerouting iifname { \"veth3\" } ct state new add @conns1000 { iifname ct count over 1000 } goto limit_open".into(),
+                "add element bridge portcullis ports_conns10 { \"veth2\" }".into(),
+                "add rule bridge portcullis prerouting iifname @ports_conns10 ct state new add @conns10 { iifname ct count over 10 } goto limit_open".into(),
+                "add element bridge portcullis ports_conns1000 { \"veth3\" }".into(),
+                "add rule bridge portcullis prerouting iifname @ports_conns1000 ct state new add @conns1000 { iifname ct count over 1000 } goto limit_open".into(),
                 // New connections per second, only where a label asks for it.
-                "add rule bridge portcullis prerouting iifname { \"veth2\" } ct state new add @new5 { iifname limit rate over 5/second burst 5 packets } goto limit_rate".into(),
+                "add element bridge portcullis ports_new5 { \"veth2\" }".into(),
+                "add rule bridge portcullis prerouting iifname @ports_new5 ct state new add @new5 { iifname limit rate over 5/second burst 5 packets } goto limit_rate".into(),
                 "add set bridge portcullis conns10 { type ifname; flags dynamic; size 65536; }".into(),
                 "add set bridge portcullis new5 { type ifname; flags dynamic,timeout; timeout 60s; size 65536; }".into(),
                 decided("add rule bridge portcullis limit_open", 'd', "limit:open", "drop"),
@@ -2468,7 +2736,8 @@ flush chain bridge portcullis limit_open
         for base in ["forward", "input"] {
             let head = format!("add rule inet portcullis {base}");
             let expected = [
-                format!("{head} ip saddr {{ 172.18.0.2 }} meta l4proto {{ tcp, udp }} th dport 53 ct direction original meta mark != 0x70630003 meta mark != 0x70630002 queue num 9"),
+                format!("{head} ip saddr @name_limited meta l4proto tcp th dport 53 ct direction original meta mark != 0x70630003 meta mark != 0x70630002 queue num 9"),
+                format!("{head} ip saddr @name_limited meta l4proto udp th dport 53 ct direction original meta mark != 0x70630003 meta mark != 0x70630002 queue num 9"),
                 format!("{head} meta mark 0x70630002 meta l4proto tcp reject with tcp reset"),
                 format!("{head} meta mark 0x70630002 reject with icmpx admin-prohibited"),
                 format!("{head} meta mark 0x70630003 meta mark set 0x0"),
@@ -2477,6 +2746,10 @@ flush chain bridge portcullis limit_open
             .join("\n");
             assert!(script.contains(&expected), "{script}");
         }
+        assert!(has_line(
+            &script,
+            "add element inet portcullis name_limited { 172.18.0.2 }"
+        ));
     }
 
     #[test]
@@ -2501,7 +2774,7 @@ flush chain bridge portcullis limit_open
         assert_lines(
             &script,
             &[
-                format!("add rule inet portcullis forward iifname {{ \"br-net0\" }} {reject}"),
+                format!("add rule inet portcullis forward iifname @enforced_bridges {reject}"),
                 decided(
                     "add rule inet portcullis egress0 meta l4proto udp ct original proto-dst 53",
                     'd',
@@ -2509,7 +2782,7 @@ flush chain bridge portcullis limit_open
                     reject,
                 ),
                 decided("add rule inet portcullis egress0", 'd', "egress", reject),
-                denied_frames("meta ibrname { \"br-net0\" }", 'd'),
+                denied_frames("meta ibrname @enforced_bridges", 'd'),
             ],
         );
     }
@@ -2528,7 +2801,7 @@ flush chain bridge portcullis limit_open
                     || line.contains(" limit_rate ")),
             "{script}"
         );
-        assert!(!script.contains("iifname {"), "{script}");
+        assert!(!script.contains("iifname @enforced_bridges"), "{script}");
         assert_lines(
             &script,
             &[
@@ -2545,7 +2818,7 @@ flush chain bridge portcullis limit_open
                     "icc",
                     "accept",
                 ),
-                denied_frames("meta ibrname { \"br-net0\" }", 'w'),
+                denied_frames("meta ibrname @monitored_bridges", 'w'),
             ],
         );
     }
@@ -2590,7 +2863,7 @@ flush chain bridge portcullis limit_open
             ..OPTIONS
         };
         let script = render_with(&test_support::hostname_state(), options, false);
-        let queue = "add rule inet portcullis forward oifname { \"br-net0\" } meta l4proto { tcp, udp } th sport 53 ct direction reply queue num 9 bypass";
+        let queue = "add rule inet portcullis forward oifname @bridges meta l4proto udp th sport 53 ct direction reply queue num 9 bypass";
         let established = "add rule inet portcullis forward ct state established accept";
         let position = |line: &str| script.lines().position(|candidate| candidate == line);
         assert!(
@@ -2617,7 +2890,11 @@ flush chain bridge portcullis limit_open
         assert!(!script.contains("pc_h4_"));
         assert!(has_line(
             &script,
-            "add rule inet portcullis forward ip6 saddr vmap { fd00::2 : goto egress0 }"
+            "add rule inet portcullis forward ip6 saddr vmap @egress6"
+        ));
+        assert!(has_line(
+            &script,
+            "add element inet portcullis egress6 { fd00::2 : goto egress0 }"
         ));
         assert!(has_line(
             &script,
@@ -2658,7 +2935,7 @@ flush chain bridge portcullis limit_open
     fn renders_unresolvable_hostname_as_empty_set() {
         let script = render(&test_support::unresolvable_state());
         assert!(script.contains("add set inet portcullis pc_h4_"));
-        assert!(!script.contains("add element"));
+        assert!(!script.contains("add element inet portcullis pc_h4_"));
         assert!(script.contains("ct original ip daddr @pc_h4_"));
         assert!(script.contains(
             "ct original ip daddr 8.8.8.0/24 meta l4proto tcp ct original proto-dst 853 accept"
