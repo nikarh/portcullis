@@ -186,8 +186,13 @@ the command line override it. watch and cleanup read it too.
 OPTIONS:
   --config <path>              Config file to read instead (it must exist)
   --docker-socket <path>       Docker API socket (default: /var/run/docker.sock)
+  --docker-root <path>         Docker's data directory, read for containers that just
+                               started (default: /var/lib/docker)
   --monitor                    Monitor mode everywhere: report what would be denied, deny
                                nothing
+  --monitor-network <name>     Watch this network in monitor mode without a label, or every
+                               bridge network with *; repeat for more (in the config file:
+                               monitor-networks = [...])
   --deny-action <reject|drop>  Reject denied traffic with an ICMP error, or drop it
                                silently (default: reject)
   --log-allowed <always|monitor|never>
@@ -220,6 +225,8 @@ OPTIONS:
                                portcullis cleanup)
   -V, --version                Show the version
   -h, --help                   Show this help
+
+Documentation: https://nikarh.github.io/portcullis/
 ";
     let _ = std::io::stdout().write_all(usage.as_bytes());
 }
