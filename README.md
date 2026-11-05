@@ -230,7 +230,7 @@ With `--on-exit remove`, Portcullis removes its rules, and the saved ones, when 
        (with portcullis.icc.mode=allow-listed)
    ```
 
-   `audit` reads JSON events (`--log-format json`) from a file or stdin and ignores other lines. Review the suggestions before using them: they describe what happened, not what should happen.
+   `audit` reads JSON events (`--log-format json`) from a file or stdin and ignores other lines. Review the suggestions before using them: they describe what happened, not what should happen. To keep them short, it joins consecutive ports into ranges, suggests a [pattern](#names-and-patterns) for three or more hostnames under one domain with the same ports (`host:*.redd.it`, or `host:**.archive.org` when they are at different levels), and `ip:public` for ten or more public addresses with the same ports. Packets that don't start a connection (`mid_stream`, see [Events](#events)) are listed apart: they need no label.
 3. Add the labels and switch the network to `portcullis.enable=true`. From then on every denial is reported as `denied` and raises an [alert](#alerts).
 
 ### Events
@@ -251,13 +251,14 @@ A connection event:
 |---|---|
 | `verdict` | `allowed`, `denied`, or `would_deny` in monitor mode. |
 | `reason` | Which part of the policy decided: `egress`, `dns`, `icc` (traffic to a container on the same network), `source` (a container sending with an address or MAC that isn't its own, ARP included), `frame` (a kind of frame enforced networks don't carry, such as IPv6 or VLAN-tagged frames), or `limit` (a container over its [connection limits](#quarantine-and-limits)). |
-| `protocol` | `tcp`, `udp`, `icmp` or another IP protocol number; for `source` and `frame`, also `arp`, `ipv6` or `ether type 0x....`. |
+| `protocol` | `tcp`, `udp`, `sctp`, `icmp`, `igmp`, `gre`, `esp`, `ah`, or the number of another IP protocol; for `source` and `frame`, also `arp`, `ipv6` or `ether type 0x....`. |
 | `source`, `destination` | The addresses the packet claims. For egress, the destination the container asked for, before Docker's DNAT of published ports. Both are `null` for frames without IP addresses. |
 | `container` | The container that sent it. For `source` and `frame`, this is the container behind the bridge port the frame came in on, whatever address or MAC it used. |
 | `destination_container` | For `icc`, the container at the destination. |
 | `domain`, `domain_source` | The destination's name, if known: `dns` when the container looked it up and Portcullis saw the answer, `rule` when the address belongs to one of the container's `host:` rules. |
 | `query` | For denied DNS queries, the name asked for. |
 | `detail` | For `source`, what's wrong, such as which container's address was used. |
+| `mid_stream` | Present (`true`) when a TCP packet doesn't start a connection: a reply, or the rest of a connection the firewall doesn't track, because it lost track of it or the packet doesn't fit the connection. Rules decide new connections; what they say about such a packet doesn't mean a label is missing. |
 
 A flow (container, destination, protocol and port) is reported at most once a minute, however many connections it makes; the kernel filters out repeats before they reach Portcullis. Replies and the rest of a connection are never reported. Other events:
 
@@ -318,22 +319,38 @@ Only bridge networks can be enforced. The default `bridge` network can't be, bec
 Each allowed destination is one label:
 
 ```text
-portcullis.egress.<name>=<target>,<protocol>:<port>[,<protocol>:<port>...]
+portcullis.egress.<name>=<destination>,<service>[,<service>...]
 ```
 
-`<name>` is any string that makes the label key unique, for example `0`, `1` or `stripe`. The target is one of:
+`<name>` is any string that makes the label key unique, for example `0`, `1` or `stripe`. The destination is one of:
 
 - `ip:<address>` or `ip:<cidr>`, for example `ip:1.1.1.1` or `ip:10.0.0.0/8`.
-- `host:<hostname>`, for example `host:api.stripe.com`. See [Hostname rules](#hostname-rules) for how the name is resolved.
+- `ip:public`: any public address. That leaves out private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), shared (`100.64.0.0/10`, CGNAT), loopback, link-local (`169.254.0.0/16`, with cloud metadata services), multicast, documentation, benchmarking and reserved ranges, and the Docker host's own addresses, even public ones, also when the container reaches a published port through them. For a container that may connect anywhere on the internet, but not to the host, the router or the LAN.
+- `ip:*`: any address, the Docker host's and the LAN's included.
+- `host:<name>`, for example `host:api.stripe.com`, or a pattern such as `host:*.archive.org` (see [Names and patterns](#names-and-patterns)). See [Hostname rules](#hostname-rules) for how the name is resolved.
 
-Ports are `tcp:<port>` or `udp:<port>`, at least one per label. There are no port ranges and no "any port" option.
+At least one service follows:
+
+| Service | Allows |
+|---|---|
+| `tcp:443` | TCP to that port |
+| `tcp:8000-8100` | TCP to any port of the range, both ends included |
+| `tcp:80,443,8000-8100` | several ports and ranges: those after a protocol's first belong to it |
+| `tcp:*` | TCP to any port |
+| `udp:...`, `sctp:...` | the same for UDP and SCTP |
+| `icmp`, `igmp`, `gre`, `esp`, `ah` | that protocol, which has no ports; `icmp` is ICMPv6 for IPv6 |
+| `*` | anything |
 
 ```yaml
 labels:
   - portcullis.egress.stripe=host:api.stripe.com,tcp:443
   - portcullis.egress.ntp=ip:162.159.200.1,udp:123
-  - portcullis.egress.internal=ip:10.20.0.0/16,tcp:80,tcp:443
+  - portcullis.egress.internal=ip:10.20.0.0/16,tcp:80,443
+  - portcullis.egress.peers=ip:public,tcp:*,udp:1024-65535
+  - portcullis.egress.stun=ip:public,udp:3478-3479
 ```
+
+Replies, and ICMP errors about a connection, always pass: `icmp` is only needed to send ICMP of the container's own, such as `ping`. A process that joins a multicast group makes the kernel report it to the host with IGMP (`ip:224.0.0.0/4,igmp`).
 
 The Docker host counts as a destination too. Traffic to any of its addresses (the network's gateway, its other interfaces) follows the egress labels, so a container can't reach services on the host, or other containers' published ports through the host, unless a label allows it:
 
@@ -346,7 +363,16 @@ The gateway's address depends on the network's subnet; give the network a fixed 
 
 Rules match the destination a container asked for. Docker reaches a published port through the host with DNAT when its userland proxy is off (`"userland-proxy": false`), and always from other networks, so the packet then goes to the container behind the port. A label naming the host's address and the published port still allows it, and a connection to another container's published port is never mistaken for traffic between containers on the same network.
 
-Egress labels don't apply to DNS (port 53) or to containers on the same network. DNS is controlled by the [DNS labels](#dns), and containers on the same network by the [ICC mode](#traffic-between-containers). Both are checked first.
+Egress labels don't apply to DNS (port 53) or to containers on the same network, not even `ip:*,*`. DNS is controlled by the [DNS labels](#dns), and containers on the same network by the [ICC mode](#traffic-between-containers). Both are checked first.
+
+### Names and patterns
+
+Every label that names something takes the same patterns: hostnames (`host:`), containers (`container:`) and the names a container may look up (`portcullis.domains`). A name is a list of labels separated by dots, and:
+
+- `*` within a label stands for any characters of that one label, none included. `*.example.com` matches `a.example.com`, but not `a.b.example.com` or `example.com`; `cdn-*.example.com` matches `cdn-1.example.com`.
+- `**` as the first label stands for one or more labels. `**.example.com` matches `a.example.com` and `a.b.example.com`, but not `example.com`.
+
+For a domain and everything below it, list both: `example.com` and `**.example.com`. Hostnames don't depend on case or a trailing dot. A hostname pattern has to name a domain: `*` or `**` alone are invalid, use `ip:*` or `ip:public` instead.
 
 ### Traffic between containers
 
@@ -361,12 +387,12 @@ portcullis.icc.mode=allow|deny|allow-listed
 - `allow-listed` blocks all of it except the entries you list:
 
 ```text
-portcullis.icc.allow.<name>=container:<target>,<protocol>:<port>[,<protocol>:<port>...]
+portcullis.icc.allow.<name>=container:<target>,<service>[,<service>...]
 ```
 
-The target is matched the way Docker's DNS resolves names from the source container:
+Services are those of [egress labels](#allowing-outbound-connections). The target is a container name, or a [pattern](#names-and-patterns) of one, matched the way Docker's DNS resolves names from the source container:
 
-- It matches a container name or a network alias. Compose gives every container its service name as an alias, so `container:db` works for a service called `db`, even though the container itself is named something like `myproject-db-1`.
+- It matches a container name or a network alias. Compose gives every container its service name as an alias, so `container:db` works for a service called `db`, even though the container itself is named something like `myproject-db-1`. `container:worker-*` matches every service whose name starts with `worker-`, and `container:*` every container on a shared network.
 - Only containers on a network the source container is also on can match, and only their addresses on that shared network are allowed.
 - If several containers match (a service scaled to more than one replica), all of them are allowed.
 
@@ -447,12 +473,12 @@ A container with `portcullis.domains` labels may only look up the names they lis
 portcullis.domains.<name>=<domain>[,<domain>...]
 ```
 
-A domain is a name (`api.stripe.com`), or a name with `*.` in front for any name below it (`*.stripe.com` allows `api.stripe.com` and `a.b.stripe.com`, not `stripe.com`). Names of the container's `host:` rules are always allowed too.
+A domain is a name (`api.stripe.com`) or a [pattern](#names-and-patterns): `*.stripe.com` allows `api.stripe.com`, `**.stripe.com` also `a.b.stripe.com`, and neither `stripe.com`. Names and patterns of the container's `host:` rules are always allowed too.
 
 ```yaml
 labels:
   - portcullis.egress.stripe=host:api.stripe.com,tcp:443
-  - portcullis.domains.github=*.github.com,github.com
+  - portcullis.domains.github=**.github.com,github.com
 ```
 
 Lookups of any other name fail at once (Docker's DNS answers `SERVFAIL`), and are reported as denied `dns` events naming the query. So is anything sent to port 53 that isn't a DNS query.
@@ -487,6 +513,8 @@ An IP firewall can't match hostnames, so a `host:` rule allows the addresses the
 - It inspects DNS answers to managed containers. The firewall holds each answer until Portcullis has added its addresses to the matching `host:` rules of the container that received it (a CNAME the name resolved through also counts), then releases it unchanged. If Portcullis isn't running or falls behind, answers go through uninspected rather than being lost, so DNS keeps working; addresses in them are then missing from `host:` rules until a later lookup. An answer only counts for that container: a container that may ask a resolver of its choice can't make another container's `host:` rules allow whatever that resolver claims. The container can connect to exactly the addresses it was told, including ones that change with every lookup (CDNs, DNS load balancing). Queries still go to the resolver the container uses; Portcullis never answers or changes them.
 - When a hostname has no known addresses, Portcullis resolves it itself through the host's resolver. That covers containers that resolved it before Portcullis started, and containers whose lookups it can't see.
 
+A [pattern](#names-and-patterns) (`host:*.archive.org`) can't be looked up, so it only allows addresses from DNS answers to the container for names it matches: Portcullis has to [see the container's lookups](#dns-visibility). Of an answer, only the addresses of the name asked for, and of the CNAMEs it resolved through, count.
+
 An address stays allowed for its DNS TTL, but at least `--hostname-hold` (an hour by default) after it was last seen, because applications often keep using an address longer than its TTL.
 
 If Portcullis stops reading them (after a crash, for example; a clean shutdown removes all rules), held answers are released anyway, so DNS keeps working.
@@ -503,6 +531,7 @@ Portcullis assumes a container may be compromised and actively try to get past i
 - When Docker gives a removed container's address to a new container, Portcullis deletes the old container's tracked connections first, so the new container can't keep using them.
 - Fragmented packets are put back together before the rules look at them, so fragments can't hide or rewrite ports.
 - Packets from a port Portcullis doesn't know yet (a container that just started) are held for at most 2 seconds and then denied. Flooding that queue makes the kernel drop them, it never lets them through. On networks in monitor mode the same queue lets them through instead.
+- Rule updates never misjudge packets that pass while the kernel puts them in place: an established connection isn't denied, nor reported as sent from an unknown source, and nothing gets past a check meanwhile. Starting Portcullis updates the rules a previous run left in place the same way, instead of creating them again. The `updates` end-to-end scenario floods traffic between containers and out while rules are updated dozens of times.
 - Addresses a container learns from DNS answers only count for its own `host:` rules, so a container that may ask a resolver of its choice can't widen anyone else's (see [Hostname rules](#hostname-rules)). What it learns is bounded too: at most 4096 addresses per hostname at a time.
 - Traffic denied for using someone else's address or MAC is dropped, not rejected, whatever `--deny-action` says: a rejection would only go back to the sender, addressed to someone else.
 
@@ -649,7 +678,7 @@ On networks in monitor mode the hold never denies anything: a packet whose sourc
 - DNS policies can't restrict everything a container resolves; see [What can and can't be controlled](#what-can-and-cant-be-controlled).
 - Filtering traffic between containers needs connection tracking for bridged traffic. The kernel loads the `nf_conntrack_bridge` module for this the first time Portcullis installs its rules.
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close, as long as the container keeps its address and MAC. Replies to incoming connections are always allowed, so published ports keep working.
-- A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too.
+- A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses (common with CDNs and shared hosting) is reachable too. A pattern allows the addresses of every name it matches: under a domain where anyone can create names (`*.cloudfront.net`, `*.github.io`), that is anyone's server.
 - If a hostname has no known addresses, its rules allow nothing until a container looks it up or Portcullis can resolve it. Everything else is applied as usual. Portcullis retries its own lookup every 30 seconds.
 - Domains on events are best effort. They are missing for containers whose DNS lookups Portcullis can't see, for connections to addresses obtained some other way, and for HTTPS hostnames (TLS SNI), which Portcullis doesn't look at.
 - DNS answers over TCP that span more than one packet aren't inspected; they still reach the container.
