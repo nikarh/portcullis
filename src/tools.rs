@@ -70,7 +70,7 @@ struct Findings {
     count: usize,
     /// `host:<domain>` or `ip:<address>` to services.
     egress: BTreeMap<String, Services>,
-    /// Destination container to services.
+    /// `container:<name>` or `multicast:<group>` to services.
     icc: BTreeMap<String, Services>,
     /// ICC destinations that aren't known containers.
     icc_unknown: BTreeSet<IpAddr>,
@@ -174,18 +174,17 @@ impl Report {
                 };
                 findings.egress.entry(target).or_default().insert(service);
             }
-            Reason::Icc => match &connection.destination_container {
-                Some(destination) => {
-                    findings
-                        .icc
-                        .entry(destination.clone())
-                        .or_default()
-                        .insert(service);
-                }
-                None => {
-                    findings.icc_unknown.extend(connection.destination);
-                }
-            },
+            Reason::Icc => {
+                let target = match (&connection.destination_container, connection.destination) {
+                    (Some(container), _) => format!("container:{container}"),
+                    (None, Some(group)) if group.is_multicast() => format!("multicast:{group}"),
+                    (None, destination) => {
+                        findings.icc_unknown.extend(destination);
+                        return;
+                    }
+                };
+                findings.icc.entry(target).or_default().insert(service);
+            }
             Reason::Dns => {
                 findings.dns.extend(connection.destination);
             }
@@ -228,11 +227,14 @@ impl Report {
                     out.push_str("    (IGMP: the container joins multicast groups; only needed when the host relays multicast, such as with igmpproxy)\n");
                 }
             }
-            for (destination, services) in &findings.icc {
+            for (target, services) in &findings.icc {
+                let name = target
+                    .split_once(':')
+                    .map_or(target.as_str(), |(_, name)| name);
                 let _ = writeln!(
                     out,
-                    "  portcullis.icc.allow.{}=container:{destination},{}",
-                    slug(destination),
+                    "  portcullis.icc.allow.{}={target},{}",
+                    slug(name),
                     service_list(services)
                 );
             }
@@ -240,10 +242,17 @@ impl Report {
                 out.push_str("    (with portcullis.icc.mode=allow-listed)\n");
             }
             for destination in &findings.icc_unknown {
-                let _ = writeln!(
-                    out,
-                    "  traffic to {destination} on the same network, which isn't a known container"
-                );
+                if *destination == IpAddr::from([255, 255, 255, 255]) {
+                    let _ = writeln!(
+                        out,
+                        "  broadcast to every container on the network, which labels can't allow"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "  traffic to {destination} on the same network, which isn't a known container"
+                    );
+                }
             }
             for resolver in &findings.dns {
                 let _ = writeln!(
@@ -519,6 +528,25 @@ jellyfin (3 denied or would-be-denied connections)
   portcullis.egress.224-0-0-22=ip:224.0.0.22,igmp
     (IGMP: the container joins multicast groups; only needed when the host relays multicast, such as with igmpproxy)
   IP protocol 41 to 192.0.2.1, which labels can't allow
+"
+        );
+    }
+
+    #[test]
+    fn suggests_multicast_groups_between_containers() {
+        let icc = |destination: &str, port: u16| {
+            format!(
+                r#"{{"time":"T","event":"connection","verdict":"would_deny","reason":"icc","container":"api","network":"n","protocol":"udp","source":"172.18.0.2","source_port":1,"destination":"{destination}","destination_port":{port},"destination_container":null,"domain":null,"domain_source":null,"query":null,"detail":null}}"#
+            )
+        };
+        let report = lines(&[&icc("224.2.2.3", 54327), &icc("255.255.255.255", 21027)]);
+        assert_eq!(
+            report.render(),
+            "\
+api (2 denied or would-be-denied connections)
+  portcullis.icc.allow.224-2-2-3=multicast:224.2.2.3,udp:54327
+    (with portcullis.icc.mode=allow-listed)
+  broadcast to every container on the network, which labels can't allow
 "
         );
     }

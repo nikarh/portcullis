@@ -29,7 +29,7 @@ use tracing::{error, trace};
 use crate::dns::{HostResolver, normalize};
 use crate::model::{
     BridgePort, ConnectionLimit, Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule,
-    IccMode, MacAddress, NetworkAttachment, Protocol, RuntimeState, Service,
+    IccMode, IccTarget, MacAddress, NetworkAttachment, Protocol, RuntimeState, Service,
 };
 use crate::pattern::NamePattern;
 
@@ -544,20 +544,32 @@ where
             .get_or_insert_with(|| IccTargets::build(state));
 
         for rule in allow_list {
-            let mut destinations: Vec<IpAddr> = targets
-                .lookup(attachment.network_id.as_str(), &rule.target_container)
-                .map(|target| target.address)
-                .filter(|destination| *destination != source && same_family(source, *destination))
-                .collect();
-            // A container matching by name and by alias is still one destination.
-            destinations.sort_unstable();
-            destinations.dedup();
+            let destinations: Vec<Destination> = match &rule.target {
+                IccTarget::Container(pattern) => {
+                    let mut addresses: Vec<IpAddr> = targets
+                        .lookup(attachment.network_id.as_str(), pattern)
+                        .map(|target| target.address)
+                        .filter(|destination| {
+                            *destination != source && same_family(source, *destination)
+                        })
+                        .collect();
+                    // A container matching by name and by alias is still one destination.
+                    addresses.sort_unstable();
+                    addresses.dedup();
+                    addresses.into_iter().map(Destination::Addr).collect()
+                }
+                // Before the denial of all multicast, see `deny_icc`.
+                IccTarget::Multicast(groups) if source.is_ipv4() => {
+                    vec![Destination::Net(IpNet::V4(*groups))]
+                }
+                IccTarget::Multicast(_) => Vec::new(),
+            };
 
             for destination in destinations {
                 self.plan
                     .rules
                     .extend(rule.services.iter().map(|service| Rule::Accept {
-                        destination: Destination::Addr(destination),
+                        destination,
                         service: *service,
                     }));
             }
@@ -604,7 +616,7 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct IccTarget<'s> {
+struct IccEntry<'s> {
     network_id: &'s str,
     key: &'s str,
     address: IpAddr,
@@ -617,7 +629,7 @@ struct IccTarget<'s> {
 /// deliberately not matched: they change on every recreate, so they can't be used in labels.
 /// A single sorted vector of borrowed keys: one allocation, binary search lookups.
 struct IccTargets<'s> {
-    entries: Vec<IccTarget<'s>>,
+    entries: Vec<IccEntry<'s>>,
 }
 
 impl<'s> IccTargets<'s> {
@@ -629,7 +641,7 @@ impl<'s> IccTargets<'s> {
                 let address = attachment.ip_address;
                 let keys = std::iter::once(container.name.as_str())
                     .chain(attachment.aliases.iter().map(String::as_str));
-                entries.extend(keys.map(|key| IccTarget {
+                entries.extend(keys.map(|key| IccEntry {
                     network_id,
                     key,
                     address,
@@ -646,7 +658,7 @@ impl<'s> IccTargets<'s> {
         &'a self,
         network_id: &'a str,
         pattern: &'a NamePattern,
-    ) -> impl Iterator<Item = &'a IccTarget<'s>> + 'a {
+    ) -> impl Iterator<Item = &'a IccEntry<'s>> + 'a {
         let entries = if pattern.is_exact() {
             let key = pattern.as_str();
             let start = self
@@ -920,7 +932,7 @@ mod tests {
             let mut state = test_support::icc_state();
             let mut web = state.containers().get("abc").cloned().expect("web fixture");
             if let Some(rule) = web.policy.icc_allow.first_mut() {
-                rule.target_container = NamePattern::container(key);
+                rule.target = crate::model::IccTarget::Container(NamePattern::container(key));
             }
             state.apply_action(crate::model::RuntimeStateAction::CreateContainer {
                 container: Box::new(web),
@@ -1001,6 +1013,32 @@ mod tests {
             source(&plan, "172.18.0.2").domains,
             Some(vec![NamePattern::host("*.archive.org")])
         );
+    }
+
+    #[test]
+    fn icc_allow_list_opens_multicast_groups_before_denying_the_rest() {
+        let mut state = test_support::icc_state();
+        let mut web = state.containers().get("abc").cloned().expect("web fixture");
+        web.policy.icc_allow.push(IccAllowRule {
+            target: IccTarget::Multicast("224.2.2.3/32".parse().expect("group")),
+            services: vec![Service::Protocol(
+                Protocol::Udp,
+                Some(crate::model::PortRange::single(54327)),
+            )],
+        });
+        state.apply_action(crate::model::RuntimeStateAction::CreateContainer {
+            container: Box::new(web),
+        });
+        let (plan, _) = build(&state);
+        let rules = icc_of(&plan, "172.18.0.2");
+        let position = |rule: &Rule| rules.iter().position(|candidate| candidate == rule);
+        let group = position(&Rule::Accept {
+            destination: Destination::Net(net("224.2.2.3/32")),
+            service: Service::Protocol(Protocol::Udp, Some(crate::model::PortRange::single(54327))),
+        })
+        .expect("group rule");
+        let multicast = position(&Rule::DenyNet(net("224.0.0.0/4"))).expect("multicast denial");
+        assert!(group < multicast, "{rules:#?}");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use ipnet::IpNet;
 use crate::dns::{DnsError, HostResolver};
 use crate::model::{
     Container, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
-    MacAddress, Network, NetworkAttachment, RuntimeState, RuntimeStateAction, Service,
+    IccTarget, MacAddress, Network, NetworkAttachment, RuntimeState, RuntimeStateAction, Service,
 };
 use crate::pattern::NamePattern;
 
@@ -176,7 +176,7 @@ pub fn icc_state() -> RuntimeState {
 
     let mut web = policy(IccMode::AllowListed, Vec::new());
     web.icc_allow = vec![IccAllowRule {
-        target_container: NamePattern::container("db"),
+        target: IccTarget::Container(NamePattern::container("db")),
         services: vec![tcp(5432)],
     }];
     add_container(
@@ -290,7 +290,7 @@ pub fn services_state() -> RuntimeState {
         ],
     );
     web.icc_allow = vec![IccAllowRule {
-        target_container: NamePattern::container("worker-*"),
+        target: IccTarget::Container(NamePattern::container("worker-*")),
         services: vec![Service::Any],
     }];
     add_container(

@@ -7,7 +7,7 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 
 use crate::pattern::NamePattern;
 
@@ -278,8 +278,17 @@ pub struct EgressRule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IccAllowRule {
-    pub target_container: NamePattern,
+    pub target: IccTarget,
     pub services: Vec<Service>,
+}
+
+/// What an ICC allow rule lets a container reach on its networks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IccTarget {
+    /// Containers whose name or alias matches (`container:`).
+    Container(NamePattern),
+    /// Multicast groups (`multicast:`), which reach every container on the network.
+    Multicast(Ipv4Net),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,15 +1,15 @@
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
 use indexmap::IndexMap;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use thiserror::Error;
 
 use crate::events::WarningKind;
 use crate::model::{
     ConnectionLimit, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
-    PortRange, Protocol, Service,
+    IccTarget, PortRange, Protocol, Service,
 };
 use crate::pattern::{NameKind, NamePattern};
 
@@ -373,22 +373,32 @@ fn parse_icc_allow_value(key: &str, value: &str) -> Result<IccAllowRule, LabelPa
         ));
     };
 
-    let (kind, target) = split_once_colon(key, target_part)?;
-    if kind != "container" {
-        return Err(LabelParseError::InvalidContainerTarget(
-            key.to_string(),
-            (*target_part).to_string(),
-        ));
-    }
-    let target_container = NamePattern::parse(target, NameKind::Container).map_err(|_| {
-        LabelParseError::InvalidContainerTarget(key.to_string(), (*target_part).to_string())
-    })?;
+    let (kind, value) = split_once_colon(key, target_part)?;
+    let invalid =
+        || LabelParseError::InvalidContainerTarget(key.to_string(), (*target_part).to_string());
+    let target = match kind {
+        "container" => NamePattern::parse(value, NameKind::Container)
+            .map(IccTarget::Container)
+            .map_err(|_| invalid())?,
+        "multicast" => IccTarget::Multicast(parse_multicast(value).ok_or_else(invalid)?),
+        _ => return Err(invalid()),
+    };
 
     let services = parse_services(key, service_parts)?;
-    Ok(IccAllowRule {
-        target_container,
-        services,
-    })
+    Ok(IccAllowRule { target, services })
+}
+
+/// A multicast group, a range of groups, or `*` for all of them (`224.0.0.0/4`).
+fn parse_multicast(value: &str) -> Option<Ipv4Net> {
+    let all = Ipv4Net::new(Ipv4Addr::new(224, 0, 0, 0), 4).ok()?;
+    if value == "*" {
+        return Some(all);
+    }
+    let groups = Ipv4Net::from_str(value)
+        .or_else(|_| Ipv4Addr::from_str(value).map(Ipv4Net::from))
+        .ok()?
+        .trunc();
+    all.contains(&groups).then_some(groups)
 }
 
 fn split_once_colon<'a>(key: &str, part: &'a str) -> Result<(&'a str, &'a str), LabelParseError> {
@@ -539,8 +549,8 @@ mod tests {
         );
         assert_eq!(parsed.icc_allow.len(), 1);
         assert_eq!(
-            parsed.icc_allow[0].target_container,
-            NamePattern::container("db")
+            parsed.icc_allow[0].target,
+            IccTarget::Container(NamePattern::container("db"))
         );
         assert_eq!(parsed.icc_allow[0].services, [Service::tcp(5432)]);
         assert_eq!(parsed.dns_targets, vec![DnsTarget::Docker]);
@@ -632,8 +642,8 @@ mod tests {
         assert_eq!(parsed.icc_mode, IccMode::AllowListed);
         assert_eq!(parsed.icc_allow.len(), 1);
         assert_eq!(
-            parsed.icc_allow[0].target_container,
-            NamePattern::container("redis")
+            parsed.icc_allow[0].target,
+            IccTarget::Container(NamePattern::container("redis"))
         );
     }
 
@@ -757,6 +767,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_multicast_groups() {
+        let target = |value: &str| {
+            parse_strict(&labels(&[(
+                "portcullis.icc.allow.x",
+                &format!("{value},udp:5353"),
+            )]))
+            .map(|policy| policy.icc_allow[0].target.clone())
+        };
+        let group = |value: &str| Ok(IccTarget::Multicast(value.parse().expect("group")));
+        assert_eq!(target("multicast:224.0.0.251"), group("224.0.0.251/32"));
+        assert_eq!(target("multicast:239.0.0.0/8"), group("239.0.0.0/8"));
+        assert_eq!(target("multicast:*"), group("224.0.0.0/4"));
+        for invalid in [
+            "multicast:",
+            "multicast:10.0.0.1",
+            "multicast:0.0.0.0/0",
+            "multicast:224.0.0.0/3",
+            "multicast:255.255.255.255",
+            "multicast:ff02::fb",
+            "multicast:mdns",
+        ] {
+            assert!(target(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn parses_container_patterns() {
         let parsed = parse_strict(&labels(&[
             (
@@ -767,12 +803,12 @@ mod tests {
         ]))
         .expect("parser should not fail");
         assert_eq!(
-            parsed.icc_allow[0].target_container,
-            NamePattern::container("app-worker-*")
+            parsed.icc_allow[0].target,
+            IccTarget::Container(NamePattern::container("app-worker-*"))
         );
         assert_eq!(
-            parsed.icc_allow[1].target_container,
-            NamePattern::container("*")
+            parsed.icc_allow[1].target,
+            IccTarget::Container(NamePattern::container("*"))
         );
         assert!(
             parse_strict(&labels(&[(
