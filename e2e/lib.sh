@@ -3,7 +3,7 @@
 
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${E2E_DIR}/.." && pwd)"
-PORTCULLIS_BIN="${PROJECT_ROOT}/target/release/portcullis"
+PORTCULLIS_BIN="${PORTCULLIS_BIN:-${PROJECT_ROOT}/target/release/portcullis}"
 TESTER_IMAGE=portcullis-e2e-tester
 
 FAILURES=0

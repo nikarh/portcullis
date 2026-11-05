@@ -14,13 +14,13 @@ The host needs `qemu-system-x86_64`, `genisoimage` (or `mkisofs`), `ssh`, `rsync
 
 CI runs the suite the same way on every push (`.github/workflows/ci.yml`), on a GitHub runner with KVM.
 
-`e2e/vm.sh` manages the VM on its own: `up`, `sync` (copy the working tree and build), `ssh [command]`, `down`, and `destroy` (delete the disk).
+`e2e/vm.sh` manages the VM on its own: `up`, `sync` (copy the working tree and build), `ssh [command]`, `down`, and `destroy` (delete the disk). To run the suite against another build (an older version, to see a check fail), set `PORTCULLIS_BIN` to its path in the VM for `suite.sh`.
 
 ## How it works
 
 `suite.sh` runs inside the VM as root. It starts Portcullis (with an event socket, and an alert hook appending to a file), runs every scenario, stops Portcullis with SIGTERM, checks that its rules stayed in place and that `portcullis cleanup` removes them. Then it repeats two scenarios with `--deny-action drop` and `--on-exit remove`, and checks that stopping removed the rules.
 
-Outbound targets live in a network namespace routed from the Docker host (`outside.sh`), so traffic to them is forwarded and filtered like traffic to the internet. It serves TCP 80, 443 and 8080 and UDP 9000 on `198.51.100.2` to `.5`, and a DNS server on `198.51.100.2` that resolves `api.test` to `.3`, `other.test` to `.4` and `dyn.test` to `.5`. The Docker host resolves `api.test` and `other.test` through `/etc/hosts`, but not `dyn.test`, so Portcullis can only learn its address from a container's lookup.
+Outbound targets live in a network namespace routed from the Docker host (`outside.sh`), so traffic to them is forwarded and filtered like traffic to the internet. It serves TCP 80, 443 and 8080 and UDP 9000 on `198.51.100.2` to `.5`, and a DNS server on `198.51.100.2` that resolves `api.test` to `.3`, `other.test` to `.4` and `dyn.test` to `.5`. The Docker host resolves `api.test` and `other.test` through `/etc/hosts`, but not `dyn.test`, so Portcullis can only learn its address from a container's lookup. The same services listen on the public addresses `11.22.33.2` to `.5` (`198.51.100.0/24` is a documentation range, which `ip:public` leaves out), and the Docker host has the public address `11.22.33.1` of its own. The DNS server also answers names for patterns: `one.wild.test`, `deep.two.wild.test`, `wild.test`, `evilwild.test`, `s1.sub.test` and `t1.sub.test`, each with its own public address.
 
 Each scenario in `scenarios/<name>/` is a Compose project on a network with `portcullis.enable=true`, plus a `test.sh` with checks. No check waits for a timeout to pass:
 
@@ -36,10 +36,12 @@ The scenario also tries ARP from another container's MAC or claiming the gateway
 
 The `checks` scenario starts containers with configurations that get around the rules (a second network that isn't enforced, host networking, a shared network namespace, the Docker socket, `NET_ADMIN`, IPv6) and checks their warnings in the alert log, and that acknowledged ones stay quiet. The `flood` scenario checks quarantine (for a spoofed packet, and for too many denials), release on restart, and the connection limits. The `domains` scenario checks that a container with `portcullis.domains` labels can only look up the names they list, through Docker's DNS, directly, and over TCP.
 
+The `patterns` scenario checks port ranges and lists, protocols without ports, `*`, `ip:*` and `ip:public` (not the host, through any of its addresses or a published port, nor private, shared or link-local addresses), and name patterns of `host:`, `container:` and `portcullis.domains`: that a pattern doesn't match its domain itself, names a level too deep, or names that only end the same, and that `*` doesn't open DNS. The `updates` scenario floods traffic between two containers and out while containers starting and stopping make Portcullis update its rules dozens of times, and checks that no packet is lost and nothing of theirs is reported as denied.
+
 The `boot` scenario plays a reboot: it stops Portcullis, deletes its tables (as a reboot would) and stops Docker, then starts Portcullis with a stand-in for systemd's notification socket (`wait-ready.py`), checks that the saved rules are back before Docker runs, and starts Docker, whose `restart: always` container tries a listed and an unlisted destination right away.
 
 To check what happens before Portcullis has applied rules for a container, the `fast-start` scenario stops Portcullis with SIGSTOP, starts a container that sends right away, and resumes Portcullis with SIGCONT.
 
 The `monitor-start` scenario checks that Portcullis finds containers without Docker (see "Finding new containers" in the README): Portcullis talks to Docker through a `socat` proxy, which the scenario pauses with SIGSTOP while containers start on a monitored and an enforced network. Their first connections must be reported with the container, and the enforced one's labels (read from Docker's files) must decide its traffic. It also checks, on the monitored network, that a veth on the bridge with no container behind it is let through after its hold and reported as an unknown source, that a spoofed address is reported with its sender, and that nothing is held while Portcullis is stopped.
 
-Probes (`tcp`, `udp`, `dns`, `resolve`, `from_outside`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname. The checks of a scenario run in parallel; a failed check prints the probe's output.
+Probes (`tcp`, `udp`, `dns`, `resolve`, `ping_probe`, `from_outside`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname. The checks of a scenario run in parallel; a failed check prints the probe's output.

@@ -1,0 +1,21 @@
+# Traffic between two containers, and out, while the rules are updated again and again.
+services:
+  client:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.server=container:server,*
+      - portcullis.egress.out=ip:198.51.100.3,icmp
+  server:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=deny
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

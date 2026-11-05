@@ -28,6 +28,8 @@ SCENARIOS=(
   checks
   flood
   domains
+  patterns
+  updates
   boot
 )
 

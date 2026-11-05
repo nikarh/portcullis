@@ -1,0 +1,94 @@
+# Name patterns, ports, protocols, and destinations of any and public addresses, as every
+# label takes them; see outside.sh for the names and addresses.
+services:
+  ports:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.range=ip:198.51.100.2,tcp:443-8080
+      - portcullis.egress.list=ip:198.51.100.3,tcp:80,8080
+      # Runs a DNS server: DNS still only goes where the DNS labels allow.
+      - portcullis.egress.any=ip:198.51.100.4,*
+      - portcullis.egress.udp=ip:198.51.100.5,udp:*
+      - portcullis.egress.ping=ip:11.22.33.2,icmp
+  public:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.public=ip:public,tcp:*
+  anywhere:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.any=ip:*,tcp:*
+  # One level below wild.test.
+  wild:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.egress.wild=host:*.wild.test,tcp:80
+  # Any level below wild.test.
+  deep:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.egress.wild=host:**.wild.test,tcp:80
+  # A wildcard within a label.
+  glob:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.egress.sub=host:s*.sub.test,tcp:80
+  # May only look up names one level below wild.test.
+  names:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.domains.wild=*.wild.test
+  client:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [icc]
+    labels:
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.workers=container:worker-*,tcp:8080
+      - portcullis.icc.allow.ping=container:*,icmp
+  worker-a:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [icc]
+  worker-b:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [icc]
+  db:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [icc]
+  # A published port, on a network Portcullis doesn't enforce.
+  web:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [side]
+    ports:
+      - "18081:8080"
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true
+  icc:
+    labels:
+      - portcullis.enable=true
+  side: {}
