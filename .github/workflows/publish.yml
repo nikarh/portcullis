@@ -241,7 +241,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: scripts/apt-repo.sh "$REPO" ${{ env.TAG == 'latest' && 100 || 0 }} release/portcullis_amd64.deb release/portcullis_arm64.deb
-      # Added as a user would (see the README).
+      # Added as a user would (see Installation in the docs).
       - name: Check apt sees the new version
         run: |
           set -euo pipefail

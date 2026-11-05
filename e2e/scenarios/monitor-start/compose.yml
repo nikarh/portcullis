@@ -1,6 +1,6 @@
 # Containers that start while Docker's API doesn't answer Portcullis: Portcullis has to find
 # them from their bridge ports, the kernel and Docker's files (see "Finding new containers"
-# in the README). One network is in monitor mode, the other enforced.
+# in the docs). One network is in monitor mode, the other enforced.
 services:
   # Keep both networks managed, and serve ICC.
   peer:

@@ -33,7 +33,7 @@ sign() {
 if ! gh release view "${tag}" >/dev/null 2>&1; then
   # A pre-release, so that releases/latest stays the newest vX.Y.Z.
   gh release create "${tag}" --prerelease --latest=false --title "pacman repository (${tag})" \
-    --notes "The \`${repo}\` pacman repository, see the README. Updated by the Publish workflow."
+    --notes "The \`${repo}\` pacman repository, see https://nikarh.github.io/portcullis/start/installation/. Updated by the Publish workflow."
 fi
 assets=$(gh release view "${tag}" --json assets --jq '.assets | sort_by(.createdAt) | .[].name')
 if grep -qxF "${file}" <<<"${assets}"; then

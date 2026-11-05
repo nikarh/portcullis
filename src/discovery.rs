@@ -10,7 +10,7 @@
 //! what is found here once it arrives.
 //!
 //! A container can change its own interface's address only with `NET_ADMIN`, which
-//! Portcullis can't restrain anyway (see the README).
+//! Portcullis can't restrain anyway (see "Limitations" in the docs).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
