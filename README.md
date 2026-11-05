@@ -400,7 +400,13 @@ Services are those of [egress labels](#allowing-outbound-connections). The targe
 
 Container IDs are not accepted, since they change every time a container is recreated.
 
-With `deny` and `allow-listed`, broadcast (`255.255.255.255`) and multicast (`224.0.0.0/4`) traffic is blocked too, since the bridge delivers it to every container on the network.
+With `deny` and `allow-listed`, broadcast (`255.255.255.255`) and multicast (`224.0.0.0/4`) traffic is blocked too, since the bridge delivers it to every container on the network. An `allow-listed` container can be let send to multicast groups:
+
+```text
+portcullis.icc.allow.<name>=multicast:<group>,<service>[,<service>...]
+```
+
+The group is an address (`224.0.0.251`), a range (`239.0.0.0/8`), or `*` for any. Members of a cluster that find each other by multicast need it, such as Hazelcast (`224.2.2.3`, UDP 54327) or JGroups' UDP stack (Infinispan, Keycloak); so do services that announce themselves over mDNS (`224.0.0.251`, UDP 5353) to others on the network. Every container on the network receives what is sent to a group it joined, whatever its own labels: they only decide what a container sends. Answers to multicast are usually sent to the sender's own address, which takes a `container:` rule. Broadcast can't be allowed.
 
 The mode only controls connections the container starts. Whether others can reach it is decided by their own labels.
 
@@ -643,6 +649,28 @@ networks:
 ```
 
 `db` and `redis` can still answer the API's connections; the `deny` mode only stops them from opening their own.
+
+Replicas of a service that form a cluster, finding each other by multicast (Hazelcast here) and talking to each other on TCP 5701, while the API may only reach them on 5701:
+
+```yaml
+services:
+  cache:
+    image: hazelcast/hazelcast:5.5
+    deploy:
+      replicas: 3
+    networks: [backend]
+    labels:
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.discovery=multicast:224.2.2.3,udp:54327
+      - portcullis.icc.allow.members=container:cache,tcp:5701
+
+  api:
+    image: ghcr.io/acme/api:latest
+    networks: [backend]
+    labels:
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.cache=container:cache,tcp:5701
+```
 
 A container that runs its own resolver against a public DNS server:
 
