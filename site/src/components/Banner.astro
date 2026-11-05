@@ -1,0 +1,53 @@
+---
+// Starlight's banner, plus a notice on every page of docs that aren't the latest release's.
+import Default from '@astrojs/starlight/components/Banner.astro';
+const version = import.meta.env.DOCS_VERSION;
+---
+
+<Default />
+<portcullis-version-notice data-version={version} data-pagefind-ignore hidden>
+	<p></p>
+</portcullis-version-notice>
+
+<script>
+	import { loadVersions, versionUrl } from '../versions';
+
+	class VersionNotice extends HTMLElement {
+		async connectedCallback() {
+			const current = this.dataset.version!;
+			const versions = await loadVersions();
+			if (!versions?.latest || current === versions.latest) return;
+			const text =
+				current === 'main'
+					? 'This is the documentation of main, which has changes not released yet.'
+					: `This is the documentation of ${current}, an older release.`;
+			const link = document.createElement('a');
+			link.textContent = `Read it for ${versions.latest}, the latest release`;
+			link.href = await versionUrl(current, versions.latest);
+			this.querySelector('p')!.replaceChildren(`${text} `, link, '.');
+			this.hidden = false;
+		}
+	}
+	customElements.define('portcullis-version-notice', VersionNotice);
+</script>
+
+<style>
+	portcullis-version-notice {
+		display: block;
+		padding: 0.5rem var(--sl-nav-pad-x);
+		background: var(--sl-color-accent-low);
+		color: var(--sl-color-accent-high);
+		border-bottom: 1px solid var(--sl-color-hairline-light);
+		font-size: var(--sl-text-sm);
+		text-align: center;
+		text-wrap: balance;
+	}
+	portcullis-version-notice[hidden] {
+		display: none;
+	}
+	portcullis-version-notice :global(a) {
+		color: inherit;
+		font-weight: 600;
+		text-underline-offset: 0.2em;
+	}
+</style>

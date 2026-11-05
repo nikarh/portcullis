@@ -1,0 +1,26 @@
+---
+// The portcullis grille: a beam, four bars ending in spikes, two cross bars. Drawn in currentColor.
+interface Props {
+	size?: number;
+	class?: string;
+}
+const { size = 24, class: className } = Astro.props;
+---
+
+<svg
+	class={className}
+	width={size}
+	height={size}
+	viewBox="0 0 32 32"
+	fill="none"
+	stroke="currentColor"
+	stroke-width="2.4"
+	aria-hidden="true"
+>
+	<path d="M3 4.5h26M4 11h24M4 17.5h24M7 4.5v18M12.33 4.5v18M19.67 4.5v18M25 4.5v18" />
+	<path
+		d="M5.3 22h3.4L7 28zM10.63 22h3.4l-1.7 6zM17.97 22h3.4l-1.7 6zM23.3 22h3.4L25 28z"
+		fill="currentColor"
+		stroke="none"
+	/>
+</svg>

@@ -1,0 +1,334 @@
+---
+// The front page: what Portcullis does, shown as a policy next to the decisions it produces, then what it covers,
+// how to install it, and where to read on.
+import { Code, Tabs, TabItem } from '@astrojs/starlight/components';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const link = (path: string) => `${base}${path}`;
+
+const compose = `services:
+  billing:
+    image: ghcr.io/acme/billing:latest
+    networks: [backend]
+    labels:
+      - portcullis.egress.stripe=host:api.stripe.com,tcp:443
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.db=container:db,tcp:5432
+
+networks:
+  backend:
+    labels:
+      - portcullis.enable=true`;
+
+const events = [
+	{ verdict: 'allowed', reason: 'egress', to: 'api.stripe.com (104.18.3.4)', service: 'tcp/443' },
+	{ verdict: 'allowed', reason: 'icc', to: 'db (172.18.0.5)', service: 'tcp/5432' },
+	{ verdict: 'DENIED', reason: 'egress', to: 'pastebin.com (104.20.67.143)', service: 'tcp/443' },
+	{ verdict: 'DENIED', reason: 'icc', to: 'redis (172.18.0.6)', service: 'tcp/6379' },
+	{ verdict: 'DENIED', reason: 'egress', to: '172.18.0.1', service: 'tcp/22' },
+];
+
+const covers = [
+	['Outbound connections', 'Destinations by address, range, public internet, or hostname and pattern, per protocol and port.', '/policy/egress/'],
+	['Containers on the same network', 'Allow all, deny all, or only named containers and multicast groups.', '/policy/icc/'],
+	['DNS', 'Which resolvers a container may use, and which names it may look up, so lookups can’t carry data out.', '/policy/dns/'],
+	['Spoofing and floods', 'Frames must come from the container’s own bridge port, address and MAC. Misbehaving containers are cut off.', '/internals/bypass/'],
+	['Monitor mode', 'Report what a policy would deny before enforcing it, and turn the reports into labels.', '/guides/rollout/'],
+	['Boot and failure', 'Rules are back in place before Docker starts, and stay in place while Portcullis restarts.', '/guides/service/'],
+];
+---
+
+<div class="home not-content">
+	<section class="intro">
+		<div class="lead">
+			<p class="summary">
+				A daemon for the Docker host that limits what containers can connect to. You put the policy in labels next to
+				the service; Portcullis turns it into nftables rules and keeps them current as containers come and go.
+			</p>
+			<p>
+				Enforced networks deny everything by default. Each container gets back the destinations its labels list, and
+				every decision is reported with the container, the destination and its domain.
+			</p>
+			<div class="actions">
+				<a class="button primary" href={link('/start/quick-start/')}>Quick start</a>
+				<a class="button" href={link('/start/introduction/')}>Read the docs</a>
+				<a class="button" href="https://github.com/nikarh/portcullis">Source on GitHub</a>
+			</div>
+			<p class="meta">Linux, Docker bridge networks, IPv4. MIT or Apache-2.0. Written in Rust.</p>
+		</div>
+		<div class="demo">
+			<Code code={compose} lang="yaml" title="docker-compose.yml" />
+			<div class="events" role="figure" aria-label="Events the policy produces, from portcullis watch">
+				<div class="events-title">sudo portcullis watch</div>
+				<ol>
+					{
+						events.map((event) => (
+							<li>
+								<span class:list={['verdict', event.verdict === 'DENIED' ? 'v-denied' : 'v-allowed']}>
+									{event.verdict}
+								</span>
+								<span class="reason">{event.reason}</span>
+								<span class="arrow">billing →</span>
+								<span class="to">{event.to}</span>
+								<span class="service">{event.service}</span>
+							</li>
+						))
+					}
+				</ol>
+			</div>
+		</div>
+	</section>
+
+	<section class="covers">
+		<h2>What a policy covers</h2>
+		<dl>
+			{
+				covers.map(([term, text, href]) => (
+					<div>
+						<dt>
+							<a href={link(href!)}>{term}</a>
+						</dt>
+						<dd>{text}</dd>
+					</div>
+				))
+			}
+		</dl>
+	</section>
+
+	<section class="install">
+		<h2>Install</h2>
+		<p>
+			Packages for Debian, Ubuntu and Arch Linux, x86_64 and aarch64, signed. Details and other systems
+			are in <a href={link('/start/installation/')}>Installation</a>.
+		</p>
+		<Tabs syncKey="distro">
+			<TabItem label="Debian / Ubuntu">
+				<Code
+					lang="bash"
+					code={`sudo install -d /etc/apt/keyrings
+curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc \\
+  | sudo tee /etc/apt/keyrings/portcullis.asc >/dev/null
+printf '%s\\n' 'Types: deb' \\
+  'URIs: https://github.com/nikarh/portcullis/releases/download/apt/' \\
+  'Suites: ./' 'Signed-By: /etc/apt/keyrings/portcullis.asc' \\
+  | sudo tee /etc/apt/sources.list.d/portcullis.sources >/dev/null
+sudo apt update && sudo apt install portcullis`}
+				/>
+			</TabItem>
+			<TabItem label="Arch Linux">
+				<Code
+					lang="bash"
+					code={`curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key 33DD9B9FB720453D48136F2EB90B594ECF87B58B
+printf '\\n[portcullis]\\nServer = https://github.com/nikarh/portcullis/releases/download/pacman-$arch\\n' \\
+  | sudo tee -a /etc/pacman.conf
+sudo pacman -Syu portcullis && sudo systemctl enable --now portcullis`}
+				/>
+			</TabItem>
+		</Tabs>
+	</section>
+
+	<section class="next">
+		<h2>Reading order</h2>
+		<ol>
+			<li><a href={link('/start/introduction/')}>Introduction</a>: the model, and what Portcullis isn’t.</li>
+			<li><a href={link('/start/quick-start/')}>Quick start</a>: observe, write labels, enforce, on one host.</li>
+			<li><a href={link('/policy/overview/')}>Policy labels</a>: every label, and how a packet is decided.</li>
+			<li><a href={link('/examples/single-api/')}>Examples</a>: complete Compose files for common setups.</li>
+			<li><a href={link('/limits/limitations/')}>Limitations</a> and <a href={link('/limits/escape-hatches/')}>workarounds</a>: what it can’t do, and what to use instead.</li>
+		</ol>
+	</section>
+</div>
+
+<style>
+	.home {
+		--gap: clamp(1.5rem, 4vw, 3rem);
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: calc(var(--gap) * 1.25);
+		margin-top: 0.5rem;
+	}
+	.home > *,
+	.intro > * {
+		min-width: 0;
+	}
+	.home h2 {
+		font-size: var(--sl-text-xl);
+		font-weight: 650;
+		letter-spacing: -0.01em;
+		color: var(--sl-color-white);
+		margin: 0 0 1rem;
+	}
+	.home a {
+		color: var(--sl-color-text-accent);
+		text-underline-offset: 0.2em;
+		text-decoration-thickness: 1px;
+	}
+
+	.intro {
+		display: grid;
+		grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+		gap: var(--gap);
+		align-items: start;
+	}
+	.lead p {
+		color: var(--sl-color-gray-2);
+		line-height: 1.65;
+		margin: 0 0 1rem;
+		max-width: 38rem;
+	}
+	.lead .summary {
+		font-size: var(--sl-text-xl);
+		line-height: 1.5;
+		color: var(--sl-color-white);
+		text-wrap: pretty;
+	}
+	.actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.6rem;
+		margin: 1.5rem 0 1.25rem;
+	}
+	.button {
+		display: inline-flex;
+		align-items: center;
+		padding: 0.5rem 0.95rem;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: 6px;
+		font-size: var(--sl-text-sm);
+		font-weight: 600;
+		color: var(--sl-color-white) !important;
+		text-decoration: none;
+		transition: border-color 160ms cubic-bezier(0.16, 1, 0.3, 1), background-color 160ms cubic-bezier(0.16, 1, 0.3, 1);
+	}
+	.button:hover {
+		border-color: var(--sl-color-gray-3);
+		background: var(--sl-color-gray-6);
+	}
+	.button.primary {
+		background: var(--sl-color-accent);
+		border-color: var(--sl-color-accent);
+		color: var(--sl-color-black) !important;
+	}
+	.button.primary:hover {
+		background: var(--sl-color-accent-high);
+		border-color: var(--sl-color-accent-high);
+	}
+	.lead .meta {
+		font-size: var(--sl-text-sm);
+		color: var(--sl-color-gray-3);
+	}
+
+	.demo {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: 0.75rem;
+		min-width: 0;
+	}
+	.events {
+		border: 1px solid var(--sl-color-hairline-light);
+		border-radius: 6px;
+		background: var(--sl-color-gray-6);
+		font-family: var(--__sl-font-mono);
+		font-size: 0.78rem;
+		overflow-x: auto;
+	}
+	.events-title {
+		padding: 0.45rem 1rem;
+		border-bottom: 1px solid var(--sl-color-hairline-light);
+		color: var(--sl-color-gray-3);
+	}
+	.events-title::before {
+		content: '$ ';
+	}
+	.events ol {
+		list-style: none;
+		margin: 0;
+		padding: 0.6rem 1rem 0.75rem;
+		display: grid;
+		gap: 0.15rem;
+	}
+	.events li {
+		display: grid;
+		grid-template-columns: 4.75rem 3.75rem auto auto 1fr;
+		gap: 0.6rem;
+		white-space: nowrap;
+		color: var(--sl-color-gray-2);
+		margin: 0;
+	}
+	.events .verdict.v-denied,
+	.events .verdict.v-allowed {
+		font-size: inherit;
+	}
+	.events .reason,
+	.events .arrow {
+		color: var(--sl-color-gray-3);
+	}
+	.events .to {
+		color: var(--sl-color-white);
+	}
+	.events .service {
+		color: var(--sl-color-gray-3);
+	}
+
+	.covers dl {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 0;
+		margin: 0;
+		border-top: 1px solid var(--sl-color-hairline-light);
+	}
+	.covers dl > div {
+		padding: 1rem 1.25rem 1.1rem 0;
+		border-bottom: 1px solid var(--sl-color-hairline);
+	}
+	.covers dt {
+		font-weight: 650;
+		margin-bottom: 0.3rem;
+	}
+	.covers dt a {
+		color: var(--sl-color-white);
+		text-decoration: none;
+	}
+	.covers dt a:hover {
+		color: var(--sl-color-text-accent);
+		text-decoration: underline;
+	}
+	.covers dd {
+		margin: 0;
+		color: var(--sl-color-gray-2);
+		font-size: var(--sl-text-sm);
+		line-height: 1.55;
+	}
+
+	.install p,
+	.next li {
+		color: var(--sl-color-gray-2);
+	}
+	.install p {
+		margin: 0 0 1rem;
+	}
+	.next ol {
+		margin: 0;
+		padding-left: 1.25rem;
+		display: grid;
+		gap: 0.35rem;
+	}
+
+	@media (max-width: 64rem) {
+		.intro {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.covers dl {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+	@media (max-width: 40rem) {
+		.covers dl {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.lead .summary {
+			font-size: var(--sl-text-lg);
+		}
+	}
+</style>

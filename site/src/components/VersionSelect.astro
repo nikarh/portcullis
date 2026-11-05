@@ -1,0 +1,88 @@
+---
+// Switches between the versions of the docs on GitHub Pages. Each version lives under /portcullis/<version>/;
+// /portcullis/versions.json (written by scripts/docs-deploy.sh) lists them, newest first, `main` at the top.
+// Read at run time, so the docs of an old release offer the releases made after it too.
+const version = import.meta.env.DOCS_VERSION;
+---
+
+<portcullis-version-select data-version={version}>
+	<label class="version">
+		<span class="sr-only">Documentation version</span>
+		<select autocomplete="off" aria-label="Documentation version">
+			<option value={version} selected>{version}</option>
+		</select>
+		<svg class="caret" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+			<path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" />
+		</svg>
+	</label>
+</portcullis-version-select>
+
+<script>
+	import { loadVersions, versionUrl } from '../versions';
+
+	class VersionSelect extends HTMLElement {
+		async connectedCallback() {
+			const current = this.dataset.version!;
+			const select = this.querySelector('select')!;
+			const versions = await loadVersions();
+			if (!versions) return;
+			select.replaceChildren(
+				...versions.all.map((name) => {
+					const label = name === 'main' ? 'main (unreleased)' : name === versions.latest ? `${name} (latest)` : name;
+					return new Option(label, name, false, name === current);
+				}),
+			);
+			if (!versions.all.includes(current)) select.prepend(new Option(current, current, true, true));
+			select.addEventListener('change', async () => {
+				window.location.href = await versionUrl(current, select.value);
+			});
+			// A page restored from the back/forward cache keeps the option picked before leaving it.
+			window.addEventListener('pageshow', () => (select.value = current));
+		}
+	}
+	customElements.define('portcullis-version-select', VersionSelect);
+</script>
+
+<style>
+	.version {
+		position: relative;
+		display: flex;
+		align-items: center;
+		color: var(--sl-color-gray-2);
+	}
+	.version:hover {
+		color: var(--sl-color-white);
+	}
+	select {
+		appearance: none;
+		font: inherit;
+		font-family: var(--__sl-font-mono);
+		font-size: var(--sl-text-xs);
+		color: inherit;
+		background: var(--sl-color-gray-6);
+		border: 1px solid var(--sl-color-hairline-light);
+		border-radius: 4px;
+		padding: 0.15rem 1.5rem 0.15rem 0.5rem;
+		cursor: pointer;
+		max-width: 11rem;
+		text-overflow: ellipsis;
+	}
+	@media (max-width: 50rem) {
+		select {
+			max-width: 7.5rem;
+		}
+	}
+	select:focus-visible {
+		outline: 2px solid var(--sl-color-accent);
+		outline-offset: 1px;
+	}
+	select :global(option) {
+		background-color: var(--sl-color-bg-nav);
+		color: var(--sl-color-gray-1);
+	}
+	.caret {
+		position: absolute;
+		right: 0.45rem;
+		pointer-events: none;
+	}
+</style>

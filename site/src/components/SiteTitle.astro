@@ -1,0 +1,38 @@
+---
+// The site title with the portcullis mark, and the version switcher next to it.
+import Mark from './Mark.astro';
+import VersionSelect from './VersionSelect.astro';
+const { siteTitle, siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<div class="title-group">
+	<a href={siteTitleHref} class="site-title">
+		<Mark size={22} class="mark" />
+		<span translate="no">{siteTitle}</span>
+	</a>
+	<VersionSelect />
+</div>
+
+<style>
+	.title-group {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		min-width: 0;
+	}
+	.site-title {
+		display: flex;
+		align-items: center;
+		gap: 0.55rem;
+		font-size: var(--sl-text-lg);
+		font-weight: 650;
+		letter-spacing: -0.01em;
+		color: var(--sl-color-white);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.mark {
+		color: var(--sl-color-accent);
+		flex: none;
+	}
+</style>

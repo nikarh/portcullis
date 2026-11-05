@@ -1,4 +1,9 @@
-# Releasing
+---
+title: Releasing
+description: How releases, builds of main, packages, repositories and docs are published, and the one-time setup behind them.
+sidebar:
+  order: 3
+---
 
 ## How a release happens
 
@@ -10,6 +15,8 @@
    binary as `.deb` and Arch Linux packages with [nfpm](https://nfpm.goreleaser.com/) (`scripts/package.sh`, config
    in `dist/packaging/`), checks that the `.deb` installs, starts and purges, writes `SHA256SUMS` and its GPG signature, and
    uploads everything to the release.
+4. The **Docs** workflow builds the documentation from the tag and publishes it as `/portcullis/vX.Y.Z/` on GitHub
+   Pages, where it stays; the site's root then redirects to it. See [Writing the docs](/project/docs/#versions).
 
 Every push to `main` also updates the `latest` pre-release (the **Latest** workflow): the tag moves to the new
 commit, the notes list the unreleased changes, and Publish uploads the same files, signed the same way, with the
@@ -28,7 +35,7 @@ architectures: `apt` for releases and `apt-latest` for builds of main. They are 
 `dists/` and `pool/`, which a release can't have): the index (`Packages`, `Packages.gz`, `Release`, signed as
 `InRelease` and `Release.gpg`) lists every package in the release, so older versions install with
 `apt install portcullis=<version>`. The packages are named so that GitHub keeps the name (`~` and `+` in the version
-become `-` and `.`). After an update the job checks that apt, set up as in the README, sees the new version.
+become `-` and `.`). After an update the job checks that apt, set up as in [Installation](/start/installation/), sees the new version.
 
 Both take the packages from the release itself, checked against its `SHA256SUMS`. To add a release to them again
 without building it again (say a repository job failed), run Publish by hand with its tag and *repositories-only*:
@@ -86,7 +93,7 @@ Before it expires, extend it (`gpg --quick-set-expire`), and update the secret a
 ### Actions policy
 
 The repository allows only GitHub's own actions, actions by verified creators and the third party actions in
-[`.github/allowed-actions.txt`](../.github/allowed-actions.txt), and requires every action to be pinned to a full
+[`.github/allowed-actions.txt`](https://github.com/nikarh/portcullis/blob/main/.github/allowed-actions.txt), and requires every action to be pinned to a full
 commit SHA. Every workflow refers to actions as `owner/action@<40 hex SHA> # vX.Y.Z`; Dependabot updates the SHA and
 the version comment together. `scripts/check-actions.sh` (run in CI) fails when a workflow uses an action that isn't
 pinned or isn't allowed. Adding a third party action: add it to `allowed-actions.txt`, pin it, and add it to the

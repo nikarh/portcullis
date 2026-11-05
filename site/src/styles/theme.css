@@ -1,0 +1,232 @@
+/*
+ * Portcullis docs theme on top of Starlight: cool steel neutrals and one verdigris accent, in dark and light.
+ * Everything else is Starlight's own layout.
+ */
+
+:root {
+	--pc-hue: 168;
+
+	--sl-color-accent-low: hsl(var(--pc-hue), 45%, 14%);
+	--sl-color-accent: hsl(var(--pc-hue), 52%, 52%);
+	--sl-color-accent-high: hsl(var(--pc-hue), 55%, 82%);
+
+	--sl-color-white: hsl(180, 12%, 96%);
+	--sl-color-gray-1: hsl(180, 8%, 88%);
+	--sl-color-gray-2: hsl(180, 5%, 74%);
+	--sl-color-gray-3: hsl(180, 4%, 56%);
+	--sl-color-gray-4: hsl(180, 5%, 36%);
+	--sl-color-gray-5: hsl(185, 8%, 22%);
+	--sl-color-gray-6: hsl(190, 10%, 13%);
+	--sl-color-black: hsl(195, 12%, 8%);
+
+	--sl-color-bg-nav: hsl(195, 12%, 9.5%);
+	--sl-color-bg-sidebar: hsl(195, 12%, 8%);
+	--sl-color-hairline: hsl(190, 9%, 15%);
+	--sl-color-bg-inline-code: hsl(190, 10%, 15%);
+
+	--sl-font: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans', sans-serif;
+	--sl-font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+
+	--sl-content-width: 47rem;
+	--sl-text-h1: 2.25rem;
+	--sl-text-h2: 1.5rem;
+	--sl-text-h3: 1.1875rem;
+	--sl-text-h4: 1.0625rem;
+	--sl-line-height: 1.7;
+
+	--pc-code-text: hsl(var(--pc-hue), 40%, 80%);
+	--pc-allowed: hsl(150, 50%, 60%);
+	--pc-denied: hsl(355, 75%, 70%);
+	--pc-would: hsl(40, 85%, 64%);
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: hsl(var(--pc-hue), 45%, 92%);
+	--sl-color-accent: hsl(var(--pc-hue), 75%, 25%);
+	--sl-color-accent-high: hsl(var(--pc-hue), 80%, 18%);
+
+	--sl-color-white: hsl(195, 18%, 9%);
+	--sl-color-gray-1: hsl(195, 12%, 16%);
+	--sl-color-gray-2: hsl(195, 8%, 24%);
+	--sl-color-gray-3: hsl(195, 6%, 36%);
+	--sl-color-gray-4: hsl(190, 5%, 54%);
+	--sl-color-gray-5: hsl(190, 8%, 82%);
+	--sl-color-gray-6: hsl(190, 14%, 94%);
+	--sl-color-gray-7: hsl(190, 18%, 97%);
+	--sl-color-black: hsl(0, 0%, 100%);
+
+	--sl-color-bg-nav: hsl(0, 0%, 100%);
+	--sl-color-bg-sidebar: hsl(190, 18%, 98%);
+	--sl-color-hairline: hsl(190, 12%, 90%);
+	--sl-color-bg-inline-code: hsl(190, 16%, 94%);
+
+	--pc-code-text: hsl(var(--pc-hue), 70%, 20%);
+	--pc-allowed: hsl(150, 65%, 28%);
+	--pc-denied: hsl(355, 65%, 42%);
+	--pc-would: hsl(35, 90%, 32%);
+}
+
+/* Browser surfaces. */
+::selection {
+	background: color-mix(in srgb, var(--sl-color-accent) 35%, transparent);
+	color: var(--sl-color-white);
+}
+html {
+	scrollbar-color: var(--sl-color-gray-5) transparent;
+	accent-color: var(--sl-color-accent);
+}
+:focus-visible {
+	outline-color: var(--sl-color-accent);
+}
+
+/* Header: a hairline, not a shadow. */
+header.header {
+	border-bottom-color: var(--sl-color-hairline-light);
+}
+
+/* Sidebar: quiet group labels, the current page marked by the accent rather than a filled block. */
+.sidebar-content .group-label .large {
+	font-size: var(--sl-text-xs);
+	font-weight: 650;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--sl-color-gray-3);
+}
+.sidebar-content a {
+	font-size: var(--sl-text-sm);
+}
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover,
+.sidebar-content a[aria-current='page']:focus {
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-accent-high);
+	font-weight: 600;
+}
+
+/* Reading column. */
+.sl-markdown-content {
+	font-size: 1rem;
+}
+.sl-markdown-content :is(h2, h3, h4) {
+	letter-spacing: -0.01em;
+	font-weight: 650;
+	color: var(--sl-color-white);
+	text-wrap: balance;
+}
+.sl-markdown-content h2 {
+	margin-top: 2.75rem;
+	padding-top: 1.25rem;
+	border-top: 1px solid var(--sl-color-hairline);
+}
+.sl-markdown-content h3 {
+	margin-top: 2rem;
+}
+.content-panel h1 {
+	letter-spacing: -0.02em;
+	font-weight: 700;
+	text-wrap: balance;
+}
+.sl-markdown-content a:not(:where(.not-content *)) {
+	color: var(--sl-color-text-accent);
+	text-decoration-thickness: 1px;
+	text-underline-offset: 0.2em;
+	text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+.sl-markdown-content a:not(:where(.not-content *)):hover {
+	text-decoration-color: currentColor;
+}
+
+/* Inline code: tinted text on a quiet ground, so label keys read as names. */
+.sl-markdown-content :not(pre) > code {
+	color: var(--pc-code-text);
+	background: var(--sl-color-bg-inline-code);
+	border: 1px solid var(--sl-color-hairline);
+	border-radius: 4px;
+	padding: 0.08em 0.32em;
+	font-size: 0.86em;
+	overflow-wrap: anywhere;
+}
+.sl-markdown-content a > code {
+	color: inherit;
+}
+
+/* Tables: reference material, so dense, ruled and numerals aligned. */
+.sl-markdown-content table {
+	font-size: var(--sl-text-sm);
+	font-variant-numeric: tabular-nums;
+	border-collapse: collapse;
+	display: table;
+	width: 100%;
+}
+.sl-markdown-content :is(th, td) {
+	border: none;
+	border-bottom: 1px solid var(--sl-color-hairline);
+	padding: 0.55rem 0.75rem 0.55rem 0;
+	vertical-align: top;
+	line-height: 1.55;
+}
+.sl-markdown-content th {
+	font-size: var(--sl-text-xs);
+	font-weight: 650;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--sl-color-gray-3);
+	border-bottom-color: var(--sl-color-gray-5);
+	background: none;
+}
+.sl-markdown-content tr:nth-child(2n) {
+	background: none;
+}
+.sl-markdown-content td:first-child {
+	white-space: nowrap;
+}
+.sl-markdown-content td:first-child code {
+	overflow-wrap: normal;
+}
+@media (max-width: 50rem) {
+	.sl-markdown-content table {
+		display: block;
+		overflow-x: auto;
+	}
+	.sl-markdown-content td:first-child {
+		white-space: normal;
+	}
+}
+
+/* Asides: hairline boxes tinted by kind, no thick side bar. */
+.starlight-aside {
+	border: 1px solid color-mix(in srgb, var(--sl-color-asides-border) 45%, transparent);
+	border-radius: 6px;
+	padding: 0.85rem 1rem;
+}
+.starlight-aside__title {
+	font-size: var(--sl-text-sm);
+	letter-spacing: 0.01em;
+}
+
+/* Verdicts in event examples and tables: <span class="v-allowed">allowed</span> etc. */
+.v-allowed,
+.v-denied,
+.v-would {
+	font-family: var(--__sl-font-mono);
+	font-size: 0.86em;
+	font-weight: 600;
+}
+.v-allowed {
+	color: var(--pc-allowed);
+}
+.v-denied {
+	color: var(--pc-denied);
+}
+.v-would {
+	color: var(--pc-would);
+}
+
+/* Right-hand table of contents. */
+starlight-toc a {
+	font-size: var(--sl-text-xs);
+}
+starlight-toc a[aria-current='true'] {
+	color: var(--sl-color-accent-high);
+	font-weight: 600;
+}

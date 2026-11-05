@@ -1,4 +1,16 @@
-# Tools for the release workflows (Rust itself comes from rust-toolchain.toml).
+# Tools for the release and docs workflows (Rust itself comes from rust-toolchain.toml).
 [tools]
 git-cliff = "2.14.2"
 nfpm = "2.48.0"
+node = "26.13.0"
+
+[tasks.docs]
+description = "Serve the docs site locally with live reload, at http://localhost:4321"
+dir = "site"
+run = ["npm install --no-audit --no-fund", "npm run dev"]
+
+[tasks."docs:build"]
+description = "Build the docs site as CI does, into site/dist, and check its links"
+dir = "site"
+env = { DOCS_VERSION = "main" }
+run = ["npm install --no-audit --no-fund", "npm run build"]

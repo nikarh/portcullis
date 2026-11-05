@@ -1,0 +1,158 @@
+---
+title: Installation
+description: Requirements, packages and repositories for Debian, Ubuntu and Arch Linux, verifying downloads, builds of main, and building from source.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Requirements
+
+- Linux, with Portcullis running as root: it manages the firewall and reads the Docker socket.
+- Docker with bridge networks.
+- `libnftables` (`libnftables1` on Debian and Ubuntu, `nftables` on Fedora and Arch), for both building and running.
+- Recommended: a `dns` setting in `/etc/docker/daemon.json`, so Portcullis can see containers' DNS lookups. See [DNS visibility](/policy/dns/#dns-visibility).
+
+Docker can use iptables or nftables for its own rules; Portcullis works next to either.
+
+## Packages
+
+Each [release](https://github.com/nikarh/portcullis/releases) has packages for Debian and Ubuntu (`.deb`) and Arch Linux (`.pkg.tar.zst`), and the bare binary, alone and in an archive with the systemd unit, the config file, the README and the licenses. All of them are for x86_64 and aarch64 Linux with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 or later).
+
+<Tabs syncKey="distro">
+<TabItem label="Debian / Ubuntu">
+
+Add the Portcullis apt repository, so that `apt upgrade` keeps it up to date. Its index is signed with the [release signing key](#verifying-downloads):
+
+```bash
+sudo install -d /etc/apt/keyrings
+curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc \
+  | sudo tee /etc/apt/keyrings/portcullis.asc >/dev/null
+sudo tee /etc/apt/sources.list.d/portcullis.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://github.com/nikarh/portcullis/releases/download/apt/
+Suites: ./
+Signed-By: /etc/apt/keyrings/portcullis.asc
+EOF
+sudo apt update
+sudo apt install portcullis
+```
+
+The repository lists every version it has, so `apt list -a portcullis` shows them and `sudo apt install portcullis=0.1.0-1` installs one. Without the repository, take `portcullis_amd64.deb` or `portcullis_arm64.deb` from a release and `sudo apt install ./portcullis_amd64.deb` it.
+
+As Debian packages do, it enables and starts the service right away. So that this doesn't block anything you haven't reviewed, its config starts in monitor mode (`monitor = true` in `/etc/portcullis/config.toml`): enforced networks report what would be denied and deny nothing. Once the reports look right (see [Rolling out a policy](/guides/rollout/)), set `monitor = false` and `sudo systemctl restart portcullis`.
+
+</TabItem>
+<TabItem label="Arch Linux">
+
+Add the `portcullis` repository, so that `pacman -Syu` keeps it up to date. Trust the release signing key, which signs the packages and the repository:
+
+```bash
+curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key 33DD9B9FB720453D48136F2EB90B594ECF87B58B
+```
+
+Add it to `/etc/pacman.conf`, then install:
+
+```ini title="/etc/pacman.conf"
+[portcullis]
+Server = https://github.com/nikarh/portcullis/releases/download/pacman-$arch
+```
+
+```bash
+sudo pacman -Syu portcullis
+sudo systemctl enable --now portcullis
+```
+
+The repository has the newest version; older ones stay in it and install with `sudo pacman -U https://github.com/nikarh/portcullis/releases/download/pacman-x86_64/portcullis-0.1.0-1-x86_64.pkg.tar.zst`. Without the repository, take `portcullis-x86_64.pkg.tar.zst` or `portcullis-aarch64.pkg.tar.zst` from a release and `sudo pacman -U` it.
+
+As Arch packages do, it leaves enabling the service to you, and its config enforces policies from the start.
+
+</TabItem>
+<TabItem label="Other distributions">
+
+Take `portcullis-x86_64-linux-gnu.tar.gz` or `portcullis-aarch64-linux-gnu.tar.gz` from a release, unpack it, and install the binary, the systemd unit and the config file:
+
+```bash
+tar -xzf portcullis-x86_64-linux-gnu.tar.gz
+sudo install -m 0755 portcullis/portcullis /usr/local/bin/
+sudo install -m 0644 portcullis/portcullis.service /etc/systemd/system/
+sudo install -D -m 0644 portcullis/config.toml /etc/portcullis/config.toml
+sudo systemctl daemon-reload
+sudo systemctl enable --now portcullis
+```
+
+This config file enforces policies from the start; set `monitor = true` in it to begin in monitor mode. Without systemd, see [Running as a service](/guides/service/#without-systemd).
+
+</TabItem>
+</Tabs>
+
+Both packages install the binary as `/usr/bin/portcullis`, the systemd unit and the config file (see [Configuration](/reference/configuration/)), and depend on libnftables.
+
+- Upgrading restarts the service if it runs; the rules stay in place meanwhile. A config file you changed is left alone.
+- Removing the package stops the service and removes its rules (`portcullis cleanup`), since nothing could remove them once the binary is gone. `apt purge` also removes the config and the saved rules.
+
+## Verifying downloads
+
+`SHA256SUMS` in each release lists the checksums of its files, and `SHA256SUMS.asc` is its signature, made with the release signing key:
+
+```text
+Portcullis releases <nikarh@users.noreply.github.com>
+33DD 9B9F B720 453D 4813  6F2E B90B 594E CF87 B58B
+```
+
+The key is in the repository as [`docs/signing-key.asc`](https://github.com/nikarh/portcullis/blob/main/docs/signing-key.asc). To download a file of the newest release and check it:
+
+```bash
+file=portcullis_amd64.deb
+base=https://github.com/nikarh/portcullis/releases/latest/download
+curl -fL -O "${base}/${file}" -O "${base}/SHA256SUMS" -O "${base}/SHA256SUMS.asc"
+curl -fL https://raw.githubusercontent.com/nikarh/portcullis/main/docs/signing-key.asc | gpg --import
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+```
+
+Asset names never change between releases, so `https://github.com/nikarh/portcullis/releases/latest/download/<name>` always points at the newest file:
+
+| Asset | Contents |
+| --- | --- |
+| `portcullis-x86_64-linux-gnu`, `portcullis-aarch64-linux-gnu` | The binary |
+| `portcullis-x86_64-linux-gnu.tar.gz`, `portcullis-aarch64-linux-gnu.tar.gz` | The binary, the systemd unit, the config file, the README and the licenses |
+| `portcullis_amd64.deb`, `portcullis_arm64.deb` | Debian and Ubuntu packages |
+| `portcullis-x86_64.pkg.tar.zst`, `portcullis-aarch64.pkg.tar.zst` | Arch Linux packages |
+| `portcullis.service` | The systemd unit |
+| `SHA256SUMS`, `SHA256SUMS.asc` | Checksums of all of the above, and their signature |
+
+## Builds of main
+
+The [`latest`](https://github.com/nikarh/portcullis/releases/tag/latest) pre-release has the same files, built and signed from the newest commit of `main`. Its version says so: `portcullis --version` prints something like `0.1.0-dev+abc1234`.
+
+Its packages are versioned by the number of commits on `main`: newer than the release `0.1.0` once that is out, older before it (`0.1.0+dev205.abc1234` or `0.1.0~dev205.abc1234`), so a package manager upgrades from one to the next. They have repositories of their own:
+
+- apt: `https://github.com/nikarh/portcullis/releases/download/apt-latest/` instead of `.../apt/`.
+- pacman: `Server = https://github.com/nikarh/portcullis/releases/download/pacman-latest-$arch`.
+
+The repositories of releases keep every release; those of `main` keep its last 100 builds.
+
+These docs have a version for `main` too: pick it in the version menu next to the title.
+
+## Building from source
+
+Building needs Rust (the toolchain in `rust-toolchain.toml`, which `rustup` installs on the first build), the libnftables development headers and clang, which generates the libnftables bindings.
+
+```bash
+# Debian and Ubuntu
+sudo apt install libnftables-dev clang libclang-dev
+git clone https://github.com/nikarh/portcullis
+cd portcullis
+cargo build --release
+```
+
+The binary is `target/release/portcullis`. Run it in the foreground with:
+
+```bash
+sudo ./target/release/portcullis
+```
+
+It runs until it gets SIGINT or SIGTERM. To run it for real, install it as a service: the files are `target/release/portcullis`, `dist/portcullis.service` and `dist/config.toml`, installed as in the archive tab above. See [Running as a service](/guides/service/) for why it matters that it starts before Docker.
