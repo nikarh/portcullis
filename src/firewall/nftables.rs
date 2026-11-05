@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use super::FirewallError;
 use super::plan::{
@@ -116,6 +116,8 @@ impl fmt::Display for ChainName {
 pub trait NftRunner {
     /// Run an nft script as a single atomic transaction.
     fn run_script(&self, script: String) -> Result<(), FirewallError>;
+    /// Run a listing command (`list ...`), and return what it printed, without set elements.
+    fn list(&self, command: &str) -> Result<String, FirewallError>;
 }
 
 /// What happens to traffic a policy doesn't allow.
@@ -236,6 +238,57 @@ struct Installed {
     sets: BTreeSet<String>,
     /// The container of each managed address.
     sources: BTreeMap<IpAddr, ContainerName>,
+    /// Found in place at the start, rather than installed by this run.
+    found: bool,
+}
+
+impl Installed {
+    /// Add the chains and sets of a terse listing of `table`, except the base chains and
+    /// the sets every update creates anyway.
+    fn add_listed(&mut self, table: Table, listing: &str) {
+        let fixed: BTreeSet<&str> = NamedSet::ALL
+            .iter()
+            .filter(|set| set.table() == table)
+            .map(|set| set.name())
+            .chain([
+                QUARANTINED_SET,
+                LOGGED_SET_V4,
+                LOGGED_SET_V6,
+                LOGGED_SET_FRAMES,
+                LOGGED_SET_ARP,
+            ])
+            .collect();
+        let mut lines = listing.lines().map(str::trim).peekable();
+        while let Some(line) = lines.next() {
+            let Some((kind, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some(name) = rest.strip_suffix(" {") else {
+                continue;
+            };
+            match kind {
+                // A base chain says so on its first line.
+                "chain" if !lines.peek().is_some_and(|next| next.starts_with("type ")) => {
+                    self.chains.insert(format!("{table} {name}"));
+                }
+                "set" | "map" if !fixed.contains(name) => {
+                    self.sets.insert(format!("{table} {name}"));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// What [`NftablesFirewall::restore`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restored {
+    /// Rules a previous run left in place, kept.
+    Kept,
+    /// The rules a previous run saved, put in place.
+    Saved,
+    /// No rules of a previous run.
+    Nothing,
 }
 
 impl<R> NftablesFirewall<R>
@@ -260,24 +313,56 @@ where
         self
     }
 
-    /// Put the rules a previous run saved in place, replacing whatever is there. Returns
-    /// whether there were any.
-    pub fn restore(&self) -> Result<bool, FirewallError> {
+    /// Get the rules of a previous run in place. Rules a previous run left in place (it
+    /// stopped, keeping them) are kept, and the first update changes what it needs of them,
+    /// as any other update would: deleting and creating the tables again would misjudge
+    /// packets that pass meanwhile, denying established connections. Otherwise the rules a
+    /// previous run saved are put in place, if any (after a reboot).
+    pub fn restore(&self) -> Result<Restored, FirewallError> {
+        if let Some(found) = self.find_installed()? {
+            *self
+                .installed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(found);
+            return Ok(Restored::Kept);
+        }
         let Some(path) = &self.saved else {
-            return Ok(false);
+            return Ok(Restored::Nothing);
         };
         let script = match fs::read_to_string(path) {
             Ok(script) => script,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Restored::Nothing),
             Err(error) => return Err(FirewallError::Saved(error)),
         };
         self.runner.run_script(script)?;
-        // The next update starts from empty tables again.
+        // What the script installed is known by name only from the kernel.
         *self
             .installed
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
-        Ok(true)
+            .unwrap_or_else(PoisonError::into_inner) = self.find_installed()?;
+        Ok(Restored::Saved)
+    }
+
+    /// The chains and sets of both tables, when both exist.
+    fn find_installed(&self) -> Result<Option<Installed>, FirewallError> {
+        let tables = self.runner.list("list tables")?;
+        let exists = |table: Table| {
+            tables
+                .lines()
+                .any(|line| line.trim() == format!("table {table}"))
+        };
+        if !(exists(Table::Inet) && exists(Table::Bridge)) {
+            return Ok(None);
+        }
+        let mut installed = Installed {
+            found: true,
+            ..Installed::default()
+        };
+        for table in [Table::Inet, Table::Bridge] {
+            let listing = self.runner.list(&format!("list table {table}"))?;
+            installed.add_listed(table, &listing);
+        }
+        Ok(Some(installed))
     }
 
     /// Forget the saved rules, so the next start doesn't restore them.
@@ -363,7 +448,19 @@ where
         let now_installed =
             render_apply_script(&plan, self.options, installed.as_ref(), &mut script)?;
         before(&plan);
-        self.runner.run_script(script)?;
+        let now_installed = match self.runner.run_script(script) {
+            Ok(()) => now_installed,
+            // Tables another version left may not fit these rules (a set of another type):
+            // start from empty ones.
+            Err(error) if installed.as_ref().is_some_and(|installed| installed.found) => {
+                warn!(%error, "can't update the rules found in place; replacing them");
+                let mut script = String::with_capacity(plan.rule_count() * 96);
+                let now_installed = render_apply_script(&plan, self.options, None, &mut script)?;
+                self.runner.run_script(script)?;
+                now_installed
+            }
+            Err(error) => return Err(error),
+        };
         *installed = Some(now_installed);
         drop(installed);
         Ok(plan)
@@ -1842,6 +1939,10 @@ trait NftApi {
     fn buffer_error(&self, handle: Self::Handle) -> i32;
     fn run_script(&self, handle: Self::Handle, script: &CStr) -> i32;
     fn error_output(&self, handle: Self::Handle) -> Option<String>;
+    /// What the last command listed.
+    fn output(&self, handle: Self::Handle) -> Option<String>;
+    /// List sets without their elements.
+    fn set_terse(&self, handle: Self::Handle);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1889,6 +1990,28 @@ impl NftApi for RealNftApi {
         let cstr = unsafe { CStr::from_ptr(pointer) };
         Some(cstr.to_string_lossy().trim().to_string())
     }
+
+    fn output(&self, handle: Self::Handle) -> Option<String> {
+        // SAFETY: pointer is owned by libnftables for this context and may be null.
+        let pointer = unsafe { bindings::nft_ctx_get_output_buffer(handle.as_ptr()) };
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: non-null C string pointer returned by libnftables.
+        let cstr = unsafe { CStr::from_ptr(pointer) };
+        Some(cstr.to_string_lossy().into_owned())
+    }
+
+    fn set_terse(&self, handle: Self::Handle) {
+        // SAFETY: `handle` points to a valid live context.
+        unsafe {
+            let flags = bindings::nft_ctx_output_get_flags(handle.as_ptr());
+            bindings::nft_ctx_output_set_flags(
+                handle.as_ptr(),
+                flags | bindings::NFT_CTX_OUTPUT_TERSE,
+            );
+        }
+    }
 }
 
 struct NftContext<A>
@@ -1926,7 +2049,14 @@ where
             });
         }
 
+        api.set_terse(handle);
         Ok(Self { api, handle })
+    }
+
+    /// Run a listing command and return what it printed.
+    fn list(&mut self, command: &str) -> Result<String, FirewallError> {
+        self.run_script(command)?;
+        Ok(self.api.output(self.handle).unwrap_or_default())
     }
 
     /// Run `script`. Taking ownership of a `String` lets the NUL terminator be appended
@@ -1987,6 +2117,14 @@ impl NftRunner for LibNftablesRunner {
             .lock()
             .map_err(|_| FirewallError::LibContextLock)?;
         guard.run_script(script)
+    }
+
+    fn list(&self, command: &str) -> Result<String, FirewallError> {
+        let mut guard = self
+            .context
+            .lock()
+            .map_err(|_| FirewallError::LibContextLock)?;
+        guard.list(command)
     }
 }
 
@@ -2080,6 +2218,12 @@ mod libnftables_tests {
             };
             Some(guard.error_message.clone())
         }
+
+        fn output(&self, _handle: Self::Handle) -> Option<String> {
+            None
+        }
+
+        fn set_terse(&self, _handle: Self::Handle) {}
     }
 
     fn base_state() -> MockState {
@@ -2945,13 +3089,216 @@ flush chain bridge portcullis limit_open
     #[derive(Default)]
     struct RecordingRunner {
         scripts: Mutex<Vec<String>>,
+        /// What listing commands print.
+        listings: Mutex<BTreeMap<String, String>>,
+        /// Scripts fail while they contain this.
+        failing: Mutex<Option<String>>,
+        /// Listings the next script makes appear, as if it created the tables.
+        creates: Mutex<Option<BTreeMap<String, String>>>,
+    }
+
+    impl RecordingRunner {
+        /// Pretend both tables exist, as a previous run left them.
+        fn with_tables(inet: &str, bridge: &str) -> Self {
+            let runner = Self::default();
+            runner
+                .listings
+                .lock()
+                .expect("lock")
+                .extend(Self::tables(inet, bridge));
+            runner
+        }
+
+        fn tables(inet: &str, bridge: &str) -> BTreeMap<String, String> {
+            BTreeMap::from([
+                (
+                    "list tables".to_string(),
+                    "table inet portcullis\ntable ip nat\ntable bridge portcullis\n".to_string(),
+                ),
+                ("list table inet portcullis".to_string(), inet.to_string()),
+                (
+                    "list table bridge portcullis".to_string(),
+                    bridge.to_string(),
+                ),
+            ])
+        }
     }
 
     impl NftRunner for RecordingRunner {
         fn run_script(&self, script: String) -> Result<(), FirewallError> {
+            let failing = self.failing.lock().expect("lock");
+            if failing
+                .as_ref()
+                .is_some_and(|text| script.contains(text.as_str()))
+            {
+                return Err(FirewallError::LibCommandFailure {
+                    code: 1,
+                    stderr: "Device or resource busy".to_string(),
+                });
+            }
             self.scripts.lock().expect("lock").push(script);
+            if let Some(created) = self.creates.lock().expect("lock").take() {
+                self.listings.lock().expect("lock").extend(created);
+            }
             Ok(())
         }
+
+        fn list(&self, command: &str) -> Result<String, FirewallError> {
+            Ok(self
+                .listings
+                .lock()
+                .expect("lock")
+                .get(command)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    const INET_LISTING: &str = "table inet portcullis {
+	set logged4 {
+		type ipv4_addr . ipv4_addr . inet_proto . inet_service
+		size 65536
+		flags dynamic,timeout
+		timeout 1m
+	}
+	map egress4 {
+		type ipv4_addr : verdict
+	}
+	set pc_h4_00000000000000aa {
+		type ipv4_addr
+		size 8192
+		flags timeout
+	}
+	chain forward {
+		type filter hook forward priority -1; policy accept;
+		ct state established accept
+	}
+	chain egress0 {
+		ct state related ct original ip saddr 172.18.0.2 accept
+	}
+	chain egress7 {
+	}
+}
+";
+
+    const BRIDGE_LISTING: &str = "table bridge portcullis {
+	set quarantined {
+		type ifname
+	}
+	set conns16384 {
+		type ifname
+		size 65536
+		flags dynamic
+	}
+	chain prerouting {
+		type filter hook prerouting priority -1; policy accept;
+	}
+	chain icc3 {
+		ct state established accept
+	}
+	chain limit_open {
+		drop
+	}
+}
+";
+
+    #[test]
+    fn keeps_the_rules_a_previous_run_left_in_place() {
+        let firewall = NftablesFirewall::new(
+            RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING),
+            OPTIONS,
+        );
+        assert_eq!(firewall.restore().expect("restore"), Restored::Kept);
+        firewall
+            .apply(
+                &test_support::hostname_state(),
+                &mut MockResolver::default(),
+                &[],
+                false,
+            )
+            .expect("apply");
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        let [script] = scripts.as_slice() else {
+            panic!("expected one script: {scripts:#?}");
+        };
+        // Updated in place, as by any update.
+        assert!(!script.contains("delete table"), "{script}");
+        // Chains and sets it doesn't need anymore are removed; base chains and the sets
+        // every update creates are kept.
+        assert_lines(
+            script,
+            &[
+                "flush chain inet portcullis egress7\ndelete chain inet portcullis egress7".into(),
+                "flush chain bridge portcullis icc3\ndelete chain bridge portcullis icc3".into(),
+                "delete set inet portcullis pc_h4_00000000000000aa".into(),
+                "delete set bridge portcullis conns16384".into(),
+            ],
+        );
+        for kept in [
+            "chain inet portcullis forward",
+            "chain bridge portcullis prerouting",
+            "chain inet portcullis egress0",
+            "chain bridge portcullis limit_open",
+            "set inet portcullis logged4",
+            "map inet portcullis egress4",
+            "set bridge portcullis quarantined",
+        ] {
+            assert!(
+                !script.contains(&format!("delete {kept}\n")),
+                "{kept}:\n{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn replaces_rules_found_in_place_that_updates_cant_change() {
+        let runner = RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING);
+        *runner.failing.lock().expect("lock") = Some("delete chain inet portcullis egress7".into());
+        let firewall = NftablesFirewall::new(runner, OPTIONS);
+        firewall.restore().expect("restore");
+        let state = test_support::hostname_state();
+        let mut resolver = MockResolver::default();
+        firewall
+            .apply(&state, &mut resolver, &[], false)
+            .expect("apply");
+        let scripts = firewall.runner.scripts.lock().expect("lock").clone();
+        assert_eq!(scripts.len(), 1);
+        assert!(
+            scripts[0].starts_with("add table inet portcullis\ndelete table inet portcullis\n")
+        );
+        // Only the first update does: rules this run installed stay updated in place.
+        *firewall.runner.failing.lock().expect("lock") = Some("add rule".into());
+        assert!(firewall.apply(&state, &mut resolver, &[], false).is_err());
+        assert_eq!(firewall.runner.scripts.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn lists_installed_chains_and_sets() {
+        let mut installed = Installed::default();
+        installed.add_listed(Table::Inet, INET_LISTING);
+        installed.add_listed(Table::Bridge, BRIDGE_LISTING);
+        assert_eq!(
+            installed.chains,
+            BTreeSet::from(
+                [
+                    "inet portcullis egress0",
+                    "inet portcullis egress7",
+                    "bridge portcullis icc3",
+                    "bridge portcullis limit_open",
+                ]
+                .map(String::from)
+            )
+        );
+        assert_eq!(
+            installed.sets,
+            BTreeSet::from(
+                [
+                    "inet portcullis pc_h4_00000000000000aa",
+                    "bridge portcullis conns16384"
+                ]
+                .map(String::from)
+            )
+        );
     }
 
     #[test]
@@ -3008,7 +3355,11 @@ flush chain bridge portcullis limit_open
         let _ = fs::remove_file(&path);
         let firewall =
             NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
-        assert!(!firewall.restore().expect("restore"), "nothing saved yet");
+        assert_eq!(
+            firewall.restore().expect("restore"),
+            Restored::Nothing,
+            "nothing saved yet"
+        );
         let mut resolver = MockResolver::default();
         for state in [test_support::icc_state(), test_support::hostname_state()] {
             let plan = firewall
@@ -3024,8 +3375,11 @@ flush chain bridge portcullis limit_open
         assert!(saved.contains("ct original ip daddr @pc_h4_"));
         assert!(!saved.contains("delete chain"), "{saved}");
 
-        // Restoring runs it, and the next update starts from empty tables again.
-        assert!(firewall.restore().expect("restore"));
+        // Without tables in place (after a reboot), restoring runs it, and the next update
+        // changes what it installed in place.
+        *firewall.runner.creates.lock().expect("lock") =
+            Some(RecordingRunner::tables(INET_LISTING, BRIDGE_LISTING));
+        assert_eq!(firewall.restore().expect("restore"), Restored::Saved);
         firewall
             .apply(&test_support::icc_state(), &mut resolver, &[], false)
             .expect("apply");
@@ -3034,9 +3388,18 @@ flush chain bridge portcullis limit_open
         assert!(
             scripts
                 .get(3)
-                .is_some_and(|script| script.contains("delete table"))
+                .is_some_and(|script| !script.contains("delete table"))
         );
         drop(scripts);
+
+        // With tables in place, they are kept, and the saved script isn't run.
+        let kept = NftablesFirewall::new(
+            RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING),
+            OPTIONS,
+        )
+        .saving_to(path.clone());
+        assert_eq!(kept.restore().expect("restore"), Restored::Kept);
+        assert!(kept.runner.scripts.lock().expect("lock").is_empty());
 
         firewall.forget_saved().expect("forget");
         assert!(!path.exists());

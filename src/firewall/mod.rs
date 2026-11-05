@@ -7,7 +7,7 @@ use thiserror::Error;
 
 pub use nftables::{
     DEFAULT_CONNECTION_LIMIT, DNS_ALLOWED_MARK, DNS_DENIED_MARK, DenyAction, HOLD_EXPIRED_MARK,
-    LOG_PREFIX, LogAllowed, NftablesFirewall, Options,
+    LOG_PREFIX, LogAllowed, NftablesFirewall, Options, Restored,
 };
 pub use plan::{Destination, HostSet, Plan, Rule};
 

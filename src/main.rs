@@ -48,7 +48,7 @@ use crate::docker::{
 use crate::events::{
     ContainerAction, ContainerChange, Event, EventBus, Mode, Sinks, Warning, WarningKind,
 };
-use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan};
+use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored};
 use crate::logging::LoggingError;
 use crate::model::{ContainerId, MacAddress, RuntimeState, RuntimeStateAction};
 use crate::monitor::{DockerMonitor, MonitorError};
@@ -590,13 +590,14 @@ fn run(config: &Config) -> Result<(), MainError> {
         .saving_to(config.state_dir.join(SAVED_RULES)),
     );
 
-    // Before anything else, put the last run's rules back: after a reboot there are none,
-    // and Docker may be about to start containers. Their bridge ports are new, so their
-    // packets are held until this run's first update has rules for them. That update
-    // replaces these rules in one step.
+    // Before anything else, get the last run's rules in place: after a reboot there are
+    // none, and Docker may be about to start containers. Their bridge ports are new, so
+    // their packets are held until this run's first update has rules for them. That update
+    // changes these rules in one step.
     match firewall.restore() {
-        Ok(true) => info!("restored the rules of the last run"),
-        Ok(false) => info!("no rules of a last run to restore"),
+        Ok(Restored::Kept) => info!("kept the rules of the last run in place"),
+        Ok(Restored::Saved) => info!("restored the rules of the last run"),
+        Ok(Restored::Nothing) => info!("no rules of a last run to restore"),
         Err(error) => warn!(%error, "can't restore the rules of the last run"),
     }
 
