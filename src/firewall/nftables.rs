@@ -14,11 +14,11 @@ use tracing::{info, trace, warn};
 
 use super::FirewallError;
 use super::plan::{
-    DNS_PORT, Destination, HostSet, ICC_BROADCAST_V4, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6,
-    Source,
+    DNS_PORT, Destination, HostSet, ICC_BROADCAST_V4, PRIVATE_V4, PRIVATE_V6, Plan, Rule,
+    SET_PREFIX_V4, SET_PREFIX_V6, Source,
 };
 use crate::dns::{HostResolver, MAX_ADDRESSES_PER_HOST};
-use crate::model::{ConnectionLimit, ContainerName, MacAddress, RuntimeState};
+use crate::model::{ConnectionLimit, ContainerName, MacAddress, Protocol, RuntimeState, Service};
 
 /// Name of both managed tables.
 const TABLE_NAME: &str = "portcullis";
@@ -1838,6 +1838,23 @@ impl Match {
             format!("{protocol} dport {port}")
         }
     }
+    /// What matches `service`, with a leading space; nothing for any traffic.
+    fn service(&self, service: Service, ipv6: bool) -> String {
+        let Service::Protocol(protocol, ports) = service else {
+            return String::new();
+        };
+        let name = match protocol {
+            Protocol::Icmp if ipv6 => "ipv6-icmp",
+            _ => protocol.as_str(),
+        };
+        match ports {
+            Some(ports) if self.original => {
+                format!(" meta l4proto {name} ct original proto-dst {ports}")
+            }
+            Some(ports) => format!(" {name} dport {ports}"),
+            None => format!(" meta l4proto {name}"),
+        }
+    }
 }
 
 fn render_rule(
@@ -1895,15 +1912,14 @@ fn render_rule(
             format_args!("add rule {chain} {daddr} {destination}"),
             deny(reason),
         ),
-        Rule::AcceptPort {
+        Rule::Accept {
             destination,
-            protocol,
-            port,
+            service,
         } => {
-            let port = to.dport(protocol.as_str(), port);
-            let destination = match destination {
-                Destination::Net(destination) => destination.to_string(),
-                Destination::Addr(destination) => destination.to_string(),
+            let mut head = format!("add rule {chain}");
+            match destination {
+                Destination::Net(destination) => write!(head, " {daddr} {destination}")?,
+                Destination::Addr(destination) => write!(head, " {daddr} {destination}")?,
                 Destination::HostSet(index) => {
                     let Some(set) = plan.host_set(index) else {
                         return Ok(());
@@ -1913,14 +1929,26 @@ fn render_rule(
                     } else {
                         SET_PREFIX_V6
                     };
-                    format!("@{}", set.id.name(prefix))
+                    write!(head, " {daddr} @{}", set.id.name(prefix))?;
                 }
-            };
-            decide(
-                out,
-                format_args!("add rule {chain} {daddr} {destination} {port}"),
-                allow,
-            )
+                Destination::Any => {}
+                Destination::Public => {
+                    let private: &[&str] = if source.address.is_ipv4() {
+                        &PRIVATE_V4
+                    } else {
+                        &PRIVATE_V6
+                    };
+                    // One prefix at a time, not a set of ranges, see `NamedSet`.
+                    for range in private {
+                        write!(head, " {daddr} != {range}")?;
+                    }
+                    // The host's own addresses are local wherever they are: traffic to them
+                    // goes to the input hook, or, to a published port, gets DNAT.
+                    head.push_str(" fib daddr type != local ct status & dnat == 0");
+                }
+            }
+            head.push_str(&to.service(service, source.address.is_ipv6()));
+            decide(out, format_args!("{head}"), allow)
         }
     }
 }
@@ -2855,7 +2883,7 @@ flush chain bridge portcullis limit_open
         let mut state = RuntimeState::default();
         test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
         let limited = crate::model::ContainerPolicy {
-            domains: Some(vec!["api.test".to_string()]),
+            domains: Some(vec![crate::pattern::NamePattern::host("api.test")]),
             ..crate::model::ContainerPolicy::default()
         };
         test_support::add_container(
@@ -3073,6 +3101,87 @@ flush chain bridge portcullis limit_open
         );
         assert_eq!(script.matches(": goto icc").count(), 1);
         assert!(!script.contains("ip daddr 172.19.0.10 tcp dport 5432"));
+    }
+
+    #[test]
+    fn renders_destinations_and_services_of_every_kind() {
+        let script = render(&test_support::services_state());
+        let public = PRIVATE_V4
+            .iter()
+            .map(|range| format!("ct original ip daddr != {range}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let egress = script
+            .split("172.18.0.2 : goto ")
+            .nth(1)
+            .and_then(|rest| rest.split([',', ' ']).next())
+            .expect("web's egress chain");
+        let set = script
+            .split("ct original ip daddr @")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .expect("host set");
+        assert_lines(
+            &script,
+            &[
+                // Public: none of the ranges that aren't, and nothing local, before or after
+                // DNAT.
+                format!(
+                    "add rule inet portcullis {egress} {public} fib daddr type != local ct status & dnat == 0 meta l4proto tcp ct original proto-dst 1024-65535 accept"
+                ),
+                format!(
+                    "add rule inet portcullis {egress} {public} fib daddr type != local ct status & dnat == 0 meta l4proto udp ct original proto-dst 3478-3479 accept"
+                ),
+                format!("add rule inet portcullis {egress} meta l4proto icmp accept"),
+                format!(
+                    "add rule inet portcullis {egress} ct original ip daddr @{set} meta l4proto tcp accept"
+                ),
+            ],
+        );
+        let chain = script
+            .split("172.18.0.2 . 02:42:ac:12:00:02 : goto ")
+            .nth(1)
+            .and_then(|rest| rest.split([',', ' ']).next())
+            .expect("web's ICC chain");
+        assert_lines(
+            &script,
+            &[
+                format!("add rule bridge portcullis {chain} ip daddr 172.18.0.11 accept"),
+                format!("add rule bridge portcullis {chain} ip daddr 172.18.0.12 accept"),
+            ],
+        );
+        assert!(!script.contains("ip daddr 172.18.0.20 accept"), "{script}");
+        // DNS is still decided by the DNS rules, before any of these.
+        let position = |text: String| script.find(&text).expect("rule");
+        assert!(
+            position(format!(
+                "{egress} meta l4proto udp ct original proto-dst 53 drop"
+            )) < position(format!("{egress} meta l4proto icmp accept"))
+        );
+    }
+
+    #[test]
+    fn renders_services_for_traffic_between_containers() {
+        use crate::model::{PortRange, Protocol};
+        let to = Match::new(test_support::ip("172.18.0.2"), Chain::Icc(0));
+        let ports = PortRange {
+            first: 1,
+            last: 200,
+        };
+        assert_eq!(
+            to.service(Service::Protocol(Protocol::Tcp, Some(ports)), false),
+            " tcp dport 1-200"
+        );
+        assert_eq!(
+            to.service(Service::Protocol(Protocol::Sctp, None), false),
+            " meta l4proto sctp"
+        );
+        assert_eq!(to.service(Service::Any, false), "");
+        let routed = Match::new(test_support::ip("fd00::2"), Chain::Egress(0));
+        assert_eq!(
+            routed.service(Service::Protocol(Protocol::Icmp, None), true),
+            " meta l4proto ipv6-icmp"
+        );
     }
 
     #[test]

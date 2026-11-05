@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use ipnet::IpNet;
 
+use crate::pattern::NamePattern;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ContainerId(Arc<String>);
 
@@ -123,44 +125,161 @@ impl Deref for NetworkId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An IP protocol rules can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Protocol {
     Tcp,
     Udp,
+    Sctp,
+    /// ICMP, or `ICMPv6` for IPv6 sources.
+    Icmp,
+    Igmp,
+    Gre,
+    Esp,
+    Ah,
 }
 
 impl Protocol {
+    pub const ALL: [Self; 8] = [
+        Self::Tcp,
+        Self::Udp,
+        Self::Sctp,
+        Self::Icmp,
+        Self::Igmp,
+        Self::Gre,
+        Self::Esp,
+        Self::Ah,
+    ];
+
+    /// Its name in labels, and to nftables.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
+            Self::Sctp => "sctp",
+            Self::Icmp => "icmp",
+            Self::Igmp => "igmp",
+            Self::Gre => "gre",
+            Self::Esp => "esp",
+            Self::Ah => "ah",
+        }
+    }
+
+    /// Whether its traffic goes to ports.
+    #[must_use]
+    pub const fn has_ports(self) -> bool {
+        matches!(self, Self::Tcp | Self::Udp | Self::Sctp)
+    }
+
+    /// Its IP protocol number.
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::Tcp => 6,
+            Self::Udp => 17,
+            Self::Sctp => 132,
+            Self::Icmp => 1,
+            Self::Igmp => 2,
+            Self::Gre => 47,
+            Self::Esp => 50,
+            Self::Ah => 51,
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|protocol| protocol.as_str() == name)
+    }
+
+    #[must_use]
+    pub fn from_number(number: u8) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|protocol| protocol.number() == number)
+    }
+}
+
+/// Ports `first` to `last`, both included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PortRange {
+    pub first: u16,
+    pub last: u16,
+}
+
+impl PortRange {
+    #[must_use]
+    pub const fn single(port: u16) -> Self {
+        Self {
+            first: port,
+            last: port,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PortSpec {
-    pub protocol: Protocol,
-    pub port: u16,
+/// `80`, or `8000-8100`.
+impl fmt::Display for PortRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.first == self.last {
+            write!(f, "{}", self.first)
+        } else {
+            write!(f, "{}-{}", self.first, self.last)
+        }
+    }
+}
+
+/// What traffic to a destination a rule allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Service {
+    /// Any protocol, any port (`*`).
+    Any,
+    /// One protocol, on some ports, or on any (`None`, also for protocols without ports).
+    Protocol(Protocol, Option<PortRange>),
+}
+
+impl Service {
+    #[cfg(test)]
+    #[must_use]
+    pub const fn tcp(port: u16) -> Self {
+        Self::Protocol(Protocol::Tcp, Some(PortRange::single(port)))
+    }
+}
+
+/// As in labels: `*`, `tcp:*`, `tcp:443`, `udp:1024-65535`, `icmp`.
+impl fmt::Display for Service {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Any => f.write_str("*"),
+            Self::Protocol(protocol, _) if !protocol.has_ports() => f.write_str(protocol.as_str()),
+            Self::Protocol(protocol, None) => write!(f, "{}:*", protocol.as_str()),
+            Self::Protocol(protocol, Some(ports)) => write!(f, "{}:{ports}", protocol.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EgressTarget {
     IpCidr(IpNet),
-    Hostname(String),
+    /// Any address (`ip:*`), the Docker host's included.
+    AnyAddress,
+    /// Any public address (`ip:public`): not a private, shared, loopback, link-local,
+    /// multicast or otherwise reserved one, nor one of the Docker host's.
+    PublicAddress,
+    Hostname(NamePattern),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressRule {
     pub target: EgressTarget,
-    pub ports: Vec<PortSpec>,
+    pub services: Vec<Service>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IccAllowRule {
-    pub target_container: ContainerName,
-    pub ports: Vec<PortSpec>,
+    pub target_container: NamePattern,
+    pub services: Vec<Service>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +317,7 @@ pub struct ContainerPolicy {
     /// Whether the container is cut off when it misbehaves (`portcullis.quarantine`).
     pub quarantine: bool,
     /// The domain names the container may look up (`portcullis.domains.*`), if limited.
-    pub domains: Option<Vec<String>>,
+    pub domains: Option<Vec<NamePattern>>,
 }
 
 /// `portcullis.limit.connections`.

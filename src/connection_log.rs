@@ -21,10 +21,9 @@ use crate::events::{
     Connection, DomainSource, Event, EventBus, Reason, Verdict, Warning, WarningKind,
 };
 use crate::firewall::LOG_PREFIX;
-use crate::model::MacAddress;
+use crate::model::{MacAddress, Protocol};
 use crate::nfnetlink::{
-    ArpPacket, Ipv4Packet, LoggedPacket, NflogSocket, Overruns, PROTOCOL_TCP, PROTOCOL_UDP,
-    is_overrun,
+    ArpPacket, Ipv4Packet, LoggedPacket, NflogSocket, Overruns, PROTOCOL_TCP, is_overrun,
 };
 use crate::quarantine::Watch;
 
@@ -363,13 +362,12 @@ fn query_name(packet: &Ipv4Packet<'_>) -> Option<String> {
     Some(crate::dns::normalize(&query.name().to_utf8()))
 }
 
+/// The protocol's name in labels, or its number for those labels can't name.
 fn protocol_name(protocol: u8) -> String {
-    match protocol {
-        PROTOCOL_TCP => "tcp".to_string(),
-        PROTOCOL_UDP => "udp".to_string(),
-        1 => "icmp".to_string(),
-        other => other.to_string(),
-    }
+    Protocol::from_number(protocol).map_or_else(
+        || protocol.to_string(),
+        |protocol| protocol.as_str().to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -531,7 +529,7 @@ mod tests {
             ipv4(
                 [172, 18, 0, 2],
                 [8, 8, 8, 8],
-                PROTOCOL_UDP,
+                crate::nfnetlink::PROTOCOL_UDP,
                 &udp(5000, 53, &data),
             ),
         );

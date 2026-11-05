@@ -9,8 +9,9 @@ use thiserror::Error;
 use crate::events::WarningKind;
 use crate::model::{
     ConnectionLimit, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
-    PortSpec, Protocol,
+    PortRange, Protocol, Service,
 };
+use crate::pattern::{NameKind, NamePattern};
 
 const ICC_MODE_LABEL: &str = "portcullis.icc.mode";
 const EGRESS_PREFIX: &str = "portcullis.egress.";
@@ -33,13 +34,13 @@ pub enum LabelParseError {
     InvalidIccAllow(String, String),
     #[error("invalid CIDR in {0}: {1}")]
     InvalidCidr(String, String),
-    #[error("invalid hostname in {0}: {1}")]
-    InvalidHostname(String, String),
+    #[error("invalid name in {0}: {1}: {2}")]
+    InvalidHostname(String, String, &'static str),
     #[error("invalid container target in {0}: {1}")]
     InvalidContainerTarget(String, String),
-    #[error("invalid port spec in {0}: {1}")]
-    InvalidPortSpec(String, String),
-    #[error("no ports defined in {0}")]
+    #[error("invalid protocol or ports in {0}: {1}: {2}")]
+    InvalidPortSpec(String, String, &'static str),
+    #[error("no protocols or ports in {0}: add some, like tcp:443, udp:1024-65535, icmp, or *")]
     MissingPorts(String),
     #[error("invalid dns target in {0}: {1}")]
     InvalidDnsTarget(String, String),
@@ -101,7 +102,7 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
     let mut connection_limit = ConnectionLimit::Default;
     let mut new_connection_rate = None;
     let mut quarantine = true;
-    let mut domains: Option<Vec<String>> = None;
+    let mut domains: Option<Vec<NamePattern>> = None;
 
     for (key, value) in labels {
         let result = if key.starts_with(EGRESS_PREFIX) {
@@ -181,31 +182,15 @@ fn parse_dns_target(key: &str, value: &str) -> Result<DnsTarget, LabelParseError
     }
 }
 
-/// Comma-separated domain names, each either exact (`api.example.com`) or for any name
-/// below one (`*.example.com`). Normalized to lower case without a trailing dot.
-fn parse_domains(key: &str, value: &str) -> Result<Vec<String>, LabelParseError> {
+/// Comma-separated name patterns (see `pattern`).
+fn parse_domains(key: &str, value: &str) -> Result<Vec<NamePattern>, LabelParseError> {
     value
         .split(',')
         .map(str::trim)
         .map(|pattern| {
-            let normalized = crate::dns::normalize(pattern);
-            let name = normalized.strip_prefix("*.").unwrap_or(&normalized);
-            let valid = !name.is_empty()
-                && name.split('.').all(|label| {
-                    !label.is_empty()
-                        && label.len() <= 63
-                        && label
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                });
-            if valid {
-                Ok(normalized)
-            } else {
-                Err(LabelParseError::InvalidHostname(
-                    key.to_string(),
-                    pattern.to_string(),
-                ))
-            }
+            NamePattern::parse(pattern, NameKind::Host).map_err(|reason| {
+                LabelParseError::InvalidHostname(key.to_string(), pattern.to_string(), reason)
+            })
         })
         .collect()
 }
@@ -246,13 +231,8 @@ fn parse_icc_mode(value: &str) -> Result<IccMode, LabelParseError> {
 }
 
 fn parse_egress_value(key: &str, value: &str) -> Result<EgressRule, LabelParseError> {
-    let parts: Vec<&str> = value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
-
-    let Some((target_part, port_parts)) = parts.split_first() else {
+    let parts = split_value(value);
+    let Some((target_part, service_parts)) = parts.split_first() else {
         return Err(LabelParseError::InvalidEgress(
             key.to_string(),
             value.to_string(),
@@ -260,31 +240,42 @@ fn parse_egress_value(key: &str, value: &str) -> Result<EgressRule, LabelParseEr
     };
 
     let target = parse_target(key, target_part)?;
-    let ports = parse_ports(key, port_parts)?;
+    let services = parse_services(key, service_parts)?;
 
-    Ok(EgressRule { target, ports })
+    Ok(EgressRule { target, services })
+}
+
+/// The comma-separated parts of a value, trimmed, without empty ones.
+fn split_value(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
 }
 
 fn parse_target(key: &str, part: &str) -> Result<EgressTarget, LabelParseError> {
     let (kind, value) = split_once_colon(key, part)?;
 
     match kind {
-        "ip" => {
-            // A plain address means just that address.
-            let cidr = IpNet::from_str(value)
-                .or_else(|_| IpAddr::from_str(value).map(IpNet::from))
-                .map_err(|_| LabelParseError::InvalidCidr(key.to_string(), value.to_string()))?;
-            Ok(EgressTarget::IpCidr(cidr))
-        }
-        "host" => {
-            if value.is_empty() {
-                return Err(LabelParseError::InvalidHostname(
-                    key.to_string(),
-                    value.to_string(),
-                ));
+        "ip" => match value {
+            "*" => Ok(EgressTarget::AnyAddress),
+            "public" => Ok(EgressTarget::PublicAddress),
+            _ => {
+                // A plain address means just that address.
+                let cidr = IpNet::from_str(value)
+                    .or_else(|_| IpAddr::from_str(value).map(IpNet::from))
+                    .map_err(|_| {
+                        LabelParseError::InvalidCidr(key.to_string(), value.to_string())
+                    })?;
+                Ok(EgressTarget::IpCidr(cidr.trunc()))
             }
-            Ok(EgressTarget::Hostname(value.to_string()))
-        }
+        },
+        "host" => NamePattern::parse(value, NameKind::Host)
+            .map(EgressTarget::Hostname)
+            .map_err(|reason| {
+                LabelParseError::InvalidHostname(key.to_string(), value.to_string(), reason)
+            }),
         _ => Err(LabelParseError::InvalidEgress(
             key.to_string(),
             part.to_string(),
@@ -292,49 +283,90 @@ fn parse_target(key: &str, part: &str) -> Result<EgressTarget, LabelParseError> 
     }
 }
 
-fn parse_ports(key: &str, parts: &[&str]) -> Result<Vec<PortSpec>, LabelParseError> {
+/// What a rule allows to its destination, one entry per part:
+/// - `*`: anything;
+/// - `<protocol>:<ports>` for protocols with ports (`tcp`, `udp`, `sctp`), where ports are
+///   `*`, a port, or a range (`1024-65535`); parts that are only ports or ranges after it
+///   are more ports of the same protocol (`tcp:80,443,8000-8100`);
+/// - `<protocol>` for those without (`icmp`, `igmp`, `gre`, `esp`, `ah`).
+fn parse_services(key: &str, parts: &[&str]) -> Result<Vec<Service>, LabelParseError> {
     if parts.is_empty() {
         return Err(LabelParseError::MissingPorts(key.to_string()));
     }
-
-    let mut ports = Vec::with_capacity(parts.len());
-
+    let invalid = |part: &str, reason| {
+        LabelParseError::InvalidPortSpec(key.to_string(), part.to_string(), reason)
+    };
+    let mut services = Vec::with_capacity(parts.len());
+    // The protocol bare ports belong to.
+    let mut current = None;
     for part in parts {
-        let (proto, port_value) = split_once_colon(key, part)?;
-        let protocol = match proto {
-            "tcp" => Protocol::Tcp,
-            "udp" => Protocol::Udp,
-            _ => {
-                return Err(LabelParseError::InvalidPortSpec(
-                    key.to_string(),
-                    part.to_string(),
+        if *part == "*" {
+            services.push(Service::Any);
+            current = None;
+        } else if let Some((name, ports)) = part.split_once(':') {
+            let protocol =
+                Protocol::from_name(name).ok_or_else(|| invalid(part, "unknown protocol"))?;
+            if !protocol.has_ports() {
+                return Err(invalid(part, "this protocol has no ports; name it alone"));
+            }
+            services.push(Service::Protocol(
+                protocol,
+                parse_port_range(ports).map_err(|reason| invalid(part, reason))?,
+            ));
+            current = Some(protocol);
+        } else if let Some(protocol) = Protocol::from_name(part) {
+            if protocol.has_ports() {
+                return Err(invalid(
+                    part,
+                    "say which ports, like tcp:443, or tcp:* for any",
                 ));
             }
-        };
-
-        let port = u16::from_str(port_value)
-            .map_err(|_| LabelParseError::InvalidPortSpec(key.to_string(), (*part).to_string()))?;
-
-        if port == 0 {
-            return Err(LabelParseError::InvalidPortSpec(
-                key.to_string(),
-                part.to_string(),
-            ));
+            services.push(Service::Protocol(protocol, None));
+            current = None;
+        } else if part.starts_with(|c: char| c.is_ascii_digit()) {
+            let protocol =
+                current.ok_or_else(|| invalid(part, "ports need a protocol, like tcp:443"))?;
+            let ports = parse_port_range(part).map_err(|reason| invalid(part, reason))?;
+            if ports.is_none() {
+                return Err(invalid(part, "ports need a protocol, like tcp:*"));
+            }
+            services.push(Service::Protocol(protocol, ports));
+        } else {
+            return Err(invalid(part, "unknown protocol"));
         }
-
-        ports.push(PortSpec { protocol, port });
     }
+    services.sort_unstable();
+    services.dedup();
+    Ok(services)
+}
 
-    Ok(ports)
+/// `*` (any port, `None`), a port, or a range of ports.
+fn parse_port_range(value: &str) -> Result<Option<PortRange>, &'static str> {
+    if value == "*" {
+        return Ok(None);
+    }
+    let port = |text: &str| {
+        u16::from_str(text)
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or("ports are 1 to 65535")
+    };
+    let range = match value.split_once('-') {
+        Some((first, last)) => PortRange {
+            first: port(first)?,
+            last: port(last)?,
+        },
+        None => PortRange::single(port(value)?),
+    };
+    if range.first > range.last {
+        return Err("a range goes from the lower port to the higher one");
+    }
+    Ok(Some(range))
 }
 
 fn parse_icc_allow_value(key: &str, value: &str) -> Result<IccAllowRule, LabelParseError> {
-    let parts: Vec<&str> = value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
-    let Some((target_part, port_parts)) = parts.split_first() else {
+    let parts = split_value(value);
+    let Some((target_part, service_parts)) = parts.split_first() else {
         return Err(LabelParseError::InvalidIccAllow(
             key.to_string(),
             value.to_string(),
@@ -342,17 +374,20 @@ fn parse_icc_allow_value(key: &str, value: &str) -> Result<IccAllowRule, LabelPa
     };
 
     let (kind, target) = split_once_colon(key, target_part)?;
-    if kind != "container" || target.is_empty() {
+    if kind != "container" {
         return Err(LabelParseError::InvalidContainerTarget(
             key.to_string(),
             (*target_part).to_string(),
         ));
     }
+    let target_container = NamePattern::parse(target, NameKind::Container).map_err(|_| {
+        LabelParseError::InvalidContainerTarget(key.to_string(), (*target_part).to_string())
+    })?;
 
-    let ports = parse_ports(key, port_parts)?;
+    let services = parse_services(key, service_parts)?;
     Ok(IccAllowRule {
-        target_container: target.to_string().into(),
-        ports,
+        target_container,
+        services,
     })
 }
 
@@ -425,19 +460,20 @@ mod tests {
     }
 
     use crate::events::WarningKind;
-    use crate::model::{DnsTarget, EgressTarget, IccMode, Protocol};
+    use crate::model::{DnsTarget, EgressTarget, IccMode, PortRange, Protocol, Service};
+    use crate::pattern::NamePattern;
 
     #[test]
     fn parses_domains() {
         let (policy, errors) = parse_policy(&labels(&[
             ("portcullis.domains.stripe", "API.stripe.com., *.github.com"),
-            ("portcullis.domains.bad", "*.bad*.com"),
+            ("portcullis.domains.bad", "*.bad**.com"),
         ]));
         assert_eq!(
             policy.domains,
             Some(vec![
-                "api.stripe.com".to_string(),
-                "*.github.com".to_string()
+                NamePattern::host("api.stripe.com"),
+                NamePattern::host("*.github.com")
             ])
         );
         assert_eq!(errors.len(), 1);
@@ -489,22 +525,24 @@ mod tests {
         assert_eq!(parsed.icc_mode, IccMode::Deny);
         assert_eq!(parsed.egress.len(), 2);
 
-        assert_eq!(parsed.egress[0].ports.len(), 2);
-        assert_eq!(parsed.egress[0].ports[0].protocol, Protocol::Tcp);
-        assert_eq!(parsed.egress[0].ports[0].port, 443);
-        assert_eq!(parsed.egress[0].ports[1].protocol, Protocol::Udp);
-        assert_eq!(parsed.egress[0].ports[1].port, 53);
+        assert_eq!(
+            parsed.egress[0].services,
+            [
+                Service::tcp(443),
+                Service::Protocol(Protocol::Udp, Some(PortRange::single(53)))
+            ]
+        );
 
         assert_eq!(
             parsed.egress[1].target,
-            EgressTarget::Hostname("api.example.com".to_string())
+            EgressTarget::Hostname(NamePattern::host("api.example.com"))
         );
         assert_eq!(parsed.icc_allow.len(), 1);
         assert_eq!(
             parsed.icc_allow[0].target_container,
-            "db".to_string().into()
+            NamePattern::container("db")
         );
-        assert_eq!(parsed.icc_allow[0].ports[0].port, 5432);
+        assert_eq!(parsed.icc_allow[0].services, [Service::tcp(5432)]);
         assert_eq!(parsed.dns_targets, vec![DnsTarget::Docker]);
     }
 
@@ -554,7 +592,7 @@ mod tests {
     fn parse_policy_rejects_invalid_port_definition() {
         let error = parse_strict(&labels(&[(
             "portcullis.egress.0",
-            "ip:1.1.1.1/32,sctp:443",
+            "ip:1.1.1.1/32,quic:443",
         )]))
         .expect_err("invalid port should be rejected");
 
@@ -562,7 +600,8 @@ mod tests {
             error,
             LabelParseError::InvalidPortSpec(
                 "portcullis.egress.0".to_string(),
-                "sctp:443".to_string()
+                "quic:443".to_string(),
+                "unknown protocol"
             )
         );
     }
@@ -576,7 +615,8 @@ mod tests {
             error,
             LabelParseError::InvalidPortSpec(
                 "portcullis.egress.0".to_string(),
-                "tcp:0".to_string()
+                "tcp:0".to_string(),
+                "ports are 1 to 65535"
             )
         );
     }
@@ -593,7 +633,153 @@ mod tests {
         assert_eq!(parsed.icc_allow.len(), 1);
         assert_eq!(
             parsed.icc_allow[0].target_container,
-            "redis".to_string().into()
+            NamePattern::container("redis")
+        );
+    }
+
+    /// The services of one egress label, or its error.
+    fn services(value: &str) -> Result<Vec<Service>, LabelParseError> {
+        parse_strict(&labels(&[(
+            "portcullis.egress.x",
+            &format!("ip:1.1.1.1,{value}"),
+        )]))
+        .map(|policy| policy.egress[0].services.clone())
+    }
+
+    fn ports(protocol: Protocol, first: u16, last: u16) -> Service {
+        Service::Protocol(protocol, Some(PortRange { first, last }))
+    }
+
+    #[test]
+    fn parses_ports_ranges_and_lists() {
+        assert_eq!(
+            services("tcp:80,443,8000-8100,udp:1024-65535,3478").expect("services"),
+            [
+                ports(Protocol::Tcp, 80, 80),
+                ports(Protocol::Tcp, 443, 443),
+                ports(Protocol::Tcp, 8000, 8100),
+                ports(Protocol::Udp, 1024, 65535),
+                ports(Protocol::Udp, 3478, 3478),
+            ]
+        );
+        assert_eq!(
+            services("tcp:*,sctp:1-2").expect("services"),
+            [
+                Service::Protocol(Protocol::Tcp, None),
+                ports(Protocol::Sctp, 1, 2)
+            ]
+        );
+        // Duplicates are listed once.
+        assert_eq!(
+            services("tcp:443,tcp:443,443").expect("services"),
+            [Service::tcp(443)]
+        );
+    }
+
+    #[test]
+    fn parses_protocols_without_ports_and_anything() {
+        assert_eq!(
+            services("icmp,igmp,gre,esp,ah").expect("services"),
+            [
+                Service::Protocol(Protocol::Icmp, None),
+                Service::Protocol(Protocol::Igmp, None),
+                Service::Protocol(Protocol::Gre, None),
+                Service::Protocol(Protocol::Esp, None),
+                Service::Protocol(Protocol::Ah, None),
+            ]
+        );
+        assert_eq!(services("*").expect("services"), [Service::Any]);
+    }
+
+    #[test]
+    fn rejects_invalid_ports_and_protocols() {
+        for invalid in [
+            "tcp",
+            "tcp:",
+            "tcp:0",
+            "tcp:65536",
+            "tcp:90-80",
+            "tcp:1-",
+            "tcp:-1",
+            "tcp:a",
+            "443",
+            "tcp:80,*-1",
+            "icmp:8",
+            "icmp,80",
+            "*,80",
+            "quic:443",
+            "TCP:443",
+            "tcp:1,2,x",
+            "tcp:80,0",
+        ] {
+            assert!(
+                matches!(services(invalid), Err(LabelParseError::InvalidPortSpec(..))),
+                "{invalid}: {:?}",
+                services(invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn parses_destinations() {
+        let target = |value: &str| {
+            parse_strict(&labels(&[(
+                "portcullis.egress.x",
+                &format!("{value},tcp:443"),
+            )]))
+            .map(|policy| policy.egress[0].target.clone())
+        };
+        assert_eq!(target("ip:*"), Ok(EgressTarget::AnyAddress));
+        assert_eq!(target("ip:public"), Ok(EgressTarget::PublicAddress));
+        assert_eq!(
+            target("ip:10.1.2.3/8"),
+            Ok(EgressTarget::IpCidr("10.0.0.0/8".parse().expect("cidr")))
+        );
+        assert_eq!(
+            target("host:*.Archive.org."),
+            Ok(EgressTarget::Hostname(NamePattern::host("*.archive.org")))
+        );
+        assert_eq!(
+            target("host:**.redd.it"),
+            Ok(EgressTarget::Hostname(NamePattern::host("**.redd.it")))
+        );
+        for invalid in [
+            "host:*",
+            "host:**",
+            "host:a.**.b",
+            "host:",
+            "ip:private",
+            "any",
+            "*",
+        ] {
+            assert!(target(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn parses_container_patterns() {
+        let parsed = parse_strict(&labels(&[
+            (
+                "portcullis.icc.allow.workers",
+                "container:app-worker-*,tcp:8080",
+            ),
+            ("portcullis.icc.allow.any", "container:*,icmp"),
+        ]))
+        .expect("parser should not fail");
+        assert_eq!(
+            parsed.icc_allow[0].target_container,
+            NamePattern::container("app-worker-*")
+        );
+        assert_eq!(
+            parsed.icc_allow[1].target_container,
+            NamePattern::container("*")
+        );
+        assert!(
+            parse_strict(&labels(&[(
+                "portcullis.icc.allow.x",
+                "container:a b,tcp:1"
+            )]))
+            .is_err()
         );
     }
 

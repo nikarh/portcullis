@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use crate::dns::normalize;
 use crate::firewall::{Destination, HostSet, Plan, Rule};
 use crate::model::MacAddress;
+use crate::pattern::NamePattern;
 
 /// Observations kept before expired ones are pruned, at most once per [`PRUNE_EVERY`].
 const PRUNE_ABOVE: usize = 16_384;
@@ -37,7 +38,7 @@ pub struct SourceInfo {
     /// IPv6 is enabled on the container's network.
     pub ipv6_network: bool,
     /// The domain names the container may look up, if limited.
-    pub domains: Option<Vec<String>>,
+    pub domains: Option<Vec<NamePattern>>,
 }
 
 #[derive(Debug, Default)]
@@ -116,7 +117,7 @@ impl Directory {
                 .egress_rules(source)
                 .iter()
                 .filter_map(|rule| match rule {
-                    Rule::AcceptPort {
+                    Rule::Accept {
                         destination: Destination::HostSet(index),
                         ..
                     } => plan.host_set(*index).map(|set| set.host.clone()),
@@ -230,13 +231,17 @@ impl Directory {
             .unwrap_or_default()
     }
 
-    /// Hostname sets of `container`'s current rules for any of `names`.
+    /// Hostname sets of `container`'s current rules whose hostname, or pattern, matches
+    /// any of `names`.
     #[must_use]
     pub fn host_sets_for(&self, container: &str, names: &[String]) -> Vec<HostSet> {
         self.read()
             .host_sets
             .iter()
-            .filter(|set| set.container.as_str() == container && names.contains(&set.host))
+            .filter(|set| {
+                set.container.as_str() == container
+                    && names.iter().any(|name| set.pattern.matches(name))
+            })
             .cloned()
             .collect()
     }
@@ -444,5 +449,29 @@ mod tests {
             directory.host_sets_for("db", &[test_support::HOST.to_string()]),
             [] as [crate::firewall::HostSet; 0]
         );
+    }
+
+    #[test]
+    fn finds_host_sets_by_pattern() {
+        let plan = Plan::build(
+            &test_support::services_state(),
+            &mut MockResolver::default(),
+            &[],
+            false,
+        );
+        let directory = Directory::default();
+        directory.update(&plan);
+        let found = |names: &[&str]| {
+            directory
+                .host_sets_for(
+                    "web",
+                    &names.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                )
+                .len()
+        };
+        assert_eq!(found(&["ia800.archive.org"]), 1);
+        // A CNAME the name resolved through counts too.
+        assert_eq!(found(&["coverartarchive.org", "ia800.archive.org"]), 1);
+        assert_eq!(found(&["a.ia800.archive.org", "archive.org"]), 0);
     }
 }

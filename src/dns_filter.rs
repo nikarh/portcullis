@@ -21,7 +21,7 @@ use hickory_proto::op::{Message, MessageType};
 use tracing::{debug, warn};
 
 use crate::directory::Directory;
-use crate::dns::{domain_matches, normalize};
+use crate::dns::normalize;
 use crate::events::{Connection, Event, EventBus, Reason, Verdict};
 use crate::firewall::{DNS_ALLOWED_MARK, DNS_DENIED_MARK};
 use crate::nfnetlink::{
@@ -122,7 +122,7 @@ fn decide(payload: &[u8], directory: &Directory) -> Decision {
     };
     match names
         .iter()
-        .find(|name| !domains.iter().any(|pattern| domain_matches(pattern, name)))
+        .find(|name| !domains.iter().any(|pattern| pattern.matches(name)))
     {
         None => Decision::Allowed,
         Some(name) => denied(
@@ -222,15 +222,25 @@ mod tests {
     use crate::firewall::test_support::{self, MockResolver};
     use crate::model::{ContainerPolicy, EgressRule, EgressTarget};
     use crate::nfnetlink::tests::{ipv4, udp};
+    use crate::pattern::NamePattern;
 
     fn directory() -> Directory {
         let mut state = test_support::icc_state();
         let policy = ContainerPolicy {
-            domains: Some(vec!["*.github.com".to_string()]),
-            egress: vec![EgressRule {
-                target: EgressTarget::Hostname("API.stripe.com".to_string()),
-                ports: Vec::new(),
-            }],
+            domains: Some(vec![
+                NamePattern::host("**.github.com"),
+                NamePattern::host("*.gitlab.com"),
+            ]),
+            egress: vec![
+                EgressRule {
+                    target: EgressTarget::Hostname(NamePattern::host("API.stripe.com")),
+                    services: Vec::new(),
+                },
+                EgressRule {
+                    target: EgressTarget::Hostname(NamePattern::host("s*.api.example.com")),
+                    services: Vec::new(),
+                },
+            ],
             ..ContainerPolicy::default()
         };
         test_support::add_container(
@@ -276,12 +286,30 @@ mod tests {
     #[test]
     fn allows_listed_names_and_names_of_host_rules() {
         let directory = directory();
-        for name in ["api.github.com.", "api.stripe.com", "Api.Stripe.Com."] {
+        for name in [
+            "api.github.com.",
+            "a.b.github.com",
+            "x.gitlab.com",
+            "api.stripe.com",
+            "Api.Stripe.Com.",
+            "s17.api.example.com",
+        ] {
             let packet = from_filtered(&query(&[name], MessageType::Query));
             assert!(
                 matches!(decide(&packet, &directory), Decision::Allowed),
                 "{name}"
             );
+        }
+        // One level below, not more, and not the name itself.
+        for name in [
+            "a.b.gitlab.com",
+            "gitlab.com",
+            "github.com",
+            "x.s1.api.example.com",
+            "t1.api.example.com",
+        ] {
+            let packet = from_filtered(&query(&[name], MessageType::Query));
+            assert_eq!(query_of(&decide(&packet, &directory)), Some(name), "{name}");
         }
     }
 

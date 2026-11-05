@@ -18,6 +18,7 @@ mod logging;
 mod model;
 mod monitor;
 mod nfnetlink;
+mod pattern;
 mod quarantine;
 mod rtnetlink;
 mod source_hold;

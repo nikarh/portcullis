@@ -71,18 +71,6 @@ struct HostEntry {
     retry_at: Option<Instant>,
 }
 
-/// Whether `name` (normalized) matches a `portcullis.domains` pattern: the name itself, or
-/// with `*.`, any name below it.
-#[must_use]
-pub fn domain_matches(pattern: &str, name: &str) -> bool {
-    match pattern.strip_prefix("*.") {
-        Some(parent) => name
-            .strip_suffix(parent)
-            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1),
-        None => pattern == name,
-    }
-}
-
 /// Addresses one container may learn for one hostname from DNS answers, while they are
 /// allowed. A container that may ask a resolver of its own could otherwise answer itself
 /// with millions of addresses, each held for at least `--hostname-hold`, and make every
@@ -190,8 +178,10 @@ where
         let entry = self.resolved.entry(host.clone()).or_default();
         entry.addresses.retain(|_, expires| *expires > now);
         // Look the hostname up when nothing is known for this container: it may have
-        // resolved the name before Portcullis started, or where Portcullis can't see it.
+        // resolved the name before Portcullis started, or where Portcullis can't see it. A
+        // pattern (`*.example.com`) can't be looked up: only answers to the container fill it.
         if addresses.is_empty()
+            && !host.contains('*')
             && entry.addresses.is_empty()
             && entry.retry_at.is_none_or(|retry_at| retry_at <= now)
         {
@@ -378,13 +368,27 @@ mod tests {
     }
 
     #[test]
-    fn matches_domain_patterns() {
-        assert!(domain_matches("api.test", "api.test"));
-        assert!(!domain_matches("api.test", "x.api.test"));
-        assert!(domain_matches("*.api.test", "x.api.test"));
-        assert!(domain_matches("*.api.test", "a.b.api.test"));
-        assert!(!domain_matches("*.api.test", "api.test"));
-        assert!(!domain_matches("*.api.test", "evilapi.test"));
+    fn patterns_are_only_filled_by_answers() {
+        let resolver = MockResolver {
+            answer: vec![ip("1.1.1.1")],
+            ..MockResolver::default()
+        };
+        let mut hosts = HostAddresses::new(resolver.clone(), HOLD);
+        let now = Instant::now();
+        assert_eq!(
+            hosts
+                .addresses_at("web", "*.api.test", now)
+                .expect("addresses"),
+            []
+        );
+        hosts.observe("web", "*.api.test", ip("2.2.2.2"), HOLD, now);
+        assert_eq!(
+            hosts
+                .addresses_at("web", "*.api.test", now)
+                .expect("addresses"),
+            vec![(ip("2.2.2.2"), HOLD)]
+        );
+        assert_eq!(*resolver.calls.lock().expect("lock"), 0);
     }
 
     #[test]

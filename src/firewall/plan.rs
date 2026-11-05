@@ -29,8 +29,9 @@ use tracing::{error, trace};
 use crate::dns::{HostResolver, normalize};
 use crate::model::{
     BridgePort, ConnectionLimit, Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule,
-    IccMode, MacAddress, NetworkAttachment, Protocol, RuntimeState,
+    IccMode, MacAddress, NetworkAttachment, Protocol, RuntimeState, Service,
 };
+use crate::pattern::NamePattern;
 
 pub const DNS_PORT: u16 = 53;
 const DNS_PROTOCOLS: [Protocol; 2] = [Protocol::Udp, Protocol::Tcp];
@@ -44,14 +45,55 @@ pub const ICC_BROADCAST_V4: [IpNet; 2] = [
     )),
 ];
 
-/// Destination of an [`Rule::AcceptPort`] rule.
+/// Destination of an [`Rule::Accept`] rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Destination {
     Net(IpNet),
     Addr(IpAddr),
     /// Index into [`Plan::host_sets`].
     HostSet(usize),
+    /// Any address.
+    Any,
+    /// Any public address, see [`PRIVATE_V4`]; none of the host's.
+    Public,
 }
+
+/// IPv4 ranges that aren't public: this network, private (RFC 1918), shared (CGNAT),
+/// loopback, link-local, IETF protocol assignments, documentation, benchmarking,
+/// multicast, and reserved (with the limited broadcast address).
+pub const PRIVATE_V4: [&str; 14] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+/// The same for IPv6: unspecified and loopback, IPv4-mapped, local NAT64, discard, IETF
+/// protocol assignments (Teredo included), documentation, 6to4 (which can embed any IPv4
+/// address), unique local, link-local and multicast.
+pub const PRIVATE_V6: [&str; 11] = [
+    "::/127",
+    "::ffff:0:0/96",
+    "64:ff9b:1::/48",
+    "100::/64",
+    "2001::/23",
+    "2001:db8::/32",
+    "2002::/16",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+    "3fff::/20",
+];
 
 /// A rule of one source. Every address in a rule has the same family as the source; the
 /// planner never emits mixed-family rules.
@@ -76,11 +118,10 @@ pub enum Rule {
     AcceptHost(IpAddr),
     /// Deny all traffic to a subnet (ICC deny).
     DenyNet(IpNet),
-    /// Allow traffic to `destination` on a single port.
-    AcceptPort {
+    /// Allow some traffic to `destination`.
+    Accept {
         destination: Destination,
-        protocol: Protocol,
-        port: u16,
+        service: Service,
     },
 }
 
@@ -108,8 +149,8 @@ pub struct Source {
     /// The container is quarantined: nothing it sends gets anywhere.
     pub quarantined: bool,
     /// The domain names the container may look up, if limited: its `portcullis.domains`
-    /// patterns and the hostnames of its `host:` rules.
-    pub domains: Option<Vec<String>>,
+    /// patterns and those of its `host:` rules.
+    pub domains: Option<Vec<NamePattern>>,
     /// Range into [`Plan::rules`] of rules for traffic leaving the network.
     egress: Range<usize>,
     /// Range into [`Plan::rules`] of rules for traffic to containers on the same network.
@@ -168,8 +209,10 @@ pub struct HostSet {
     pub id: HostSetId,
     /// The container whose rules use the set.
     pub container: ContainerName,
-    /// The hostname, normalized.
+    /// The hostname, or pattern, normalized.
     pub host: String,
+    /// The same, to match names against.
+    pub pattern: NamePattern,
     /// Addresses and how long each stays allowed.
     pub addresses: Vec<(IpAddr, Duration)>,
     /// Whether any IPv4 rule references this set.
@@ -303,7 +346,7 @@ struct Planner<'s, 'r, R> {
     plan: Plan,
     seen_sources: HashSet<IpAddr>,
     /// Container name and hostname -> index into `plan.host_sets`.
-    host_index: HashMap<(&'s str, &'s str), usize>,
+    host_index: HashMap<(&'s str, &'s NamePattern), usize>,
     /// Built lazily, only when an allow-listed container exists.
     icc_targets: Option<IccTargets<'s>>,
     /// Reused buffer for DNS destinations.
@@ -349,6 +392,8 @@ where
                     Destination::Net(*net)
                 }
                 EgressTarget::IpCidr(_) => continue,
+                EgressTarget::AnyAddress => Destination::Any,
+                EgressTarget::PublicAddress => Destination::Public,
                 EgressTarget::Hostname(host) => {
                     let index = self.host_set(&container.name, host);
                     if let Some(set) = self.plan.host_sets.get_mut(index) {
@@ -363,10 +408,9 @@ where
             };
             self.plan
                 .rules
-                .extend(rule.ports.iter().map(|port| Rule::AcceptPort {
+                .extend(rule.services.iter().map(|service| Rule::Accept {
                     destination,
-                    protocol: port.protocol,
-                    port: port.port,
+                    service: *service,
                 }));
         }
 
@@ -408,8 +452,8 @@ where
             domains: policy.domains.as_ref().map(|domains| {
                 let mut domains = domains.clone();
                 domains.extend(policy.egress.iter().filter_map(|rule| match &rule.target {
-                    EgressTarget::Hostname(host) => Some(crate::dns::normalize(host)),
-                    EgressTarget::IpCidr(_) => None,
+                    EgressTarget::Hostname(host) => Some(host.clone()),
+                    _ => None,
                 }));
                 domains.sort_unstable();
                 domains.dedup();
@@ -500,22 +544,21 @@ where
             .get_or_insert_with(|| IccTargets::build(state));
 
         for rule in allow_list {
-            let destinations = targets
-                .lookup(
-                    attachment.network_id.as_str(),
-                    rule.target_container.as_str(),
-                )
-                .iter()
+            let mut destinations: Vec<IpAddr> = targets
+                .lookup(attachment.network_id.as_str(), &rule.target_container)
                 .map(|target| target.address)
-                .filter(|destination| *destination != source && same_family(source, *destination));
+                .filter(|destination| *destination != source && same_family(source, *destination))
+                .collect();
+            // A container matching by name and by alias is still one destination.
+            destinations.sort_unstable();
+            destinations.dedup();
 
             for destination in destinations {
                 self.plan
                     .rules
-                    .extend(rule.ports.iter().map(|port| Rule::AcceptPort {
+                    .extend(rule.services.iter().map(|service| Rule::Accept {
                         destination: Destination::Addr(destination),
-                        protocol: port.protocol,
-                        port: port.port,
+                        service: *service,
                     }));
             }
         }
@@ -523,13 +566,13 @@ where
 
     /// Index of the set for `host` in `container`'s rules. A hostname that can't be
     /// resolved gets an empty set, so its rules allow nothing while the rest of the policy
-    /// still applies.
-    fn host_set(&mut self, container: &'s ContainerName, host: &'s str) -> usize {
+    /// still applies. A pattern's set only holds what DNS answers to the container said.
+    fn host_set(&mut self, container: &'s ContainerName, host: &'s NamePattern) -> usize {
         if let Some(index) = self.host_index.get(&(container.as_str(), host)) {
             return *index;
         }
 
-        let normalized = normalize(host);
+        let normalized = normalize(host.as_str());
         let addresses = match self.resolver.addresses(container, &normalized) {
             Ok(addresses) => addresses,
             Err(error) => {
@@ -537,7 +580,10 @@ where
                 Vec::new()
             }
         };
-        if addresses.is_empty() && !self.plan.unresolved_hosts.contains(&normalized) {
+        if addresses.is_empty()
+            && host.is_exact()
+            && !self.plan.unresolved_hosts.contains(&normalized)
+        {
             self.plan.unresolved_hosts.push(normalized.clone());
         }
         trace!(%host, ip_count = addresses.len(), ?addresses, "known hostname addresses");
@@ -547,6 +593,7 @@ where
             id: HostSetId::for_host(container, &normalized),
             container: container.clone(),
             host: normalized,
+            pattern: host.clone(),
             addresses,
             used_v4: false,
             used_v6: false,
@@ -594,13 +641,32 @@ impl<'s> IccTargets<'s> {
         Self { entries }
     }
 
-    fn lookup(&self, network_id: &str, key: &str) -> &[IccTarget<'s>] {
-        let start = self
-            .entries
-            .partition_point(|entry| (entry.network_id, entry.key) < (network_id, key));
-        let rest = self.entries.get(start..).unwrap_or_default();
-        let len = rest.partition_point(|entry| entry.network_id == network_id && entry.key == key);
-        rest.get(..len).unwrap_or_default()
+    /// Targets on `network_id` whose name or alias matches `pattern`.
+    fn lookup<'a>(
+        &'a self,
+        network_id: &'a str,
+        pattern: &'a NamePattern,
+    ) -> impl Iterator<Item = &'a IccTarget<'s>> + 'a {
+        let entries = if pattern.is_exact() {
+            let key = pattern.as_str();
+            let start = self
+                .entries
+                .partition_point(|entry| (entry.network_id, entry.key) < (network_id, key));
+            let rest = self.entries.get(start..).unwrap_or_default();
+            let len =
+                rest.partition_point(|entry| entry.network_id == network_id && entry.key == key);
+            rest.get(..len).unwrap_or_default()
+        } else {
+            let start = self
+                .entries
+                .partition_point(|entry| entry.network_id < network_id);
+            let rest = self.entries.get(start..).unwrap_or_default();
+            let len = rest.partition_point(|entry| entry.network_id == network_id);
+            rest.get(..len).unwrap_or_default()
+        };
+        entries
+            .iter()
+            .filter(move |entry| pattern.matches(entry.key))
     }
 }
 
@@ -612,6 +678,7 @@ const fn same_family(a: IpAddr, b: IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::firewall::test_support::{self, MockResolver, ip, net};
+    use crate::pattern::NamePattern;
 
     fn build(state: &RuntimeState) -> (Plan, MockResolver) {
         let mut resolver = MockResolver::default();
@@ -661,15 +728,13 @@ mod tests {
                 Rule::DenyDns {
                     protocol: Protocol::Tcp
                 },
-                Rule::AcceptPort {
+                Rule::Accept {
                     destination: Destination::HostSet(0),
-                    protocol: Protocol::Tcp,
-                    port: 443
+                    service: Service::tcp(443),
                 },
-                Rule::AcceptPort {
+                Rule::Accept {
                     destination: Destination::Net(net("8.8.8.0/24")),
-                    protocol: Protocol::Tcp,
-                    port: 853
+                    service: Service::tcp(853),
                 },
             ]
         );
@@ -796,10 +861,9 @@ mod tests {
             let set = plan.host_set(index).expect("host set");
             assert_eq!(set.container, source.container);
             assert_eq!(set.host, test_support::HOST);
-            assert!(plan.egress_rules(source).contains(&Rule::AcceptPort {
+            assert!(plan.egress_rules(source).contains(&Rule::Accept {
                 destination: Destination::HostSet(index),
-                protocol: Protocol::Tcp,
-                port: 443,
+                service: Service::tcp(443),
             }));
         }
         assert_ne!(plan.host_sets[0].id, plan.host_sets[1].id);
@@ -836,15 +900,18 @@ mod tests {
         let accepted: Vec<_> = icc_of(&plan, "172.18.0.2")
             .into_iter()
             .filter_map(|rule| match rule {
-                Rule::AcceptPort {
+                Rule::Accept {
                     destination: Destination::Addr(destination),
-                    port,
+                    service: Service::Protocol(_, Some(port)),
                     ..
                 } => Some((destination, port)),
                 _ => None,
             })
             .collect();
-        assert_eq!(accepted, vec![(ip("172.18.0.10"), 5432)]);
+        assert_eq!(
+            accepted,
+            vec![(ip("172.18.0.10"), crate::model::PortRange::single(5432))]
+        );
     }
 
     #[test]
@@ -853,7 +920,7 @@ mod tests {
             let mut state = test_support::icc_state();
             let mut web = state.containers().get("abc").cloned().expect("web fixture");
             if let Some(rule) = web.policy.icc_allow.first_mut() {
-                rule.target_container = key.to_string().into();
+                rule.target_container = NamePattern::container(key);
             }
             state.apply_action(crate::model::RuntimeStateAction::CreateContainer {
                 container: Box::new(web),
@@ -861,10 +928,9 @@ mod tests {
 
             let (plan, _) = build(&state);
             assert_eq!(
-                icc_of(&plan, "172.18.0.2").contains(&Rule::AcceptPort {
+                icc_of(&plan, "172.18.0.2").contains(&Rule::Accept {
                     destination: Destination::Addr(ip("172.18.0.10")),
-                    protocol: Protocol::Tcp,
-                    port: 5432,
+                    service: Service::tcp(5432),
                 }),
                 matches,
                 "target {key}"
@@ -883,11 +949,75 @@ mod tests {
                 ..
             }
         )));
-        assert!(rules.contains(&Rule::AcceptPort {
+        assert!(rules.contains(&Rule::Accept {
             destination: Destination::Net(net("2001:db8::/32")),
-            protocol: Protocol::Tcp,
-            port: 443,
+            service: Service::tcp(443),
         }));
+    }
+
+    #[test]
+    fn plans_destinations_and_services_of_every_kind() {
+        use crate::model::{PortRange, Protocol};
+        let (plan, resolver) = build(&test_support::services_state());
+        let rules = rules_of(&plan, "172.18.0.2");
+        let ports =
+            |protocol, first, last| Service::Protocol(protocol, Some(PortRange { first, last }));
+        for expected in [
+            Rule::Accept {
+                destination: Destination::Public,
+                service: ports(Protocol::Tcp, 1024, 65535),
+            },
+            Rule::Accept {
+                destination: Destination::Public,
+                service: ports(Protocol::Udp, 3478, 3479),
+            },
+            Rule::Accept {
+                destination: Destination::Any,
+                service: Service::Protocol(Protocol::Icmp, None),
+            },
+            Rule::Accept {
+                destination: Destination::HostSet(0),
+                service: Service::Protocol(Protocol::Tcp, None),
+            },
+        ] {
+            assert!(rules.contains(&expected), "{expected:?} in {rules:#?}");
+        }
+        // A pattern's addresses only come from DNS answers to the container, and an empty
+        // set isn't a hostname that failed to resolve.
+        let set = plan.host_set(0).expect("host set");
+        assert_eq!(set.host, "*.archive.org");
+        assert!(set.pattern.matches("ia800.archive.org"));
+        assert_eq!(resolver.calls, 1);
+        assert_eq!(plan.unresolved_hosts, [] as [String; 0]);
+        // Names of host: patterns may be looked up when names are limited.
+        let mut limited = test_support::services_state();
+        let mut web = limited.containers().get("abc").cloned().expect("web");
+        web.policy.domains = Some(Vec::new());
+        limited.apply_action(crate::model::RuntimeStateAction::CreateContainer {
+            container: Box::new(web),
+        });
+        let (plan, _) = build(&limited);
+        assert_eq!(
+            source(&plan, "172.18.0.2").domains,
+            Some(vec![NamePattern::host("*.archive.org")])
+        );
+    }
+
+    #[test]
+    fn icc_allow_list_matches_container_patterns() {
+        let (plan, _) = build(&test_support::services_state());
+        let allowed: Vec<_> = icc_of(&plan, "172.18.0.2")
+            .into_iter()
+            .filter_map(|rule| match rule {
+                Rule::Accept {
+                    destination: Destination::Addr(destination),
+                    service: Service::Any,
+                } => Some(destination),
+                _ => None,
+            })
+            .collect();
+        // Each worker once, whether it matches by name or alias; not db.
+        assert_eq!(allowed, [ip("172.18.0.11"), ip("172.18.0.12")]);
     }
 
     #[test]
@@ -901,15 +1031,13 @@ mod tests {
         );
         assert!(set.used_v4);
         let rules = rules_of(&plan, "172.18.0.2");
-        assert!(rules.contains(&Rule::AcceptPort {
+        assert!(rules.contains(&Rule::Accept {
             destination: Destination::HostSet(0),
-            protocol: Protocol::Tcp,
-            port: 443,
+            service: Service::tcp(443),
         }));
-        assert!(rules.contains(&Rule::AcceptPort {
+        assert!(rules.contains(&Rule::Accept {
             destination: Destination::Net(net("8.8.8.0/24")),
-            protocol: Protocol::Tcp,
-            port: 853,
+            service: Service::tcp(853),
         }));
         assert_eq!(
             plan.bridges

@@ -9,8 +9,9 @@ use ipnet::IpNet;
 use crate::dns::{DnsError, HostResolver};
 use crate::model::{
     Container, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
-    MacAddress, Network, NetworkAttachment, PortSpec, Protocol, RuntimeState, RuntimeStateAction,
+    MacAddress, Network, NetworkAttachment, RuntimeState, RuntimeStateAction, Service,
 };
+use crate::pattern::NamePattern;
 
 pub const HOST: &str = "api.example.com";
 /// A hostname [`MockResolver`] fails to resolve.
@@ -55,11 +56,8 @@ pub fn net(value: &str) -> IpNet {
     value.parse().expect("subnet fixture should parse")
 }
 
-pub const fn tcp(port: u16) -> PortSpec {
-    PortSpec {
-        protocol: Protocol::Tcp,
-        port,
-    }
+pub const fn tcp(port: u16) -> Service {
+    Service::tcp(port)
 }
 
 pub fn add_network(state: &mut RuntimeState, id: &str, subnet: &str, gateway: &str) {
@@ -117,8 +115,8 @@ pub fn add_container(
 
 pub fn host_egress() -> EgressRule {
     EgressRule {
-        target: EgressTarget::Hostname(HOST.to_string()),
-        ports: vec![tcp(443)],
+        target: EgressTarget::Hostname(NamePattern::host(HOST)),
+        services: vec![tcp(443)],
     }
 }
 
@@ -147,7 +145,7 @@ pub fn hostname_state() -> RuntimeState {
                 host_egress(),
                 EgressRule {
                     target: EgressTarget::IpCidr(net("8.8.8.0/24")),
-                    ports: vec![tcp(853)],
+                    services: vec![tcp(853)],
                 },
             ],
         ),
@@ -178,8 +176,8 @@ pub fn icc_state() -> RuntimeState {
 
     let mut web = policy(IccMode::AllowListed, Vec::new());
     web.icc_allow = vec![IccAllowRule {
-        target_container: "db".to_string().into(),
-        ports: vec![tcp(5432)],
+        target_container: NamePattern::container("db"),
+        services: vec![tcp(5432)],
     }];
     add_container(
         &mut state,
@@ -223,7 +221,7 @@ pub fn ipv6_state() -> RuntimeState {
                 host_egress(),
                 EgressRule {
                     target: EgressTarget::IpCidr(net("2001:db8::/32")),
-                    ports: vec![tcp(443)],
+                    services: vec![tcp(443)],
                 },
             ],
         ),
@@ -244,15 +242,76 @@ pub fn unresolvable_state() -> RuntimeState {
             IccMode::Deny,
             vec![
                 EgressRule {
-                    target: EgressTarget::Hostname(UNRESOLVABLE_HOST.to_string()),
-                    ports: vec![tcp(443)],
+                    target: EgressTarget::Hostname(NamePattern::host(UNRESOLVABLE_HOST)),
+                    services: vec![tcp(443)],
                 },
                 EgressRule {
                     target: EgressTarget::IpCidr(net("8.8.8.0/24")),
-                    ports: vec![tcp(853)],
+                    services: vec![tcp(853)],
                 },
             ],
         ),
     );
+    state
+}
+
+/// `web` (172.18.0.2, net0) with rules of every kind of destination and service:
+/// - `ip:public` on TCP 1024 to 65535 and UDP 3478 to 3479;
+/// - `ip:*` for ICMP;
+/// - `host:*.archive.org` on any TCP port;
+/// - ICC to `container:worker-*` on anything.
+///
+/// `worker-1` (172.18.0.11, alias `jobs`), `worker-2` (172.18.0.12) and `db`
+/// (172.18.0.20) share net0.
+pub fn services_state() -> RuntimeState {
+    use crate::model::{PortRange, Protocol};
+    let mut state = RuntimeState::default();
+    add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+    let ports =
+        |protocol, first, last| Service::Protocol(protocol, Some(PortRange { first, last }));
+    let mut web = policy(
+        IccMode::AllowListed,
+        vec![
+            EgressRule {
+                target: EgressTarget::PublicAddress,
+                services: vec![
+                    ports(Protocol::Tcp, 1024, 65535),
+                    ports(Protocol::Udp, 3478, 3479),
+                ],
+            },
+            EgressRule {
+                target: EgressTarget::AnyAddress,
+                services: vec![Service::Protocol(Protocol::Icmp, None)],
+            },
+            EgressRule {
+                target: EgressTarget::Hostname(NamePattern::host("*.archive.org")),
+                services: vec![Service::Protocol(Protocol::Tcp, None)],
+            },
+        ],
+    );
+    web.icc_allow = vec![IccAllowRule {
+        target_container: NamePattern::container("worker-*"),
+        services: vec![Service::Any],
+    }];
+    add_container(
+        &mut state,
+        "abc",
+        "web",
+        &[("net0", "172.18.0.2", &[])],
+        web,
+    );
+    for (id, name, address, aliases) in [
+        ("w1", "worker-1", "172.18.0.11", &["jobs"][..]),
+        ("w2", "worker-2", "172.18.0.12", &[][..]),
+        ("db", "db", "172.18.0.20", &[][..]),
+    ] {
+        add_container(
+            &mut state,
+            id,
+            name,
+            &[("net0", address, aliases)],
+            ContainerPolicy::default(),
+        );
+    }
     state
 }
