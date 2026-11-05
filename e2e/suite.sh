@@ -29,6 +29,7 @@ SCENARIOS=(
   flood
   domains
   patterns
+  multicast
   updates
   boot
 )

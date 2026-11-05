@@ -1,0 +1,36 @@
+# Cluster members finding each other by multicast, as Hazelcast does on 224.2.2.3:54327,
+# on a network where they may otherwise only reach each other.
+x-node: &node
+  image: portcullis-e2e-tester
+  pull_policy: never
+  networks: [cluster]
+  labels:
+    - portcullis.icc.mode=allow-listed
+    - portcullis.icc.allow.discovery=multicast:224.2.2.3,udp:54327
+    - portcullis.icc.allow.peers=container:node-*,udp:*
+  # Answer the group (and a second one) on the discovery port, the group on another port,
+  # and TCP 8080, with the hostname.
+  command:
+    - sh
+    - -c
+    - >-
+      socat UDP4-RECVFROM:54328,ip-add-membership=224.2.2.3:eth0,fork SYSTEM:hostname &
+      socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:hostname &
+      exec socat UDP4-RECVFROM:54327,ip-add-membership=224.2.2.3:eth0,ip-add-membership=224.2.2.4:eth0,fork SYSTEM:hostname
+
+services:
+  node-a: *node
+  node-b: *node
+  # May reach node-a on TCP 8080, and no group.
+  client:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [cluster]
+    labels:
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.node=container:node-a,tcp:8080
+
+networks:
+  cluster:
+    labels:
+      - portcullis.enable=true
