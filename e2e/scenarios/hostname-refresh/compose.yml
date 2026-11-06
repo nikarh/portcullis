@@ -1,7 +1,7 @@
 # Portcullis runs with a hold of 20 seconds here, so it looks names up every 5 seconds. The
 # containers connect by address and never look the names up themselves, like applications
 # that resolved a name once and kept the address. moving.test and late.test resolve on the
-# Docker host only (/etc/hosts).
+# Docker host only (/etc/hosts), dyn.test through the outside DNS server only.
 services:
   app:
     image: portcullis-e2e-tester
@@ -17,6 +17,13 @@ services:
     labels:
       - portcullis.egress.moving=host:moving.test,tcp:80
       - portcullis.hostname-hold=10m
+  resolver:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    dns: [198.51.100.2]
+    labels:
+      - portcullis.egress.dyn=host:dyn.test,tcp:80
 
 networks:
   net:

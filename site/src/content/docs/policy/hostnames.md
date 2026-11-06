@@ -41,6 +41,7 @@ An address stays allowed for the hold, an hour by default, after anything last s
 - An address DNS no longer returns stays allowed for the rest of its hold, then is removed. The hold isn't cut short when the name moves: many names return a different subset of a pool at every lookup, so an address missing from one answer may well still be in use, and still the name's.
 - When the host's resolver doesn't answer, addresses get one more hold: containers that don't need DNS right then keep working through an outage of up to an hour. When it answers that the name doesn't exist, they run out as usual.
 - Connections that are open keep working when their address runs out. Only new connections need it allowed.
+- Addresses outlast a restart of Portcullis: the first rule update keeps what the rules left in place have, each for the time it had left. After a reboot, rules put back from the saved copy start without them, as those may be days old.
 
 So a shorter hold removes addresses DNS no longer returns sooner, and a longer one keeps addresses an application holds on to working longer, even when DNS has moved on. Set the hold for every container in the config:
 

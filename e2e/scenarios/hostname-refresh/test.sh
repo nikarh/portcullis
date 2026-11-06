@@ -17,7 +17,7 @@ hosts_entry moving.test 198.51.100.3
 hosts_entry late.test
 stop_portcullis
 start_portcullis --hostname-hold 20
-wait_managed "$(svc_ip app net)" "$(svc_ip patient net)"
+wait_managed "$(svc_ip app net)" "$(svc_ip patient net)" "$(svc_ip resolver net)"
 
 allowed "the address Portcullis looked up" tcp app 198.51.100.3 80
 flush_checks
@@ -42,6 +42,18 @@ blocked "a name that doesn't resolve" tcp app 198.51.100.5 80
 flush_checks
 hosts_entry late.test 198.51.100.5
 check "the name once it resolves" wait_allowed 10 app 198.51.100.5
+flush_checks
+
+# What a container learned from its own lookups survives a restart of Portcullis, though
+# the host can't resolve the name: the rules left in place still have it.
+allowed "the lookup" resolve resolver dyn.test
+flush_checks
+allowed "the address from the answer" tcp resolver 198.51.100.5 80
+flush_checks
+stop_portcullis
+start_portcullis --hostname-hold 20
+wait_managed "$(svc_ip resolver net)"
+allowed "the address from the answer, after a restart" tcp resolver 198.51.100.5 80
 flush_checks
 
 hosts_entry moving.test

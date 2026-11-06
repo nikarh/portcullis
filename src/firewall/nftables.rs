@@ -242,6 +242,9 @@ struct Installed {
     sources: BTreeMap<IpAddr, ContainerName>,
     /// Found in place at the start, rather than installed by this run.
     found: bool,
+    /// Left in place by a previous run that stopped, rather than put back from the saved
+    /// rules: the addresses in its hostname sets are as current as that run left them.
+    kept: bool,
 }
 
 impl Installed {
@@ -325,7 +328,10 @@ where
             *self
                 .installed
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(found);
+                .unwrap_or_else(PoisonError::into_inner) = Some(Installed {
+                kept: true,
+                ..found
+            });
             return Ok(Restored::Kept);
         }
         let Some(path) = &self.saved else {
@@ -1045,11 +1051,11 @@ fn render_objects(
     }
     for set in &plan.host_sets {
         if set.used_v4 {
-            let name = render_set(out, set, SET_PREFIX_V4, "ipv4_addr", || set.v4())?;
+            let name = render_set(out, set, SET_PREFIX_V4, "ipv4_addr", || set.v4(), previous)?;
             installed.sets.insert(name);
         }
         if set.used_v6 {
-            let name = render_set(out, set, SET_PREFIX_V6, "ipv6_addr", || set.v6())?;
+            let name = render_set(out, set, SET_PREFIX_V6, "ipv6_addr", || set.v6(), previous)?;
             installed.sets.insert(name);
         }
     }
@@ -1737,12 +1743,18 @@ fn render_elements<T: fmt::Display>(
 
 /// Sets have per-element timeouts: addresses expire when nothing renews them. Returns the
 /// set's qualified name.
+///
+/// An update empties the set and fills it with what Portcullis knows, except the first one
+/// after a restart, in rules the previous run left in place: Portcullis doesn't remember
+/// the addresses that run learned from DNS answers, but the set does, with the time each
+/// has left. Those are kept, to run out as they would have; the update renews the rest.
 fn render_set<I>(
     out: &mut String,
     set: &HostSet,
     prefix: &'static str,
     type_name: &str,
     addresses: impl Fn() -> I,
+    previous: &Installed,
 ) -> Result<String, fmt::Error>
 where
     I: Iterator<Item = (IpAddr, Duration)>,
@@ -1753,13 +1765,17 @@ where
         out,
         "add set {name} {{ type {type_name}; flags timeout; size {HOST_SET_SIZE}; }}"
     )?;
-    writeln!(out, "flush set {name}")?;
-    render_elements(
-        out,
-        format_args!("add element {name}"),
-        addresses().map(|(address, timeout)| Timed(address, timeout)),
-        "",
-    )?;
+    if previous.kept && previous.sets.contains(&name) {
+        render_timeouts(out, format_args!("{name}"), addresses)?;
+    } else {
+        writeln!(out, "flush set {name}")?;
+        render_elements(
+            out,
+            format_args!("add element {name}"),
+            addresses().map(|(address, timeout)| Timed(address, timeout)),
+            "",
+        )?;
+    }
     Ok(name)
 }
 
@@ -3526,6 +3542,60 @@ flush chain bridge portcullis limit_open
                  add element inet portcullis {name} {{ 198.51.100.3 timeout 2s }}\n"
             )]
         );
+    }
+
+    #[test]
+    fn keeps_host_addresses_a_previous_run_left_in_place_at_the_first_update() {
+        let state = test_support::hostname_state();
+        let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
+        let name = plan.host_set(0).expect("host set").id.name(SET_PREFIX_V4);
+        let inet = format!(
+            "table inet portcullis {{\n\tset {name} {{\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}}\n}}\n"
+        );
+        let renewed = format!(
+            "add element inet portcullis {name} {{ 1.1.1.1 timeout 3600s }}\n\
+             delete element inet portcullis {name} {{ 1.1.1.1 }}\n\
+             add element inet portcullis {name} {{ 1.1.1.1 timeout 3600s }}\n"
+        );
+        let flushed = format!(
+            "flush set inet portcullis {name}\nadd element inet portcullis {name} {{ 1.1.1.1 timeout 3600s }}\n"
+        );
+
+        // Left in place by a run that stopped: what the set has stays, the update renews
+        // what Portcullis knows.
+        let firewall =
+            NftablesFirewall::new(RecordingRunner::with_tables(&inet, BRIDGE_LISTING), OPTIONS);
+        assert_eq!(firewall.restore().expect("restore"), Restored::Kept);
+        for _ in 0..2 {
+            firewall
+                .apply(&state, &mut MockResolver::default(), &[], false)
+                .expect("apply");
+        }
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        assert!(scripts[0].contains(&renewed), "{}", scripts[0]);
+        assert!(!scripts[0].contains(&format!("flush set inet portcullis {name}")));
+        // Later updates start the set over.
+        assert!(scripts[1].contains(&flushed), "{}", scripts[1]);
+        drop(scripts);
+
+        // Put back from the saved rules after a reboot: those addresses may be days old.
+        let path = std::env::temp_dir().join(format!(
+            "portcullis-saved-hosts-{}/rules.nft",
+            std::process::id()
+        ));
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, "# saved\n").expect("save");
+        let restored =
+            NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
+        *restored.runner.creates.lock().expect("lock") =
+            Some(RecordingRunner::tables(&inet, BRIDGE_LISTING));
+        assert_eq!(restored.restore().expect("restore"), Restored::Saved);
+        restored
+            .apply(&state, &mut MockResolver::default(), &[], false)
+            .expect("apply");
+        let scripts = restored.runner.scripts.lock().expect("lock");
+        assert!(scripts[1].contains(&flushed), "{}", scripts[1]);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
