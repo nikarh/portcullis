@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.3.0] - 2026-11-06
+
+### Features
+
+- Look the names of host: rules up again while they are in use, with a hold per container by @nikarh
+
+### Fixes
+
+- Keep the addresses host: rules learned across a restart of Portcullis by @nikarh
+
 ## [0.2.1] - 2026-11-06
 
 ### Fixes
@@ -227,6 +237,7 @@ All notable changes to this project are documented in this file. The format is b
 - Verifying signed releases, and how releasing works by @nikarh
 - Remove the crates.io badge; portcullis on crates.io is another project by @nikarh
 
+[0.3.0]: https://github.com/nikarh/portcullis/compare/v0.2.1..v0.3.0
 [0.2.1]: https://github.com/nikarh/portcullis/compare/v0.2.0..v0.2.1
 [0.2.0]: https://github.com/nikarh/portcullis/compare/v0.1.5..v0.2.0
 [0.1.5]: https://github.com/nikarh/portcullis/compare/v0.1.4..v0.1.5
