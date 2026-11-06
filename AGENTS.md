@@ -2,6 +2,11 @@ When adding dependencies to the project don't edit files - use package managers 
 Commit your changes. Use conventional commits. Split logical changes to individual commits.
 Before committing run fmt, clippy and tests.
 
+Commit messages, pull requests, code, tests and docs describe bugs and their fixes, in general terms: what goes
+wrong, under which conditions, and what changed. Never frame them around a particular deployment, server, run or
+data set ("on my server", "traefik on the fileserver did X", "from these logs"), and never name its containers,
+networks, addresses or domains; use placeholders (`app`, `db`, `example.org`, documentation address ranges).
+
 ## Documentation
 
 The documentation is the Starlight site in `site/` (pages in `site/src/content/docs/`), published to GitHub Pages
