@@ -4,8 +4,9 @@ Before committing run fmt, clippy and tests.
 
 Commit messages, pull requests, code, tests and docs describe bugs and their fixes, in general terms: what goes
 wrong, under which conditions, and what changed. Never frame them around a particular deployment, server, run or
-data set ("on my server", "the proxy on that host did X", "from these logs"), and never name its containers,
-networks, addresses or domains; use placeholders (`app`, `db`, `example.org`, documentation address ranges).
+data set ("on my server", "the proxy on that host did X", "from these logs"), and don't carry over its details:
+its names of containers and networks, addresses, domains, or what runs where. Well-known software is fine in
+examples (a Traefik reverse proxy, a Postgres database), as long as the example isn't a copy of someone's setup.
 
 ## Documentation
 

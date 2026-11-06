@@ -24,7 +24,7 @@ When a configuration is intended, acknowledge it with a label, and its warning i
 
 ```yaml title="docker-compose.yml"
 services:
-  proxy:
+  traefik:
     labels:
       - portcullis.ack=docker-socket,dns-not-observable
 ```
