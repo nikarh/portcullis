@@ -13,6 +13,7 @@ Portcullis assumes a container may be compromised and actively try to get past i
 - A container can't take over another container's MAC in the bridge's forwarding table, or claim another container's address, or the gateway's, in its neighbours' ARP caches.
 - ARP has to be a plain request or reply for Ethernet and IPv4: 28 bytes, or 46 with zero padding. ARP reaches other containers whatever their ICC rules, so data after it, or ARP of another shape, is denied as a frame enforced networks don't carry.
 - Portcullis finds each container's port by asking the kernel about the container's network namespace; it never runs anything inside the container.
+- Routed traffic is only checked against a container's egress rules when it comes in from a managed network's bridge. Packets with a container's address from anywhere else aren't the container's: they aren't reported as its, and don't count towards its [quarantine](/policy/limits/#quarantine).
 - A container with no port on the bridge, such as one that is stopping (Docker removes its interface before it reports it gone), can't send anything there, so nothing sent with its address or MAC passes as its.
 - When Docker gives a removed container's address to a new container, Portcullis deletes the old container's tracked connections first, so the new container can't keep using them.
 

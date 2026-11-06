@@ -923,7 +923,15 @@ fn render_egress_dispatch(
         if base == Chain::Base(Table::Inet) {
             map.fill(out, entries)?;
         }
-        writeln!(out, "add rule {base} {family} saddr vmap @{}", map.name())?;
+        // Only from a managed bridge: a container's address arriving from anywhere else
+        // isn't the container, and its traffic mustn't count against the container (or
+        // get it quarantined).
+        writeln!(
+            out,
+            "add rule {base} iifname @{} {family} saddr vmap @{}",
+            NamedSet::InetBridges.name(),
+            map.name()
+        )?;
     }
     // Unknown or spoofed sources of enforced networks; the bridge table already reported
     // them.
@@ -2679,13 +2687,13 @@ flush chain bridge portcullis limit_open
         assert_lines(
             &script,
             &[
-                "add element inet portcullis egress4 { 172.18.0.2 : goto egress0 }\nadd rule inet portcullis forward ip saddr vmap @egress4".into(),
+                "add element inet portcullis egress4 { 172.18.0.2 : goto egress0 }\nadd rule inet portcullis forward iifname @bridges ip saddr vmap @egress4".into(),
                 // Traffic to the host follows the same rules.
                 "add rule inet portcullis input ct state established accept".into(),
                 // ICMP errors only from an end of the connection they are about.
                 "add rule inet portcullis egress0 ct state related ct original ip saddr 172.18.0.2 accept".into(),
                 "add rule inet portcullis egress0 ct state related ct reply ip saddr 172.18.0.2 accept".into(),
-                "add rule inet portcullis input ip saddr vmap @egress4".into(),
+                "add rule inet portcullis input iifname @bridges ip saddr vmap @egress4".into(),
                 "add rule inet portcullis input iifname @enforced_bridges drop".into(),
                 "add element inet portcullis enforced_bridges { \"br-net0\" }".into(),
                 // The gateway is the host: traffic to it follows the egress rules. So does
@@ -3271,7 +3279,7 @@ flush chain bridge portcullis limit_open
         assert!(!script.contains("pc_h4_"));
         assert!(has_line(
             &script,
-            "add rule inet portcullis forward ip6 saddr vmap @egress6"
+            "add rule inet portcullis forward iifname @bridges ip6 saddr vmap @egress6"
         ));
         assert!(has_line(
             &script,
