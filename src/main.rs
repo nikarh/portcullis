@@ -813,12 +813,17 @@ fn run(config: &Config) -> Result<(), MainError> {
                     DockerWorkerEvent::Event(event) => {
                         trace!(event = ?event, "docker event received");
                         if event.kind == DockerEventKind::Container
+                            && matches!(event.action, DockerEventAction::Kill | DockerEventAction::Stop)
+                        {
+                            runtime_state.stopped(&event.id.clone().into());
+                        }
+                        if event.kind == DockerEventKind::Container
                             && event.action == DockerEventAction::Start
                         {
                             monitor.check_container(&runtime_state, &event.id);
                             publish_warnings(&mut monitor, &bus);
-                            // A restart starts it over from a clean state.
-                            if runtime_state.release(&event.id.clone().into()) {
+                            // A restart through Docker starts it over from a clean state.
+                            if runtime_state.started(&event.id.clone().into()) {
                                 info!(container = %event.id, "quarantined container restarted; letting it back");
                                 if let Err(error) = applier.apply(&mut runtime_state) {
                                     error!(%error, "firewall apply failed; continuing");
@@ -848,7 +853,10 @@ fn run(config: &Config) -> Result<(), MainError> {
                             Ok(client) => {
                                 monitor = DockerMonitor::new(client).with_monitored_networks(config.monitor_networks.clone());
                                 match monitor.initialize() {
-                                    Ok(state) => {
+                                    Ok(mut state) => {
+                                        // Docker restarting doesn't let quarantined
+                                        // containers back.
+                                        state.keep_quarantine(&runtime_state);
                                         runtime_state = state;
                                         monitor.check_containers(&runtime_state);
                                         publish_warnings(&mut monitor, &bus);

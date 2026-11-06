@@ -76,7 +76,7 @@ An enforced network with IPv6 enabled has all IPv6 denied (and an `ipv6_network`
 
 ## A container is cut off completely
 
-It was quarantined: look for a `quarantined` warning. Restart or recreate the container to let it back; it starts from a clean state. Restarting Portcullis also releases every quarantined container.
+It was quarantined: look for a `quarantined` warning. Restart or recreate the container through Docker (`docker restart`) to let it back; it starts from a clean state. Being started again by its restart policy after it exited doesn't. Restarting Portcullis also releases every quarantined container.
 
 If the container has a reason to craft packets, opt it out with `portcullis.quarantine=off`. If it was quarantined for too many denials, find out what it was trying to reach first. See [Quarantine and limits](/policy/limits/).
 

@@ -7,6 +7,15 @@ services:
     networks: [net]
     labels:
       - portcullis.egress.web=ip:198.51.100.3,tcp:80
+  # The same, but started again by Docker whenever it exits, which it does when told to.
+  restarter:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    restart: always
+    command: ["sh", "-c", "rm -f /tmp/exit; while [ ! -e /tmp/exit ]; do sleep 0.1; done"]
+    labels:
+      - portcullis.egress.web=ip:198.51.100.3,tcp:80
   # Scans more ports than --quarantine-denials allows per minute.
   scanner:
     image: portcullis-e2e-tester

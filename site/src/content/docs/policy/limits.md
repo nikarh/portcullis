@@ -16,7 +16,7 @@ A container is quarantined when:
 
 A quarantined container is cut off from its networks: nothing it sends gets anywhere, not even ARP, and the firewall drops it before looking at anything else. It is reported with a `quarantined` warning, which raises an [alert](/guides/events-and-alerts/#alerts).
 
-Restarting the container (`docker restart`, or recreating it) lets it back, starting from a clean state; if it misbehaves again, it is quarantined again. Quarantine is kept in memory, so restarting Portcullis lets quarantined containers back too.
+Restarting the container through Docker (`docker restart`, `docker stop` or `docker kill` and then `docker start`, or recreating it) lets it back, starting from a clean state; if it misbehaves again, it is quarantined again. A container can't let itself back: when it exits on its own and its restart policy (`restart: always`, `unless-stopped`, `on-failure`) starts it again, it stays cut off. So does every quarantined container when Docker restarts. Quarantine is kept in memory, so restarting Portcullis lets quarantined containers back.
 
 | Setting | Effect |
 | --- | --- |

@@ -496,8 +496,9 @@ pub struct RuntimeState {
     ports: HashMap<IpAddr, BridgePort>,
     /// Container addresses known to have no bridge port: their container can't send.
     portless: HashSet<IpAddr>,
-    /// Containers cut off from their networks, see `quarantine`.
-    quarantined: HashSet<ContainerId>,
+    /// Containers cut off from their networks, see `quarantine`, and whether they were
+    /// stopped through Docker since.
+    quarantined: HashMap<ContainerId, bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -573,17 +574,43 @@ impl RuntimeState {
 
     /// Cut a container off from its networks. Returns whether it wasn't already.
     pub fn quarantine(&mut self, container: &ContainerId) -> bool {
-        self.containers.contains_key(container) && self.quarantined.insert(container.clone())
+        self.containers.contains_key(container)
+            && self.quarantined.insert(container.clone(), false).is_none()
     }
 
-    /// Let a quarantined container back. Returns whether it was quarantined.
-    pub fn release(&mut self, container: &ContainerId) -> bool {
-        self.quarantined.remove(container)
+    /// A container was stopped or killed through Docker's API: someone with access to
+    /// Docker did it, not the container, whose own exit only makes Docker report it dead.
+    pub fn stopped(&mut self, container: &ContainerId) {
+        if let Some(stopped) = self.quarantined.get_mut(container) {
+            *stopped = true;
+        }
+    }
+
+    /// A container started: a quarantined one is let back if it was stopped through Docker
+    /// first. A container that only exited, and was started again by its restart policy,
+    /// stays cut off. Returns whether it was let back.
+    pub fn started(&mut self, container: &ContainerId) -> bool {
+        let stopped = self.quarantined.get(container) == Some(&true);
+        if stopped {
+            self.quarantined.remove(container);
+        }
+        stopped
     }
 
     #[must_use]
     pub fn is_quarantined(&self, container: &ContainerId) -> bool {
-        self.quarantined.contains(container)
+        self.quarantined.contains_key(container)
+    }
+
+    /// Keep what `previous` knew of quarantined containers that still exist, as this state
+    /// replaces it after Docker's state was read again.
+    pub fn keep_quarantine(&mut self, previous: &Self) {
+        self.quarantined = previous
+            .quarantined
+            .iter()
+            .filter(|(container, _)| self.containers.contains_key(*container))
+            .map(|(container, stopped)| (container.clone(), *stopped))
+            .collect();
     }
 
     fn remove_network(&mut self, network_id: &NetworkId) -> bool {
@@ -721,6 +748,53 @@ mod tests {
         assert_eq!(addresses, ["n0 172.18.0.2", "n1 172.19.0.9"]);
         // Nothing new.
         assert!(!state.apply_action(discovered(restarted)));
+    }
+
+    #[test]
+    fn quarantine_lasts_until_the_container_is_stopped_through_docker() {
+        let mut state = RuntimeState::default();
+        state.apply_action(RuntimeStateAction::CreateContainer {
+            container: Box::new(container("a", "n0", "172.18.0.2", "/a")),
+        });
+        let a: ContainerId = "a".to_string().into();
+        assert!(state.quarantine(&a));
+        assert!(!state.quarantine(&a), "already");
+        // Exited on its own and started again by its restart policy.
+        assert!(!state.started(&a));
+        assert!(state.is_quarantined(&a));
+        // docker restart: killed or stopped, then started.
+        state.stopped(&a);
+        assert!(state.started(&a));
+        assert!(!state.is_quarantined(&a));
+        // Stopping a container that isn't quarantined doesn't keep a later quarantine from
+        // lasting.
+        state.stopped(&a);
+        assert!(state.quarantine(&a));
+        assert!(!state.started(&a));
+        assert!(state.is_quarantined(&a));
+    }
+
+    #[test]
+    fn quarantine_survives_reading_dockers_state_again() {
+        let mut state = RuntimeState::default();
+        for (id, address) in [("a", "172.18.0.2"), ("b", "172.18.0.3")] {
+            state.apply_action(RuntimeStateAction::CreateContainer {
+                container: Box::new(container(id, "n0", address, "/x")),
+            });
+        }
+        let (a, b): (ContainerId, ContainerId) = ("a".to_string().into(), "b".to_string().into());
+        assert!(state.quarantine(&a));
+        assert!(state.quarantine(&b));
+        state.stopped(&b);
+        // Read again after Docker restarted: b is gone.
+        let mut read = RuntimeState::default();
+        read.apply_action(RuntimeStateAction::CreateContainer {
+            container: Box::new(container("a", "n0", "172.18.0.2", "/y")),
+        });
+        read.keep_quarantine(&state);
+        assert!(read.is_quarantined(&a));
+        assert!(!read.is_quarantined(&b));
+        assert!(!read.started(&a), "not stopped through Docker");
     }
 
     #[test]
