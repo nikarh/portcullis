@@ -2013,7 +2013,19 @@ fn render_rule(
             if let Some(gateway) = gateway {
                 write!(out, "{daddr} != {gateway} ")?;
             }
-            writeln!(out, "oifname @{} accept", NamedSet::InetBridges.name())
+            writeln!(out, "oifname @{} accept", NamedSet::InetBridges.name())?;
+            // Broadcast and multicast are never routed: leaving through a bridge, they are
+            // bridged, and the ICC rules decided on them.
+            if subnet.addr().is_ipv4() {
+                for destination in &ICC_BROADCAST_V4 {
+                    writeln!(
+                        out,
+                        "add rule {chain} {daddr} {destination} oifname @{} accept",
+                        NamedSet::InetBridges.name()
+                    )?;
+                }
+            }
+            Ok(())
         }
         Rule::AcceptNet(destination) => decide(
             out,
@@ -2680,6 +2692,9 @@ flush chain bridge portcullis limit_open
                 // anything else the host receives, such as broadcast to the subnet: only
                 // what leaves through a bridge is for other containers.
                 "add rule inet portcullis egress0 ct original ip daddr 172.18.0.0/16 ct original ip daddr != 172.18.0.1 oifname @bridges accept".into(),
+                // Broadcast and multicast leaving through a bridge are bridged (with
+                // br_netfilter): the ICC rules decided on them.
+                "add rule inet portcullis egress0 ct original ip daddr 255.255.255.255/32 oifname @bridges accept\nadd rule inet portcullis egress0 ct original ip daddr 224.0.0.0/4 oifname @bridges accept".into(),
                 // Reported by the bridge table already.
                 "add rule inet portcullis forward iifname @enforced_bridges drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
