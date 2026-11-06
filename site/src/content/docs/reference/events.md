@@ -99,7 +99,7 @@ A container address became managed or stopped being managed.
 Something that needs attention. Every warning raises an alert.
 
 ```json
-{"time":"2026-11-02T10:15:29.902Z","event":"warning","kind":"docker_socket","container":"traefik",
+{"time":"2026-11-02T10:15:29.902Z","event":"warning","kind":"docker_socket","container":"proxy",
  "message":"..."}
 ```
 
@@ -152,7 +152,7 @@ With `log-format = "text"` (the default), and in `portcullis watch`, each event 
 2026-11-02T10:15:30.101Z dns billing A api.stripe.com via 192.168.1.1: No Error 104.18.3.4 104.18.2.4
 2026-11-02T10:15:30.120Z DENIED egress billing 172.18.0.2 -> api.stripe.com (104.18.3.4) tcp/443
 2026-11-02T10:15:31.004Z would deny icc worker 172.18.0.4 -> db (172.18.0.5) tcp/5432
-2026-11-02T10:15:32.450Z warning traefik: ...
+2026-11-02T10:15:32.450Z warning proxy: ...
 2026-11-02T10:15:33.000Z releasing billing 172.18.0.2 on backend (enforce)
 ```
 
