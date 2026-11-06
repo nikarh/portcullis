@@ -31,7 +31,7 @@ gpg_() { gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 "$@" <<<"$
 if ! gh release view "${tag}" >/dev/null 2>&1; then
   # A pre-release, so that releases/latest stays the newest vX.Y.Z.
   gh release create "${tag}" --prerelease --latest=false --title "apt repository (${tag})" \
-    --notes "The Portcullis apt repository, see https://nikarh.github.io/portcullis/start/installation/. Updated by the Publish workflow."
+    --notes "The Portcullis apt repository, see https://portcullis.arhipov.net/start/installation/. Updated by the Publish workflow."
 fi
 assets=$(gh release view "${tag}" --json assets --jq '.assets | sort_by(.createdAt) | .[].name')
 

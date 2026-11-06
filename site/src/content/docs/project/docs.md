@@ -52,14 +52,19 @@ Every change to behaviour updates the docs in the same pull request:
 
 ## Versions
 
-The site is published on GitHub Pages from the `gh-pages` branch, one directory per version:
+The site is published on GitHub Pages from the `gh-pages` branch, at `https://portcullis.arhipov.net/` (the
+`CNAME` file; the DNS record is at Cloudflare), one directory per version:
 
 | Path | Built from | Updated |
 | --- | --- | --- |
-| `/portcullis/main/` | the tip of `main` | on every push to `main` |
-| `/portcullis/vX.Y.Z/` | the release tag | once, when the release is published; kept for good |
-| `/portcullis/` | | redirects to the newest release |
-| `/portcullis/versions.json` | | the list of versions, read by the version menu |
+| `/main/` | the tip of `main` | on every push to `main` |
+| `/vX.Y.Z/` | the release tag | once, when the release is published; kept for good |
+| `/` | | redirects to the newest release |
+| `/versions.json` | | the list of versions, read by the version menu |
+
+A path without a version (`/reference/configuration/`, what the config file and `--help` link to) goes to that page
+of the newest release, through `404.html`. So do links to `https://nikarh.github.io/portcullis/`, where the docs were
+before: GitHub redirects them to the domain.
 
 The **Docs** workflow (`.github/workflows/docs.yml`) builds the site with `DOCS_VERSION` set to the version, which sets the base path, and `scripts/docs-publish.sh` copies the build into the version's directory of `gh-pages`, rewrites `versions.json` and the root redirect, and pushes. Pull requests only build, so broken links fail them.
 

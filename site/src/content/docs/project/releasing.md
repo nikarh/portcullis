@@ -15,7 +15,7 @@ sidebar:
    binary as `.deb` and Arch Linux packages with [nfpm](https://nfpm.goreleaser.com/) (`scripts/package.sh`, config
    in `dist/packaging/`), checks that the `.deb` installs, starts and purges, writes `SHA256SUMS` and its GPG signature, and
    uploads everything to the release.
-4. The **Docs** workflow builds the documentation from the tag and publishes it as `/portcullis/vX.Y.Z/` on GitHub
+4. The **Docs** workflow builds the documentation from the tag and publishes it as `/vX.Y.Z/` on GitHub
    Pages, where it stays; the site's root then redirects to it. See [Writing the docs](/project/docs/#versions).
 
 Every push to `main` also updates the `latest` pre-release (the **Latest** workflow): the tag moves to the new

@@ -4,7 +4,9 @@ import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join, relative, dirname, posix } from 'node:path';
 
 const dist = new URL('../dist/', import.meta.url).pathname;
-const base = process.env.DOCS_VERSION ? `/portcullis/${process.env.DOCS_VERSION}/` : '/';
+const base = process.env.DOCS_VERSION ? `/${process.env.DOCS_VERSION}/` : '/';
+// What lives next to this build on GitHub Pages, not in it: other versions and versions.json.
+const beside = /^\/(?:main\/|v\d+\.\d+\.\d+\/|versions\.json$)/;
 
 const pages = new Map();
 const walk = (dir) => {
@@ -42,8 +44,7 @@ for (const [file, html] of pages) {
 		if (pathPart === '') path = pagePath;
 		else if (pathPart.startsWith('/')) {
 			if (!pathPart.startsWith(base)) {
-				// Other versions and versions.json live next to this build on GitHub Pages, not in it.
-				if (pathPart.startsWith('/portcullis/')) continue;
+				if (beside.test(pathPart)) continue;
 				broken.push(`${relative(dist, file)}: ${attribute}="${url}" is outside the base ${base}`);
 				continue;
 			}

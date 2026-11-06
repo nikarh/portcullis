@@ -226,7 +226,7 @@ OPTIONS:
   -V, --version                Show the version
   -h, --help                   Show this help
 
-Documentation: https://nikarh.github.io/portcullis/
+Documentation: https://portcullis.arhipov.net/
 ";
     let _ = std::io::stdout().write_all(usage.as_bytes());
 }

@@ -1,6 +1,6 @@
 [Unit]
 Description=Portcullis: network rules for Docker containers, from their labels
-Documentation=https://nikarh.github.io/portcullis/
+Documentation=https://portcullis.arhipov.net/
 # Portcullis puts the last rules back and reports itself ready before Docker starts, so
 # no container on an enforced network starts unrestricted, at boot or ever. It waits for
 # Docker on its own.

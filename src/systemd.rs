@@ -3,7 +3,7 @@
 //! Portcullis reports itself ready once the rules of its last run are back in place, before
 //! it has even reached Docker: Docker, ordered after it, then starts no container before
 //! they are. See "Running as a service" in the docs
-//! (<https://nikarh.github.io/portcullis/guides/service/>).
+//! (<https://portcullis.arhipov.net/guides/service/>).
 
 use std::env;
 use std::io;

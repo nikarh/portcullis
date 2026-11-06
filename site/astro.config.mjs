@@ -5,13 +5,13 @@ import { satteri } from '@astrojs/markdown-satteri';
 import baseLinks from './src/plugins/base-links.mjs';
 
 // Every version of the docs is built on its own, into a directory of the gh-pages branch named after it
-// (see scripts/docs-deploy.sh): DOCS_VERSION is `main` or a release tag, and the base is /portcullis/<version>/.
+// (see scripts/docs-publish.sh): DOCS_VERSION is `main` or a release tag, and the base is /<version>/.
 // Without DOCS_VERSION (mise run docs) the site is served at the root as `dev`.
 const version = process.env.DOCS_VERSION || 'dev';
-const base = process.env.DOCS_VERSION ? `/portcullis/${version}` : '/';
+const base = process.env.DOCS_VERSION ? `/${version}` : '/';
 
 export default defineConfig({
-	site: 'https://nikarh.github.io',
+	site: 'https://portcullis.arhipov.net',
 	base,
 	trailingSlash: 'always',
 	image: { service: passthroughImageService() },

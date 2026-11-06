@@ -4,7 +4,7 @@
 #   sudo systemctl restart portcullis
 #
 # The rules stay in place while it restarts. Commented out settings show the defaults.
-# See https://nikarh.github.io/portcullis/reference/configuration/ for what each one does.
+# See https://portcullis.arhipov.net/reference/configuration/ for what each one does.
 
 # Monitor mode on every network: report what would be denied, deny nothing. Networks
 # can also be put in monitor mode one at a time, with portcullis.enable=monitor.

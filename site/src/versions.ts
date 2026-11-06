@@ -1,6 +1,6 @@
-// The versions of the docs published on GitHub Pages, from /portcullis/versions.json.
+// The versions of the docs published on GitHub Pages, from /versions.json.
 
-const ROOT = '/portcullis/';
+const ROOT = '/';
 
 export interface Versions {
 	/** Every published version, newest first: `main`, then releases. */

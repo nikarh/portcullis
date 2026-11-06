@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Publishes a built version of the docs to the gh-pages branch, which GitHub Pages serves as
-# https://nikarh.github.io/portcullis/. Each version has a directory of its own: main/ for the tip of main, vX.Y.Z/ for
+# https://portcullis.arhipov.net/ (the CNAME file). Each version has a directory of its own: main/ for the tip of main, vX.Y.Z/ for
 # releases. The build replaces its version's directory, and the script rewrites what spans versions: versions.json
-# (read by the version menu), the root index.html (a redirect to the newest release) and 404.html.
+# (read by the version menu), the root index.html (a redirect to the newest release), 404.html and CNAME.
 #
 #   scripts/docs-publish.sh <version> <built site>      e.g. scripts/docs-publish.sh v0.2.0 site/dist
 #
@@ -14,6 +14,7 @@ version=${1:?usage: docs-publish.sh <version> <built site>}
 built=$(realpath "${2:?usage: docs-publish.sh <version> <built site>}")
 remote=${DOCS_REMOTE:-origin}
 branch=gh-pages
+domain=portcullis.arhipov.net
 
 if ! [[ $version == main || $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "docs-publish: version must be main or vX.Y.Z, not $version" >&2
@@ -46,30 +47,32 @@ render_root() {
 <meta charset="utf-8">
 <title>Portcullis</title>
 <meta http-equiv="refresh" content="0; url=./$latest/">
-<link rel="canonical" href="https://nikarh.github.io/portcullis/$latest/">
+<link rel="canonical" href="https://$domain/$latest/">
 <p>The documentation of the latest release is at <a href="./$latest/">$latest</a>.</p>
 HTML
   # GitHub Pages serves this for any path that doesn't exist. A path without a version, such as
-  # /portcullis/reference/configuration/ (what the config file and --help link to), goes to that page of the latest
-  # release; anything else gets a page pointing at the versions.
+  # /reference/configuration/ (what the config file and --help link to), goes to that page of the latest release;
+  # anything else gets a page pointing at the versions. Links to https://nikarh.github.io/portcullis/<path>, where the
+  # docs were before, arrive here without /portcullis (GitHub redirects them); paths that still have it lose it.
   cat > "$dir/404.html" <<HTML
 <!doctype html>
 <meta charset="utf-8">
 <title>Not found · Portcullis</title>
 <script>
   (function () {
-    var root = "/portcullis/", latest = "$latest";
+    var latest = "$latest";
     var versions = $(cat "$dir/versions.json");
-    var rest = location.pathname.indexOf(root) === 0 ? location.pathname.slice(root.length) : "";
-    var first = rest.split("/")[0];
-    if (rest && versions.indexOf(first) < 0) location.replace(root + latest + "/" + rest + location.search + location.hash);
+    var path = location.pathname.slice(1), rest = path.replace(/^portcullis\//, ""), first = rest.split("/")[0];
+    var to = rest && versions.indexOf(first) < 0 ? latest + "/" + rest : rest !== path ? rest : null;
+    if (to !== null) location.replace("/" + to + location.search + location.hash);
   })();
 </script>
 <style>body{font:16px/1.6 system-ui,sans-serif;max-width:36rem;margin:15vh auto;padding:0 1rem;color:#1d2b2b}a{color:#0e6b5f}@media (prefers-color-scheme:dark){body{background:#121a1b;color:#e4ecea}a{color:#4cc2ad}}</style>
 <h1>Page not found</h1>
 <p>This page doesn't exist in this version of the Portcullis docs. It may have moved, or belong to another version.</p>
-<p><a href="/portcullis/$latest/">Go to the documentation of $latest</a> or <a href="/portcullis/main/">of main</a>.</p>
+<p><a href="/$latest/">Go to the documentation of $latest</a> or <a href="/main/">of main</a>.</p>
 HTML
+  echo "$domain" > "$dir/CNAME"
   touch "$dir/.nojekyll"
 }
 
