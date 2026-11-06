@@ -71,4 +71,16 @@ A hostname rule allows the hostname's addresses, not the hostname. Any other ser
 
 When that matters, send the container's traffic through a proxy that filters by name; see [Filtering by hostname with a proxy](/examples/egress-proxy/).
 
-A resolver the container may use and someone else controls can answer any name with any address, and the container's `host:` rule then allows that address. Allow only resolvers you trust; see [How DNS gets abused](/policy/domains/#how-dns-gets-abused).
+## Which DNS answers count
+
+Portcullis believes a DNS answer that comes from a resolver the container may use and goes to that container. It doesn't check that the container asked the question: the name and addresses are read from the answer, and answers aren't matched to queries. So every resolver the container's [resolver labels](/policy/dns/#resolver-labels) allow is trusted to say where its hostnames are. One that someone else controls can make the container's rule for `api.stripe.com` allow any address, by answering that name with it, whether or not the container asked (see [How DNS gets abused](/policy/domains/#how-dns-gets-abused)). Other containers' rules aren't affected, and [domain labels](/policy/domains/) don't help: the names of `host:` rules are always allowed.
+
+Tools that allow egress by name settle this in one of three ways:
+
+| Approach | Example | What a resolver can still do |
+| --- | --- | --- |
+| Learn from answers of trusted servers | Calico's domain-based policy learns addresses from DNS responses of the servers listed in `dnsTrustedServers` (the cluster DNS by default). | A trusted server can answer any name with any address. |
+| Forward the lookups itself | Cilium's `toFQDNs` rules send a pod's lookups through Cilium's DNS proxy, which learns addresses only from answers to the queries it forwarded for that pod. | Names the pod didn't ask for can't get in, but the upstream resolver is still trusted for the names it was asked. |
+| Resolve and connect itself | Istio's sidecar picks the destination of HTTP and TLS traffic by Host header or SNI, and for a `ServiceEntry` with `resolution: DNS` connects to the address Envoy resolved, whatever the application was told. | Nothing, as long as the sidecar's own resolver is right. It needs a proxy in the path of every connection, and plain TCP has no name to go by. |
+
+Portcullis takes the first approach, with the resolvers the container may use as the trusted servers. To keep that list to servers you trust, leave the container on `docker` (the default) with DNS servers you run or choose, and avoid `portcullis.dns.*=*` and `ip:` resolvers you don't control on containers with `host:` rules. For the third approach, put a filtering proxy in front of the container: see [Filtering by hostname with a proxy](/examples/egress-proxy/).

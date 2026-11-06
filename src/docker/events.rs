@@ -203,6 +203,8 @@ fn build_events_path(since: i64) -> Result<String, DockerError> {
         "event": [
             "create",
             "start",
+            "kill",
+            "stop",
             "rename",
             "update",
             "destroy",

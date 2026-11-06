@@ -67,7 +67,7 @@ sudo systemctl disable --now portcullis
 sudo portcullis cleanup
 ```
 
-Removes every firewall rule Portcullis owns (its `inet` and `bridge` tables) and the saved rules in the state directory, so they don't come back at the next start. Prints `portcullis: firewall rules removed`.
+Removes every firewall rule Portcullis owns (its `inet` and `bridge` tables) and what it saved in the state directory (the rules, and who container addresses belonged to), so they don't come back at the next start. Prints `portcullis: firewall rules removed`.
 
 The state directory is `--state-dir`, else `state-dir` from the config file, else `/var/lib/portcullis`. Stop the daemon first: a running daemon puts its rules back at its next update.
 

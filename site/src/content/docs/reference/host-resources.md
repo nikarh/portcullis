@@ -13,6 +13,7 @@ sidebar:
 | `/etc/portcullis/config.toml` | The config file, see [Configuration](/reference/configuration/) |
 | `portcullis.service` | The systemd unit, see [The systemd unit](/guides/service/#the-systemd-unit) |
 | `/var/lib/portcullis/rules.nft` | The rules of the last update, put back at the next start (`state-dir`) |
+| `/var/lib/portcullis/owners` | Which container each container address belonged to at the last update, to tell at the next start which addresses changed hands meanwhile (`state-dir`) |
 | `/run/portcullis.sock` | The events socket, when `events-socket` is set (it is in the packaged config) |
 | `/var/run/docker.sock` | Docker's API, read (`docker-socket`) |
 | `/var/lib/docker/containers/<id>/config.v2.json`, `hostconfig.json` | Read for containers that just started (`docker-root`), see [Finding new containers](/internals/discovery/) |

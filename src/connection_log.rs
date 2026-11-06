@@ -107,6 +107,8 @@ const ETHER_TYPE_IPV6: u16 = 0x86dd;
 enum Payload<'a> {
     Ipv4(Ipv4Packet<'a>),
     Arp(ArpPacket),
+    /// ARP that isn't for Ethernet and IPv4, or is cut short.
+    OtherArp,
     /// An IPv6 packet: its source and destination.
     Ipv6(IpAddr, IpAddr),
     /// Any other kind of frame, by ether type.
@@ -118,7 +120,9 @@ impl<'a> Payload<'a> {
         // The routed traffic of the inet table is always IPv4 or IPv6.
         match packet.protocol.unwrap_or(ETHER_TYPE_IPV4) {
             ETHER_TYPE_IPV4 => Ipv4Packet::parse(&packet.payload).map(Self::Ipv4),
-            ETHER_TYPE_ARP => ArpPacket::parse(&packet.payload).map(Self::Arp),
+            ETHER_TYPE_ARP => {
+                Some(ArpPacket::parse(&packet.payload).map_or(Self::OtherArp, Self::Arp))
+            }
             ETHER_TYPE_IPV6 => {
                 let address = |range: std::ops::Range<usize>| {
                     let octets: [u8; 16] = packet.payload.get(range)?.try_into().ok()?;
@@ -183,6 +187,7 @@ fn connection_event(
             event.source = Some(IpAddr::V4(arp.sender));
             event.destination = Some(IpAddr::V4(arp.target));
         }
+        Payload::OtherArp => event.protocol = "arp".to_string(),
         Payload::Ipv6(source, destination) => {
             event.protocol = "ipv6".to_string();
             event.source = Some(*source);
@@ -344,9 +349,11 @@ fn attribute_frame(
         match payload {
             Payload::Ipv6(..) => "IPv6, which Portcullis doesn't manage".to_string(),
             Payload::Other(ether_type) => format!("a frame of ether type {ether_type:#06x}"),
-            Payload::Ipv4(_) | Payload::Arp(_) => {
-                "a frame of a kind that isn't allowed".to_string()
+            Payload::Arp(_) | Payload::OtherArp => {
+                "ARP that isn't a plain request or reply for Ethernet and IPv4, or carries more"
+                    .to_string()
             }
+            Payload::Ipv4(_) => "a frame of a kind that isn't allowed".to_string(),
         }
     };
     event.detail = Some(detail);
@@ -748,6 +755,28 @@ mod tests {
             event.detail.as_deref(),
             Some("a frame to the link-local group address 01:80:c2:00:00:0e")
         );
+
+        // ARP with data after it, and ARP for something else than Ethernet and IPv4.
+        let mut carrying = crate::nfnetlink::tests::arp(
+            test_support::mac_of("172.18.0.2").expect("mac").octets(),
+            [172, 18, 0, 2],
+            [172, 18, 0, 3],
+        );
+        carrying.extend_from_slice(b"data");
+        let mut other = carrying.clone();
+        other[1] = 6;
+        for payload in [carrying, other] {
+            let event = connection_event(&frame(ETHER_TYPE_ARP, payload), &directory, &hosts)
+                .expect("event");
+            assert_eq!(event.protocol, "arp");
+            assert_eq!(event.container.as_deref(), Some("web"));
+            assert_eq!(
+                event.detail.as_deref(),
+                Some(
+                    "ARP that isn't a plain request or reply for Ethernet and IPv4, or carries more"
+                )
+            );
+        }
 
         let event =
             connection_event(&frame(0x88cc, vec![1, 2, 3]), &directory, &hosts).expect("event");

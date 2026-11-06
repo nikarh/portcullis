@@ -67,7 +67,7 @@ Replies, and ICMP errors about a connection, always pass. `icmp` is only needed 
 
 ## The Docker host
 
-The Docker host counts as a destination too. Traffic to any of its addresses (the network's gateway, its other interfaces) follows the egress labels, so a container can't reach services on the host, or other containers' published ports through the host, unless a label allows it:
+The Docker host counts as a destination too. Traffic to any of its addresses (the network's gateway, its other interfaces) follows the egress labels, so a container can't reach services on the host, or other containers' published ports through the host, unless a label allows it. So does broadcast and multicast the host receives, such as broadcast to the network's subnet (`172.18.255.255`), whatever the [ICC mode](/policy/icc/#broadcast-and-multicast) lets other containers receive:
 
 ```yaml
 labels:

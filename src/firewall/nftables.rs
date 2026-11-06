@@ -61,6 +61,9 @@ enum Chain {
     /// Reports and denies connections over a container's limit: open connections, or new
     /// connections per second (`rate`), in monitor mode or not.
     Limited { rate: bool, monitor: bool },
+    /// Denies (or in monitor mode, reports) ARP that isn't a plain request or reply, see
+    /// `render_arp_check`.
+    ArpCheck { monitor: bool },
     /// Egress rules of the n-th source, in the inet table.
     Egress(usize),
     /// ICC rules of the n-th source, in the bridge table.
@@ -81,9 +84,11 @@ impl Chain {
         match self {
             Self::Base(table) => table,
             Self::Input | Self::Egress(_) => Table::Inet,
-            Self::BridgeInput | Self::BridgeForward | Self::Limited { .. } | Self::Icc(_) => {
-                Table::Bridge
-            }
+            Self::BridgeInput
+            | Self::BridgeForward
+            | Self::Limited { .. }
+            | Self::ArpCheck { .. }
+            | Self::Icc(_) => Table::Bridge,
         }
     }
 }
@@ -109,6 +114,9 @@ impl fmt::Display for ChainName {
                 if rate { "rate" } else { "open" },
                 if monitor { "_monitor" } else { "" }
             ),
+            Chain::ArpCheck { monitor } => {
+                write!(f, "arp_check{}", if monitor { "_monitor" } else { "" })
+            }
             Chain::Egress(index) => write!(f, "egress{index}"),
             Chain::Icc(index) => write!(f, "icc{index}"),
         }
@@ -915,7 +923,15 @@ fn render_egress_dispatch(
         if base == Chain::Base(Table::Inet) {
             map.fill(out, entries)?;
         }
-        writeln!(out, "add rule {base} {family} saddr vmap @{}", map.name())?;
+        // Only from a managed bridge: a container's address arriving from anywhere else
+        // isn't the container, and its traffic mustn't count against the container (or
+        // get it quarantined).
+        writeln!(
+            out,
+            "add rule {base} iifname @{} {family} saddr vmap @{}",
+            NamedSet::InetBridges.name(),
+            map.name()
+        )?;
     }
     // Unknown or spoofed sources of enforced networks; the bridge table already reported
     // them.
@@ -1019,7 +1035,12 @@ fn render_objects(
         .into_iter()
         .flatten()
         .flat_map(|rate| [false, true].map(|monitor| Chain::Limited { rate, monitor }));
-    for chain in chains.chain(limited) {
+    let arp_checks = (!plan.bridges.is_empty())
+        .then_some([false, true])
+        .into_iter()
+        .flatten()
+        .map(|monitor| Chain::ArpCheck { monitor });
+    for chain in chains.chain(limited).chain(arp_checks) {
         writeln!(out, "add chain {chain}")?;
         writeln!(out, "flush chain {chain}")?;
         installed.chains.insert(chain.to_string());
@@ -1109,6 +1130,7 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         NamedSet::BridgeBridges.name()
     )?;
     render_limits(out, plan, options)?;
+    render_arp_check(out, plan, options)?;
     render_known_sources(out, plan, options, base)?;
     for monitor in [true, false] {
         if !plan.bridges.iter().any(|bridge| bridge.monitor == monitor) {
@@ -1120,6 +1142,50 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
             options.source_queue
         };
         render_unknown_sources(out, plan, options, monitor, queue)?;
+    }
+    Ok(())
+}
+
+/// ARP of a container is accepted by who it says it is (see `render_known_sources`); what
+/// it carries besides must be nothing more than ARP itself. A request or reply for Ethernet
+/// and IPv4 is 28 bytes, padded with zeros to 46 by some senders: anything else, such as
+/// data after the ARP body, would reach containers ARP goes to whatever their ICC rules
+/// say. Denied as a frame enforced networks don't carry. Checked in a chain of its own,
+/// which other frames skip with one rule.
+fn render_arp_check(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+    const MALFORMED: [&str; 8] = [
+        "arp htype != 1",
+        "arp ptype != ip",
+        "arp hlen != 6",
+        "arp plen != 4",
+        "arp operation != 1-2",
+        "meta length != 28 meta length != 46",
+        // The padding, 18 bytes after the body, in two parts: a comparison takes at most 16.
+        "meta length 46 @nh,224,128 != 0",
+        "meta length 46 @nh,352,16 != 0",
+    ];
+    let base = Chain::Base(Table::Bridge);
+    for (monitor, bridges) in [
+        (false, NamedSet::EnforcedBridges),
+        (true, NamedSet::MonitoredBridges),
+    ] {
+        if !plan.bridges.iter().any(|bridge| bridge.monitor == monitor) {
+            continue;
+        }
+        let chain = Chain::ArpCheck { monitor };
+        writeln!(
+            out,
+            "add rule {base} meta ibrname @{} ether type arp jump {}",
+            bridges.name(),
+            ChainName(chain)
+        )?;
+        for malformed in MALFORMED {
+            decide(
+                out,
+                format_args!("add rule {chain} {malformed}"),
+                Outcome::deny(options, monitor, "frame").for_frame(),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1947,12 +2013,27 @@ fn render_rule(
             format_args!("add rule {chain} {}", to.dport(protocol.as_str(), DNS_PORT)),
             deny("dns").snaplen(LOG_SNAPLEN_DNS),
         ),
+        // Only what leaves through a bridge: the chain also checks traffic to the host
+        // (from the input hook, without an output interface), which can have a destination
+        // in the subnet too, its broadcast address.
         Rule::AcceptPeers { subnet, gateway } => {
             write!(out, "add rule {chain} {daddr} {subnet} ")?;
             if let Some(gateway) = gateway {
                 write!(out, "{daddr} != {gateway} ")?;
             }
-            writeln!(out, "accept")
+            writeln!(out, "oifname @{} accept", NamedSet::InetBridges.name())?;
+            // Broadcast and multicast are never routed: leaving through a bridge, they are
+            // bridged, and the ICC rules decided on them.
+            if subnet.addr().is_ipv4() {
+                for destination in &ICC_BROADCAST_V4 {
+                    writeln!(
+                        out,
+                        "add rule {chain} {daddr} {destination} oifname @{} accept",
+                        NamedSet::InetBridges.name()
+                    )?;
+                }
+            }
+            Ok(())
         }
         Rule::AcceptNet(destination) => decide(
             out,
@@ -2606,17 +2687,22 @@ flush chain bridge portcullis limit_open
         assert_lines(
             &script,
             &[
-                "add element inet portcullis egress4 { 172.18.0.2 : goto egress0 }\nadd rule inet portcullis forward ip saddr vmap @egress4".into(),
+                "add element inet portcullis egress4 { 172.18.0.2 : goto egress0 }\nadd rule inet portcullis forward iifname @bridges ip saddr vmap @egress4".into(),
                 // Traffic to the host follows the same rules.
                 "add rule inet portcullis input ct state established accept".into(),
                 // ICMP errors only from an end of the connection they are about.
                 "add rule inet portcullis egress0 ct state related ct original ip saddr 172.18.0.2 accept".into(),
                 "add rule inet portcullis egress0 ct state related ct reply ip saddr 172.18.0.2 accept".into(),
-                "add rule inet portcullis input ip saddr vmap @egress4".into(),
+                "add rule inet portcullis input iifname @bridges ip saddr vmap @egress4".into(),
                 "add rule inet portcullis input iifname @enforced_bridges drop".into(),
                 "add element inet portcullis enforced_bridges { \"br-net0\" }".into(),
-                // The gateway is the host: traffic to it follows the egress rules.
-                "add rule inet portcullis egress0 ct original ip daddr 172.18.0.0/16 ct original ip daddr != 172.18.0.1 accept".into(),
+                // The gateway is the host: traffic to it follows the egress rules. So does
+                // anything else the host receives, such as broadcast to the subnet: only
+                // what leaves through a bridge is for other containers.
+                "add rule inet portcullis egress0 ct original ip daddr 172.18.0.0/16 ct original ip daddr != 172.18.0.1 oifname @bridges accept".into(),
+                // Broadcast and multicast leaving through a bridge are bridged (with
+                // br_netfilter): the ICC rules decided on them.
+                "add rule inet portcullis egress0 ct original ip daddr 255.255.255.255/32 oifname @bridges accept\nadd rule inet portcullis egress0 ct original ip daddr 224.0.0.0/4 oifname @bridges accept".into(),
                 // Reported by the bridge table already.
                 "add rule inet portcullis forward iifname @enforced_bridges drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
@@ -2671,6 +2757,54 @@ flush chain bridge portcullis limit_open
         // Monitor mode lets them through, reported.
         let monitored = render_with(&test_support::hostname_state(), options, true);
         assert!(!monitored.contains("queue num 9"), "{monitored}");
+    }
+
+    #[test]
+    fn denies_arp_that_carries_more_than_arp() {
+        let script = render(&test_support::hostname_state());
+        // Checked before ARP is accepted by its sender.
+        let jump = "add rule bridge portcullis prerouting meta ibrname @enforced_bridges ether type arp jump arp_check";
+        let accepted = script.find("@arp_by_").expect("ARP accepted by sender");
+        assert!(
+            script.find(jump).is_some_and(|at| at < accepted),
+            "{script}"
+        );
+        assert!(
+            script.contains("add chain bridge portcullis arp_check\n"),
+            "{script}"
+        );
+        for malformed in [
+            "arp htype != 1",
+            "arp ptype != ip",
+            "arp hlen != 6",
+            "arp plen != 4",
+            "arp operation != 1-2",
+            "meta length != 28 meta length != 46",
+            "meta length 46 @nh,224,128 != 0",
+            "meta length 46 @nh,352,16 != 0",
+        ] {
+            let head = format!("add rule bridge portcullis arp_check {malformed}");
+            assert!(
+                script.contains(&framed(&head, 'd', "frame", "drop")),
+                "{malformed}: {script}"
+            );
+        }
+        // Reported only, on networks in monitor mode.
+        let monitored = render_with(&test_support::hostname_state(), OPTIONS, true);
+        assert!(
+            monitored
+                .contains("meta ibrname @monitored_bridges ether type arp jump arp_check_monitor"),
+            "{monitored}"
+        );
+        assert!(
+            monitored.contains(&framed(
+                "add rule bridge portcullis arp_check_monitor arp htype != 1",
+                'w',
+                "frame",
+                "accept"
+            )),
+            "{monitored}"
+        );
     }
 
     #[test]
@@ -3020,6 +3154,7 @@ flush chain bridge portcullis limit_open
                 line.starts_with("add rule bridge portcullis prerouting ")
                     || line.starts_with("add rule bridge portcullis forward ")
                     || line.starts_with("add rule bridge portcullis limit_")
+                    || line.starts_with("add rule bridge portcullis arp_check ")
                     || line.contains("@quarantined")
                     || line.contains(LINK_LOCAL_GROUP),
                 "{line}"
@@ -3144,7 +3279,7 @@ flush chain bridge portcullis limit_open
         assert!(!script.contains("pc_h4_"));
         assert!(has_line(
             &script,
-            "add rule inet portcullis forward ip6 saddr vmap @egress6"
+            "add rule inet portcullis forward iifname @bridges ip6 saddr vmap @egress6"
         ));
         assert!(has_line(
             &script,

@@ -109,7 +109,8 @@ pub enum Rule {
     /// Allow all traffic to a subnet (ICC allow).
     AcceptNet(IpNet),
     /// Leave traffic to the other containers of the source's own network (`subnet`) to the
-    /// ICC rules, but not traffic to the host there (`gateway`).
+    /// ICC rules, but not traffic to the host there (`gateway`, or anything the host
+    /// receives itself, such as broadcast).
     AcceptPeers {
         subnet: IpNet,
         gateway: Option<IpAddr>,
@@ -377,7 +378,8 @@ where
         let egress_start = self.plan.rules.len();
         // Traffic within the network is up to the ICC rules. It only reaches the routed
         // path at all when br_netfilter is loaded; don't let the egress deny catch it there.
-        // The gateway is the host, and traffic to the host follows the egress rules.
+        // The gateway is the host, and traffic to the host follows the egress rules, also
+        // when sent to the subnet's broadcast address.
         if let Some(network) = network {
             self.plan.rules.push(Rule::AcceptPeers {
                 subnet: network.subnet,

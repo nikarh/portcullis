@@ -70,13 +70,13 @@ A pattern such as `host:*.archive.org` can't be looked up. It only allows addres
 
 ## Source or frame events
 
-A well-behaved container never sends with an address or MAC that isn't its own, or IPv6 or VLAN-tagged frames on a network without IPv6. `source` and `frame` denials mean something in the container crafts its own packets: a compromised process, or a network tool. They get the container quarantined.
+A well-behaved container never sends with an address or MAC that isn't its own, IPv6 or VLAN-tagged frames on a network without IPv6, or ARP with data after it. `source` and `frame` denials mean something in the container crafts its own packets: a compromised process, or a network tool. They get the container quarantined.
 
 An enforced network with IPv6 enabled has all IPv6 denied (and an `ipv6_network` warning). Disable IPv6 on it.
 
 ## A container is cut off completely
 
-It was quarantined: look for a `quarantined` warning. Restart or recreate the container to let it back; it starts from a clean state. Restarting Portcullis also releases every quarantined container.
+It was quarantined: look for a `quarantined` warning. Restart or recreate the container through Docker (`docker restart`) to let it back; it starts from a clean state. Being started again by its restart policy after it exited doesn't. Restarting Portcullis also releases every quarantined container.
 
 If the container has a reason to craft packets, opt it out with `portcullis.quarantine=off`. If it was quarantined for too many denials, find out what it was trying to reach first. See [Quarantine and limits](/policy/limits/).
 

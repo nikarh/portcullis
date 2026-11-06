@@ -52,7 +52,7 @@ Reasons:
 | `dns` | [DNS labels](/policy/dns/) and [domain labels](/policy/domains/): traffic to port 53 |
 | `icc` | The [ICC mode](/policy/icc/): traffic to a container on the same network |
 | `source` | [Source checks](/internals/bypass/): a container sending with an address or MAC that isn't its own, ARP included |
-| `frame` | Source checks: a kind of frame enforced networks don't carry, such as IPv6 or VLAN-tagged frames |
+| `frame` | Source checks: a kind of frame enforced networks don't carry, such as IPv6, VLAN-tagged frames, or ARP that carries data or isn't for Ethernet and IPv4 |
 | `limit` | [Connection limits](/policy/limits/#connection-limits) |
 
 A flow (container, destination, protocol and port) is reported at most once a minute. Replies and the rest of a connection are never reported.

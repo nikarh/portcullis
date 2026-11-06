@@ -226,6 +226,8 @@ impl RouteSocket {
 /// address and MAC.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PortProblem {
+    /// Docker didn't say where the container's namespace is (inspecting it failed).
+    NoNamespace,
     /// The container's namespace has no ID here, so no port can name it as the peer's.
     NoNamespaceId,
     /// Its namespace couldn't be looked up.
@@ -235,6 +237,9 @@ pub enum PortProblem {
 impl std::fmt::Display for PortProblem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NoNamespace => {
+                f.write_str("Docker didn't report the container's network namespace")
+            }
             Self::NoNamespaceId => f.write_str("the container's network namespace has no ID here"),
             Self::Namespace(error) => {
                 write!(
@@ -285,6 +290,9 @@ fn match_ports(
             continue;
         }
         let Some(sandbox) = &container.sandbox else {
+            found
+                .problems
+                .push((container.id.clone(), PortProblem::NoNamespace));
             continue;
         };
         let namespace = match namespace_id(Path::new(sandbox)) {
@@ -488,6 +496,17 @@ mod tests {
                 found.problems.as_slice(),
                 [(container, PortProblem::Namespace(_))] if *container == id
             ));
+            assert!(found.absent.is_empty());
+            // Docker didn't say where its namespace is.
+            let mut state = state();
+            let mut app = state.containers().get("a").cloned().expect("app");
+            app.sandbox = None;
+            state.apply_action(RuntimeStateAction::CreateContainer {
+                container: Box::new(app),
+            });
+            let found = match_ports(&state, &links, |_| Ok(Some(5)));
+            assert_eq!(found.problems, [(id, PortProblem::NoNamespace)]);
+            assert!(found.ports.is_empty());
             assert!(found.absent.is_empty());
         }
     }
