@@ -1,0 +1,91 @@
+---
+// Releases from CHANGELOG.md: all of them on the changelog page, the newest few on the front page (`limit`).
+import { releases } from '../changelog';
+
+interface Props {
+	/** Show only the newest releases. */
+	limit?: number;
+	/** Heading level of each release; its groups are one level below. */
+	level?: 2 | 3;
+	/** Groups to leave out, such as `Documentation`. */
+	skip?: string[];
+}
+
+const { limit, level = 2, skip = [] } = Astro.props;
+const shown = (limit ? releases.slice(0, limit) : releases).map((release) => ({
+	...release,
+	groups: release.groups.filter((group) => !skip.includes(group.title)),
+}));
+const Release = `h${level}` as 'h2' | 'h3';
+const Group = `h${level + 1}` as 'h3' | 'h4';
+---
+
+<div class="changelog">
+	{
+		shown.map((release) => (
+			<section>
+				<Release id={`v${release.version}`} class="release">
+					<a href={release.url}>{release.version}</a>
+					{release.date && <time datetime={release.date}>{release.date}</time>}
+				</Release>
+				{release.groups.map((group) => (
+					<>
+						<Group class="group">{group.title}</Group>
+						<ul>
+							{group.items.map((item) => (
+								<li set:html={item} />
+							))}
+						</ul>
+					</>
+				))}
+			</section>
+		))
+	}
+</div>
+
+<style>
+	.changelog {
+		display: grid;
+		gap: 1.75rem;
+	}
+	.release {
+		display: flex;
+		align-items: baseline;
+		gap: 0.75rem;
+		font-size: var(--sl-text-xl);
+		font-weight: 650;
+		margin: 0 0 0.5rem;
+	}
+	.release a {
+		color: var(--sl-color-white);
+		text-decoration: none;
+		font-family: var(--__sl-font-mono);
+	}
+	.release a:hover {
+		color: var(--sl-color-text-accent);
+		text-decoration: underline;
+	}
+	.release time {
+		font-size: var(--sl-text-sm);
+		font-weight: 400;
+		color: var(--sl-color-gray-3);
+	}
+	.group {
+		font-size: var(--sl-text-xs);
+		font-weight: 600;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--sl-color-gray-3);
+		margin: 1rem 0 0.35rem;
+	}
+	ul {
+		margin: 0;
+		padding-left: 1.25rem;
+		display: grid;
+		gap: 0.2rem;
+		color: var(--sl-color-gray-2);
+	}
+	li {
+		margin: 0;
+	}
+</style>
