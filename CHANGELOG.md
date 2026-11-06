@@ -3,7 +3,18 @@
 All notable changes to this project are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [Semantic Versioning](https://semver.org).
 
-## [0.2.0] - 2026-11-05
+## [0.2.1] - 2026-11-06
+
+### Fixes
+
+- Renew a hostname's addresses when DNS answers give them again by @nikarh
+
+### Documentation
+
+- A changelog page, and the recent releases on the front page by @nikarh
+- Serve the docs at portcullis.arhipov.net by @nikarh
+
+## [0.2.0] - 2026-11-06
 
 ### Features
 
@@ -216,6 +227,7 @@ All notable changes to this project are documented in this file. The format is b
 - Verifying signed releases, and how releasing works by @nikarh
 - Remove the crates.io badge; portcullis on crates.io is another project by @nikarh
 
+[0.2.1]: https://github.com/nikarh/portcullis/compare/v0.2.0..v0.2.1
 [0.2.0]: https://github.com/nikarh/portcullis/compare/v0.1.5..v0.2.0
 [0.1.5]: https://github.com/nikarh/portcullis/compare/v0.1.4..v0.1.5
 [0.1.4]: https://github.com/nikarh/portcullis/compare/v0.1.3..v0.1.4
