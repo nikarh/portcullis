@@ -11,7 +11,9 @@ capabilities (NET_RAW), so every probe here is available to any container.
     craft icmp-error --dst IP --about IP:PORT --dport N
                                                ICMP port unreachable to IP, quoting a UDP
                                                datagram from IP:N to the --about address
-    craft arp [--src IP] [--src-mac MAC]       gratuitous ARP announcing IP at MAC
+    craft arp [--src IP] [--src-mac MAC] [--data N]
+                                               gratuitous ARP announcing IP at MAC, with
+                                               N bytes of data after it
     craft ipv6 [--src-mac MAC]                 IPv6 UDP datagram to all nodes
 
 Options:
@@ -125,7 +127,8 @@ def send_only(args, subnet, src, src_mac, own_mac):
     if args.mode == "arp":
         sendp(
             Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")
-            / ARP(op=2, psrc=src, hwsrc=src_mac, pdst=src, hwdst="ff:ff:ff:ff:ff:ff"),
+            / ARP(op=2, psrc=src, hwsrc=src_mac, pdst=src, hwdst="ff:ff:ff:ff:ff:ff")
+            / Raw(b"D" * args.data),
             iface=IFACE,
         )
     elif args.mode == "ipv6":
@@ -183,6 +186,7 @@ def main():
     parser.add_argument("--fragment", type=int)
     parser.add_argument("--overlap", type=int)
     parser.add_argument("--count", type=int, default=2000)
+    parser.add_argument("--data", type=int, default=0)
     parser.add_argument("--wait", type=float, default=4)
     args = parser.parse_args()
 

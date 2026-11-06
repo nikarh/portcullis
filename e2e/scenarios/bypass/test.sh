@@ -40,6 +40,10 @@ event "ARP from another container's MAC" "event=connection verdict=denied reason
 event "ARP claiming the gateway's address" "event=connection verdict=denied reason=source container~attacker protocol=arp source=${gateway} detail~instead" \
   craft attacker arp --src "${gateway}"
 event "IPv6" "event=connection verdict=denied reason=frame container~attacker protocol=ipv6" craft attacker ipv6
+# ARP with the attacker's own address and MAC, carrying data to whoever gets it, ICC
+# rules or not.
+event "ARP carrying data" "event=connection verdict=denied reason=frame container~attacker protocol=arp detail~carries" \
+  craft attacker arp --data 1000
 flush_checks
 # The bridge learns where a MAC is from the frames it gets; a frame from the victim's MAC
 # would send the victim's traffic to the attacker.

@@ -61,6 +61,9 @@ enum Chain {
     /// Reports and denies connections over a container's limit: open connections, or new
     /// connections per second (`rate`), in monitor mode or not.
     Limited { rate: bool, monitor: bool },
+    /// Denies (or in monitor mode, reports) ARP that isn't a plain request or reply, see
+    /// `render_arp_check`.
+    ArpCheck { monitor: bool },
     /// Egress rules of the n-th source, in the inet table.
     Egress(usize),
     /// ICC rules of the n-th source, in the bridge table.
@@ -81,9 +84,11 @@ impl Chain {
         match self {
             Self::Base(table) => table,
             Self::Input | Self::Egress(_) => Table::Inet,
-            Self::BridgeInput | Self::BridgeForward | Self::Limited { .. } | Self::Icc(_) => {
-                Table::Bridge
-            }
+            Self::BridgeInput
+            | Self::BridgeForward
+            | Self::Limited { .. }
+            | Self::ArpCheck { .. }
+            | Self::Icc(_) => Table::Bridge,
         }
     }
 }
@@ -109,6 +114,9 @@ impl fmt::Display for ChainName {
                 if rate { "rate" } else { "open" },
                 if monitor { "_monitor" } else { "" }
             ),
+            Chain::ArpCheck { monitor } => {
+                write!(f, "arp_check{}", if monitor { "_monitor" } else { "" })
+            }
             Chain::Egress(index) => write!(f, "egress{index}"),
             Chain::Icc(index) => write!(f, "icc{index}"),
         }
@@ -1019,7 +1027,12 @@ fn render_objects(
         .into_iter()
         .flatten()
         .flat_map(|rate| [false, true].map(|monitor| Chain::Limited { rate, monitor }));
-    for chain in chains.chain(limited) {
+    let arp_checks = (!plan.bridges.is_empty())
+        .then_some([false, true])
+        .into_iter()
+        .flatten()
+        .map(|monitor| Chain::ArpCheck { monitor });
+    for chain in chains.chain(limited).chain(arp_checks) {
         writeln!(out, "add chain {chain}")?;
         writeln!(out, "flush chain {chain}")?;
         installed.chains.insert(chain.to_string());
@@ -1109,6 +1122,7 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
         NamedSet::BridgeBridges.name()
     )?;
     render_limits(out, plan, options)?;
+    render_arp_check(out, plan, options)?;
     render_known_sources(out, plan, options, base)?;
     for monitor in [true, false] {
         if !plan.bridges.iter().any(|bridge| bridge.monitor == monitor) {
@@ -1120,6 +1134,50 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
             options.source_queue
         };
         render_unknown_sources(out, plan, options, monitor, queue)?;
+    }
+    Ok(())
+}
+
+/// ARP of a container is accepted by who it says it is (see `render_known_sources`); what
+/// it carries besides must be nothing more than ARP itself. A request or reply for Ethernet
+/// and IPv4 is 28 bytes, padded with zeros to 46 by some senders: anything else, such as
+/// data after the ARP body, would reach containers ARP goes to whatever their ICC rules
+/// say. Denied as a frame enforced networks don't carry. Checked in a chain of its own,
+/// which other frames skip with one rule.
+fn render_arp_check(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+    const MALFORMED: [&str; 8] = [
+        "arp htype != 1",
+        "arp ptype != ip",
+        "arp hlen != 6",
+        "arp plen != 4",
+        "arp operation != 1-2",
+        "meta length != 28 meta length != 46",
+        // The padding, 18 bytes after the body, in two parts: a comparison takes at most 16.
+        "meta length 46 @nh,224,128 != 0",
+        "meta length 46 @nh,352,16 != 0",
+    ];
+    let base = Chain::Base(Table::Bridge);
+    for (monitor, bridges) in [
+        (false, NamedSet::EnforcedBridges),
+        (true, NamedSet::MonitoredBridges),
+    ] {
+        if !plan.bridges.iter().any(|bridge| bridge.monitor == monitor) {
+            continue;
+        }
+        let chain = Chain::ArpCheck { monitor };
+        writeln!(
+            out,
+            "add rule {base} meta ibrname @{} ether type arp jump {}",
+            bridges.name(),
+            ChainName(chain)
+        )?;
+        for malformed in MALFORMED {
+            decide(
+                out,
+                format_args!("add rule {chain} {malformed}"),
+                Outcome::deny(options, monitor, "frame").for_frame(),
+            )?;
+        }
     }
     Ok(())
 }
@@ -2674,6 +2732,54 @@ flush chain bridge portcullis limit_open
     }
 
     #[test]
+    fn denies_arp_that_carries_more_than_arp() {
+        let script = render(&test_support::hostname_state());
+        // Checked before ARP is accepted by its sender.
+        let jump = "add rule bridge portcullis prerouting meta ibrname @enforced_bridges ether type arp jump arp_check";
+        let accepted = script.find("@arp_by_").expect("ARP accepted by sender");
+        assert!(
+            script.find(jump).is_some_and(|at| at < accepted),
+            "{script}"
+        );
+        assert!(
+            script.contains("add chain bridge portcullis arp_check\n"),
+            "{script}"
+        );
+        for malformed in [
+            "arp htype != 1",
+            "arp ptype != ip",
+            "arp hlen != 6",
+            "arp plen != 4",
+            "arp operation != 1-2",
+            "meta length != 28 meta length != 46",
+            "meta length 46 @nh,224,128 != 0",
+            "meta length 46 @nh,352,16 != 0",
+        ] {
+            let head = format!("add rule bridge portcullis arp_check {malformed}");
+            assert!(
+                script.contains(&framed(&head, 'd', "frame", "drop")),
+                "{malformed}: {script}"
+            );
+        }
+        // Reported only, on networks in monitor mode.
+        let monitored = render_with(&test_support::hostname_state(), OPTIONS, true);
+        assert!(
+            monitored
+                .contains("meta ibrname @monitored_bridges ether type arp jump arp_check_monitor"),
+            "{monitored}"
+        );
+        assert!(
+            monitored.contains(&framed(
+                "add rule bridge portcullis arp_check_monitor arp htype != 1",
+                'w',
+                "frame",
+                "accept"
+            )),
+            "{monitored}"
+        );
+    }
+
+    #[test]
     fn holds_unknown_sources_of_monitored_networks_failing_open() {
         let options = Options {
             source_queue: Some(9),
@@ -3020,6 +3126,7 @@ flush chain bridge portcullis limit_open
                 line.starts_with("add rule bridge portcullis prerouting ")
                     || line.starts_with("add rule bridge portcullis forward ")
                     || line.starts_with("add rule bridge portcullis limit_")
+                    || line.starts_with("add rule bridge portcullis arp_check ")
                     || line.contains("@quarantined")
                     || line.contains(LINK_LOCAL_GROUP),
                 "{line}"

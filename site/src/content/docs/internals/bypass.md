@@ -11,6 +11,7 @@ Portcullis assumes a container may be compromised and actively try to get past i
 
 - Every frame entering an enforced bridge has to come from a managed container's own port on the bridge (the host side of its network interface), with that container's MAC and, for IPv4 and ARP, its address. Borrowing another container's address, MAC or both doesn't borrow its rules or its connections.
 - A container can't take over another container's MAC in the bridge's forwarding table, or claim another container's address, or the gateway's, in its neighbours' ARP caches.
+- ARP has to be a plain request or reply for Ethernet and IPv4: 28 bytes, or 46 with zero padding. ARP reaches other containers whatever their ICC rules, so data after it, or ARP of another shape, is denied as a frame enforced networks don't carry.
 - Portcullis finds each container's port by asking the kernel about the container's network namespace; it never runs anything inside the container.
 - A container with no port on the bridge, such as one that is stopping (Docker removes its interface before it reports it gone), can't send anything there, so nothing sent with its address or MAC passes as its.
 - When Docker gives a removed container's address to a new container, Portcullis deletes the old container's tracked connections first, so the new container can't keep using them.

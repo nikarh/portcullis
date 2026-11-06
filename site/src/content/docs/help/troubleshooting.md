@@ -70,7 +70,7 @@ A pattern such as `host:*.archive.org` can't be looked up. It only allows addres
 
 ## Source or frame events
 
-A well-behaved container never sends with an address or MAC that isn't its own, or IPv6 or VLAN-tagged frames on a network without IPv6. `source` and `frame` denials mean something in the container crafts its own packets: a compromised process, or a network tool. They get the container quarantined.
+A well-behaved container never sends with an address or MAC that isn't its own, IPv6 or VLAN-tagged frames on a network without IPv6, or ARP with data after it. `source` and `frame` denials mean something in the container crafts its own packets: a compromised process, or a network tool. They get the container quarantined.
 
 An enforced network with IPv6 enabled has all IPv6 denied (and an `ipv6_network` warning). Disable IPv6 on it.
 
