@@ -75,7 +75,13 @@
 <div class="sl-heading-wrapper level-h2"><h2 id="quarantine">Quarantine</h2><a class="sl-anchor-link" href="#quarantine"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Quarantine”</span></a></div>
 <p>A container is quarantined when:</p>
 <ul>
-<li>it sends anything with an address or MAC that isn’t its own, or a kind of frame enforced networks don’t carry (a <code dir="auto">source</code> or <code dir="auto">frame</code> denial). A well-behaved container never does: it takes a raw socket and intent. IPv6 on a network with IPv6 enabled doesn’t count.</li>
+<li>it sends anything with an address or MAC that isn’t its own, or a kind of frame enforced networks don’t carry (a <code dir="auto">source</code> or <code dir="auto">frame</code> denial). A well-behaved container never does: it takes a raw socket and intent. IPv6 on a network with IPv6 enabled doesn’t count. Neither do <code dir="auto">source</code> denials of what the container may well send without crafting anything (see <a href="/main/help/troubleshooting/#source-or-frame-events">Source or frame events</a>):
+<ul>
+<li>its own address and MAC from its own port, which the rules judged before they knew them (detail <code dir="auto">sent before its rules were in place</code>);</li>
+<li>its address on another of its networks, with its MAC on this one (detail <code dir="auto">uses its own address on &lt;network&gt;</code>);</li>
+<li>packets held for a container that just started, whose hold ran out before Portcullis knew where they came from (detail ending in <code dir="auto">before Portcullis knew its port</code>).</li>
+</ul>
+</li>
 <li>more than <code dir="auto">quarantine-denials</code> (1000 by default) of its connections are denied within a minute: scanning, probing, or flooding destinations it may not reach.</li>
 </ul>
 <p>A quarantined container is cut off from its networks: nothing it sends gets anywhere, not even ARP, and the firewall drops it before looking at anything else. It is reported with a <code dir="auto">quarantined</code> warning, which raises an <a href="/main/guides/events-and-alerts/#alerts">alert</a>.</p>
