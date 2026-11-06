@@ -19,6 +19,7 @@ mod logging;
 mod model;
 mod monitor;
 mod nfnetlink;
+mod owners;
 mod pattern;
 mod quarantine;
 mod rtnetlink;
@@ -52,9 +53,10 @@ use crate::events::{
 };
 use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored};
 use crate::logging::LoggingError;
-use crate::model::{ContainerId, MacAddress, RuntimeState, RuntimeStateAction};
+use crate::model::{ContainerId, RuntimeState, RuntimeStateAction};
 use crate::monitor::{DockerMonitor, MonitorError};
 use crate::nfnetlink::QueueOverflow;
+use crate::owners::Owners;
 use crate::source_hold::SourceHold;
 
 /// Cargo.toml's version, with `PORTCULLIS_VERSION_SUFFIX` at build time (see build.rs).
@@ -67,6 +69,8 @@ const DNS_QUEUE: u16 = 4242;
 const SOURCE_QUEUE: u16 = 4243;
 /// File in the state directory the rules of every update are saved to.
 const SAVED_RULES: &str = "rules.nft";
+/// File in the state directory who each container address belongs to is saved to.
+const SAVED_OWNERS: &str = "owners";
 /// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held in.
 const DNS_QUERY_QUEUE: u16 = 4244;
 /// NFQUEUE number the same packets are held in on networks in monitor mode.
@@ -161,6 +165,16 @@ fn run_cleanup(args: Arguments) -> Result<(), MainError> {
         .saving_to(state_dir.join(SAVED_RULES));
     firewall.cleanup()?;
     firewall.forget_saved()?;
+    let owners = state_dir.join(SAVED_OWNERS);
+    match std::fs::remove_file(&owners) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(MainError::Tool(std::io::Error::new(
+                error.kind(),
+                format!("can't remove {}: {error}", owners.display()),
+            )));
+        }
+        _ => {}
+    }
     let _ = std::io::stdout().write_all(b"portcullis: firewall rules removed\n");
     Ok(())
 }
@@ -308,9 +322,6 @@ struct Managed {
 }
 
 /// Applies rules and reports what changed.
-/// Who an address belongs to: a recreated container has a new ID, and usually a new MAC.
-type Owner = (ContainerId, Option<MacAddress>);
-
 struct Applier {
     source_hold: SourceHold,
     firewall: Arc<NftablesFirewall>,
@@ -322,7 +333,7 @@ struct Applier {
     monitor_all: bool,
     managed: HashMap<IpAddr, Managed>,
     /// The container (and its MAC) each container address belonged to at the last update.
-    owners: HashMap<IpAddr, Owner>,
+    owners: Owners,
     /// Containers already reported as not having observable DNS.
     unobservable_reported: HashSet<String>,
     /// Containers whose bridge port can't be found, and why, as last reported.
@@ -421,30 +432,14 @@ impl Applier {
     }
 
     /// Delete the tracked connections of addresses that left their container, before rules
-    /// for a new owner are applied (see `conntrack`). Addresses that just appeared keep
-    /// theirs: that is every address when Portcullis starts.
+    /// for a new owner are applied (see `conntrack` and `owners`).
     fn forget_reassigned_connections(&mut self, state: &RuntimeState) {
-        let owners: HashMap<IpAddr, Owner> = state
-            .containers()
-            .values()
-            .flat_map(|container| {
-                container.attachments.iter().map(|attachment| {
-                    (
-                        attachment.ip_address,
-                        (container.id.clone(), attachment.mac_address),
-                    )
-                })
-            })
-            .collect();
-        let reassigned: HashSet<IpAddr> = self
-            .owners
-            .iter()
-            .filter(|(address, owner)| owners.get(address) != Some(owner))
-            .map(|(address, _)| *address)
-            .collect();
-        self.owners = owners;
+        let reassigned = self.owners.update(state);
         if let Err(error) = conntrack::forget(&reassigned) {
             warn!(%error, "can't forget the tracked connections of reassigned addresses; a container that got a removed container's address may keep using its connections");
+        }
+        if let Err(error) = self.owners.save() {
+            warn!(%error, "can't save who container addresses belong to; a container that gets a removed container's address while Portcullis isn't running may keep using its connections");
         }
     }
 
@@ -727,7 +722,10 @@ fn run(config: &Config) -> Result<(), MainError> {
         bus: bus.clone(),
         monitor_all: config.monitor,
         managed: HashMap::new(),
-        owners: HashMap::new(),
+        owners: Owners::load(config.state_dir.join(SAVED_OWNERS)).unwrap_or_else(|error| {
+            warn!(%error, "can't read who container addresses belonged to at the last run");
+            Owners::default()
+        }),
         unobservable_reported: HashSet::new(),
         port_problems: HashSet::new(),
         failures: 0,

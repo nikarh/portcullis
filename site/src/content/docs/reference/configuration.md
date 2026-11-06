@@ -51,7 +51,7 @@ connection-limit = "none"
 | --- | --- | --- |
 | `--docker-socket <path>` | `/var/run/docker.sock` | Docker API socket. A `unix://` prefix is accepted. |
 | `--docker-root <path>` | `/var/lib/docker` | Docker's data directory (`docker info -f '{{.DockerRootDir}}'`), where Portcullis reads the settings of containers that just started, see [Finding new containers](/internals/discovery/). |
-| `--state-dir <path>` | `/var/lib/portcullis` | Where the rules are saved, to be put back first thing at the next start, see [Boot order](/guides/service/#boot-order). |
+| `--state-dir <path>` | `/var/lib/portcullis` | Where the rules are saved, to be put back first thing at the next start, see [Boot order](/guides/service/#boot-order); and who each container address belongs to, see [Files](/reference/host-resources/#files). |
 | `--on-exit <keep\|remove>` | `keep` | What happens to the firewall rules when Portcullis stops, see [While Portcullis isn't running](/guides/service/#while-portcullis-isnt-running). |
 
 ## Command line only

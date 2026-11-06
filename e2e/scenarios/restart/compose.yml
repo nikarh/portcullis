@@ -5,8 +5,19 @@ services:
     networks: [net]
     labels:
       - portcullis.egress.tcp=ip:198.51.100.3,tcp:80
+  # Has a UDP flow its address's next owner mustn't get.
+  donor:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.udp=ip:198.51.100.4,udp:9000
 
 networks:
   net:
     labels:
       - portcullis.enable=true
+    # Fixed, so a new container can be given a removed container's address.
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
