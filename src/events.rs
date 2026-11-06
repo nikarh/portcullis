@@ -483,7 +483,7 @@ fn write_connection(line: &mut String, connection: &Connection) -> std::fmt::Res
 }
 
 /// RFC 3339 UTC timestamp with millisecond precision.
-fn timestamp(time: SystemTime) -> String {
+pub fn timestamp(time: SystemTime) -> String {
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = since_epoch.as_secs();
     let days = i64::try_from(seconds / 86_400).unwrap_or_default();

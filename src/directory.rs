@@ -49,6 +49,8 @@ struct Snapshot {
     by_port: HashMap<u32, (IpAddr, SourceInfo)>,
     /// Bridge name to network name.
     bridges: HashMap<String, String>,
+    /// Gateway address (the Docker host's) to network name.
+    gateways: HashMap<IpAddr, String>,
     /// Hostnames of each source's `host:` rules, with the container's hold.
     rule_hosts: HashMap<IpAddr, Vec<(String, Duration)>>,
     host_sets: Vec<HostSet>,
@@ -134,6 +136,11 @@ impl Directory {
             .bridges
             .iter()
             .map(|bridge| (bridge.name.clone(), bridge.network.clone()))
+            .collect();
+        snapshot.gateways = plan
+            .bridges
+            .iter()
+            .filter_map(|bridge| Some((bridge.gateway?, bridge.network.clone())))
             .collect();
         snapshot.host_sets.clone_from(&plan.host_sets);
 
@@ -221,6 +228,12 @@ impl Directory {
         let master = fs::read_link(Path::new("/sys/class/net").join(&name).join("master")).ok()?;
         let bridge = master.file_name()?.to_str()?;
         snapshot.bridges.get(bridge).cloned()
+    }
+
+    /// The network whose gateway, the Docker host's address on it, is `address`.
+    #[must_use]
+    pub fn gateway_of(&self, address: IpAddr) -> Option<String> {
+        self.read().gateways.get(&address).cloned()
     }
 
     /// Hostnames of the `host:` rules of the container at `source`.

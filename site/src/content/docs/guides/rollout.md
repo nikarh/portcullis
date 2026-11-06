@@ -41,7 +41,7 @@ Let the services run long enough to do everything they do: a full business cycle
 journalctl -u portcullis -o cat --since "-7d" | portcullis audit
 ```
 
-`audit` reads a file, or stdin when the file is `-` or missing. It prints, for each container, the labels that would have allowed what it tried:
+`audit` reads a file, or stdin when the file is `-` or missing. After you change labels, recreate the containers and audit again with `--since` set to when you did, so that what they did before doesn't come back. It prints, for each container, the labels that would have allowed what it tried:
 
 ```text
 billing (12 denied or would-be-denied connections)

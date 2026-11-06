@@ -27,6 +27,18 @@ use crate::nfnetlink::{
 };
 use crate::quarantine::Watch;
 
+/// Details of source denials that weren't forged (see [`Connection::forged`]): what the
+/// rules judged before they knew the sender, its address on another of its networks, and
+/// packets held until it was too late.
+pub const BEFORE_RULES: &str = "sent before its rules were in place";
+pub const OWN_ADDRESS: &str = "uses its own address on ";
+pub const HELD: &str = ", before Portcullis knew its port";
+
+/// Whether a source denial's detail says it wasn't forged.
+pub fn unforged(detail: &str) -> bool {
+    detail == BEFORE_RULES || detail.starts_with(OWN_ADDRESS) || detail.ends_with(HELD)
+}
+
 /// Known hostname addresses, shared with planning and DNS inspection.
 pub type SharedHosts = Arc<Mutex<HostAddresses<SystemUpstreamResolver>>>;
 
@@ -229,6 +241,9 @@ fn connection_event(
         }
         (Reason::Dns, Payload::Ipv4(ip)) => event.query = query_name(ip),
         (Reason::Egress, _) => {
+            if let Some(network) = directory.gateway_of(destination) {
+                event.detail = Some(format!("the Docker host, the gateway of {network}"));
+            }
             if let Some(domain) = directory.domain(source, destination) {
                 event.domain = Some(domain);
                 event.domain_source = Some(DomainSource::Dns);
@@ -312,7 +327,7 @@ fn attribute_spoofed(
     // be the sender's after all, such as an address Docker took from a removed container.
     event.forged = forged && !held;
     event.detail = Some(if held && forged {
-        format!("{detail}, before Portcullis knew its port")
+        format!("{detail}{HELD}")
     } else {
         detail
     });
@@ -345,10 +360,8 @@ fn spoofed(
     match (claimed, &owner) {
         // Its own address and MAC from its own port: the rules that judged it didn't know
         // them yet (they were being updated), or no longer did.
-        (None, _) if own_mac => (false, "sent before its rules were in place".to_string()),
-        (Some(address), _) if address == *own && own_mac => {
-            (false, "sent before its rules were in place".to_string())
-        }
+        (None, _) if own_mac => (false, BEFORE_RULES.to_string()),
+        (Some(address), _) if address == *own && own_mac => (false, BEFORE_RULES.to_string()),
         // Its address on another of its networks, with its MAC on this one: a container
         // on several networks may route a packet out of another network than the one its
         // source address is on (Linux doesn't tie addresses to interfaces). That takes no
@@ -357,7 +370,7 @@ fn spoofed(
             if owner.container == sender.container && owner.network != sender.network =>
         {
             if own_mac {
-                (false, format!("uses its own address on {}", owner.network))
+                (false, format!("{OWN_ADDRESS}{}", owner.network))
             } else {
                 (true, wrong_mac(packet, sender, directory))
             }
@@ -548,6 +561,15 @@ mod tests {
         assert_eq!(event.network.as_deref(), Some("net0"));
         assert_eq!(event.destination_port, Some(443));
         assert_eq!(event.domain, None);
+        assert_eq!(event.detail, None);
+
+        // The gateway is the Docker host.
+        let to_host = logged("pc:d:egress", tcp([172, 18, 0, 2], [172, 18, 0, 1], 8080));
+        let event = connection_event(&to_host, &directory, &hosts).expect("event");
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("the Docker host, the gateway of net0")
+        );
 
         directory.observe(
             ip("172.18.0.2"),

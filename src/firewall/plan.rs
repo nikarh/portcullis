@@ -246,6 +246,8 @@ pub struct ManagedBridge {
     pub name: String,
     pub network: String,
     pub subnet: IpNet,
+    /// The network's gateway: the Docker host's address on it.
+    pub gateway: Option<IpAddr>,
     /// Monitor mode: denials are reported, not enforced.
     pub monitor: bool,
     /// IPv6 is enabled on the network.
@@ -305,6 +307,7 @@ impl Plan {
                 name: network.bridge.clone(),
                 network: network.name.clone(),
                 subnet: network.subnet,
+                gateway: network.gateway,
                 monitor: monitor_all || network.monitor,
                 ipv6: network.ipv6,
             }));

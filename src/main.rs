@@ -153,9 +153,14 @@ fn run_watch(args: Arguments) -> Result<(), MainError> {
 }
 
 fn run_audit(mut args: Arguments) -> Result<(), MainError> {
+    let since = args
+        .opt_value_from_str::<_, String>("--since")?
+        .map(|since| tools::since(&since))
+        .transpose()
+        .map_err(MainError::Tool)?;
     let input = args.opt_free_from_str::<PathBuf>()?;
     config::finish(args)?;
-    tools::audit(input.as_deref()).map_err(MainError::Tool)
+    tools::audit(input.as_deref(), since.as_deref()).map_err(MainError::Tool)
 }
 
 /// Remove every rule Portcullis owns, and the saved ones, for when it isn't going to run
@@ -189,8 +194,11 @@ USAGE:
   portcullis [OPTIONS]                 run the firewall daemon
   portcullis watch [--events-socket <path>]
                                        show live events of a running daemon
-  portcullis audit [FILE]              summarize what containers tried that their labels
-                                       don't allow, from JSON events (FILE or stdin)
+  portcullis audit [--since <time>] [FILE]
+                                       summarize what containers tried that their labels
+                                       don't allow, from JSON events (FILE or stdin), from
+                                       <time> (UTC, such as 2026-11-06T10:30) or that long
+                                       ago (such as 12h or 7d) on
   portcullis cleanup [--state-dir <path>]
                                        remove all firewall rules Portcullis left in place,
                                        and the saved ones
