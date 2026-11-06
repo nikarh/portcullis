@@ -215,6 +215,8 @@ pub struct HostSet {
     pub pattern: NamePattern,
     /// Addresses and how long each stays allowed.
     pub addresses: Vec<(IpAddr, Duration)>,
+    /// How long an address stays allowed after it was last seen, the container's.
+    pub hold: Duration,
     /// Whether any IPv4 rule references this set.
     pub used_v4: bool,
     /// Whether any IPv6 rule references this set.
@@ -395,7 +397,7 @@ where
                 EgressTarget::AnyAddress => Destination::Any,
                 EgressTarget::PublicAddress => Destination::Public,
                 EgressTarget::Hostname(host) => {
-                    let index = self.host_set(&container.name, host);
+                    let index = self.host_set(&container.name, host, policy.hostname_hold);
                     if let Some(set) = self.plan.host_sets.get_mut(index) {
                         if source.is_ipv4() {
                             set.used_v4 = true;
@@ -579,13 +581,19 @@ where
     /// Index of the set for `host` in `container`'s rules. A hostname that can't be
     /// resolved gets an empty set, so its rules allow nothing while the rest of the policy
     /// still applies. A pattern's set only holds what DNS answers to the container said.
-    fn host_set(&mut self, container: &'s ContainerName, host: &'s NamePattern) -> usize {
+    fn host_set(
+        &mut self,
+        container: &'s ContainerName,
+        host: &'s NamePattern,
+        hold: Option<Duration>,
+    ) -> usize {
         if let Some(index) = self.host_index.get(&(container.as_str(), host)) {
             return *index;
         }
 
         let normalized = normalize(host.as_str());
-        let addresses = match self.resolver.addresses(container, &normalized) {
+        let hold = hold.unwrap_or_else(|| self.resolver.default_hold());
+        let addresses = match self.resolver.addresses(container, &normalized, hold) {
             Ok(addresses) => addresses,
             Err(error) => {
                 error!(%host, %error, "failed to resolve hostname; its rules allow nothing until it resolves");
@@ -607,6 +615,7 @@ where
             host: normalized,
             pattern: host.clone(),
             addresses,
+            hold,
             used_v4: false,
             used_v6: false,
         });

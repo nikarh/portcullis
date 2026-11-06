@@ -1,0 +1,24 @@
+# Portcullis runs with a hold of 20 seconds here, so it looks names up every 5 seconds. The
+# containers connect by address and never look the names up themselves, like applications
+# that resolved a name once and kept the address. moving.test and late.test resolve on the
+# Docker host only (/etc/hosts).
+services:
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.moving=host:moving.test,tcp:80
+      - portcullis.egress.late=host:late.test,tcp:80
+  patient:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.moving=host:moving.test,tcp:80
+      - portcullis.hostname-hold=10m
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true

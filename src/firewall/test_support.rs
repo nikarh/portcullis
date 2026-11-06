@@ -27,18 +27,24 @@ pub struct MockResolver {
 pub const HOLD: Duration = Duration::from_secs(3600);
 
 impl HostResolver for MockResolver {
+    fn default_hold(&self) -> Duration {
+        HOLD
+    }
+
     fn addresses(
         &mut self,
         _container: &str,
         host: &str,
+        hold: Duration,
     ) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
         self.calls += 1;
         if host == HOST {
-            return Ok(vec![(ip("1.1.1.1"), HOLD), (ip("2606:4700::1111"), HOLD)]);
+            return Ok(vec![(ip("1.1.1.1"), hold), (ip("2606:4700::1111"), hold)]);
         }
         Err(DnsError::LookupFailed {
             host: host.to_string(),
             message: "host not found".to_string(),
+            missing: true,
         })
     }
 }

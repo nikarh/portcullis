@@ -202,7 +202,7 @@ fn allow_addresses(
                 .iter()
                 .filter_map(|(address, ttl)| {
                     let allowed_for =
-                        hosts.observe(&owner.container, &set.host, *address, *ttl, now);
+                        hosts.observe(&owner.container, &set.host, *address, *ttl, set.hold, now);
                     if allowed_for.is_none() {
                         debug!(container = %owner.container, host = %set.host, %address, "too many addresses for a hostname; not allowing more until some expire");
                     }
@@ -211,7 +211,7 @@ fn allow_addresses(
                 .collect()
         };
         debug!(host = %set.host, ?allowed, "allowing addresses from a DNS answer");
-        if let Err(error) = firewall.add_host_addresses(&set, &allowed) {
+        if let Err(error) = firewall.update_host_addresses(&set, &allowed) {
             // The set may be gone after a concurrent rule update; the next update includes
             // the addresses anyway.
             debug!(%error, host = %set.host, "failed to add addresses to a hostname set");

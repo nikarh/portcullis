@@ -468,15 +468,9 @@ where
         Ok(plan)
     }
 
-    /// Allow more addresses for a hostname set of the current rules, for the given time from
-    /// now, also when they are in the set already.
-    ///
-    /// Adding an element that exists doesn't renew its timeout (kernels before 6.10 never do,
-    /// later ones only when the timeout differs), so an address seen again would still expire
-    /// when it was first due. Each address is added, deleted and added again in one
-    /// transaction instead: the add before the delete makes sure there is something to
-    /// delete, and packets only ever see the set before or after, never without the address.
-    pub fn add_host_addresses(
+    /// Set how much longer each of `addresses` stays allowed in a hostname set of the
+    /// current rules, whether it is in the set already or not; zero removes it.
+    pub fn update_host_addresses(
         &self,
         set: &HostSet,
         addresses: &[(IpAddr, Duration)],
@@ -490,30 +484,16 @@ where
             ),
             (SET_PREFIX_V6, set.used_v6, IpAddr::is_ipv6),
         ] {
-            if !used {
-                continue;
+            let family = || {
+                addresses
+                    .iter()
+                    .copied()
+                    .filter(|(address, _)| is_family(address))
+            };
+            if used {
+                let (table, name) = (Table::Inet, set.id.name(prefix));
+                render_timeouts(&mut script, format_args!("{table} {name}"), family)?;
             }
-            let (table, name) = (Table::Inet, set.id.name(prefix));
-            let addresses = || addresses.iter().filter(|(address, _)| is_family(address));
-            let timed = || addresses().map(|(address, timeout)| Timed(*address, *timeout));
-            render_elements(
-                &mut script,
-                format_args!("add element {table} {name}"),
-                timed(),
-                "",
-            )?;
-            render_elements(
-                &mut script,
-                format_args!("delete element {table} {name}"),
-                addresses().map(|(address, _)| address),
-                "",
-            )?;
-            render_elements(
-                &mut script,
-                format_args!("add element {table} {name}"),
-                timed(),
-                "",
-            )?;
         }
         if script.is_empty() {
             return Ok(());
@@ -1065,14 +1045,12 @@ fn render_objects(
     }
     for set in &plan.host_sets {
         if set.used_v4 {
-            installed
-                .sets
-                .insert(render_set(out, set, SET_PREFIX_V4, "ipv4_addr", set.v4())?);
+            let name = render_set(out, set, SET_PREFIX_V4, "ipv4_addr", || set.v4())?;
+            installed.sets.insert(name);
         }
         if set.used_v6 {
-            installed
-                .sets
-                .insert(render_set(out, set, SET_PREFIX_V6, "ipv6_addr", set.v6())?);
+            let name = render_set(out, set, SET_PREFIX_V6, "ipv6_addr", || set.v6())?;
+            installed.sets.insert(name);
         }
     }
     // Nothing references them anymore: the chains that did were flushed above.
@@ -1759,13 +1737,16 @@ fn render_elements<T: fmt::Display>(
 
 /// Sets have per-element timeouts: addresses expire when nothing renews them. Returns the
 /// set's qualified name.
-fn render_set(
+fn render_set<I>(
     out: &mut String,
     set: &HostSet,
     prefix: &'static str,
     type_name: &str,
-    addresses: impl Iterator<Item = (IpAddr, Duration)>,
-) -> Result<String, fmt::Error> {
+    addresses: impl Fn() -> I,
+) -> Result<String, fmt::Error>
+where
+    I: Iterator<Item = (IpAddr, Duration)>,
+{
     let name = format!("{} {}", Table::Inet, set.id.name(prefix));
     // Bounded in the kernel too: addresses are added from DNS answers between updates.
     writeln!(
@@ -1776,10 +1757,42 @@ fn render_set(
     render_elements(
         out,
         format_args!("add element {name}"),
-        addresses.map(|(address, timeout)| Timed(address, timeout)),
+        addresses().map(|(address, timeout)| Timed(address, timeout)),
         "",
     )?;
     Ok(name)
+}
+
+/// Set how much longer each address stays in the set `name`, whether it is there already or
+/// not; zero removes it.
+///
+/// Adding an element that exists doesn't renew its timeout (kernels before 6.10 never do,
+/// later ones only when the timeout differs), so an address seen again would still expire
+/// when it was first due. Each address is added, deleted and added again in one
+/// transaction instead: the add before the delete makes sure there is something to delete,
+/// and packets only ever see the set before or after, never without an address it keeps.
+fn render_timeouts<I>(
+    out: &mut String,
+    name: fmt::Arguments<'_>,
+    addresses: impl Fn() -> I,
+) -> fmt::Result
+where
+    I: Iterator<Item = (IpAddr, Duration)>,
+{
+    let timed = || addresses().map(|(address, timeout)| Timed(address, timeout));
+    render_elements(out, format_args!("add element {name}"), timed(), "")?;
+    render_elements(
+        out,
+        format_args!("delete element {name}"),
+        addresses().map(|(address, _)| address),
+        "",
+    )?;
+    render_elements(
+        out,
+        format_args!("add element {name}"),
+        timed().filter(|timed| !timed.1.is_zero()),
+        "",
+    )
 }
 
 /// Room in a hostname set: the addresses a container may learn for a hostname, and those
@@ -3479,7 +3492,7 @@ flush chain bridge portcullis limit_open
     }
 
     #[test]
-    fn adds_addresses_to_host_sets() {
+    fn sets_how_long_addresses_stay_in_host_sets() {
         let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
         let plan = Plan::build(
             &test_support::hostname_state(),
@@ -3489,26 +3502,27 @@ flush chain bridge portcullis limit_open
         );
         let set = plan.host_set(0).expect("host set");
         firewall
-            .add_host_addresses(
+            .update_host_addresses(
                 set,
                 &[
                     (
                         test_support::ip("198.51.100.3"),
                         Duration::from_millis(1500),
                     ),
+                    (test_support::ip("198.51.100.4"), Duration::ZERO),
                     (test_support::ip("2001:db8::1"), Duration::from_secs(60)),
                 ],
             )
-            .expect("add");
+            .expect("update");
         let scripts = firewall.runner.scripts.lock().expect("lock");
         let name = set.id.name(SET_PREFIX_V4);
         // Added, deleted and added again: an add alone doesn't renew the timeout of an
-        // address that is in the set already.
+        // address that is in the set already. Zero removes an address, there or not.
         assert_eq!(
             scripts.as_slice(),
             [format!(
-                "add element inet portcullis {name} {{ 198.51.100.3 timeout 2s }}\n\
-                 delete element inet portcullis {name} {{ 198.51.100.3 }}\n\
+                "add element inet portcullis {name} {{ 198.51.100.3 timeout 2s, 198.51.100.4 timeout 1s }}\n\
+                 delete element inet portcullis {name} {{ 198.51.100.3, 198.51.100.4 }}\n\
                  add element inet portcullis {name} {{ 198.51.100.3 timeout 2s }}\n"
             )]
         );

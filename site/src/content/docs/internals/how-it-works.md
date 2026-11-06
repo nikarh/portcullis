@@ -45,6 +45,8 @@ The rules log what they allow and deny to an NFLOG group, which Portcullis reads
 
 Portcullis looks at the DNS answers containers receive. The firewall holds each answer to a managed container until Portcullis has read it, then releases it unchanged. That gives events their domains, and gives [hostname rules](/policy/hostnames/) the exact addresses each container was told. If Portcullis isn't running or falls behind, answers go through uninspected rather than being lost.
 
+Portcullis also looks the hostnames of `host:` rules up itself, through the host's resolver, a few times per hold, and adds what it gets to the rules of every container that uses the name, without a rule update. That keeps an address allowed while DNS still returns it, also for applications that resolved it once and kept it.
+
 For containers with [`portcullis.domains`](/policy/domains/) labels, queries are held too, until Portcullis has checked the names they ask for. Those are denied, not let through, when Portcullis can't check them.
 
 ## Failure handling

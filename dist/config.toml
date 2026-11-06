@@ -23,8 +23,10 @@
 # in monitor mode only) or never. Denied ones always are.
 #log-allowed = "monitor"
 
-# Seconds an address of a host: rule stays allowed after it was last seen.
-#hostname-hold = 3600
+# How long an address of a host: rule stays allowed after DNS last returned it: seconds,
+# or a number with s, m, h or d ("30m", "2h", "1d"), from 10s to 7d. Containers can set
+# their own with the portcullis.hostname-hold label.
+#hostname-hold = "1h"
 
 # Serve events as JSON lines on this Unix socket, for portcullis watch.
 events-socket = "/run/portcullis.sock"

@@ -20,6 +20,7 @@ A policy is a set of Docker labels. Networks get one label that turns Portcullis
 | [`portcullis.limit.connections`](/policy/limits/#connection-limits) | container | `<n>` or `none` | `connection-limit` setting (16384) |
 | [`portcullis.limit.new-connections`](/policy/limits/#connection-limits) | container | `<n>` per second | no limit |
 | [`portcullis.quarantine`](/policy/limits/#quarantine) | container | `on`, `off` | `on` |
+| [`portcullis.hostname-hold`](/policy/hostnames/#how-long-an-address-stays-allowed) | container | a duration: `600`, `30m`, `2h`, `1d` | `hostname-hold` setting (1h) |
 | [`portcullis.ack`](/policy/checks/#acknowledging-a-warning) | container, network | warning names, comma separated | none |
 
 `<name>` in a label key is any string that makes the key unique, such as `0`, `1` or `stripe`. It has no meaning beyond that, and shows up in nothing but the label itself.

@@ -29,7 +29,7 @@ connection-limit = "none"
 | `--monitor` | off | Monitor mode on every network: report what would be denied, deny nothing. In the file, `monitor = true` or `false`. |
 | `--monitor-network <name>` | none | Watch this network in monitor mode without a `portcullis.enable` label; `*` watches every bridge network. Repeat the flag for more networks. In the file, `monitor-networks = ["backend", "frontend"]`. A network's label, if it has one, wins. See [Enforcing a network](/policy/networks/#watching-networks-without-a-label). |
 | `--deny-action <reject\|drop>` | `reject` | `reject` answers denied traffic with an ICMP "administratively prohibited" error, so applications fail immediately with "Host is unreachable". `drop` discards it silently, and applications wait for their own timeout. Traffic denied for its source or kind (reasons `source` and `frame`) is always dropped: a rejection would go to an address the sender only claims. |
-| `--hostname-hold <seconds>` | `3600` | How long an address of a `host:` rule stays allowed after it was last seen, see [Hostname rules](/policy/hostnames/#how-long-an-address-stays-allowed). |
+| `--hostname-hold <duration>` | `3600` | How long an address of a `host:` rule stays allowed after DNS last returned it: seconds, or a number with `s`, `m`, `h` or `d`, from 10s to 7d. Containers can set their own with `portcullis.hostname-hold`. See [Hostname rules](/policy/hostnames/#how-long-an-address-stays-allowed). |
 | `--quarantine <isolate\|report\|off>` | `isolate` | What happens to a container that misbehaves, see [Quarantine](/policy/limits/#quarantine). |
 | `--quarantine-denials <n>` | `1000` | Denied connections per minute past which a container is quarantined. |
 | `--connection-limit <n\|none>` | `16384` | Open connections a container may have at a time, unless its labels say otherwise. At least 1. In the file, a number or `"none"`. See [Connection limits](/policy/limits/#connection-limits). |
@@ -69,7 +69,7 @@ monitor = false
 monitor-networks = []
 deny-action = "reject"
 log-allowed = "monitor"
-hostname-hold = 3600
+hostname-hold = "1h"
 events-socket = "/run/portcullis.sock"
 alert-exec = "logger -t portcullis-alert"
 alert-interval = 600

@@ -60,7 +60,7 @@ If `docker info -f '{{.DockerRootDir}}'` isn't `/var/lib/docker`, set `docker-ro
 
 ## A `host:` rule allows nothing
 
-An `applied` event lists, under `unresolved_hosts`, the hostnames of `host:` rules with no known addresses. Their rules allow nothing until a container looks the name up or Portcullis can resolve it itself through the host's resolver. It retries every 30 seconds.
+An `applied` event lists, under `unresolved_hosts`, the hostnames of `host:` rules with no known addresses. Their rules allow nothing until a container looks the name up or Portcullis can resolve it itself through the host's resolver; see [From Portcullis's own lookups](/policy/hostnames/#from-portculliss-own-lookups) for how often it tries.
 
 Check that the host can resolve the name (`getent hosts api.example.com`), and that the container's lookups are visible to Portcullis (see [DNS visibility](/policy/dns/#dns-visibility)). Without visibility, a name that resolves to different addresses for the container than for the host (DNS load balancing, CDNs) allows the host's answer only.
 

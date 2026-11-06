@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 use ipnet::{IpNet, Ipv4Net};
 use thiserror::Error;
 
+use crate::dns;
 use crate::events::WarningKind;
 use crate::model::{
     ConnectionLimit, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
@@ -21,6 +22,7 @@ const DOMAINS_PREFIX: &str = "portcullis.domains.";
 const CONNECTION_LIMIT_LABEL: &str = "portcullis.limit.connections";
 const NEW_CONNECTIONS_LABEL: &str = "portcullis.limit.new-connections";
 const QUARANTINE_LABEL: &str = "portcullis.quarantine";
+const HOSTNAME_HOLD_LABEL: &str = "portcullis.hostname-hold";
 /// Configuration warnings acknowledged for a container or network, comma-separated.
 pub const ACK_LABEL: &str = "portcullis.ack";
 
@@ -103,6 +105,7 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
     let mut new_connection_rate = None;
     let mut quarantine = true;
     let mut domains: Option<Vec<NamePattern>> = None;
+    let mut hostname_hold = None;
 
     for (key, value) in labels {
         let result = if key.starts_with(EGRESS_PREFIX) {
@@ -121,6 +124,14 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
             parse_connection_limit(value).map(|limit| connection_limit = limit)
         } else if key == NEW_CONNECTIONS_LABEL {
             parse_count(NEW_CONNECTIONS_LABEL, value).map(|rate| new_connection_rate = Some(rate))
+        } else if key == HOSTNAME_HOLD_LABEL {
+            // An invalid value leaves the default hold, which is never longer than the
+            // longest valid one.
+            dns::parse_hold(value)
+                .map(|hold| hostname_hold = Some(hold))
+                .map_err(|expected| {
+                    LabelParseError::InvalidValue(HOSTNAME_HOLD_LABEL, value.clone(), expected)
+                })
         } else if key == QUARANTINE_LABEL {
             match value.as_str() {
                 "on" => Ok(()),
@@ -158,6 +169,7 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
         new_connection_rate,
         quarantine,
         domains,
+        hostname_hold,
     };
     (policy, errors)
 }
@@ -414,6 +426,8 @@ fn split_once_colon<'a>(key: &str, part: &'a str) -> Result<(&'a str, &'a str), 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// The policy, or the first label error.
@@ -472,6 +486,41 @@ mod tests {
     use crate::events::WarningKind;
     use crate::model::{DnsTarget, EgressTarget, IccMode, PortRange, Protocol, Service};
     use crate::pattern::NamePattern;
+
+    #[test]
+    fn parses_the_hostname_hold() {
+        for (value, hold) in [
+            ("600", 600),
+            ("90s", 90),
+            ("30m", 1800),
+            ("2h", 7200),
+            ("7d", 604_800),
+        ] {
+            let (policy, errors) = parse_policy(&labels(&[("portcullis.hostname-hold", value)]));
+            assert_eq!(errors, []);
+            assert_eq!(
+                policy.hostname_hold,
+                Some(Duration::from_secs(hold)),
+                "{value}"
+            );
+        }
+        for value in ["", "5", "8d", "1w", "1.5h", "-1", "h", "1h30m"] {
+            let (policy, errors) = parse_policy(&labels(&[("portcullis.hostname-hold", value)]));
+            assert_eq!(policy.hostname_hold, None, "{value}");
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [LabelParseError::InvalidValue(
+                        "portcullis.hostname-hold",
+                        _,
+                        _
+                    )]
+                ),
+                "{value}: {errors:?}"
+            );
+        }
+        assert_eq!(parse_policy(&labels(&[])).0.hostname_hold, None);
+    }
 
     #[test]
     fn parses_domains() {

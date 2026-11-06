@@ -10,6 +10,7 @@ use pico_args::Arguments;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::dns;
 use crate::firewall::{self, DenyAction, LogAllowed};
 use crate::logging::{LogFormat, LogLevel};
 use crate::tools;
@@ -75,7 +76,7 @@ impl Default for Config {
             monitor: false,
             monitor_networks: Vec::new(),
             log_allowed: LogAllowed::Monitor,
-            hostname_hold: Duration::from_secs(3600),
+            hostname_hold: dns::DEFAULT_HOLD,
             alert_exec: None,
             alert_interval: Duration::from_secs(600),
             log_level: LogLevel::Info,
@@ -125,7 +126,7 @@ struct Settings {
     monitor: Option<bool>,
     monitor_networks: Option<Vec<String>>,
     log_allowed: Option<String>,
-    hostname_hold: Option<u64>,
+    hostname_hold: Option<Limit>,
     alert_exec: Option<String>,
     alert_interval: Option<u64>,
     log_level: Option<String>,
@@ -309,8 +310,10 @@ impl Config {
                 _ => return Err(invalid("log-allowed", value, "always, monitor or never")),
             };
         }
-        if let Some(seconds) = settings.hostname_hold {
-            self.hostname_hold = Duration::from_secs(seconds);
+        if let Some(value) = settings.hostname_hold {
+            let value = value.to_string();
+            self.hostname_hold = dns::parse_hold(&value)
+                .map_err(|expected| invalid("hostname-hold", value, expected))?;
         }
         if let Some(command) = settings.alert_exec {
             self.alert_exec = Some(command);
@@ -550,6 +553,8 @@ mod tests {
             ("--on-exit", "bad"),
             ("--quarantine", "bad"),
             ("--hostname-hold", "soon"),
+            ("--hostname-hold", "5"),
+            ("--hostname-hold", "30d"),
             ("--connection-limit", "0"),
             ("--connection-limit", "many"),
             ("--monitor-network", ""),
@@ -563,6 +568,8 @@ mod tests {
         for text in [
             r#"deny-action = "bad""#,
             r#"hostname-hold = "soon""#,
+            "hostname-hold = 0",
+            "hostname-hold = -1",
             "monitor = \"yes\"",
             "connection-limit = -1",
             "connection-limit = 0",
@@ -572,6 +579,22 @@ mod tests {
         ] {
             assert!(from_file(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn takes_the_hostname_hold_in_seconds_or_with_a_unit() {
+        for (text, seconds) in [
+            ("hostname-hold = 600", 600),
+            (r#"hostname-hold = "600""#, 600),
+            (r#"hostname-hold = "2h""#, 7200),
+            (r#"hostname-hold = "1d""#, 86_400),
+        ] {
+            let config = from_file(text).expect(text);
+            assert_eq!(config.hostname_hold, Duration::from_secs(seconds), "{text}");
+        }
+        let config = from_flags(&["--hostname-hold", "30m"]).expect("flags");
+        assert_eq!(config.hostname_hold, Duration::from_mins(30));
+        assert_eq!(Config::default().hostname_hold, Duration::from_secs(3600));
     }
 
     #[test]

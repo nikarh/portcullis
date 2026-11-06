@@ -21,17 +21,44 @@ This needs Docker to forward the container's lookups from its own address; see [
 
 ## From Portcullis's own lookups
 
-When a hostname has no known addresses, Portcullis resolves it itself through the host's resolver. That covers containers that resolved it before Portcullis started, and containers whose lookups it can't see. It retries every 30 seconds while the name doesn't resolve.
+Portcullis also resolves every hostname of a `host:` rule itself, through the host's resolver: when a rule first needs it, then again four times per [hold](#how-long-an-address-stays-allowed) (every 15 minutes with the default hold of an hour). What a lookup returns is allowed for every container with a rule for the name, right away.
 
-Until a name has addresses, its rules allow nothing; everything else is applied as usual. The [`applied` event](/reference/events/#applied) lists such names as `unresolved_hosts`.
+That covers what the container's own answers can't:
+
+- Applications that resolve a name once and keep the address, such as nginx with a hostname in `proxy_pass`, or a connection pool. Without lookups of its own, Portcullis would stop allowing the address an hour after the container's lookup, while the application still uses it.
+- Containers whose lookups Portcullis can't see, such as those using DNS over HTTPS or TLS.
+- Containers that looked the name up before Portcullis started.
+
+When the resolver doesn't answer, Portcullis tries again every 30 seconds. When it answers that the name doesn't exist, Portcullis asks again at the usual pace: the name may only exist for the resolver the container uses. Until a name has addresses, its rules allow nothing; everything else is applied as usual. The [`applied` event](/reference/events/#applied) lists such names as `unresolved_hosts`, and a new `applied` event follows as soon as one resolves.
+
+Lookups go through the host's resolver (`/etc/resolv.conf`, `/etc/hosts`), not the container's. The host's resolver can give other addresses for the same name than the container's does, for names that resolve differently by location or network. The container's own answers still count for it.
 
 ## How long an address stays allowed
 
-An address stays allowed for its DNS TTL, but at least `hostname-hold` seconds (an hour by default) after it was last seen, because applications often keep using an address longer than its TTL. Change it in the config:
+An address stays allowed for the hold, an hour by default, after anything last said it belongs to the name: a DNS answer to the container, or one of Portcullis's lookups. An answer with a longer TTL allows it for that TTL, up to 7 days.
+
+- While DNS keeps returning an address, it stays allowed, however long the container keeps it without looking it up.
+- An address DNS no longer returns stays allowed for the rest of its hold, then is removed. The hold isn't cut short when the name moves: many names return a different subset of a pool at every lookup, so an address missing from one answer may well still be in use, and still the name's.
+- When the host's resolver doesn't answer, addresses get one more hold: containers that don't need DNS right then keep working through an outage of up to an hour. When it answers that the name doesn't exist, they run out as usual.
+- Connections that are open keep working when their address runs out. Only new connections need it allowed.
+
+So a shorter hold removes addresses DNS no longer returns sooner, and a longer one keeps addresses an application holds on to working longer, even when DNS has moved on. Set the hold for every container in the config:
 
 ```toml title="/etc/portcullis/config.toml"
-hostname-hold = 3600
+hostname-hold = "1h"
 ```
+
+and for one container with a label:
+
+```yaml
+labels:
+  - portcullis.egress.api=host:api.example.com,tcp:443
+  - portcullis.hostname-hold=10m
+```
+
+A hold is seconds (`3600`), or a number with `s`, `m`, `h` or `d` (`90s`, `30m`, `2h`, `1d`), from 10 seconds to 7 days. A container's hold applies to all its `host:` rules, and only to them. An invalid label is reported, and the container gets the hold of the config.
+
+A longer hold is for applications that keep using an address DNS stopped returning, typically one of a pool: an application that resolves once at startup and keeps the address for days needs a hold of days, or an `ip:` rule. Prefer making the application look names up again (nginx: a `resolver` directive and a variable in `proxy_pass`).
 
 ## Patterns
 

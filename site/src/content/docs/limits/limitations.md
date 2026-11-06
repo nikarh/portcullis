@@ -25,7 +25,8 @@ sidebar:
 
 - A network is enforced once Portcullis has seen it created, which usually takes milliseconds. Until then, its traffic isn't filtered at all. Containers that start on a brand-new network can get packets out in that window, for example when `docker compose up` creates the network and starts its containers right away. Create enforced networks ahead of time to close it; see [When enforcement starts](/policy/networks/#when-enforcement-starts).
 - Rules apply to new connections. Connections that were already open when a policy changed keep working until they close, as long as the container keeps its address and MAC. Replies to incoming connections are always allowed, so published ports keep working.
-- If a hostname has no known addresses, its rules allow nothing until a container looks it up or Portcullis can resolve it. Everything else is applied as usual. Portcullis retries its own lookup every 30 seconds.
+- If a hostname has no known addresses, its rules allow nothing until a container looks it up or Portcullis can resolve it. Everything else is applied as usual. Portcullis looks it up again every 30 seconds while the host's resolver doesn't answer, and four times per hold (every 15 minutes by default) while it says the name doesn't exist.
+- An application that keeps an address DNS no longer returns is denied once the address's [hold](/policy/hostnames/#how-long-an-address-stays-allowed) runs out, for new connections. That happens with names that return a different part of a pool at every lookup, to an application that resolves once and keeps one address for longer than the hold.
 - While Portcullis isn't running, its last rules stay in force (by default) but nothing is updated or reported; see [While Portcullis isn't running](/guides/service/#while-portcullis-isnt-running). With `on-exit = "remove"`, containers are unrestricted while it isn't running.
 
 ## Reports

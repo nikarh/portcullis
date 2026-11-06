@@ -49,8 +49,8 @@ struct Snapshot {
     by_port: HashMap<u32, (IpAddr, SourceInfo)>,
     /// Bridge name to network name.
     bridges: HashMap<String, String>,
-    /// Hostnames of each source's `host:` rules.
-    rule_hosts: HashMap<IpAddr, Vec<String>>,
+    /// Hostnames of each source's `host:` rules, with the container's hold.
+    rule_hosts: HashMap<IpAddr, Vec<(String, Duration)>>,
     host_sets: Vec<HostSet>,
 }
 
@@ -113,14 +113,16 @@ impl Directory {
                     .insert(port, (source.address, info.clone()));
             }
             snapshot.sources.insert(source.address, info);
-            let mut hosts: Vec<String> = plan
+            let mut hosts: Vec<(String, Duration)> = plan
                 .egress_rules(source)
                 .iter()
                 .filter_map(|rule| match rule {
                     Rule::Accept {
                         destination: Destination::HostSet(index),
                         ..
-                    } => plan.host_set(*index).map(|set| set.host.clone()),
+                    } => plan
+                        .host_set(*index)
+                        .map(|set| (set.host.clone(), set.hold)),
                     _ => None,
                 })
                 .collect();
@@ -223,12 +225,18 @@ impl Directory {
 
     /// Hostnames of the `host:` rules of the container at `source`.
     #[must_use]
-    pub fn rule_hosts(&self, source: IpAddr) -> Vec<String> {
+    pub fn rule_hosts(&self, source: IpAddr) -> Vec<(String, Duration)> {
         self.read()
             .rule_hosts
             .get(&source)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The hostname sets of the current rules.
+    #[must_use]
+    pub fn host_sets(&self) -> Vec<HostSet> {
+        self.read().host_sets.clone()
     }
 
     /// Hostname sets of `container`'s current rules whose hostname, or pattern, matches

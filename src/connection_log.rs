@@ -248,7 +248,8 @@ fn rule_domain(
     let now = Instant::now();
     rule_hosts
         .into_iter()
-        .find(|host| hosts.allows(&container, host, destination, now))
+        .find(|(host, hold)| hosts.allows(&container, host, destination, *hold, now))
+        .map(|(host, _)| host)
 }
 
 /// The container that sent a frame, by the bridge port it came in on, with its address.
@@ -505,6 +506,7 @@ mod tests {
             "rule.test",
             ip("198.51.100.5"),
             Duration::from_secs(60),
+            Duration::from_secs(3600),
             Instant::now(),
         );
         let packet = logged("pc:a:egress", tcp([172, 18, 0, 2], [198, 51, 100, 5], 443));
@@ -531,6 +533,7 @@ mod tests {
             test_support::HOST,
             ip("198.51.100.5"),
             Duration::from_secs(60),
+            Duration::from_secs(3600),
             Instant::now(),
         );
         let packet = logged("pc:a:egress", tcp([172, 18, 0, 2], [198, 51, 100, 5], 443));

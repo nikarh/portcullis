@@ -13,6 +13,7 @@ mod docker;
 mod events;
 mod firewall;
 mod host_dns;
+mod host_refresh;
 mod labels;
 mod logging;
 mod model;
@@ -199,8 +200,8 @@ OPTIONS:
                                Which allowed connections and DNS lookups are reported;
                                denied ones always are (default: monitor, i.e. on networks
                                in monitor mode)
-  --hostname-hold <seconds>    How long an address of a host: rule stays allowed after it
-                               was last seen in a DNS answer (default: 3600)
+  --hostname-hold <duration>   How long an address of a host: rule stays allowed after DNS
+                               last returned it: seconds, or with s, m, h or d (default: 1h)
   --events-socket <path>       Serve events as JSON lines on this Unix socket (mode 0600;
                                off by default)
   --alert-exec <command>       Run this command with sh -c for every denial and warning,
@@ -315,6 +316,8 @@ struct Applier {
     firewall: Arc<NftablesFirewall>,
     hosts: SharedHosts,
     directory: Arc<Directory>,
+    /// Tells the thread that looks hostnames up again that the rules changed.
+    refresh: Sender<()>,
     bus: EventBus,
     monitor_all: bool,
     managed: HashMap<IpAddr, Managed>,
@@ -364,7 +367,6 @@ impl Applier {
         self.forget_reassigned_connections(state);
         let result = {
             let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-            hosts.prune(Instant::now());
             let directory = &self.directory;
             self.firewall.apply_with(
                 state,
@@ -385,6 +387,7 @@ impl Applier {
                     plan.unresolved_hosts.clone(),
                 );
                 self.source_hold.rules_applied();
+                let _ = self.refresh.send(());
                 info!("firewall rules applied");
                 if let Err(error) = self.firewall.save(&plan) {
                     warn!(%error, "can't save the rules; the next start begins without them");
@@ -706,11 +709,21 @@ fn run(config: &Config) -> Result<(), MainError> {
     )
     .map_err(MainError::SourceHold)?;
 
+    let (refresh_tx, refresh_rx) = unbounded::<()>();
+    let (resolved_tx, resolved_rx) = unbounded::<()>();
+    host_refresh::spawn(
+        Arc::clone(&firewall),
+        Arc::clone(&directory),
+        Arc::clone(&hosts),
+        refresh_rx,
+        resolved_tx,
+    );
     let mut applier = Applier {
         source_hold,
         firewall: Arc::clone(&firewall),
         hosts,
         directory,
+        refresh: refresh_tx,
         bus: bus.clone(),
         monitor_all: config.monitor,
         managed: HashMap::new(),
@@ -758,6 +771,14 @@ fn run(config: &Config) -> Result<(), MainError> {
                 info!("trying the failed rule update again");
                 if let Err(error) = applier.apply(&mut runtime_state) {
                     error!(%error, "firewall apply failed again");
+                }
+            }
+            recv(resolved_rx) -> _ => {
+                // A hostname that didn't resolve does now: its addresses are in place, the
+                // update reports it.
+                while resolved_rx.try_recv().is_ok() {}
+                if let Err(error) = applier.apply(&mut runtime_state) {
+                    error!(%error, "firewall apply failed; continuing");
                 }
             }
             recv(terminate_rx) -> _ => {

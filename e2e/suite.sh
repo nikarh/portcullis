@@ -22,6 +22,7 @@ SCENARIOS=(
   fast-start
   monitor-start
   dns-inspection
+  hostname-refresh
   monitor
   events
   alerts

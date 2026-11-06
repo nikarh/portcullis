@@ -6,6 +6,7 @@ use std::net::IpAddr;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ipnet::{IpNet, Ipv4Net};
 
@@ -327,6 +328,9 @@ pub struct ContainerPolicy {
     pub quarantine: bool,
     /// The domain names the container may look up (`portcullis.domains.*`), if limited.
     pub domains: Option<Vec<NamePattern>>,
+    /// How long an address of its `host:` rules stays allowed after it was last seen
+    /// (`portcullis.hostname-hold`); `--hostname-hold` if not set.
+    pub hostname_hold: Option<Duration>,
 }
 
 /// `portcullis.limit.connections`.
@@ -351,6 +355,7 @@ impl Default for ContainerPolicy {
             new_connection_rate: None,
             quarantine: true,
             domains: None,
+            hostname_hold: None,
         }
     }
 }

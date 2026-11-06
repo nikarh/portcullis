@@ -121,7 +121,7 @@ Something that needs attention. Every warning raises an alert.
 
 ## `applied`
 
-Rules were updated. It comes after everything else the update caused.
+Rules were updated: when containers or networks changed, and when a hostname that didn't resolve does now. It comes after everything else the update caused.
 
 ```json
 {"time":"2026-11-02T10:15:29.912Z","event":"applied","generation":42,
