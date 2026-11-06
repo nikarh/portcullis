@@ -363,9 +363,8 @@ where
     fn find_installed(&self) -> Result<Option<Installed>, FirewallError> {
         let tables = self.runner.list("list tables")?;
         let exists = |table: Table| {
-            tables
-                .lines()
-                .any(|line| line.trim() == format!("table {table}"))
+            let wanted = format!("table {table}");
+            tables.lines().any(|line| line.trim() == wanted)
         };
         if !(exists(Table::Inet) && exists(Table::Bridge)) {
             return Ok(None);
@@ -1059,6 +1058,7 @@ fn render_objects(
         installed.sets.insert(name);
     }
     for (limit, ports) in limits(plan, options) {
+        // Kept in `installed`.
         let name = format!("{} {}", Table::Bridge, limit.ports_name());
         writeln!(out, "add set {name} {{ type ifname; }}")?;
         writeln!(out, "flush set {name}")?;
@@ -1205,7 +1205,7 @@ fn render_unknown_sources(
     } else {
         (NamedSet::EnforcedBridges, NamedSet::EnforcedPorts)
     };
-    let bridges = format!("@{}", bridges.name());
+    let bridges = bridges.name();
     if queue.is_some() {
         // Held before, and the source stayed unknown: Portcullis didn't know the sender in
         // time, whatever port it came from by now, so it isn't taken for spoofing.
@@ -1213,7 +1213,7 @@ fn render_unknown_sources(
             out,
             options,
             monitor,
-            &format!("meta ibrname {bridges} meta mark {HOLD_EXPIRED_MARK:#x}"),
+            format_args!("meta ibrname @{bridges} meta mark {HOLD_EXPIRED_MARK:#x}"),
             "source:held",
         )?;
     }
@@ -1237,7 +1237,7 @@ fn render_unknown_sources(
             out,
             options,
             monitor,
-            &format!("meta ibrname {bridges} iifname @{}", ports.name()),
+            format_args!("meta ibrname @{bridges} iifname @{}", ports.name()),
             "source",
         )?;
     }
@@ -1250,7 +1250,7 @@ fn render_unknown_sources(
         for ether_type in ["ip", "arp"] {
             writeln!(
                 out,
-                "add rule {base} meta ibrname {bridges} ether type {ether_type} queue num {queue}{}",
+                "add rule {base} meta ibrname @{bridges} ether type {ether_type} queue num {queue}{}",
                 if monitor { " bypass" } else { "" }
             )?;
         }
@@ -1259,7 +1259,7 @@ fn render_unknown_sources(
         out,
         options,
         monitor,
-        &format!("meta ibrname {bridges}"),
+        format_args!("meta ibrname @{bridges}"),
         "source",
     )
 }
@@ -1268,7 +1268,7 @@ fn render_unknown_sources(
 const QUARANTINED_SET: &str = "quarantined";
 
 fn render_quarantined_set(out: &mut String, plan: &Plan) -> fmt::Result {
-    let name = format!("{} {QUARANTINED_SET}", Table::Bridge);
+    let name = fmt::from_fn(|f| write!(f, "{} {QUARANTINED_SET}", Table::Bridge));
     writeln!(out, "add set {name} {{ type ifname; }}")?;
     writeln!(out, "flush set {name}")?;
     render_elements(
@@ -1296,17 +1296,19 @@ struct Limit {
 
 impl Limit {
     /// The set counting each port's connections, or new connections, under this limit.
-    fn set_name(self) -> String {
-        format!("{}{}", if self.rate { "new" } else { "conns" }, self.value)
+    fn set_name(self) -> impl fmt::Display {
+        fmt::from_fn(move |f| {
+            let kind = if self.rate { "new" } else { "conns" };
+            write!(f, "{kind}{}", self.value)
+        })
     }
 
     /// The set of the ports under this limit.
-    fn ports_name(self) -> String {
-        format!(
-            "ports_{}{}",
-            self.set_name(),
-            if self.monitor { "_monitor" } else { "" }
-        )
+    fn ports_name(self) -> impl fmt::Display {
+        fmt::from_fn(move |f| {
+            let monitor = if self.monitor { "_monitor" } else { "" };
+            write!(f, "ports_{}{monitor}", self.set_name())
+        })
     }
 }
 
@@ -1352,11 +1354,17 @@ fn render_limits(out: &mut String, plan: &Plan, options: Options) -> fmt::Result
         Chain::BridgeInput
     )?;
     for limit in limits(plan, options).into_keys() {
-        let check = if limit.rate {
-            format!("limit rate over {0}/second burst {0} packets", limit.value)
-        } else {
-            format!("ct count over {}", limit.value)
-        };
+        let check = fmt::from_fn(|f| {
+            if limit.rate {
+                write!(
+                    f,
+                    "limit rate over {0}/second burst {0} packets",
+                    limit.value
+                )
+            } else {
+                write!(f, "ct count over {}", limit.value)
+            }
+        });
         writeln!(
             out,
             "add rule {base} iifname @{} ct state new add @{} {{ iifname {check} }} goto {}",
@@ -1475,7 +1483,7 @@ fn render_denied_frames(
     out: &mut String,
     options: Options,
     monitor: bool,
-    selector: &str,
+    selector: fmt::Arguments<'_>,
     reason: &'static str,
 ) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
@@ -1552,7 +1560,7 @@ fn render_known_sources(
         NamedSet::SourcesByPort,
         keys().filter_map(|(index, source, key)| match key {
             SourceKey::Port(port, mac, address) => Some(Dispatch(
-                format!("{} . {address} . {mac}", Quoted(port)),
+                fmt::from_fn(move |f| write!(f, "{} . {address} . {mac}", Quoted(port))),
                 verdict(index, source),
             )),
             _ => None,
@@ -1565,7 +1573,7 @@ fn render_known_sources(
         NamedSet::SourcesByMac,
         keys().filter_map(|(index, source, key)| match key {
             SourceKey::Mac(mac, address) => Some(Dispatch(
-                format!("{address} . {mac}"),
+                fmt::from_fn(move |f| write!(f, "{address} . {mac}")),
                 verdict(index, source),
             )),
             _ => None,
@@ -1591,8 +1599,11 @@ fn render_known_sources(
         NamedSet::ArpByPort,
         keys()
             .flat_map(|(_, _, key)| match key {
-                SourceKey::Port(port, mac, address) => [address, unspecified]
-                    .map(|address| Some(format!("{} . {mac} . {mac} . {address}", Quoted(port)))),
+                SourceKey::Port(port, mac, address) => [address, unspecified].map(|address| {
+                    Some(fmt::from_fn(move |f| {
+                        write!(f, "{} . {mac} . {mac} . {address}", Quoted(port))
+                    }))
+                }),
                 _ => [None, None],
             })
             .flatten(),
@@ -1604,9 +1615,11 @@ fn render_known_sources(
         NamedSet::ArpByMac,
         keys()
             .flat_map(|(_, _, key)| match key {
-                SourceKey::Mac(mac, address) => {
-                    [address, unspecified].map(|address| Some(format!("{mac} . {mac} . {address}")))
-                }
+                SourceKey::Mac(mac, address) => [address, unspecified].map(|address| {
+                    Some(fmt::from_fn(move |f| {
+                        write!(f, "{mac} . {mac} . {address}")
+                    }))
+                }),
                 _ => [None, None],
             })
             .flatten(),
@@ -1956,37 +1969,47 @@ impl Match {
         }
     }
 
-    fn daddr(&self) -> String {
-        if self.original {
-            format!("ct original {} daddr", self.family)
-        } else {
-            format!("{} daddr", self.family)
-        }
+    fn daddr(&self) -> impl fmt::Display {
+        let (family, original) = (self.family, self.original);
+        fmt::from_fn(move |f| {
+            if original {
+                write!(f, "ct original {family} daddr")
+            } else {
+                write!(f, "{family} daddr")
+            }
+        })
     }
 
-    fn dport(&self, protocol: &str, port: u16) -> String {
-        if self.original {
-            format!("meta l4proto {protocol} ct original proto-dst {port}")
-        } else {
-            format!("{protocol} dport {port}")
-        }
-    }
-    /// What matches `service`, with a leading space; nothing for any traffic.
-    fn service(&self, service: Service, ipv6: bool) -> String {
-        let Service::Protocol(protocol, ports) = service else {
-            return String::new();
-        };
-        let name = match protocol {
-            Protocol::Icmp if ipv6 => "ipv6-icmp",
-            _ => protocol.as_str(),
-        };
-        match ports {
-            Some(ports) if self.original => {
-                format!(" meta l4proto {name} ct original proto-dst {ports}")
+    fn dport(&self, protocol: &str, port: u16) -> impl fmt::Display {
+        let original = self.original;
+        fmt::from_fn(move |f| {
+            if original {
+                write!(f, "meta l4proto {protocol} ct original proto-dst {port}")
+            } else {
+                write!(f, "{protocol} dport {port}")
             }
-            Some(ports) => format!(" {name} dport {ports}"),
-            None => format!(" meta l4proto {name}"),
-        }
+        })
+    }
+
+    /// What matches `service`, with a leading space; nothing for any traffic.
+    fn service(&self, service: Service, ipv6: bool) -> impl fmt::Display {
+        let original = self.original;
+        fmt::from_fn(move |f| {
+            let Service::Protocol(protocol, ports) = service else {
+                return Ok(());
+            };
+            let name = match protocol {
+                Protocol::Icmp if ipv6 => "ipv6-icmp",
+                _ => protocol.as_str(),
+            };
+            match ports {
+                Some(ports) if original => {
+                    write!(f, " meta l4proto {name} ct original proto-dst {ports}")
+                }
+                Some(ports) => write!(f, " {name} dport {ports}"),
+                None => write!(f, " meta l4proto {name}"),
+            }
+        })
     }
 }
 
@@ -2064,39 +2087,42 @@ fn render_rule(
             destination,
             service,
         } => {
-            let mut head = format!("add rule {chain}");
-            match destination {
-                Destination::Net(destination) => write!(head, " {daddr} {destination}")?,
-                Destination::Addr(destination) => write!(head, " {daddr} {destination}")?,
-                Destination::HostSet(index) => {
-                    let Some(set) = plan.host_set(index) else {
-                        return Ok(());
-                    };
-                    let prefix = if source.address.is_ipv4() {
-                        SET_PREFIX_V4
-                    } else {
-                        SET_PREFIX_V6
-                    };
-                    write!(head, " {daddr} @{}", set.id.name(prefix))?;
-                }
-                Destination::Any => {}
+            let set = match destination {
+                Destination::HostSet(index) => match plan.host_set(index) {
+                    Some(set) => Some(set),
+                    None => return Ok(()),
+                },
+                _ => None,
+            };
+            let ipv4 = source.address.is_ipv4();
+            let to_destination = fmt::from_fn(|f| match destination {
+                Destination::Net(destination) => write!(f, " {daddr} {destination}"),
+                Destination::Addr(destination) => write!(f, " {daddr} {destination}"),
+                Destination::HostSet(_) => match set {
+                    Some(set) => {
+                        let prefix = if ipv4 { SET_PREFIX_V4 } else { SET_PREFIX_V6 };
+                        write!(f, " {daddr} @{}", set.id.name(prefix))
+                    }
+                    None => Ok(()),
+                },
+                Destination::Any => Ok(()),
                 Destination::Public => {
-                    let private: &[&str] = if source.address.is_ipv4() {
-                        &PRIVATE_V4
-                    } else {
-                        &PRIVATE_V6
-                    };
+                    let private: &[&str] = if ipv4 { &PRIVATE_V4 } else { &PRIVATE_V6 };
                     // One prefix at a time, not a set of ranges, see `NamedSet`.
                     for range in private {
-                        write!(head, " {daddr} != {range}")?;
+                        write!(f, " {daddr} != {range}")?;
                     }
                     // The host's own addresses are local wherever they are: traffic to them
                     // goes to the input hook, or, to a published port, gets DNAT.
-                    head.push_str(" fib daddr type != local ct status & dnat == 0");
+                    f.write_str(" fib daddr type != local ct status & dnat == 0")
                 }
-            }
-            head.push_str(&to.service(service, source.address.is_ipv6()));
-            decide(out, format_args!("{head}"), allow)
+            });
+            let service = to.service(service, !ipv4);
+            decide(
+                out,
+                format_args!("add rule {chain}{to_destination}{service}"),
+                allow,
+            )
         }
     }
 }
@@ -3411,17 +3437,21 @@ flush chain bridge portcullis limit_open
             last: 200,
         };
         assert_eq!(
-            to.service(Service::Protocol(Protocol::Tcp, Some(ports)), false),
+            to.service(Service::Protocol(Protocol::Tcp, Some(ports)), false)
+                .to_string(),
             " tcp dport 1-200"
         );
         assert_eq!(
-            to.service(Service::Protocol(Protocol::Sctp, None), false),
+            to.service(Service::Protocol(Protocol::Sctp, None), false)
+                .to_string(),
             " meta l4proto sctp"
         );
-        assert_eq!(to.service(Service::Any, false), "");
+        assert_eq!(to.service(Service::Any, false).to_string(), "");
         let routed = Match::new(test_support::ip("fd00::2"), Chain::Egress(0));
         assert_eq!(
-            routed.service(Service::Protocol(Protocol::Icmp, None), true),
+            routed
+                .service(Service::Protocol(Protocol::Icmp, None), true)
+                .to_string(),
             " meta l4proto ipv6-icmp"
         );
     }
