@@ -468,7 +468,14 @@ where
         Ok(plan)
     }
 
-    /// Allow more addresses for a hostname set of the current rules.
+    /// Allow more addresses for a hostname set of the current rules, for the given time from
+    /// now, also when they are in the set already.
+    ///
+    /// Adding an element that exists doesn't renew its timeout (kernels before 6.10 never do,
+    /// later ones only when the timeout differs), so an address seen again would still expire
+    /// when it was first due. Each address is added, deleted and added again in one
+    /// transaction instead: the add before the delete makes sure there is something to
+    /// delete, and packets only ever see the set before or after, never without the address.
     pub fn add_host_addresses(
         &self,
         set: &HostSet,
@@ -486,13 +493,25 @@ where
             if !used {
                 continue;
             }
+            let (table, name) = (Table::Inet, set.id.name(prefix));
+            let addresses = || addresses.iter().filter(|(address, _)| is_family(address));
+            let timed = || addresses().map(|(address, timeout)| Timed(*address, *timeout));
             render_elements(
                 &mut script,
-                format_args!("add element {} {}", Table::Inet, set.id.name(prefix)),
-                addresses
-                    .iter()
-                    .filter(|(address, _)| is_family(address))
-                    .map(|(address, timeout)| Timed(*address, *timeout)),
+                format_args!("add element {table} {name}"),
+                timed(),
+                "",
+            )?;
+            render_elements(
+                &mut script,
+                format_args!("delete element {table} {name}"),
+                addresses().map(|(address, _)| address),
+                "",
+            )?;
+            render_elements(
+                &mut script,
+                format_args!("add element {table} {name}"),
+                timed(),
                 "",
             )?;
         }
@@ -3483,10 +3502,14 @@ flush chain bridge portcullis limit_open
             .expect("add");
         let scripts = firewall.runner.scripts.lock().expect("lock");
         let name = set.id.name(SET_PREFIX_V4);
+        // Added, deleted and added again: an add alone doesn't renew the timeout of an
+        // address that is in the set already.
         assert_eq!(
             scripts.as_slice(),
             [format!(
-                "add element inet portcullis {name} {{ 198.51.100.3 timeout 2s }}\n"
+                "add element inet portcullis {name} {{ 198.51.100.3 timeout 2s }}\n\
+                 delete element inet portcullis {name} {{ 198.51.100.3 }}\n\
+                 add element inet portcullis {name} {{ 198.51.100.3 timeout 2s }}\n"
             )]
         );
     }

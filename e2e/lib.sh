@@ -312,6 +312,23 @@ wait_managed() {
   fi
 }
 
+# seconds_allowed <address>: print how many seconds the hostname sets still allow <address>
+# (the longest of them), or nothing when none has it.
+seconds_allowed() {
+  nft -j list table inet portcullis | python3 -c '
+import json, sys
+left = [
+    elem["elem"]["expires"]
+    for item in json.load(sys.stdin)["nftables"]
+    if item.get("set", {}).get("name", "").startswith("pc_h")
+    for elem in item["set"].get("elem", [])
+    if isinstance(elem, dict) and elem["elem"]["val"] == sys.argv[1]
+]
+if left:
+    print(max(left))
+' "$1"
+}
+
 # host_service <port>: serve TCP <port> on every address of the Docker host, answering
 # "host"; returns once it listens. Stop it with stop_host_service.
 host_service() {

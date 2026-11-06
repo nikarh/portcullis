@@ -108,7 +108,8 @@ where
     }
 
     /// Record an address a DNS answer to `container` gave for `host`. Returns how long it
-    /// is allowed, or `None` when the container's addresses for the hostname are at
+    /// is allowed from `now` on (by this answer or an earlier one that allowed it longer),
+    /// or `None` when the container's addresses for the hostname are at
     /// [`MAX_ADDRESSES_PER_HOST`].
     pub fn observe(
         &mut self,
@@ -132,7 +133,7 @@ where
         }
         let current = addresses.entry(address).or_insert(expires);
         *current = (*current).max(expires);
-        Some(allowed_for)
+        Some(current.saturating_duration_since(now))
     }
 
     /// Whether `address` is currently allowed for `host` in `container`'s rules.
@@ -330,6 +331,29 @@ mod tests {
         );
         // Expired addresses are gone; the hostname is then looked up again.
         assert!(hosts.addresses_at("web", "api.test", now + long).is_err());
+    }
+
+    #[test]
+    fn observing_an_address_again_renews_it_but_never_shortens_it() {
+        let mut hosts = HostAddresses::new(MockResolver::default(), HOLD);
+        let now = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let later = now + Duration::from_secs(300);
+        hosts.observe("web", "api.test", ip("1.1.1.1"), ttl, now);
+        assert_eq!(
+            hosts.observe("web", "api.test", ip("1.1.1.1"), ttl, later),
+            Some(HOLD),
+            "a full hold from the answer seen again"
+        );
+        assert!(hosts.allows("web", "api.test", ip("1.1.1.1"), now + HOLD));
+
+        let long = Duration::from_secs(7200);
+        hosts.observe("web", "api.test", ip("2.2.2.2"), long, now);
+        assert_eq!(
+            hosts.observe("web", "api.test", ip("2.2.2.2"), ttl, later),
+            Some(Duration::from_mins(115)),
+            "what's left of the longer TTL from before"
+        );
     }
 
     #[test]
