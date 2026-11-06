@@ -264,7 +264,7 @@ pub fn unresolvable_state() -> RuntimeState {
 /// `web` (172.18.0.2, net0) with rules of every kind of destination and service:
 /// - `ip:public` on TCP 1024 to 65535 and UDP 3478 to 3479;
 /// - `ip:*` for ICMP;
-/// - `host:*.archive.org` on any TCP port;
+/// - `host:*.example.org` on any TCP port;
 /// - ICC to `container:worker-*` on anything.
 ///
 /// `worker-1` (172.18.0.11, alias `jobs`), `worker-2` (172.18.0.12) and `db`
@@ -290,7 +290,7 @@ pub fn services_state() -> RuntimeState {
                 services: vec![Service::Protocol(Protocol::Icmp, None)],
             },
             EgressRule {
-                target: EgressTarget::Hostname(NamePattern::host("*.archive.org")),
+                target: EgressTarget::Hostname(NamePattern::host("*.example.org")),
                 services: vec![Service::Protocol(Protocol::Tcp, None)],
             },
         ],

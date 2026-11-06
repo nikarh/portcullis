@@ -63,7 +63,7 @@ A longer hold is for applications that keep using an address DNS stopped returni
 
 ## Patterns
 
-A [pattern](/policy/patterns/) such as `host:*.archive.org` can't be looked up, so it only allows addresses from DNS answers to the container for names it matches. Portcullis has to see the container's lookups. Of an answer, only the addresses of the name asked for, and of the CNAMEs it resolved through, count.
+A [pattern](/policy/patterns/) such as `host:*.example.org` can't be looked up, so it only allows addresses from DNS answers to the container for names it matches. Portcullis has to see the container's lookups. Of an answer, only the addresses of the name asked for, and of the CNAMEs it resolved through, count.
 
 ## What a hostname rule allows
 

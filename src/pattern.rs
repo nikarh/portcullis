@@ -174,24 +174,24 @@ mod tests {
 
     #[test]
     fn one_star_label_matches_one_level() {
-        let pattern = host("*.archive.org");
+        let pattern = host("*.example.org");
         assert!(!pattern.is_exact());
-        assert!(pattern.matches("ia800.archive.org"));
-        assert!(!pattern.matches("a.ia800.archive.org"));
-        assert!(!pattern.matches("archive.org"));
-        assert!(!pattern.matches("evilarchive.org"));
-        assert!(!pattern.matches("ia800.archive.org.evil.test"));
-        assert!(!pattern.matches(".archive.org"));
+        assert!(pattern.matches("ia800.example.org"));
+        assert!(!pattern.matches("a.ia800.example.org"));
+        assert!(!pattern.matches("example.org"));
+        assert!(!pattern.matches("evilexample.org"));
+        assert!(!pattern.matches("ia800.example.org.evil.test"));
+        assert!(!pattern.matches(".example.org"));
     }
 
     #[test]
     fn double_star_matches_any_depth_below() {
-        let pattern = host("**.archive.org");
-        assert!(pattern.matches("ia800.archive.org"));
-        assert!(pattern.matches("a.b.c.archive.org"));
-        assert!(!pattern.matches("archive.org"));
-        assert!(!pattern.matches("xarchive.org"));
-        assert!(!pattern.matches("a..archive.org"));
+        let pattern = host("**.example.org");
+        assert!(pattern.matches("ia800.example.org"));
+        assert!(pattern.matches("a.b.c.example.org"));
+        assert!(!pattern.matches("example.org"));
+        assert!(!pattern.matches("xexample.org"));
+        assert!(!pattern.matches("a..example.org"));
     }
 
     #[test]

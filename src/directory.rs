@@ -494,9 +494,9 @@ mod tests {
                 )
                 .len()
         };
-        assert_eq!(found(&["ia800.archive.org"]), 1);
+        assert_eq!(found(&["ia800.example.org"]), 1);
         // A CNAME the name resolved through counts too.
-        assert_eq!(found(&["coverartarchive.org", "ia800.archive.org"]), 1);
-        assert_eq!(found(&["a.ia800.archive.org", "archive.org"]), 0);
+        assert_eq!(found(&["coverexample.org", "ia800.example.org"]), 1);
+        assert_eq!(found(&["a.ia800.example.org", "example.org"]), 0);
     }
 }

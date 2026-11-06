@@ -1011,8 +1011,8 @@ mod tests {
         // A pattern's addresses only come from DNS answers to the container, and an empty
         // set isn't a hostname that failed to resolve.
         let set = plan.host_set(0).expect("host set");
-        assert_eq!(set.host, "*.archive.org");
-        assert!(set.pattern.matches("ia800.archive.org"));
+        assert_eq!(set.host, "*.example.org");
+        assert!(set.pattern.matches("ia800.example.org"));
         assert_eq!(resolver.calls, 1);
         assert_eq!(plan.unresolved_hosts, [] as [String; 0]);
         // Names of host: patterns may be looked up when names are limited.
@@ -1025,7 +1025,7 @@ mod tests {
         let (plan, _) = build(&limited);
         assert_eq!(
             source(&plan, "172.18.0.2").domains,
-            Some(vec![NamePattern::host("*.archive.org")])
+            Some(vec![NamePattern::host("*.example.org")])
         );
     }
 

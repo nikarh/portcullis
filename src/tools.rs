@@ -860,14 +860,14 @@ Warnings
     #[test]
     fn names_protocols_without_ports() {
         let report = lines(&[
-            &egress("jellyfin", "igmp", "224.0.0.22", None),
-            &egress("jellyfin", "icmp", "1.1.1.1", None),
-            &egress("jellyfin", "41", "192.0.2.1", None),
+            &egress("player", "igmp", "224.0.0.22", None),
+            &egress("player", "icmp", "1.1.1.1", None),
+            &egress("player", "41", "192.0.2.1", None),
         ]);
         assert_eq!(
             report.render(),
             "\
-jellyfin (3 denied or would-be-denied connections)
+player (3 denied or would-be-denied connections)
   portcullis.egress.1-1-1-1=ip:1.1.1.1,icmp
   portcullis.egress.224-0-0-22=ip:224.0.0.22,igmp
     (IGMP: the container joins multicast groups; only needed when the host relays multicast, such as with igmpproxy)
@@ -897,14 +897,14 @@ api (2 denied or would-be-denied connections)
 
     #[test]
     fn leaves_out_packets_of_connections_the_firewall_didnt_track() {
-        let reply = r#"{"time":"T","event":"connection","verdict":"would_deny","reason":"icc","container":"outline-redis","network":"n","protocol":"tcp","source":"172.20.0.18","source_port":6379,"destination":"172.20.0.19","destination_port":42076,"destination_container":"outline","domain":null,"domain_source":null,"query":null,"detail":null,"mid_stream":true}"#;
+        let reply = r#"{"time":"T","event":"connection","verdict":"would_deny","reason":"icc","container":"app-cache","network":"n","protocol":"tcp","source":"172.20.0.18","source_port":6379,"destination":"172.20.0.19","destination_port":42076,"destination_container":"app","domain":null,"domain_source":null,"query":null,"detail":null,"mid_stream":true}"#;
         let report = lines(&[reply]);
         assert_eq!(
             report.render(),
             "\
-outline-redis (1 denied or would-be-denied connections)
+app-cache (1 denied or would-be-denied connections)
   1 packets of connections the firewall didn't track (replies, or connections it lost track of; no label needed), such as:
-    tcp 172.20.0.18:6379 to outline:42076
+    tcp 172.20.0.18:6379 to app:42076
 "
         );
     }
@@ -913,20 +913,20 @@ outline-redis (1 denied or would-be-denied connections)
     fn folds_hostnames_into_patterns() {
         let mut events = Vec::new();
         for host in [
-            "ia800.us.archive.org",
-            "ia601.us.archive.org",
-            "dn7.ca.archive.org",
+            "ia800.us.example.org",
+            "ia601.us.example.org",
+            "dn7.ca.example.org",
         ] {
-            events.push(egress("beets", "tcp", host, Some(443)));
+            events.push(egress("media", "tcp", host, Some(443)));
         }
-        for host in ["i.redd.it", "v.redd.it", "preview.redd.it"] {
-            events.push(egress("redlib", "tcp", host, Some(443)));
+        for host in ["i.example.net", "v.example.net", "preview.example.net"] {
+            events.push(egress("reader", "tcp", host, Some(443)));
         }
         // Two names aren't enough, nor names with other ports, nor a public suffix.
         for host in ["a.example.com", "b.example.com"] {
-            events.push(egress("beets", "tcp", host, Some(443)));
+            events.push(egress("media", "tcp", host, Some(443)));
         }
-        events.push(egress("beets", "tcp", "c.example.com", Some(80)));
+        events.push(egress("media", "tcp", "c.example.com", Some(80)));
         for host in ["a.co.uk", "b.co.uk", "c.co.uk"] {
             events.push(egress("other", "tcp", host, Some(443)));
         }
@@ -934,9 +934,9 @@ outline-redis (1 denied or would-be-denied connections)
         assert_eq!(
             lines(&events).render(),
             "\
-beets (6 denied or would-be-denied connections)
-  portcullis.egress.archive-org=host:**.archive.org,tcp:443
-    (3 names, such as dn7.ca.archive.org)
+media (6 denied or would-be-denied connections)
+  portcullis.egress.example-org=host:**.example.org,tcp:443
+    (3 names, such as dn7.ca.example.org)
   portcullis.egress.a-example-com=host:a.example.com,tcp:443
   portcullis.egress.b-example-com=host:b.example.com,tcp:443
   portcullis.egress.c-example-com=host:c.example.com,tcp:80
@@ -944,9 +944,9 @@ other (3 denied or would-be-denied connections)
   portcullis.egress.a-co-uk=host:a.co.uk,tcp:443
   portcullis.egress.b-co-uk=host:b.co.uk,tcp:443
   portcullis.egress.c-co-uk=host:c.co.uk,tcp:443
-redlib (3 denied or would-be-denied connections)
-  portcullis.egress.redd-it=host:*.redd.it,tcp:443
-    (3 names, such as i.redd.it)
+reader (3 denied or would-be-denied connections)
+  portcullis.egress.example-net=host:*.example.net,tcp:443
+    (3 names, such as i.example.net)
 "
         );
     }
@@ -957,7 +957,7 @@ redlib (3 denied or would-be-denied connections)
         for index in 1..=12 {
             for port in [22000, 22001, 22002, 3478] {
                 events.push(egress(
-                    "syncthing",
+                    "sync",
                     "udp",
                     &format!("45.1.2.{index}"),
                     Some(port),
@@ -965,12 +965,12 @@ redlib (3 denied or would-be-denied connections)
             }
         }
         // Not public: listed on its own.
-        events.push(egress("syncthing", "tcp", "192.168.1.5", Some(22000)));
+        events.push(egress("sync", "tcp", "192.168.1.5", Some(22000)));
         let events: Vec<&str> = events.iter().map(String::as_str).collect();
         assert_eq!(
             lines(&events).render(),
             "\
-syncthing (49 denied or would-be-denied connections)
+sync (49 denied or would-be-denied connections)
   portcullis.egress.192-168-1-5=ip:192.168.1.5,tcp:22000
   portcullis.egress.public=ip:public,udp:3478,22000-22002
     (12 public addresses, such as 45.1.2.1; or list them as ip: labels)
@@ -981,51 +981,51 @@ syncthing (49 denied or would-be-denied connections)
     #[test]
     fn suggests_one_label_per_target_with_distinct_names() {
         let mut events = Vec::new();
-        // Names on two levels under archive.org on 80 and 443, others on 443 alone, a
-        // pattern of its own on 8080 below them, and archive.org itself.
+        // Names on two levels under example.org on 80 and 443, others on 443 alone, a
+        // pattern of its own on 8080 below them, and example.org itself.
         for index in 0..3 {
             for port in [80, 443] {
                 events.push(egress(
-                    "beets",
+                    "media",
                     "tcp",
-                    &format!("dn{index}.ca.archive.org"),
+                    &format!("dn{index}.ca.example.org"),
                     Some(port),
                 ));
                 events.push(egress(
-                    "beets",
+                    "media",
                     "tcp",
-                    &format!("ia{index}.archive.org"),
+                    &format!("ia{index}.example.org"),
                     Some(port),
                 ));
             }
             events.push(egress(
-                "beets",
+                "media",
                 "tcp",
-                &format!("dn{index}.eu.archive.org"),
+                &format!("dn{index}.eu.example.org"),
                 Some(443),
             ));
             events.push(egress(
-                "beets",
+                "media",
                 "tcp",
-                &format!("eu{index}.archive.org"),
+                &format!("eu{index}.example.org"),
                 Some(443),
             ));
             events.push(egress(
-                "beets",
+                "media",
                 "tcp",
-                &format!("ia{index}.us.archive.org"),
+                &format!("ia{index}.us.example.org"),
                 Some(8080),
             ));
         }
-        events.push(egress("beets", "tcp", "archive.org", Some(443)));
+        events.push(egress("media", "tcp", "example.org", Some(443)));
         let events: Vec<&str> = events.iter().map(String::as_str).collect();
         assert_eq!(
             lines(&events).render(),
             "\
-beets (22 denied or would-be-denied connections)
-  portcullis.egress.archive-org-subdomains=host:**.archive.org,tcp:80,443,8080
-    (15 names, such as dn0.ca.archive.org)
-  portcullis.egress.archive-org=host:archive.org,tcp:443
+media (22 denied or would-be-denied connections)
+  portcullis.egress.example-org-subdomains=host:**.example.org,tcp:80,443,8080
+    (15 names, such as dn0.ca.example.org)
+  portcullis.egress.example-org=host:example.org,tcp:443
 "
         );
     }
@@ -1037,7 +1037,7 @@ beets (22 denied or would-be-denied connections)
         // usual port.
         for index in 1..=12 {
             events.push(egress(
-                "torrent",
+                "peers",
                 "udp",
                 &format!("45.1.2.{index}"),
                 Some(20_000 + index),
@@ -1045,7 +1045,7 @@ beets (22 denied or would-be-denied connections)
         }
         for index in 1..=10 {
             events.push(egress(
-                "torrent",
+                "peers",
                 "udp",
                 &format!("46.1.2.{index}"),
                 Some(6881),
@@ -1055,7 +1055,7 @@ beets (22 denied or would-be-denied connections)
         assert_eq!(
             lines(&events).render(),
             "\
-torrent (22 denied or would-be-denied connections)
+peers (22 denied or would-be-denied connections)
   portcullis.egress.public=ip:public,udp:6881-20012
     (22 public addresses, such as 46.1.2.1; or list them as ip: labels)
 "
@@ -1080,13 +1080,13 @@ torrent (22 denied or would-be-denied connections)
 
     #[test]
     fn warns_about_egress_to_the_docker_host() {
-        let to_host = egress("syncthing", "tcp", "172.20.0.129", Some(22000)).replace(
+        let to_host = egress("sync", "tcp", "172.18.0.1", Some(22000)).replace(
             r#""detail":null"#,
-            r#""detail":"the Docker host, the gateway of files_net""#,
+            r#""detail":"the Docker host, the gateway of backend""#,
         );
         let output = lines(&[&to_host]).render();
         assert!(
-            output.contains("  portcullis.egress.172-20-0-129=ip:172.20.0.129,tcp:22000\n    (careful: the Docker host, the gateway of files_net;"),
+            output.contains("  portcullis.egress.172-18-0-1=ip:172.18.0.1,tcp:22000\n    (careful: the Docker host, the gateway of backend;"),
             "{output}"
         );
     }
@@ -1095,18 +1095,18 @@ torrent (22 denied or would-be-denied connections)
     fn tells_crafted_sources_from_others() {
         let source = |detail: &str| {
             format!(
-                r#"{{"time":"T","event":"connection","verdict":"would_deny","reason":"source","container":"traefik","network":"n","protocol":"arp","source":"172.20.0.101","source_port":null,"destination":"172.20.0.101","destination_port":null,"destination_container":null,"domain":null,"domain_source":null,"query":null,"detail":"{detail}"}}"#
+                r#"{{"time":"T","event":"connection","verdict":"would_deny","reason":"source","container":"proxy","network":"n","protocol":"arp","source":"172.18.0.5","source_port":null,"destination":"172.18.0.5","destination_port":null,"destination_container":null,"domain":null,"domain_source":null,"query":null,"detail":"{detail}"}}"#
             )
         };
         let report = lines(&[
             &source("sent before its rules were in place"),
-            &source("uses the address of switcheroo"),
+            &source("uses the address of other"),
         ]);
         assert_eq!(
             report.render(),
             "\
-traefik (2 denied or would-be-denied connections)
-  suspicious: uses the address of switcheroo
+proxy (2 denied or would-be-denied connections)
+  suspicious: uses the address of other
   denied, but not crafted (no label needed): sent before its rules were in place
 "
         );

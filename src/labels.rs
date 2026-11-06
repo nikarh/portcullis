@@ -795,12 +795,12 @@ mod tests {
             Ok(EgressTarget::IpCidr("10.0.0.0/8".parse().expect("cidr")))
         );
         assert_eq!(
-            target("host:*.Archive.org."),
-            Ok(EgressTarget::Hostname(NamePattern::host("*.archive.org")))
+            target("host:*.Example.org."),
+            Ok(EgressTarget::Hostname(NamePattern::host("*.example.org")))
         );
         assert_eq!(
-            target("host:**.redd.it"),
-            Ok(EgressTarget::Hostname(NamePattern::host("**.redd.it")))
+            target("host:**.example.net"),
+            Ok(EgressTarget::Hostname(NamePattern::host("**.example.net")))
         );
         for invalid in [
             "host:*",

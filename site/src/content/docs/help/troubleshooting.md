@@ -66,7 +66,7 @@ Check that the host can resolve the name (`getent hosts api.example.com`), and t
 
 ## A pattern `host:` rule doesn't work
 
-A pattern such as `host:*.archive.org` can't be looked up. It only allows addresses from DNS answers the container received for names it matches. Portcullis has to see the container's lookups: set `dns` in `/etc/docker/daemon.json`, or `dns:` on the container. A `dns_not_observable` warning at the container's start says it can't.
+A pattern such as `host:*.example.org` can't be looked up. It only allows addresses from DNS answers the container received for names it matches. Portcullis has to see the container's lookups: set `dns` in `/etc/docker/daemon.json`, or `dns:` on the container. A `dns_not_observable` warning at the container's start says it can't.
 
 ## Source or frame events
 
