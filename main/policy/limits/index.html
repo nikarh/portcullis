@@ -79,7 +79,7 @@
 <li>more than <code dir="auto">quarantine-denials</code> (1000 by default) of its connections are denied within a minute: scanning, probing, or flooding destinations it may not reach.</li>
 </ul>
 <p>A quarantined container is cut off from its networks: nothing it sends gets anywhere, not even ARP, and the firewall drops it before looking at anything else. It is reported with a <code dir="auto">quarantined</code> warning, which raises an <a href="/main/guides/events-and-alerts/#alerts">alert</a>.</p>
-<p>Restarting the container (<code dir="auto">docker restart</code>, or recreating it) lets it back, starting from a clean state; if it misbehaves again, it is quarantined again. Quarantine is kept in memory, so restarting Portcullis lets quarantined containers back too.</p>
+<p>Restarting the container through Docker (<code dir="auto">docker restart</code>, <code dir="auto">docker stop</code> or <code dir="auto">docker kill</code> and then <code dir="auto">docker start</code>, or recreating it) lets it back, starting from a clean state; if it misbehaves again, it is quarantined again. A container can’t let itself back: when it exits on its own and its restart policy (<code dir="auto">restart: always</code>, <code dir="auto">unless-stopped</code>, <code dir="auto">on-failure</code>) starts it again, it stays cut off. So does every quarantined container when Docker restarts. Quarantine is kept in memory, so restarting Portcullis lets quarantined containers back.</p>
 <table>
 <thead>
 <tr>
