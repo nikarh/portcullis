@@ -147,6 +147,46 @@ fn parse_mac(value: Option<&str>) -> Option<MacAddress> {
     value.filter(|value| !value.is_empty())?.parse().ok()
 }
 
+/// What Docker's API says about the container or network of an event, as far as handling
+/// the event needs it.
+///
+/// It is fetched by the thread reading Docker's events (see [`fetch`]), not the main loop:
+/// Docker answers about a container only once it has finished starting it, which takes
+/// seconds for a container on many networks on a slow host, and its `connect` events come
+/// before that. Meanwhile the main loop has to find containers behind bridge ports, before
+/// the packets it holds for them run out of time (see `discovery`).
+#[derive(Debug)]
+pub enum Fetched {
+    Nothing,
+    Container(Result<DockerContainerInspect, DockerError>),
+    Network(Result<DockerNetworkInspect, DockerError>),
+}
+
+/// Ask Docker what handling `event` needs to know. Containers connecting to networks that
+/// aren't `managed` don't matter.
+pub fn fetch(
+    api: &mut impl DockerApi,
+    event: &DockerEvent,
+    managed: impl Fn(&str) -> bool,
+) -> Fetched {
+    match (&event.kind, &event.action) {
+        // For the checks of a container that started.
+        (DockerEventKind::Container, DockerEventAction::Start) => {
+            Fetched::Container(api.inspect_container(&event.id))
+        }
+        (DockerEventKind::Network, DockerEventAction::Create | DockerEventAction::Update) => {
+            Fetched::Network(api.inspect_network(&event.id))
+        }
+        (DockerEventKind::Network, DockerEventAction::Connect) if managed(&event.id) => event
+            .attributes
+            .get("container")
+            .map_or(Fetched::Nothing, |container| {
+                Fetched::Container(api.inspect_container(container))
+            }),
+        _ => Fetched::Nothing,
+    }
+}
+
 pub struct DockerMonitor<A> {
     api: A,
     /// Networks managed in monitor mode without a label, see `Config::monitor_networks`.
@@ -182,7 +222,18 @@ where
 
     /// Look for configurations that get around the rules in container `id`, see `checks`.
     pub fn check_container(&mut self, state: &RuntimeState, id: &str) {
-        match self.api.inspect_container(id) {
+        let inspect = self.api.inspect_container(id);
+        self.check_inspected(state, id, inspect);
+    }
+
+    /// The same, with what Docker said about the container.
+    pub fn check_inspected(
+        &mut self,
+        state: &RuntimeState,
+        id: &str,
+        inspect: Result<DockerContainerInspect, DockerError>,
+    ) {
+        match inspect {
             Ok(inspect) => self
                 .warnings
                 .extend(crate::checks::container_warnings(&inspect, state)),
@@ -241,10 +292,25 @@ where
         Ok(state)
     }
 
+    #[cfg(test)]
     pub fn resolve_event_action(
         &mut self,
         state: &RuntimeState,
         event: DockerEvent,
+    ) -> Result<Option<RuntimeStateAction>, MonitorError> {
+        let fetched = fetch(&mut self.api, &event, |network| {
+            state.networks().contains_key(&NetworkId::from(network))
+        });
+        self.resolve_fetched_event_action(state, event, fetched)
+    }
+
+    /// `resolve_event_action`, with what Docker said about the event's container or
+    /// network already fetched.
+    pub fn resolve_fetched_event_action(
+        &mut self,
+        state: &RuntimeState,
+        event: DockerEvent,
+        fetched: Fetched,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         match event.kind {
             DockerEventKind::Container => match event.action {
@@ -271,9 +337,15 @@ where
                     network_id: event.id.into(),
                 })),
                 DockerEventAction::Create | DockerEventAction::Update => {
-                    self.inspect_network_action(&event.id)
+                    let network = match fetched {
+                        Fetched::Network(network) => network,
+                        _ => self.api.inspect_network(&event.id),
+                    };
+                    self.network_action(&event.id, network)
                 }
-                DockerEventAction::Connect => self.resolve_network_connect_action(state, event),
+                DockerEventAction::Connect => {
+                    self.resolve_network_connect_action(state, event, fetched)
+                }
                 DockerEventAction::Disconnect => {
                     Ok(Self::resolve_network_disconnect_action(state, event))
                 }
@@ -334,14 +406,12 @@ where
         }))
     }
 
-    fn inspect_container_action(
+    fn container_action(
         &mut self,
         state: &RuntimeState,
-        container_id: &str,
+        inspect: Result<DockerContainerInspect, DockerError>,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
-        debug!(%container_id, "resolving container runtime state action");
-
-        match self.api.inspect_container(container_id) {
+        match inspect {
             Ok(inspect) => {
                 let container =
                     Self::build_container_from_inspect(state, inspect, &mut self.warnings)?;
@@ -379,6 +449,7 @@ where
         &mut self,
         state: &RuntimeState,
         event: DockerEvent,
+        fetched: Fetched,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         let network_id = NetworkId::from(event.id);
 
@@ -393,8 +464,13 @@ where
         let Some(container_id) = event.attributes.get("container") else {
             return Ok(None);
         };
-
-        self.inspect_container_action(state, container_id)
+        debug!(%container_id, "resolving container runtime state action");
+        let inspect = match fetched {
+            Fetched::Container(inspect) => inspect,
+            // The network was managed only from an event the fetch came before.
+            _ => self.api.inspect_container(container_id),
+        };
+        self.container_action(state, inspect)
     }
 
     fn resolve_network_disconnect_action(
@@ -420,12 +496,13 @@ where
         })
     }
 
-    fn inspect_network_action(
+    fn network_action(
         &mut self,
         network_id: &str,
+        network: Result<DockerNetworkInspect, DockerError>,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         debug!(%network_id, "resolving network runtime state action");
-        match self.api.inspect_network(network_id) {
+        match network {
             Ok(network) => {
                 if let Some(network) =
                     network_from_inspect(&network, &self.monitored, &mut self.warnings)
@@ -918,6 +995,43 @@ mod tests {
             ["abc".to_string()]
         );
         assert!(monitor.api.inspect_network_requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn resolves_events_with_what_was_fetched_without_asking_docker_again() {
+        let mut fetching = MockDockerApi::default();
+        fetching.containers.insert(
+            "abc".to_string(),
+            container_inspect("abc", "/web", &[], &[("managed", "net0", "172.20.0.2")]),
+        );
+        let event = network_connect_event("net0", "abc");
+        // Only networks Portcullis manages are worth asking about.
+        let fetched = fetch(&mut fetching, &event, |network| network == "net0");
+        assert!(matches!(fetched, Fetched::Container(Ok(_))));
+        assert!(matches!(
+            fetch(
+                &mut fetching,
+                &network_connect_event("other", "abc"),
+                |network| { network == "net0" }
+            ),
+            Fetched::Nothing
+        ));
+        assert_eq!(fetching.inspect_container_requests.borrow().len(), 1);
+
+        // The main loop's monitor doesn't ask Docker: it would wait for the container to
+        // finish starting.
+        let mut monitor = DockerMonitor::new(MockDockerApi::default());
+        let mut state = RuntimeState::default();
+        add_network(&mut state, "net0", "172.20.0.0/16", Some("172.20.0.1"));
+        let action = monitor
+            .resolve_fetched_event_action(&state, event, fetched)
+            .expect("connect action should resolve");
+        assert!(matches!(
+            action,
+            Some(RuntimeStateAction::CreateContainer { container })
+                if container.attachments.len() == 1
+        ));
+        assert!(monitor.api.inspect_container_requests.borrow().is_empty());
     }
 
     #[test]

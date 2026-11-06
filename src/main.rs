@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,7 +54,7 @@ use crate::events::{
 use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored};
 use crate::logging::LoggingError;
 use crate::model::{ContainerId, RuntimeState, RuntimeStateAction};
-use crate::monitor::{DockerMonitor, MonitorError};
+use crate::monitor::{DockerMonitor, Fetched, MonitorError};
 use crate::nfnetlink::QueueOverflow;
 use crate::owners::Owners;
 use crate::source_hold::SourceHold;
@@ -115,7 +115,8 @@ enum MainError {
 
 #[derive(Debug)]
 enum DockerWorkerEvent {
-    Event(DockerEvent),
+    /// An event, with what Docker's API says about its container or network.
+    Event(DockerEvent, Box<Fetched>),
     Reconnected,
 }
 
@@ -258,17 +259,20 @@ fn sleep_or_stop(stop_rx: &Receiver<()>, duration: Duration) -> bool {
 }
 
 /// Read Docker's events from `since` on (when the state was read), and send them on
-/// `event_tx`. After the stream fails, events may have been missed: once it is back,
-/// `Reconnected` says the state has to be read again.
+/// `event_tx`, with what Docker's API says about them (see `Fetched`). After the stream
+/// fails, events may have been missed: once it is back, `Reconnected` says the state has to
+/// be read again.
 fn spawn_docker_event_worker(
     docker_socket: String,
     since: Option<i64>,
+    managed_networks: SharedNetworks,
     event_tx: Sender<DockerWorkerEvent>,
     stop_rx: Receiver<()>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut since = since;
         let mut missed = false;
+        let mut api = DockerApiConnection::new(docker_socket.clone());
         loop {
             let mut event_client = loop {
                 if stop_requested(&stop_rx) {
@@ -294,7 +298,11 @@ fn spawn_docker_event_worker(
                 }
                 match event_client.next_event() {
                     Ok(Some(event)) => {
-                        if event_tx.send(DockerWorkerEvent::Event(event)).is_err() {
+                        let fetched = api.fetch(&event, &managed_networks);
+                        if event_tx
+                            .send(DockerWorkerEvent::Event(event, Box::new(fetched)))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -311,6 +319,76 @@ fn spawn_docker_event_worker(
             }
         }
     })
+}
+
+/// The IDs of the networks Portcullis manages, as the main loop last knew them, for the
+/// thread reading Docker's events.
+#[derive(Clone, Default)]
+struct SharedNetworks(Arc<RwLock<HashSet<String>>>);
+
+impl SharedNetworks {
+    fn update(&self, state: &RuntimeState) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) =
+            state.networks().keys().map(ToString::to_string).collect();
+    }
+
+    fn contains(&self, network: &str) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(network)
+    }
+}
+
+/// A connection to Docker's API, made when needed, and again after it failed.
+struct DockerApiConnection {
+    socket: String,
+    client: Option<DockerClient>,
+}
+
+impl DockerApiConnection {
+    const fn new(socket: String) -> Self {
+        Self {
+            socket,
+            client: None,
+        }
+    }
+
+    /// What Docker says about `event`'s container or network. A connection that failed
+    /// is made again, once.
+    fn fetch(&mut self, event: &DockerEvent, managed: &SharedNetworks) -> Fetched {
+        let mut fetched = Fetched::Nothing;
+        for _ in 0..2 {
+            let mut client = match self.client.take() {
+                Some(client) => client,
+                None => match DockerClient::connect(&self.socket) {
+                    Ok(client) => client,
+                    Err(error) => return failed(event, error),
+                },
+            };
+            fetched = monitor::fetch(&mut client, event, |network| managed.contains(network));
+            let broken = matches!(
+                &fetched,
+                Fetched::Container(Err(DockerError::SocketIo(_)))
+                    | Fetched::Network(Err(DockerError::SocketIo(_)))
+            );
+            if !broken {
+                self.client = Some(client);
+                break;
+            }
+        }
+        fetched
+    }
+}
+
+/// `Fetched` for an event whose fetch failed with `error`.
+fn failed(event: &DockerEvent, error: DockerError) -> Fetched {
+    match event.kind {
+        DockerEventKind::Network if event.action != DockerEventAction::Connect => {
+            Fetched::Network(Err(error))
+        }
+        _ => Fetched::Container(Err(error)),
+    }
 }
 
 /// What a managed container address looked like at the last apply.
@@ -754,9 +832,12 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     // Events from when the state was read on: a container started while the rules were
     // being applied isn't missed.
+    let managed_networks = SharedNetworks::default();
+    managed_networks.update(&runtime_state);
     let docker_thread = spawn_docker_event_worker(
         config.docker_socket.clone(),
         since,
+        managed_networks.clone(),
         docker_tx,
         docker_stop_rx,
     );
@@ -808,7 +889,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                     break Ok(());
                 };
                 match message {
-                    DockerWorkerEvent::Event(event) => {
+                    DockerWorkerEvent::Event(event, mut fetched) => {
                         trace!(event = ?event, "docker event received");
                         if event.kind == DockerEventKind::Container
                             && matches!(event.action, DockerEventAction::Kill | DockerEventAction::Stop)
@@ -818,7 +899,12 @@ fn run(config: &Config) -> Result<(), MainError> {
                         if event.kind == DockerEventKind::Container
                             && event.action == DockerEventAction::Start
                         {
-                            monitor.check_container(&runtime_state, &event.id);
+                            match std::mem::replace(&mut *fetched, Fetched::Nothing) {
+                                Fetched::Container(inspect) => {
+                                    monitor.check_inspected(&runtime_state, &event.id, inspect);
+                                }
+                                _ => monitor.check_container(&runtime_state, &event.id),
+                            }
                             publish_warnings(&mut monitor, &bus);
                             // A restart through Docker starts it over from a clean state.
                             if runtime_state.started(&event.id.clone().into()) {
@@ -832,8 +918,9 @@ fn run(config: &Config) -> Result<(), MainError> {
                             continue;
                         }
                         let update = monitor
-                            .resolve_event_action(&runtime_state, event)
+                            .resolve_fetched_event_action(&runtime_state, event, *fetched)
                             .map(|action| action.is_some_and(|value| runtime_state.apply_action(value)));
+                        managed_networks.update(&runtime_state);
                         publish_warnings(&mut monitor, &bus);
                         match update {
                             Ok(false) => trace!("docker event produced no policy state changes"),
@@ -856,6 +943,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                                         // containers back.
                                         state.keep_quarantine(&runtime_state);
                                         runtime_state = state;
+                                        managed_networks.update(&runtime_state);
                                         monitor.check_containers(&runtime_state);
                                         publish_warnings(&mut monitor, &bus);
                                         if let Err(error) = applier.apply(&mut runtime_state) {
