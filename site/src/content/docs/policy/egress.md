@@ -31,7 +31,7 @@ labels:
 | `ip:public` | any public address (see below) |
 | `ip:*` | any address, the Docker host's and the LAN's included |
 | `host:<name>` | the addresses the name resolves to, such as `host:api.stripe.com`; see [Hostname rules](/policy/hostnames/) |
-| `host:<pattern>` | the addresses of names matching a [pattern](/policy/patterns/), such as `host:*.archive.org` |
+| `host:<pattern>` | the addresses of names matching a [pattern](/policy/patterns/), such as `host:*.example.org` |
 
 IPv6 addresses aren't accepted; see [Limitations](/limits/limitations/).
 

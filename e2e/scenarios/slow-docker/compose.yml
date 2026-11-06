@@ -1,0 +1,37 @@
+# A container on several enforced networks that starts while Docker answers about it late,
+# as Docker does on a busy host: it answers an inspect of a container only once it has
+# finished starting it, attaching every network, while its events come at once.
+services:
+  # Keeps the networks managed before `multi` starts.
+  anchor:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [one, two, three, four]
+  multi:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    profiles: [late]
+    networks: [one, two, three, four]
+    labels:
+      - portcullis.egress.tcp=ip:198.51.100.3,tcp:80
+    command:
+      - sh
+      - -c
+      - |
+        nc -v -w 10 198.51.100.3 80 </dev/null 2>&1 | sed 's/^/allowed: /' &
+        nc -v -w 10 198.51.100.4 80 </dev/null 2>&1 | sed 's/^/denied: /' &
+        wait
+
+networks:
+  one:
+    labels:
+      - portcullis.enable=true
+  two:
+    labels:
+      - portcullis.enable=true
+  three:
+    labels:
+      - portcullis.enable=true
+  four:
+    labels:
+      - portcullis.enable=true

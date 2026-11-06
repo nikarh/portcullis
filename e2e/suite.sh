@@ -21,6 +21,7 @@ SCENARIOS=(
   bypass
   fast-start
   monitor-start
+  slow-docker
   dns-inspection
   hostname-refresh
   monitor

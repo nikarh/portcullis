@@ -11,7 +11,10 @@ A compromised container can try to flood its network or the host instead of gett
 
 A container is quarantined when:
 
-- it sends anything with an address or MAC that isn't its own, or a kind of frame enforced networks don't carry (a `source` or `frame` denial). A well-behaved container never does: it takes a raw socket and intent. IPv6 on a network with IPv6 enabled doesn't count.
+- it sends anything with an address or MAC that isn't its own, or a kind of frame enforced networks don't carry (a `source` or `frame` denial). A well-behaved container never does: it takes a raw socket and intent. IPv6 on a network with IPv6 enabled doesn't count. Neither do `source` denials of what the container may well send without crafting anything (see [Source or frame events](/help/troubleshooting/#source-or-frame-events)):
+  - its own address and MAC from its own port, which the rules judged before they knew them (detail `sent before its rules were in place`);
+  - its address on another of its networks, with its MAC on this one (detail `uses its own address on <network>`);
+  - packets held for a container that just started, whose hold ran out before Portcullis knew where they came from (detail ending in `before Portcullis knew its port`).
 - more than `quarantine-denials` (1000 by default) of its connections are denied within a minute: scanning, probing, or flooding destinations it may not reach.
 
 A quarantined container is cut off from its networks: nothing it sends gets anywhere, not even ARP, and the firewall drops it before looking at anything else. It is reported with a `quarantined` warning, which raises an [alert](/guides/events-and-alerts/#alerts).

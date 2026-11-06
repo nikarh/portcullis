@@ -66,11 +66,17 @@ Check that the host can resolve the name (`getent hosts api.example.com`), and t
 
 ## A pattern `host:` rule doesn't work
 
-A pattern such as `host:*.archive.org` can't be looked up. It only allows addresses from DNS answers the container received for names it matches. Portcullis has to see the container's lookups: set `dns` in `/etc/docker/daemon.json`, or `dns:` on the container. A `dns_not_observable` warning at the container's start says it can't.
+A pattern such as `host:*.example.org` can't be looked up. It only allows addresses from DNS answers the container received for names it matches. Portcullis has to see the container's lookups: set `dns` in `/etc/docker/daemon.json`, or `dns:` on the container. A `dns_not_observable` warning at the container's start says it can't.
 
 ## Source or frame events
 
 A well-behaved container never sends with an address or MAC that isn't its own, IPv6 or VLAN-tagged frames on a network without IPv6, or ARP with data after it. `source` and `frame` denials mean something in the container crafts its own packets: a compromised process, or a network tool. They get the container quarantined.
+
+Some `source` denials aren't crafted, and don't get the container quarantined. Their `detail` tells them apart:
+
+- `sent before its rules were in place`: the container's own address and MAC, from its own port, judged by rules that didn't know them yet. Containers that start or join a network while Portcullis updates its rules can cause a few.
+- `uses its own address on <network>`: a container on several networks sent a packet with its address on one network out of another. Linux picks the interface by route, not by source address: while Docker attaches a container's networks one by one as it starts, a reply to a connection made to one of its addresses can leave through whichever network has the default route at that moment. The packet is dropped; the connection sends it again.
+- a detail ending in `before Portcullis knew its port`: a packet of a container that just started was held, and Portcullis didn't learn the container in time (see [Finding new containers](/internals/discovery/)).
 
 An enforced network with IPv6 enabled has all IPv6 denied (and an `ipv6_network` warning). Disable IPv6 on it.
 

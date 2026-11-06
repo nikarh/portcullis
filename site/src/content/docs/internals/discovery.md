@@ -14,6 +14,8 @@ Docker reports a container that started through its events and API, which can ta
 
 This takes a few milliseconds. Until the container's process exists (its interface comes up a moment before), the packets stay held, and Portcullis looks again every 100 milliseconds. Docker's own report of the container, when it comes, replaces what was found.
 
+Portcullis asks Docker about containers from the thread that reads Docker's events, never while it looks for containers: Docker answers about a container only once it has finished starting it. For a container on many networks on a busy host that takes seconds, and Docker reports each network the container joins before that.
+
 The address and MAC are those of the container's own interface. A container with `NET_ADMIN` can change them, as it can do much else; see [Limitations](/limits/limitations/).
 
 ## Where it doesn't work

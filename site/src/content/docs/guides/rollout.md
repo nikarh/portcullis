@@ -41,7 +41,7 @@ Let the services run long enough to do everything they do: a full business cycle
 journalctl -u portcullis -o cat --since "-7d" | portcullis audit
 ```
 
-`audit` reads a file, or stdin when the file is `-` or missing. It prints, for each container, the labels that would have allowed what it tried:
+`audit` reads a file, or stdin when the file is `-` or missing. After you change labels, recreate the containers and audit again with `--since` set to when you did, so that what they did before doesn't come back. It prints, for each container, the labels that would have allowed what it tried:
 
 ```text
 billing (12 denied or would-be-denied connections)
@@ -53,7 +53,7 @@ billing (12 denied or would-be-denied connections)
 To keep the list short, it:
 
 - joins consecutive ports into ranges (`tcp:8000-8100`);
-- suggests a [pattern](/policy/patterns/) for three or more hostnames under one domain with the same ports: `host:*.redd.it`, or `host:**.archive.org` when they are at different levels;
+- suggests a [pattern](/policy/patterns/) for three or more hostnames under one domain with the same ports: `host:*.example.net`, or `host:**.example.org` when they are at different levels;
 - suggests `ip:public` for ten or more public addresses with the same ports;
 - lists packets that don't start a connection (`mid_stream`, see [Events](/reference/events/#connection)) apart, since they need no label;
 - lists traffic labels can't allow (broadcast, protocols without a label), resolvers queried directly (as `portcullis.dns.*` labels), traffic that used an address or MAC that isn't the container's, and warnings.

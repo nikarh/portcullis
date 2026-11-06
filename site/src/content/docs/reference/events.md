@@ -41,7 +41,7 @@ A decision about a packet: <span class="v-allowed">allowed</span>, <span class="
 | `domain` | string or null | The destination's name, if known |
 | `domain_source` | string or null | `dns` when the container looked the name up and Portcullis saw the answer, `rule` when the address belongs to one of the container's `host:` rules |
 | `query` | string or null | For denied DNS queries, the name asked for |
-| `detail` | string or null | For `source`, what's wrong, such as which container's address was used |
+| `detail` | string or null | For `source`, what's wrong, such as which container's address was used. Some details mark packets that aren't crafted, and don't get the container quarantined: see [Source or frame events](/help/troubleshooting/#source-or-frame-events). For `egress` to a network's gateway, `the Docker host, the gateway of <network>`. |
 | `mid_stream` | `true`, or absent | A TCP packet that doesn't start a connection: a reply, or the rest of a connection the firewall doesn't track, because it lost track of it or the packet doesn't fit the connection. Rules decide new connections; what they say about such a packet doesn't mean a label is missing. |
 
 Reasons:

@@ -46,6 +46,8 @@ The `hostname-refresh` scenario restarts Portcullis with a hold of 20 seconds, a
 
 To check what happens before Portcullis has applied rules for a container, the `fast-start` scenario stops Portcullis with SIGSTOP, starts a container that sends right away, and resumes Portcullis with SIGCONT.
 
+The `slow-docker` scenario starts a container on four enforced networks while a proxy (`slow-docker.py`) passes Portcullis's inspects of containers on to Docker only after 3 seconds, as Docker answers them once a container has finished starting, and checks that none of its first packets is denied as a spoofed source and that it isn't quarantined.
+
 The `monitor-start` scenario checks that Portcullis finds containers without Docker (see [Finding new containers](https://portcullis.arhipov.net/internals/discovery/)): Portcullis talks to Docker through a `socat` proxy, which the scenario pauses with SIGSTOP while containers start on a monitored and an enforced network. Their first connections must be reported with the container, and the enforced one's labels (read from Docker's files) must decide its traffic. It also checks, on the monitored network, that a veth on the bridge with no container behind it is let through after its hold and reported as an unknown source, that a spoofed address is reported with its sender, and that nothing is held while Portcullis is stopped.
 
 Probes (`tcp`, `udp`, `dns`, `resolve`, `ping_probe`, `from_outside`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname. The checks of a scenario run in parallel; a failed check prints the probe's output.

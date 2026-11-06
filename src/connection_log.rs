@@ -5,6 +5,7 @@
 //! (`egress`, `dns`, `icc`, `source`). The packet itself gives the addresses and ports; the
 //! directory gives the containers and domains.
 
+use std::borrow::Cow;
 use std::io;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -26,6 +27,18 @@ use crate::nfnetlink::{
     ArpPacket, Ipv4Packet, LoggedPacket, NflogSocket, Overruns, PROTOCOL_TCP, is_overrun,
 };
 use crate::quarantine::Watch;
+
+/// Details of source denials that weren't forged (see [`Connection::forged`]): what the
+/// rules judged before they knew the sender, its address on another of its networks, and
+/// packets held until it was too late.
+pub const BEFORE_RULES: &str = "sent before its rules were in place";
+pub const OWN_ADDRESS: &str = "uses its own address on ";
+pub const HELD: &str = ", before Portcullis knew its port";
+
+/// Whether a source denial's detail says it wasn't forged.
+pub fn unforged(detail: &str) -> bool {
+    detail == BEFORE_RULES || detail.starts_with(OWN_ADDRESS) || detail.ends_with(HELD)
+}
 
 /// Known hostname addresses, shared with planning and DNS inspection.
 pub type SharedHosts = Arc<Mutex<HostAddresses<SystemUpstreamResolver>>>;
@@ -73,7 +86,8 @@ pub fn spawn(
     }))
 }
 
-/// Verdict and reason of a log prefix, and what a `limit` was about.
+/// Verdict and reason of a log prefix, and what a `limit` was about, or that a `source`
+/// packet was `held`.
 fn parse_prefix(prefix: &str) -> Option<(Verdict, Reason, Option<&str>)> {
     let mut parts = prefix.split(':');
     if parts.next()? != LOG_PREFIX {
@@ -150,7 +164,7 @@ fn connection_event(
         reason,
         container: None,
         network: None,
-        protocol: String::new(),
+        protocol: Cow::Borrowed(""),
         source: None,
         source_port: None,
         destination: None,
@@ -161,6 +175,7 @@ fn connection_event(
         query: None,
         detail: None,
         mid_stream: false,
+        forged: false,
     };
     match &payload {
         Payload::Ipv4(ip) => {
@@ -183,21 +198,23 @@ fn connection_event(
             }
         }
         Payload::Arp(arp) => {
-            event.protocol = "arp".to_string();
+            event.protocol = "arp".into();
             event.source = Some(IpAddr::V4(arp.sender));
             event.destination = Some(IpAddr::V4(arp.target));
         }
-        Payload::OtherArp => event.protocol = "arp".to_string(),
+        Payload::OtherArp => event.protocol = "arp".into(),
         Payload::Ipv6(source, destination) => {
-            event.protocol = "ipv6".to_string();
+            event.protocol = "ipv6".into();
             event.source = Some(*source);
             event.destination = Some(*destination);
         }
-        Payload::Other(ether_type) => event.protocol = format!("ether type {ether_type:#06x}"),
+        Payload::Other(ether_type) => {
+            event.protocol = format!("ether type {ether_type:#06x}").into();
+        }
     }
 
     match reason {
-        Reason::Source => attribute_spoofed(&mut event, packet, &payload, directory),
+        Reason::Source => attribute_spoofed(&mut event, packet, &payload, directory, limit),
         Reason::Frame => attribute_frame(&mut event, packet, &payload, directory),
         Reason::Limit => {
             attribute_sender(&mut event, packet, directory);
@@ -207,7 +224,7 @@ fn connection_event(
                 } else {
                     "has as many connections open as its limit allows"
                 }
-                .to_string(),
+                .into(),
             );
         }
         _ => {
@@ -227,6 +244,7 @@ fn connection_event(
         }
         (Reason::Dns, Payload::Ipv4(ip)) => event.query = query_name(ip),
         (Reason::Egress, _) => {
+            event.detail = directory.gateway_detail(destination).map(Cow::Owned);
             if let Some(domain) = directory.domain(source, destination) {
                 event.domain = Some(domain);
                 event.domain_source = Some(DomainSource::Dns);
@@ -293,41 +311,94 @@ fn attribute_sender(
 }
 
 /// A packet whose source address or MAC isn't the sender's: name the sender by its port,
-/// and explain what it claimed.
+/// and explain what it claimed. `kind` is `held` for packets that were held until Portcullis
+/// knew their sender, and it didn't in time.
 fn attribute_spoofed(
     event: &mut Connection,
     packet: &LoggedPacket,
     payload: &Payload<'_>,
     directory: &Directory,
+    kind: Option<&str>,
 ) {
+    let held = kind == Some("held");
     let sender = attribute_sender(event, packet, directory);
     let claimed = event.source.filter(|address| !address.is_unspecified());
-    let mac = match payload {
-        // An ARP packet announces a MAC of its own, besides the frame's.
-        Payload::Arp(arp) if packet.hwaddr.is_some_and(|mac| mac != arp.sender_mac) => {
-            event.detail = Some("announces a MAC address that isn't its own".to_string());
-            return;
-        }
-        _ => packet.hwaddr,
+    let (forged, detail) = spoofed(sender.as_ref(), claimed, packet, payload, directory);
+    // The rules didn't know the sender when they judged a held packet: what it claimed may
+    // be the sender's after all, such as an address Docker took from a removed container.
+    event.forged = forged && !held;
+    event.detail = Some(if held && forged {
+        let mut detail = detail.into_owned();
+        detail.push_str(HELD);
+        detail.into()
+    } else {
+        detail
+    });
+}
+
+/// Whether a packet with a source that isn't `sender`'s was forged (see
+/// [`Connection::forged`]), and what it claimed.
+fn spoofed(
+    sender: Option<&(IpAddr, SourceInfo)>,
+    claimed: Option<IpAddr>,
+    packet: &LoggedPacket,
+    payload: &Payload<'_>,
+    directory: &Directory,
+) -> (bool, Cow<'static, str>) {
+    // An ARP packet announces a MAC of its own, besides the frame's.
+    if let Payload::Arp(arp) = payload
+        && packet.hwaddr.is_some_and(|mac| mac != arp.sender_mac)
+    {
+        return (true, "announces a MAC address that isn't its own".into());
+    }
+    let Some((own, sender)) = sender else {
+        return (false, "unknown source address".into());
     };
+    // The MAC of the sender's interface on this network, as the rules check it.
+    let own_mac = sender.mac.is_none() || packet.hwaddr == sender.mac;
     let owner = claimed.and_then(|address| directory.attributed(address));
-    let detail = match (&sender, claimed, &owner) {
-        (None, _, _) => "unknown source address".to_string(),
-        (Some((_, sender)), _, Some(owner)) if owner.container != sender.container => {
-            format!("uses the address of {}", owner.container)
-        }
-        (Some((own, _)), Some(address), None) if address != *own => {
-            format!("uses {address} instead of its address {own}")
-        }
-        // Its own address (or none), so the MAC is what's wrong.
-        (Some((_, sender)), _, _) => match mac.and_then(|mac| directory.by_mac(mac)) {
-            Some((_, other)) if other.container != sender.container => {
-                format!("uses the MAC address of {}", other.container)
+    match (claimed, &owner) {
+        // Its own address and MAC from its own port: the rules that judged it didn't know
+        // them yet (they were being updated), or no longer did.
+        (None, _) if own_mac => (false, BEFORE_RULES.into()),
+        (Some(address), _) if address == *own && own_mac => (false, BEFORE_RULES.into()),
+        // Its address on another of its networks, with its MAC on this one: a container
+        // on several networks may route a packet out of another network than the one its
+        // source address is on (Linux doesn't tie addresses to interfaces). That takes no
+        // raw socket, and gets it nowhere it couldn't go.
+        (Some(_), Some(owner))
+            if owner.container == sender.container && owner.network != sender.network =>
+        {
+            if own_mac {
+                (false, format!("{OWN_ADDRESS}{}", owner.network).into())
+            } else {
+                (true, wrong_mac(packet, sender, directory))
             }
-            _ => "uses a MAC address that isn't its own".to_string(),
-        },
-    };
-    event.detail = Some(detail);
+        }
+        (Some(_), Some(owner)) if owner.container != sender.container => (
+            true,
+            format!("uses the address of {}", owner.container).into(),
+        ),
+        (Some(address), None) if address != *own => (
+            true,
+            format!("uses {address} instead of its address {own}").into(),
+        ),
+        // Its own address (or none), so the MAC is what's wrong.
+        _ => (true, wrong_mac(packet, sender, directory)),
+    }
+}
+
+fn wrong_mac(
+    packet: &LoggedPacket,
+    sender: &SourceInfo,
+    directory: &Directory,
+) -> Cow<'static, str> {
+    match packet.hwaddr.and_then(|mac| directory.by_mac(mac)) {
+        Some((_, other)) if other.container != sender.container => {
+            format!("uses the MAC address of {}", other.container).into()
+        }
+        _ => "uses a MAC address that isn't its own".into(),
+    }
 }
 
 /// A kind of frame enforced networks don't carry: name the sender and the kind.
@@ -339,21 +410,21 @@ fn attribute_frame(
 ) {
     attribute_sender(event, packet, directory);
     let detail = if packet.vlan {
-        "a VLAN-tagged frame".to_string()
+        "a VLAN-tagged frame".into()
     } else if let Some(mac) = packet
         .destination_mac
         .filter(|mac| is_link_local_group(*mac))
     {
-        format!("a frame to the link-local group address {mac}")
+        format!("a frame to the link-local group address {mac}").into()
     } else {
         match payload {
-            Payload::Ipv6(..) => "IPv6, which Portcullis doesn't manage".to_string(),
-            Payload::Other(ether_type) => format!("a frame of ether type {ether_type:#06x}"),
+            Payload::Ipv6(..) => "IPv6, which Portcullis doesn't manage".into(),
+            Payload::Other(ether_type) => format!("a frame of ether type {ether_type:#06x}").into(),
             Payload::Arp(_) | Payload::OtherArp => {
                 "ARP that isn't a plain request or reply for Ethernet and IPv4, or carries more"
-                    .to_string()
+                    .into()
             }
-            Payload::Ipv4(_) => "a frame of a kind that isn't allowed".to_string(),
+            Payload::Ipv4(_) => "a frame of a kind that isn't allowed".into(),
         }
     };
     event.detail = Some(detail);
@@ -378,10 +449,10 @@ fn query_name(packet: &Ipv4Packet<'_>) -> Option<String> {
 }
 
 /// The protocol's name in labels, or its number for those labels can't name.
-fn protocol_name(protocol: u8) -> String {
+fn protocol_name(protocol: u8) -> Cow<'static, str> {
     Protocol::from_number(protocol).map_or_else(
-        || protocol.to_string(),
-        |protocol| protocol.as_str().to_string(),
+        || protocol.to_string().into(),
+        |protocol| protocol.as_str().into(),
     )
 }
 
@@ -496,6 +567,15 @@ mod tests {
         assert_eq!(event.network.as_deref(), Some("net0"));
         assert_eq!(event.destination_port, Some(443));
         assert_eq!(event.domain, None);
+        assert_eq!(event.detail, None);
+
+        // The gateway is the Docker host.
+        let to_host = logged("pc:d:egress", tcp([172, 18, 0, 2], [172, 18, 0, 1], 8080));
+        let event = connection_event(&to_host, &directory, &hosts).expect("event");
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("the Docker host, the gateway of net0")
+        );
 
         directory.observe(
             ip("172.18.0.2"),
@@ -599,6 +679,7 @@ mod tests {
         let event = connection_event(&packet, &directory, &hosts).expect("event");
         assert_eq!(event.container.as_deref(), Some("other"));
         assert_eq!(event.detail.as_deref(), Some("uses the address of web"));
+        assert!(event.forged);
 
         // "other" using an address outside the network.
         let mut packet = logged("pc:d:source", tcp([10, 99, 0, 5], [1, 1, 1, 1], 80));
@@ -685,6 +766,80 @@ mod tests {
     }
 
     #[test]
+    fn tells_forged_sources_from_traffic_the_rules_judged_too_early() {
+        let mut state = test_support::icc_state();
+        let port = |name: &str, index| crate::model::BridgePort {
+            name: name.to_string(),
+            index,
+        };
+        // project-db-1 is on net0 (172.18.0.10, port 20) and net1 (172.19.0.10, port 21).
+        state.set_ports(
+            [
+                (ip("172.18.0.3"), port("veth13", 13)),
+                (ip("172.18.0.10"), port("veth20", 20)),
+                (ip("172.19.0.10"), port("veth21", 21)),
+            ]
+            .into(),
+            std::collections::HashSet::new(),
+        );
+        let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
+        let (directory, hosts) = setup();
+        directory.update(&plan);
+        let from_db = |prefix: &str, source: [u8; 4]| {
+            let mut packet = logged(prefix, tcp(source, [192, 168, 1, 2], 44300));
+            packet.indev = Some(20);
+            packet.hwaddr = test_support::mac_of("172.18.0.10");
+            connection_event(&packet, &directory, &hosts).expect("event")
+        };
+
+        // Its own address, MAC and port: the rules didn't know them when they judged it.
+        let event = from_db("pc:d:source", [172, 18, 0, 10]);
+        assert_eq!(event.container.as_deref(), Some("project-db-1"));
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("sent before its rules were in place")
+        );
+        assert!(!event.forged);
+
+        // Its address on net1, routed out of net0, with its MAC on net0.
+        let event = from_db("pc:d:source", [172, 19, 0, 10]);
+        assert_eq!(event.network.as_deref(), Some("net0"));
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("uses its own address on net1")
+        );
+        assert!(!event.forged);
+        // ...but not with another MAC.
+        let mut packet = logged("pc:d:source", tcp([172, 19, 0, 10], [1, 1, 1, 1], 80));
+        packet.indev = Some(20);
+        packet.hwaddr = test_support::mac_of("172.18.0.3");
+        let event = connection_event(&packet, &directory, &hosts).expect("event");
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("uses the MAC address of other")
+        );
+        assert!(event.forged);
+
+        // Someone else's address is forged...
+        let event = from_db("pc:d:source", [172, 18, 0, 3]);
+        assert_eq!(event.detail.as_deref(), Some("uses the address of other"));
+        assert!(event.forged);
+        // ...unless the packet was held and Portcullis didn't know its sender in time.
+        let event = from_db("pc:d:source:held", [172, 18, 0, 3]);
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("uses the address of other, before Portcullis knew its port")
+        );
+        assert!(!event.forged);
+        let event = from_db("pc:w:source:held", [172, 18, 0, 10]);
+        assert_eq!(event.verdict, Verdict::WouldDeny);
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("sent before its rules were in place")
+        );
+    }
+
+    #[test]
     fn explains_spoofed_arp() {
         let (directory, hosts) = setup_with_ports();
         let other_mac = test_support::mac_of("172.18.0.3").expect("mac");
@@ -718,6 +873,7 @@ mod tests {
             event.detail.as_deref(),
             Some("announces a MAC address that isn't its own")
         );
+        assert!(event.forged);
     }
 
     #[test]

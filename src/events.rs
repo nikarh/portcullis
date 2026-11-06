@@ -7,6 +7,7 @@
 //!
 //! Diagnostic logs go to stderr and are not events.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -80,8 +81,8 @@ pub struct Connection {
     pub container: Option<String>,
     pub network: Option<String>,
     /// `tcp`, `udp`, `icmp` or another IP protocol number; for frames that aren't IPv4,
-    /// `arp`, `ipv6` or the ether type.
-    pub protocol: String,
+    /// `arp`, `ipv6` or the ether type. Mostly fixed names, which aren't copied.
+    pub protocol: Cow<'static, str>,
     /// The source address the packet claims; none for frames without one.
     pub source: Option<IpAddr>,
     pub source_port: Option<u16>,
@@ -93,13 +94,20 @@ pub struct Connection {
     pub domain_source: Option<DomainSource>,
     /// The name a denied DNS query asked for.
     pub query: Option<String>,
-    /// Extra explanation, e.g. why a source is considered spoofed.
-    pub detail: Option<String>,
+    /// Extra explanation, e.g. why a source is considered spoofed. Mostly fixed texts,
+    /// which aren't copied.
+    pub detail: Option<Cow<'static, str>>,
     /// A TCP packet that doesn't start a connection, of a connection the firewall doesn't
     /// track (it lost track, or the packet doesn't fit the connection). Rules are written
     /// for new connections; what they decide about these says little about the policy.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mid_stream: bool,
+    /// For `source`: the packet claims an address or MAC that isn't the sender's, which
+    /// takes a raw socket. Not so for the sender's own traffic that the rules judged before
+    /// they knew it, nor for its address on another of its networks, which its routing may
+    /// send out of this one. Decides quarantine; not reported.
+    #[serde(skip)]
+    pub forged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,7 +485,7 @@ fn write_connection(line: &mut String, connection: &Connection) -> std::fmt::Res
 }
 
 /// RFC 3339 UTC timestamp with millisecond precision.
-fn timestamp(time: SystemTime) -> String {
+pub fn timestamp(time: SystemTime) -> String {
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = since_epoch.as_secs();
     let days = i64::try_from(seconds / 86_400).unwrap_or_default();
@@ -762,7 +770,7 @@ mod tests {
             reason: Reason::Egress,
             container: Some("web".to_string()),
             network: Some("backend".to_string()),
-            protocol: "tcp".to_string(),
+            protocol: "tcp".into(),
             source: Some("172.18.0.2".parse().expect("ip")),
             source_port: Some(40000),
             destination: Some("104.18.3.4".parse().expect("ip")),
@@ -773,6 +781,7 @@ mod tests {
             query: None,
             detail: None,
             mid_stream: false,
+            forged: false,
         })
     }
 

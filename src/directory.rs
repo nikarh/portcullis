@@ -49,6 +49,8 @@ struct Snapshot {
     by_port: HashMap<u32, (IpAddr, SourceInfo)>,
     /// Bridge name to network name.
     bridges: HashMap<String, String>,
+    /// Gateway address (the Docker host's) to what egress events to it say.
+    gateways: HashMap<IpAddr, String>,
     /// Hostnames of each source's `host:` rules, with the container's hold.
     rule_hosts: HashMap<IpAddr, Vec<(String, Duration)>>,
     host_sets: Vec<HostSet>,
@@ -134,6 +136,14 @@ impl Directory {
             .bridges
             .iter()
             .map(|bridge| (bridge.name.clone(), bridge.network.clone()))
+            .collect();
+        snapshot.gateways = plan
+            .bridges
+            .iter()
+            .filter_map(|bridge| {
+                let detail = format!("the Docker host, the gateway of {}", bridge.network);
+                Some((bridge.gateway?, detail))
+            })
             .collect();
         snapshot.host_sets.clone_from(&plan.host_sets);
 
@@ -221,6 +231,13 @@ impl Directory {
         let master = fs::read_link(Path::new("/sys/class/net").join(&name).join("master")).ok()?;
         let bridge = master.file_name()?.to_str()?;
         snapshot.bridges.get(bridge).cloned()
+    }
+
+    /// What to say about egress to `address` when it is a network's gateway, the Docker
+    /// host's address on it.
+    #[must_use]
+    pub fn gateway_detail(&self, address: IpAddr) -> Option<String> {
+        self.read().gateways.get(&address).cloned()
     }
 
     /// Hostnames of the `host:` rules of the container at `source`.
@@ -477,9 +494,9 @@ mod tests {
                 )
                 .len()
         };
-        assert_eq!(found(&["ia800.archive.org"]), 1);
+        assert_eq!(found(&["ia800.example.org"]), 1);
         // A CNAME the name resolved through counts too.
-        assert_eq!(found(&["coverartarchive.org", "ia800.archive.org"]), 1);
-        assert_eq!(found(&["a.ia800.archive.org", "archive.org"]), 0);
+        assert_eq!(found(&["coverexample.org", "ia800.example.org"]), 1);
+        assert_eq!(found(&["a.ia800.example.org", "example.org"]), 0);
     }
 }

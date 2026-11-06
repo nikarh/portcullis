@@ -8,7 +8,7 @@ sidebar:
 ```text
 portcullis [OPTIONS]                       run the firewall daemon
 portcullis watch [--events-socket <path>]  show live events of a running daemon
-portcullis audit [FILE]                    summarize what containers tried that their labels don't allow
+portcullis audit [--since <time>] [FILE]   summarize what containers tried that their labels don't allow
 portcullis cleanup [--state-dir <path>]    remove all firewall rules Portcullis left in place, and the saved ones
 portcullis --version
 portcullis --help
@@ -45,6 +45,8 @@ Lines that aren't events are printed as they are.
 ```bash
 journalctl -u portcullis -o cat | portcullis audit
 portcullis audit events.jsonl
+portcullis audit --since 2026-11-06T10:30 events.jsonl
+journalctl -u portcullis -o cat | portcullis audit --since 12h
 ```
 
 Reads JSON events (`log-format = "json"`) from `FILE`, or from stdin when `FILE` is `-` or missing, and ignores every other line. Prints, per container, the labels that would have allowed its denied and would-be-denied connections, followed by warnings. It doesn't need root or a running daemon.
@@ -56,7 +58,13 @@ billing (12 denied or would-be-denied connections)
     (with portcullis.icc.mode=allow-listed)
 ```
 
-It joins consecutive ports into ranges, folds three or more hostnames under one domain with the same ports into a [pattern](/policy/patterns/), and ten or more public addresses with the same ports into `ip:public`. Packets of connections the firewall didn't track (`mid_stream`), traffic labels can't allow, and traffic sent with someone else's address are listed apart. See [Rolling out a policy](/guides/rollout/#3-turn-events-into-labels).
+It joins consecutive ports into ranges, folds three or more hostnames under one domain with the same ports into a [pattern](/policy/patterns/), and ten or more public addresses with the same ports into `ip:public`. Ten or more public addresses left over, each with ports of its own (peers of a peer-to-peer protocol, say), are folded into `ip:public` too, with all their ports. More than ten ports of one protocol become one range, from the lowest to the highest. Each target gets one label: suggestions for the same target are merged, a pattern takes in the names and narrower patterns it covers, and a pattern whose key would be the same as a name's gets `-subdomains` (`portcullis.egress.example-org-subdomains=host:**.example.org` next to `portcullis.egress.example-org=host:example.org`).
+
+A suggestion to reach the Docker host (a network's gateway, see [The Docker host](/policy/egress/#the-docker-host)) comes with a note: it lets the container reach services on the host. Traffic that Docker's userland proxy (`docker-proxy`) forwards to a container from a published port comes from the gateway, so a container may have learned the address from that, rather than needing it.
+
+Packets of connections the firewall didn't track (`mid_stream`), traffic labels can't allow, and traffic sent with someone else's address are listed apart. `source` denials that weren't crafted (see [Source or frame events](/help/troubleshooting/#source-or-frame-events)) are listed as needing no label.
+
+`--since` leaves out events from before a time: a UTC time as events have it, or the start of one (`2026-11-06`, `2026-11-06T10:30`), or how long ago (`30m`, `12h`, `7d`). Use it to leave out what containers did before they were recreated with the labels they have now. See [Rolling out a policy](/guides/rollout/#3-turn-events-into-labels).
 
 With no denials in the input, it prints `No denied or would-be-denied traffic found.`
 
