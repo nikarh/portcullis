@@ -145,7 +145,7 @@ mod tests {
             reason,
             container: Some("web".to_string()),
             network: None,
-            protocol: protocol.to_string(),
+            protocol: protocol.to_string().into(),
             source: None,
             source_port: None,
             destination: None,
@@ -154,7 +154,7 @@ mod tests {
             domain: None,
             domain_source: None,
             query: None,
-            detail: Some("uses the address of other".to_string()),
+            detail: Some("uses the address of other".into()),
             mid_stream: false,
             forged: reason == Reason::Source,
         }
@@ -208,7 +208,7 @@ mod tests {
         let mut watch = Watch::new(sender, 100);
         let mut early = denied(Reason::Source, "arp", 0);
         early.forged = false;
-        early.detail = Some("sent before its rules were in place".to_string());
+        early.detail = Some("sent before its rules were in place".into());
         watch.observe(&early, &directory());
         assert!(receiver.try_recv().is_err());
     }

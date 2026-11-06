@@ -1,7 +1,8 @@
 //! Command-line tools working on events: `portcullis watch` and `portcullis audit`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write as _};
 use std::net::IpAddr;
@@ -49,7 +50,7 @@ pub fn audit(input: Option<&Path>, since: Option<&str>) -> io::Result<()> {
         if let Ok(line) = serde_json::from_str::<Line>(&line?)
             && since.is_none_or(|since| line.time.as_str() >= since)
         {
-            report.add(&line.event);
+            report.add(line.event);
         }
     }
     io::stdout().lock().write_all(report.render().as_bytes())
@@ -95,7 +96,7 @@ pub fn since(value: &str) -> io::Result<String> {
 
 /// What was sent to a destination: protocol and destination port (none for protocols
 /// without ports).
-type Services = BTreeSet<(String, Option<u16>)>;
+type Services = BTreeSet<(Cow<'static, str>, Option<u16>)>;
 
 /// Examples of a kind of finding kept per container; more are only counted.
 const EXAMPLES: usize = 5;
@@ -121,7 +122,7 @@ struct Findings {
     /// `host:<domain>` or `ip:<address>` to services.
     egress: BTreeMap<String, Services>,
     /// Egress targets that are the Docker host, with what the events said about them.
-    docker_host: BTreeMap<String, String>,
+    docker_host: BTreeMap<String, Cow<'static, str>>,
     /// `container:<name>` or `multicast:<group>` to services.
     icc: BTreeMap<String, Services>,
     /// ICC destinations that aren't known containers.
@@ -129,9 +130,9 @@ struct Findings {
     /// Resolvers queried.
     dns: BTreeSet<IpAddr>,
     /// Sources that aren't the container's own.
-    spoofed: BTreeSet<String>,
+    spoofed: BTreeSet<Cow<'static, str>>,
     /// Source denials that weren't forged, see `connection_log::unforged`.
-    unforged: BTreeSet<String>,
+    unforged: BTreeSet<Cow<'static, str>>,
     /// Packets of connections the firewall didn't track, and how many.
     mid_stream: (BTreeSet<String>, usize),
     /// Traffic of protocols labels can't name.
@@ -145,7 +146,7 @@ struct Report {
 }
 
 impl Report {
-    fn add(&mut self, event: &Event) {
+    fn add(&mut self, event: Event) {
         match event {
             Event::Connection(connection)
                 if matches!(connection.verdict, Verdict::Denied | Verdict::WouldDeny) =>
@@ -161,84 +162,89 @@ impl Report {
                 ) =>
             {
                 self.warnings.insert((
-                    warning.container.clone().unwrap_or_else(|| "-".to_string()),
-                    warning.message.clone(),
+                    warning.container.unwrap_or_else(|| "-".to_string()),
+                    warning.message,
                 ));
             }
             _ => {}
         }
     }
 
-    fn add_connection(&mut self, connection: &Connection) {
-        let container = connection
-            .container
-            .clone()
-            .unwrap_or_else(|| match connection.source {
-                Some(source) => format!("unknown container at {source}"),
-                None => "unknown container".to_string(),
-            });
+    fn add_connection(&mut self, connection: Connection) {
+        let Connection {
+            reason,
+            container,
+            protocol,
+            source,
+            source_port,
+            destination,
+            destination_port,
+            destination_container,
+            domain,
+            detail,
+            mid_stream,
+            ..
+        } = connection;
+        let container = container.unwrap_or_else(|| match source {
+            Some(source) => format!("unknown container at {source}"),
+            None => "unknown container".to_string(),
+        });
         let findings = self.containers.entry(container).or_default();
         findings.count += 1;
-        let routed = matches!(
-            connection.reason,
-            Reason::Egress | Reason::Icc | Reason::Dns
-        );
+        let routed = matches!(reason, Reason::Egress | Reason::Icc | Reason::Dns);
         // Replies, and the rest of connections the firewall lost track of: rules don't
         // need to allow them, they allow the connections.
-        if routed && connection.mid_stream {
+        if routed && mid_stream {
             let (examples, count) = &mut findings.mid_stream;
             *count += 1;
             if examples.len() < EXAMPLES {
                 examples.insert(format!(
-                    "{} {} to {}",
-                    connection.protocol,
-                    endpoint(connection.source, connection.source_port, None),
+                    "{protocol} {} to {}",
+                    endpoint(source, source_port, None),
                     endpoint(
-                        connection.destination,
-                        connection.destination_port,
-                        connection.destination_container.as_deref()
+                        destination,
+                        destination_port,
+                        destination_container.as_deref()
                     )
                 ));
             }
             return;
         }
-        let protocol = connection.protocol.as_str();
-        let service = match Protocol::from_name(protocol) {
-            Some(known) if known.has_ports() => (protocol.to_string(), connection.destination_port),
+        let service = match Protocol::from_name(&protocol) {
+            Some(known) if known.has_ports() => (protocol, destination_port),
             None if routed => {
                 findings.unsupported.insert(format!(
                     "IP protocol {protocol} to {}",
-                    endpoint(
-                        connection.destination,
-                        None,
-                        connection.destination_container.as_deref()
-                    )
+                    endpoint(destination, None, destination_container.as_deref())
                 ));
                 return;
             }
             // Protocols without ports, and frames (ARP, IPv6).
-            _ => (protocol.to_string(), None),
+            _ => (protocol, None),
         };
-        match connection.reason {
+        match reason {
             Reason::Egress => {
-                let target = match (&connection.domain, connection.destination) {
-                    (Some(domain), _) => format!("host:{domain}"),
+                let target = match (domain, destination) {
+                    (Some(mut domain), _) => {
+                        domain.insert_str(0, "host:");
+                        domain
+                    }
                     (None, Some(destination)) => format!("ip:{destination}"),
                     (None, None) => return,
                 };
-                if let Some(detail) = connection
-                    .detail
-                    .as_ref()
-                    .filter(|detail| detail.starts_with(DOCKER_HOST))
+                if let Some(detail) = detail.filter(|detail| detail.starts_with(DOCKER_HOST))
                     && !findings.docker_host.contains_key(&target)
                 {
-                    findings.docker_host.insert(target.clone(), detail.clone());
+                    findings.docker_host.insert(target.clone(), detail);
                 }
                 findings.egress.entry(target).or_default().insert(service);
             }
             Reason::Icc => {
-                let target = match (&connection.destination_container, connection.destination) {
-                    (Some(container), _) => format!("container:{container}"),
+                let target = match (destination_container, destination) {
+                    (Some(mut container), _) => {
+                        container.insert_str(0, "container:");
+                        container
+                    }
                     (None, Some(group)) if group.is_multicast() => format!("multicast:{group}"),
                     (None, destination) => {
                         findings.icc_unknown.extend(destination);
@@ -248,13 +254,13 @@ impl Report {
                 findings.icc.entry(target).or_default().insert(service);
             }
             Reason::Dns => {
-                findings.dns.extend(connection.destination);
+                findings.dns.extend(destination);
             }
             Reason::Source | Reason::Frame | Reason::Limit => {
-                let detail = connection.detail.clone().unwrap_or_else(|| {
-                    format!("sent {} it isn't allowed to send", connection.protocol)
+                let detail = detail.unwrap_or_else(|| {
+                    format!("sent {} it isn't allowed to send", service.0).into()
                 });
-                if connection.reason == Reason::Source && unforged(&detail) {
+                if reason == Reason::Source && unforged(&detail) {
                     findings.unforged.insert(detail);
                 } else {
                     findings.spoofed.insert(detail);
@@ -263,30 +269,25 @@ impl Report {
         }
     }
 
-    fn render(&self) -> String {
+    fn render(self) -> String {
         let mut out = String::new();
         if self.containers.is_empty() && self.warnings.is_empty() {
             out.push_str("No denied or would-be-denied traffic found.\n");
             return out;
         }
-        for (container, findings) in &self.containers {
+        for (container, findings) in self.containers {
             let _ = writeln!(
                 out,
                 "{container} ({} denied or would-be-denied connections)",
                 findings.count
             );
-            let suggestions = fold_egress(&findings.egress);
+            let suggestions = fold_egress(findings.egress);
             let names = label_names(&suggestions);
             for (suggestion, name) in suggestions.iter().zip(names) {
-                let _ = writeln!(
-                    out,
-                    "  portcullis.egress.{name}={},{}",
-                    suggestion.target,
-                    service_list(&suggestion.services)
-                );
-                if let Some(note) = suggestion.note() {
-                    let _ = writeln!(out, "    ({note})");
-                }
+                let _ = write!(out, "  portcullis.egress.{name}={},", suggestion.target);
+                write_services(&mut out, &suggestion.services);
+                out.push('\n');
+                suggestion.write_note(&mut out);
                 if let Some(detail) = findings.docker_host.get(&suggestion.target) {
                     let _ = writeln!(
                         out,
@@ -302,15 +303,13 @@ impl Report {
                 }
             }
             for (target, services) in &findings.icc {
-                let name = target
-                    .split_once(':')
-                    .map_or(target.as_str(), |(_, name)| name);
-                let _ = writeln!(
+                let _ = write!(
                     out,
-                    "  portcullis.icc.allow.{}={target},{}",
-                    slug(name),
-                    service_list(services)
+                    "  portcullis.icc.allow.{}={target},",
+                    Slug(target_value(target))
                 );
+                write_services(&mut out, services);
+                out.push('\n');
             }
             if !findings.icc.is_empty() {
                 out.push_str("    (with portcullis.icc.mode=allow-listed)\n");
@@ -329,11 +328,7 @@ impl Report {
                 }
             }
             for resolver in &findings.dns {
-                let _ = writeln!(
-                    out,
-                    "  portcullis.dns.{}=ip:{resolver}",
-                    slug(&resolver.to_string())
-                );
+                let _ = writeln!(out, "  portcullis.dns.{}=ip:{resolver}", Slug(resolver));
             }
             for unsupported in &findings.unsupported {
                 let _ = writeln!(out, "  {unsupported}, which labels can't allow");
@@ -366,15 +361,22 @@ impl Report {
 }
 
 /// `address:port`, or the container's name for the address.
-fn endpoint(address: Option<IpAddr>, port: Option<u16>, container: Option<&str>) -> String {
-    let host = container.map_or_else(
-        || address.map_or_else(|| "?".to_string(), |address| address.to_string()),
-        ToString::to_string,
-    );
-    match port {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
-    }
+fn endpoint(
+    address: Option<IpAddr>,
+    port: Option<u16>,
+    container: Option<&str>,
+) -> impl fmt::Display {
+    fmt::from_fn(move |f| {
+        match (container, address) {
+            (Some(container), _) => f.write_str(container)?,
+            (None, Some(address)) => write!(f, "{address}")?,
+            (None, None) => f.write_str("?")?,
+        }
+        match port {
+            Some(port) => write!(f, ":{port}"),
+            None => Ok(()),
+        }
+    })
 }
 
 /// A suggested egress label: its target, services, and what was folded into it.
@@ -384,11 +386,12 @@ struct Suggestion {
     services: Services,
     /// Hostnames, or public addresses, folded into a pattern or `ip:public`.
     folded: usize,
+    /// The target of one of them.
     example: Option<String>,
 }
 
 impl Suggestion {
-    fn new(target: String, services: Services) -> Self {
+    const fn new(target: String, services: Services) -> Self {
         Self {
             target,
             services,
@@ -398,26 +401,28 @@ impl Suggestion {
     }
 
     /// Take `other` in: its services, and what it stands for.
-    fn absorb(&mut self, other: Self) {
-        self.services.extend(other.services);
+    fn absorb(&mut self, mut other: Self) {
+        self.services.append(&mut other.services);
         self.folded += other.folded.max(1);
         if self.example.is_none() {
-            self.example = other
-                .example
-                .or_else(|| Some(target_value(&other.target).to_string()));
+            self.example = other.example.or(Some(other.target));
         }
     }
 
-    fn note(&self) -> Option<String> {
-        let example = self.example.as_deref()?;
-        Some(if self.target == "ip:public" {
-            format!(
-                "{} public addresses, such as {example}; or list them as ip: labels",
-                self.folded
+    /// What was folded into it, as a line of the report.
+    fn write_note(&self, out: &mut String) {
+        let Some(example) = &self.example else {
+            return;
+        };
+        let (folded, example) = (self.folded, target_value(example));
+        let _ = if self.target == "ip:public" {
+            writeln!(
+                out,
+                "    ({folded} public addresses, such as {example}; or list them as ip: labels)"
             )
         } else {
-            format!("{} names, such as {example}", self.folded)
-        })
+            writeln!(out, "    ({folded} names, such as {example})")
+        };
     }
 }
 
@@ -426,78 +431,96 @@ fn target_value(target: &str) -> &str {
     target.split_once(':').map_or(target, |(_, value)| value)
 }
 
+/// One suggestion for each of `targets`, all with `services`.
+fn spread(targets: Vec<String>, services: Services, suggestions: &mut Vec<Suggestion>) {
+    let mut targets = targets.into_iter().peekable();
+    while let Some(target) = targets.next() {
+        let services = if targets.peek().is_some() {
+            services.clone()
+        } else {
+            return suggestions.push(Suggestion::new(target, services));
+        };
+        suggestions.push(Suggestion::new(target, services));
+    }
+}
+
 /// Egress targets with their services, folded: hostnames under one domain with the same
 /// services become a pattern, which also takes in names it covers; many public addresses
 /// `ip:public`. One label per target.
-fn fold_egress(egress: &BTreeMap<String, Services>) -> Vec<Suggestion> {
-    let mut by_services: BTreeMap<&Services, (Vec<&str>, Vec<IpAddr>)> = BTreeMap::new();
+fn fold_egress(egress: BTreeMap<String, Services>) -> Vec<Suggestion> {
+    // Hostnames, and public addresses, by their services.
+    let mut by_services: BTreeMap<Services, (Vec<String>, Vec<String>)> = BTreeMap::new();
     let mut suggestions = Vec::new();
     for (target, services) in egress {
-        let (hosts, public) = by_services.entry(services).or_default();
-        if let Some(host) = target.strip_prefix("host:") {
-            hosts.push(host);
-            continue;
-        }
-        if let Some(address) = target
+        let public = target
             .strip_prefix("ip:")
             .and_then(|address| address.parse::<IpAddr>().ok())
-            .filter(|address| is_public(*address))
-        {
-            public.push(address);
-            continue;
+            .is_some_and(is_public);
+        if target.starts_with("host:") {
+            by_services.entry(services).or_default().0.push(target);
+        } else if public {
+            by_services.entry(services).or_default().1.push(target);
+        } else {
+            suggestions.push(Suggestion::new(target, services));
         }
-        suggestions.push(Suggestion::new(target.clone(), services.clone()));
     }
     // Public addresses that weren't folded with others of the same services.
-    let mut lone_public = Vec::new();
+    let mut lone_public: Vec<(Vec<String>, Services)> = Vec::new();
     for (services, (mut hosts, public)) in by_services {
-        while let Some((parent, members)) = widest_parent(&hosts) {
-            let one_level = members.iter().all(|host| {
-                host.strip_suffix(parent)
-                    .and_then(|below| below.strip_suffix('.'))
-                    .is_some_and(|below| !below.contains('.'))
-            });
-            let wildcard = if one_level { "*" } else { "**" };
-            hosts.retain(|host| !members.contains(host));
+        while let Some(target) = widest_parent(&hosts) {
+            let pattern = target_value(&target);
+            let parent = pattern
+                .trim_start_matches('*')
+                .strip_prefix('.')
+                .unwrap_or(pattern);
+            let mut members = hosts
+                .extract_if(.., |host| below(target_value(host), parent).is_some())
+                .peekable();
+            let example = members.next();
+            let folded = members.count() + usize::from(example.is_some());
             suggestions.push(Suggestion {
-                target: format!("host:{wildcard}.{parent}"),
+                target,
                 services: services.clone(),
-                folded: members.len(),
-                example: members.first().map(ToString::to_string),
+                folded,
+                example,
             });
         }
-        suggestions.extend(
-            hosts
-                .into_iter()
-                .map(|host| Suggestion::new(format!("host:{host}"), services.clone())),
-        );
         if public.len() >= FOLD_PUBLIC {
+            let mut public = public.into_iter();
             suggestions.push(Suggestion {
                 target: "ip:public".to_string(),
                 services: services.clone(),
                 folded: public.len(),
-                example: public.first().map(ToString::to_string),
+                example: public.next(),
             });
+            spread(hosts, services, &mut suggestions);
+        } else if public.is_empty() {
+            spread(hosts, services, &mut suggestions);
         } else {
-            lone_public.extend(public.into_iter().map(|address| (address, services)));
+            spread(hosts, services.clone(), &mut suggestions);
+            lone_public.push((public, services));
         }
     }
     // Many public addresses each with ports of their own, such as peers of a peer-to-peer
     // protocol: their services together.
-    if lone_public.len() >= FOLD_PUBLIC {
+    let lone = lone_public
+        .iter()
+        .map(|(public, _)| public.len())
+        .sum::<usize>();
+    if lone >= FOLD_PUBLIC {
         let mut folded = Suggestion::new("ip:public".to_string(), Services::new());
-        folded.folded = lone_public.len();
-        folded.example = lone_public.first().map(|(address, _)| address.to_string());
-        for (_, services) in lone_public {
-            folded.services.extend(services.iter().cloned());
+        folded.folded = lone;
+        for (public, mut services) in lone_public {
+            folded.services.append(&mut services);
+            if folded.example.is_none() {
+                folded.example = public.into_iter().next();
+            }
         }
         suggestions.push(folded);
     } else {
-        suggestions.extend(
-            lone_public.into_iter().map(|(address, services)| {
-                Suggestion::new(format!("ip:{address}"), services.clone())
-            }),
-        );
+        for (public, services) in lone_public {
+            spread(public, services, &mut suggestions);
+        }
     }
     merge(suggestions)
 }
@@ -589,7 +612,7 @@ fn covers(pattern: &str, target: &str) -> bool {
 fn label_names(suggestions: &[Suggestion]) -> Vec<String> {
     let mut names: Vec<String> = suggestions
         .iter()
-        .map(|suggestion| slug(target_value(&suggestion.target)))
+        .map(|suggestion| Slug(target_value(&suggestion.target)).to_string())
         .collect();
     let shared: Vec<bool> = names
         .iter()
@@ -621,27 +644,36 @@ fn label_names(suggestions: &[Suggestion]) -> Vec<String> {
     names
 }
 
-/// The parent domain the most `hosts` are below, if at least [`FOLD_HOSTS`] are.
-fn widest_parent<'a>(hosts: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
-    let mut parents: BTreeMap<&'a str, Vec<&'a str>> = BTreeMap::new();
+/// The pattern target (`host:*.parent` when all are one level below it, else
+/// `host:**.parent`) for the parent domain the most `hosts` targets are below, if at least
+/// [`FOLD_HOSTS`] are.
+fn widest_parent(hosts: &[String]) -> Option<String> {
+    // Per parent: how many names are below it, and whether all one level below.
+    let mut parents: BTreeMap<&str, (usize, bool)> = BTreeMap::new();
     for host in hosts {
+        let name = target_value(host);
         // Parents of two labels and more (what follows a dot, and has a dot), but not
         // public suffixes like co.uk.
-        for (dot, _) in host.match_indices('.') {
-            let Some(parent) = host.get(dot + 1..) else {
+        for (index, (dot, _)) in name.match_indices('.').enumerate() {
+            let Some(parent) = name.get(dot + 1..) else {
                 continue;
             };
             if !parent.contains('.') || is_public_suffix(parent) {
                 continue;
             }
-            parents.entry(parent).or_default().push(host);
+            let (count, one_level) = parents.entry(parent).or_insert((0, true));
+            *count += 1;
+            *one_level &= index == 0;
         }
     }
     parents
         .into_iter()
-        .filter(|(_, members)| members.len() >= FOLD_HOSTS)
+        .filter(|(_, (count, _))| *count >= FOLD_HOSTS)
         // The most names; between as many, the most specific domain.
-        .max_by_key(|(parent, members)| (members.len(), parent.matches('.').count()))
+        .max_by_key(|(parent, (count, _))| (*count, parent.matches('.').count()))
+        .map(|(parent, (_, one_level))| {
+            format!("host:{}.{parent}", if one_level { "*" } else { "**" })
+        })
 }
 
 /// Second-level domains under a country's domain that anyone can register under, like
@@ -668,31 +700,31 @@ fn is_public(address: IpAddr) -> bool {
 
 /// Services as in labels: `tcp:80,443,8000-8002,udp:53,icmp`. More than [`LIST_PORTS`]
 /// ports of one protocol become one range.
-fn service_list(services: &Services) -> String {
+fn write_services(out: &mut String, services: &Services) {
     let mut ports: BTreeMap<&str, Vec<u16>> = BTreeMap::new();
     let mut any_port: BTreeSet<&str> = BTreeSet::new();
     let mut without_ports: BTreeSet<&str> = BTreeSet::new();
     for (protocol, port) in services {
         match (Protocol::from_name(protocol), port) {
             (Some(known), Some(port)) if known.has_ports() => {
-                ports.entry(protocol.as_str()).or_default().push(*port);
+                ports.entry(protocol).or_default().push(*port);
             }
             (Some(known), None) if known.has_ports() => {
-                any_port.insert(protocol.as_str());
+                any_port.insert(protocol);
             }
             _ => {
-                without_ports.insert(protocol.as_str());
+                without_ports.insert(protocol);
             }
         }
     }
-    let mut out = String::new();
-    let separate = |out: &mut String| {
-        if !out.is_empty() {
+    let mut first = true;
+    let mut separate = |out: &mut String| {
+        if !std::mem::take(&mut first) {
             out.push(',');
         }
     };
     for protocol in &any_port {
-        separate(&mut out);
+        separate(out);
         let _ = write!(out, "{protocol}:*");
     }
     for (protocol, mut ports) in ports {
@@ -712,7 +744,7 @@ fn service_list(services: &Services) -> String {
                 }
             }
         }
-        separate(&mut out);
+        separate(out);
         let _ = write!(out, "{protocol}:");
         for (index, (first, last)) in ranges.into_iter().enumerate() {
             if index > 0 {
@@ -726,25 +758,49 @@ fn service_list(services: &Services) -> String {
         }
     }
     for protocol in without_ports {
-        separate(&mut out);
+        separate(out);
         out.push_str(protocol);
     }
-    out
 }
 
-/// A label key segment: lower case letters, digits and dashes.
-fn slug(value: &str) -> String {
-    let slug: String = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
+/// A label key segment: lower case letters, digits and dashes for everything else, without
+/// dashes at either end.
+struct Slug<T>(T);
+
+impl<T: fmt::Display> fmt::Display for Slug<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        /// Writes what it is given as a slug: dashes only once something follows them.
+        struct Writer<'a, 'b> {
+            f: &'a mut fmt::Formatter<'b>,
+            started: bool,
+            dashes: usize,
+        }
+        impl fmt::Write for Writer<'_, '_> {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                for character in text.chars() {
+                    if !character.is_ascii_alphanumeric() {
+                        self.dashes += usize::from(self.started);
+                        continue;
+                    }
+                    for _ in 0..std::mem::take(&mut self.dashes) {
+                        self.f.write_char('-')?;
+                    }
+                    self.started = true;
+                    self.f.write_char(character.to_ascii_lowercase())?;
+                }
+                Ok(())
             }
-        })
-        .collect();
-    slug.trim_matches('-').to_string()
+        }
+        write!(
+            Writer {
+                f,
+                started: false,
+                dashes: 0,
+            },
+            "{}",
+            self.0
+        )
+    }
 }
 
 #[cfg(test)]
@@ -755,7 +811,7 @@ mod tests {
         let mut report = Report::default();
         for event in events {
             let line: Line = serde_json::from_str(event).expect("event");
-            report.add(&line.event);
+            report.add(line.event);
         }
         report
     }
@@ -1009,18 +1065,17 @@ torrent (22 denied or would-be-denied connections)
     #[test]
     fn keeps_ports_with_their_protocol() {
         let services: Services = [
-            ("udp".to_string(), Some(5351)),
-            ("tcp".to_string(), Some(3994)),
-            ("udp".to_string(), Some(22000)),
-            ("tcp".to_string(), Some(22000)),
-            ("icmp".to_string(), None),
-            ("sctp".to_string(), None),
+            ("udp".into(), Some(5351)),
+            ("tcp".into(), Some(3994)),
+            ("udp".into(), Some(22000)),
+            ("tcp".into(), Some(22000)),
+            ("icmp".into(), None),
+            ("sctp".into(), None),
         ]
         .into();
-        assert_eq!(
-            service_list(&services),
-            "sctp:*,tcp:3994,22000,udp:5351,22000,icmp"
-        );
+        let mut out = String::new();
+        write_services(&mut out, &services);
+        assert_eq!(out, "sctp:*,tcp:3994,22000,udp:5351,22000,icmp");
     }
 
     #[test]

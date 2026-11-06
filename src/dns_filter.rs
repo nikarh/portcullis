@@ -177,7 +177,7 @@ fn query_names(packet: &Ipv4Packet<'_>) -> Result<Vec<String>, &'static str> {
 fn denied(
     packet: Option<&Ipv4Packet<'_>>,
     query: Option<String>,
-    detail: &str,
+    detail: &'static str,
     directory: &Directory,
 ) -> Decision {
     let source = packet.map(|packet| IpAddr::V4(packet.source));
@@ -193,8 +193,8 @@ fn denied(
         container: info.as_ref().map(|info| info.container.clone()),
         network: info.map(|info| info.network),
         protocol: match packet.map(|packet| packet.protocol) {
-            Some(PROTOCOL_TCP) => "tcp".to_string(),
-            _ => "udp".to_string(),
+            Some(PROTOCOL_TCP) => "tcp".into(),
+            _ => "udp".into(),
         },
         source,
         source_port: packet.and_then(|packet| packet.ports).map(|(port, _)| port),
@@ -204,7 +204,7 @@ fn denied(
         domain: None,
         domain_source: None,
         query,
-        detail: Some(detail.to_string()),
+        detail: Some(detail.into()),
         mid_stream: false,
         forged: false,
     };
