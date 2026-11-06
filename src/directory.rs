@@ -49,7 +49,7 @@ struct Snapshot {
     by_port: HashMap<u32, (IpAddr, SourceInfo)>,
     /// Bridge name to network name.
     bridges: HashMap<String, String>,
-    /// Gateway address (the Docker host's) to network name.
+    /// Gateway address (the Docker host's) to what egress events to it say.
     gateways: HashMap<IpAddr, String>,
     /// Hostnames of each source's `host:` rules, with the container's hold.
     rule_hosts: HashMap<IpAddr, Vec<(String, Duration)>>,
@@ -140,7 +140,10 @@ impl Directory {
         snapshot.gateways = plan
             .bridges
             .iter()
-            .filter_map(|bridge| Some((bridge.gateway?, bridge.network.clone())))
+            .filter_map(|bridge| {
+                let detail = format!("the Docker host, the gateway of {}", bridge.network);
+                Some((bridge.gateway?, detail))
+            })
             .collect();
         snapshot.host_sets.clone_from(&plan.host_sets);
 
@@ -230,9 +233,10 @@ impl Directory {
         snapshot.bridges.get(bridge).cloned()
     }
 
-    /// The network whose gateway, the Docker host's address on it, is `address`.
+    /// What to say about egress to `address` when it is a network's gateway, the Docker
+    /// host's address on it.
     #[must_use]
-    pub fn gateway_of(&self, address: IpAddr) -> Option<String> {
+    pub fn gateway_detail(&self, address: IpAddr) -> Option<String> {
         self.read().gateways.get(&address).cloned()
     }
 

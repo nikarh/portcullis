@@ -230,6 +230,7 @@ impl Report {
                     .detail
                     .as_ref()
                     .filter(|detail| detail.starts_with(DOCKER_HOST))
+                    && !findings.docker_host.contains_key(&target)
                 {
                     findings.docker_host.insert(target.clone(), detail.clone());
                 }
@@ -377,7 +378,7 @@ fn endpoint(address: Option<IpAddr>, port: Option<u16>, container: Option<&str>)
 }
 
 /// A suggested egress label: its target, services, and what was folded into it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Suggestion {
     target: String,
     services: Services,
@@ -452,14 +453,14 @@ fn fold_egress(egress: &BTreeMap<String, Services>) -> Vec<Suggestion> {
     for (services, (mut hosts, public)) in by_services {
         while let Some((parent, members)) = widest_parent(&hosts) {
             let one_level = members.iter().all(|host| {
-                host.strip_suffix(parent.as_str())
+                host.strip_suffix(parent)
                     .and_then(|below| below.strip_suffix('.'))
                     .is_some_and(|below| !below.contains('.'))
             });
-            let pattern = format!("{}.{parent}", if one_level { "*" } else { "**" });
+            let wildcard = if one_level { "*" } else { "**" };
             hosts.retain(|host| !members.contains(host));
             suggestions.push(Suggestion {
-                target: format!("host:{pattern}"),
+                target: format!("host:{wildcard}.{parent}"),
                 services: services.clone(),
                 folded: members.len(),
                 example: members.first().map(ToString::to_string),
@@ -485,8 +486,10 @@ fn fold_egress(egress: &BTreeMap<String, Services>) -> Vec<Suggestion> {
     // protocol: their services together.
     if lone_public.len() >= FOLD_PUBLIC {
         let mut folded = Suggestion::new("ip:public".to_string(), Services::new());
-        for (address, services) in lone_public {
-            folded.absorb(Suggestion::new(format!("ip:{address}"), services.clone()));
+        folded.folded = lone_public.len();
+        folded.example = lone_public.first().map(|(address, _)| address.to_string());
+        for (_, services) in lone_public {
+            folded.services.extend(services.iter().cloned());
         }
         suggestions.push(folded);
     } else {
@@ -501,45 +504,65 @@ fn fold_egress(egress: &BTreeMap<String, Services>) -> Vec<Suggestion> {
 
 /// One suggestion per target, and none for a name or pattern a pattern covers: labels with
 /// the same target, or a name a pattern already allows, are one rule.
-fn merge(suggestions: Vec<Suggestion>) -> Vec<Suggestion> {
-    let mut merged: BTreeMap<String, Suggestion> = BTreeMap::new();
-    for suggestion in suggestions {
-        match merged.get_mut(&suggestion.target) {
-            Some(existing) => {
-                existing.services.extend(suggestion.services);
-                existing.folded += suggestion.folded;
-                if existing.example.is_none() {
-                    existing.example = suggestion.example;
-                }
-            }
-            None => {
-                merged.insert(suggestion.target.clone(), suggestion);
-            }
+fn merge(mut suggestions: Vec<Suggestion>) -> Vec<Suggestion> {
+    suggestions.sort_unstable_by(|a, b| a.target.cmp(&b.target));
+    suggestions.dedup_by(|later, kept| {
+        if later.target != kept.target {
+            return false;
         }
-    }
-    let patterns: Vec<String> = merged
-        .keys()
-        .filter(|target| target.starts_with("host:*"))
-        .cloned()
+        kept.services.append(&mut later.services);
+        kept.folded += later.folded;
+        if kept.example.is_none() {
+            kept.example = later.example.take();
+        }
+        true
+    });
+    // The narrowest patterns first, so that what they took in ends up in the widest.
+    let mut patterns: Vec<usize> = (0..suggestions.len())
+        .filter(|index| {
+            suggestions
+                .get(*index)
+                .is_some_and(|suggestion| suggestion.target.starts_with("host:*"))
+        })
         .collect();
-    // The widest patterns first, so that what a narrower one took in ends up in the widest.
-    let mut patterns = patterns;
-    patterns.sort_by_key(|pattern| pattern.matches('.').count());
-    for pattern in patterns.iter().rev() {
-        let covered: Vec<String> = merged
-            .keys()
-            .filter(|target| *target != pattern && covers(target_value(pattern), target))
-            .cloned()
-            .collect();
-        for target in covered {
-            if let Some(taken) = merged.remove(&target)
-                && let Some(into) = merged.get_mut(pattern)
+    let dots = |suggestions: &[Suggestion], index: usize| {
+        suggestions
+            .get(index)
+            .map_or(0, |suggestion| suggestion.target.matches('.').count())
+    };
+    patterns.sort_by_key(|index| std::cmp::Reverse(dots(&suggestions, *index)));
+    let mut taken = vec![false; suggestions.len()];
+    for pattern in patterns {
+        for index in 0..suggestions.len() {
+            let (Some(target), Some(by)) = (suggestions.get(index), suggestions.get(pattern))
+            else {
+                continue;
+            };
+            if index == pattern
+                || taken.get(index) == Some(&true)
+                || !covers(target_value(&by.target), &target.target)
             {
-                into.absorb(taken);
+                continue;
+            }
+            let covered = suggestions.get_mut(index).map(std::mem::take);
+            if let (Some(covered), Some(into)) = (covered, suggestions.get_mut(pattern)) {
+                into.absorb(covered);
+            }
+            if let Some(slot) = taken.get_mut(index) {
+                *slot = true;
             }
         }
     }
-    merged.into_values().collect()
+    suggestions
+        .into_iter()
+        .zip(taken)
+        .filter_map(|(suggestion, taken)| (!taken).then_some(suggestion))
+        .collect()
+}
+
+/// What is below `parent` in `name`: `a.b` of `a.b.parent`.
+fn below<'a>(name: &'a str, parent: &str) -> Option<&'a str> {
+    name.strip_suffix(parent)?.strip_suffix('.')
 }
 
 /// Whether the name pattern `pattern` (`*.parent` or `**.parent`) allows everything the
@@ -553,58 +576,65 @@ fn covers(pattern: &str, target: &str) -> bool {
         Some(("*", parent)) => (false, parent),
         _ => return false,
     };
-    let below = |name: &str| {
-        name.strip_suffix(parent)
-            .and_then(|below| below.strip_suffix('.'))
-            .map(ToString::to_string)
-    };
     match name.split_once('.') {
         // A pattern: as wide as this one at most.
-        Some(("**", inner)) => deep && (inner == parent || below(inner).is_some()),
-        Some(("*", inner)) => inner == parent || (deep && below(inner).is_some()),
-        _ => below(name).is_some_and(|below| deep || !below.contains('.')),
+        Some(("**", inner)) => deep && (inner == parent || below(inner, parent).is_some()),
+        Some(("*", inner)) => inner == parent || (deep && below(inner, parent).is_some()),
+        _ => below(name, parent).is_some_and(|below| deep || !below.contains('.')),
     }
 }
 
 /// A distinct label key for each suggestion, from what it names. A pattern that would share
 /// its key with a name gets `-subdomains`.
 fn label_names(suggestions: &[Suggestion]) -> Vec<String> {
-    let names: Vec<String> = suggestions
+    let mut names: Vec<String> = suggestions
         .iter()
         .map(|suggestion| slug(target_value(&suggestion.target)))
         .collect();
-    let mut taken = BTreeSet::new();
-    let mut unique = Vec::with_capacity(names.len());
-    for (suggestion, name) in suggestions.iter().zip(&names) {
-        let shared = names.iter().filter(|other| *other == name).count() > 1;
-        let mut candidate = if shared && target_value(&suggestion.target).starts_with('*') {
-            format!("{name}-subdomains")
-        } else {
-            name.clone()
-        };
-        let mut counter = 2;
-        while taken.contains(&candidate) {
-            candidate = format!("{name}-{counter}");
-            counter += 1;
+    let shared: Vec<bool> = names
+        .iter()
+        .map(|name| names.iter().filter(|other| *other == name).count() > 1)
+        .collect();
+    for ((suggestion, name), shared) in suggestions.iter().zip(&mut names).zip(shared) {
+        if shared && target_value(&suggestion.target).starts_with('*') {
+            name.push_str("-subdomains");
         }
-        taken.insert(candidate.clone());
-        unique.push(candidate);
     }
-    unique
+    // Still the same (a pattern and a name both with dashes where the other has dots):
+    // numbered.
+    for index in 1..names.len() {
+        let (before, rest) = names.split_at_mut(index);
+        let Some(name) = rest.first_mut() else {
+            continue;
+        };
+        if before.contains(name) {
+            let base = name.len();
+            for counter in 2.. {
+                name.truncate(base);
+                let _ = write!(name, "-{counter}");
+                if !before.contains(name) {
+                    break;
+                }
+            }
+        }
+    }
+    names
 }
 
 /// The parent domain the most `hosts` are below, if at least [`FOLD_HOSTS`] are.
-fn widest_parent<'a>(hosts: &[&'a str]) -> Option<(String, Vec<&'a str>)> {
-    let mut parents: BTreeMap<String, Vec<&'a str>> = BTreeMap::new();
+fn widest_parent<'a>(hosts: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
+    let mut parents: BTreeMap<&'a str, Vec<&'a str>> = BTreeMap::new();
     for host in hosts {
-        let labels: Vec<&str> = host.split('.').collect();
-        // Parents of two labels and more, but not public suffixes like co.uk.
-        for start in 1..labels.len().saturating_sub(1) {
-            let parent = labels.get(start..).unwrap_or_default();
-            if is_public_suffix(parent) {
+        // Parents of two labels and more (what follows a dot, and has a dot), but not
+        // public suffixes like co.uk.
+        for (dot, _) in host.match_indices('.') {
+            let Some(parent) = host.get(dot + 1..) else {
+                continue;
+            };
+            if !parent.contains('.') || is_public_suffix(parent) {
                 continue;
             }
-            parents.entry(parent.join(".")).or_default().push(host);
+            parents.entry(parent).or_default().push(host);
         }
     }
     parents
@@ -616,11 +646,11 @@ fn widest_parent<'a>(hosts: &[&'a str]) -> Option<(String, Vec<&'a str>)> {
 
 /// Second-level domains under a country's domain that anyone can register under, like
 /// `co.uk`.
-fn is_public_suffix(labels: &[&str]) -> bool {
+fn is_public_suffix(domain: &str) -> bool {
     matches!(
-        labels,
-        [second, country] if country.len() == 2
-            && matches!(*second, "co" | "com" | "net" | "org" | "gov" | "edu" | "ac" | "or" | "ne")
+        domain.split_once('.'),
+        Some((second, country)) if country.len() == 2
+            && matches!(second, "co" | "com" | "net" | "org" | "gov" | "edu" | "ac" | "or" | "ne")
     )
 }
 

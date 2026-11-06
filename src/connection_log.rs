@@ -241,9 +241,7 @@ fn connection_event(
         }
         (Reason::Dns, Payload::Ipv4(ip)) => event.query = query_name(ip),
         (Reason::Egress, _) => {
-            if let Some(network) = directory.gateway_of(destination) {
-                event.detail = Some(format!("the Docker host, the gateway of {network}"));
-            }
+            event.detail = directory.gateway_detail(destination);
             if let Some(domain) = directory.domain(source, destination) {
                 event.domain = Some(domain);
                 event.domain_source = Some(DomainSource::Dns);
