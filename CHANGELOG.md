@@ -3,6 +3,33 @@
 All notable changes to this project are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.2.0] - 2026-11-05
+
+### Features
+
+- Name patterns, port ranges, protocols and any or public destinations in labels by @nikarh
+- Multicast groups in icc.allow labels by @nikarh
+
+### Fixes
+
+- **firewall:** Match against named sets only, so rule updates don't misjudge traffic by @nikarh
+- **firewall:** Keep the rules a previous run left in place when starting by @nikarh
+- **dns:** Only count addresses of the name asked and its CNAMEs for host: rules by @nikarh
+- **audit:** Suggest labels only for new connections, with protocols, ranges and patterns by @nikarh
+- Don't warn about the ports of containers that are stopping by @nikarh
+- Don't recognise containers without a bridge port by their address and MAC by @nikarh
+- List --docker-root and --monitor-network in --help, and link the docs by @nikarh
+
+### Documentation
+
+- Name patterns, services, ip:public and ip:*, and what the audit folds by @nikarh
+- What IGMP from containers is, and when to allow it by @nikarh
+- Multicast in icc.allow, with a cluster example by @nikarh
+- Add the documentation site by @nikarh
+- Move the documentation from the README to the site by @nikarh
+- Point the config file, unit, scripts and comments at the docs site by @nikarh
+- A title of its own for the front page by @nikarh
+
 ## [0.1.5] - 2026-11-04
 
 ### Fixes
@@ -189,6 +216,7 @@ All notable changes to this project are documented in this file. The format is b
 - Verifying signed releases, and how releasing works by @nikarh
 - Remove the crates.io badge; portcullis on crates.io is another project by @nikarh
 
+[0.2.0]: https://github.com/nikarh/portcullis/compare/v0.1.5..v0.2.0
 [0.1.5]: https://github.com/nikarh/portcullis/compare/v0.1.4..v0.1.5
 [0.1.4]: https://github.com/nikarh/portcullis/compare/v0.1.3..v0.1.4
 [0.1.3]: https://github.com/nikarh/portcullis/compare/v0.1.2..v0.1.3
