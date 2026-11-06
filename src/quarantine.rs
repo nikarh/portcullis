@@ -2,7 +2,9 @@
 //!
 //! A well-behaved container never sends with an address or MAC that isn't its own, nor
 //! frames enforced networks don't carry: Docker doesn't set it up to. Doing so takes a raw
-//! socket and intent, so the first such denial is enough. A container whose traffic is
+//! socket and intent, so the first such denial is enough. Source denials that aren't forged
+//! (see [`Connection::forged`]) don't count: the container's own traffic, judged by rules
+//! that didn't know it yet, or its address on another of its networks. A container whose traffic is
 //! denied at a high rate (probing, scanning, flooding) is cut off too, past a threshold of
 //! denied flows per minute.
 //!
@@ -69,6 +71,7 @@ impl Watch {
         let reason = match connection.reason {
             // IPv6 is expected from containers of networks with IPv6 enabled.
             Reason::Frame if connection.protocol == "ipv6" && info.ipv6_network => None,
+            Reason::Source if !connection.forged => None,
             Reason::Source | Reason::Frame => Some(format!(
                 "sent {}{}",
                 connection.protocol,
@@ -153,6 +156,7 @@ mod tests {
             query: None,
             detail: Some("uses the address of other".to_string()),
             mid_stream: false,
+            forged: reason == Reason::Source,
         }
     }
 
@@ -196,6 +200,17 @@ mod tests {
                 .try_recv()
                 .is_ok_and(|misbehaviour| misbehaviour.reason.starts_with("more than 3"))
         );
+    }
+
+    #[test]
+    fn leaves_containers_whose_source_denials_werent_forged() {
+        let (sender, receiver) = unbounded();
+        let mut watch = Watch::new(sender, 100);
+        let mut early = denied(Reason::Source, "arp", 0);
+        early.forged = false;
+        early.detail = Some("sent before its rules were in place".to_string());
+        watch.observe(&early, &directory());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

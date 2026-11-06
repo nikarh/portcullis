@@ -206,6 +206,7 @@ fn denied(
         query,
         detail: Some(detail.to_string()),
         mid_stream: false,
+        forged: false,
     };
     Decision::Denied {
         monitor,

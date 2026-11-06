@@ -100,6 +100,12 @@ pub struct Connection {
     /// for new connections; what they decide about these says little about the policy.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mid_stream: bool,
+    /// For `source`: the packet claims an address or MAC that isn't the sender's, which
+    /// takes a raw socket. Not so for the sender's own traffic that the rules judged before
+    /// they knew it, nor for its address on another of its networks, which its routing may
+    /// send out of this one. Decides quarantine; not reported.
+    #[serde(skip)]
+    pub forged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -773,6 +779,7 @@ mod tests {
             query: None,
             detail: None,
             mid_stream: false,
+            forged: false,
         })
     }
 

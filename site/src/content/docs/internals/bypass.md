@@ -44,7 +44,7 @@ Portcullis assumes a container may be compromised and actively try to get past i
 
 Reports can't be flooded away. A flood of new flows can fill the set Portcullis uses to report each flow once a minute; denials are then still reported, up to 10 a second per rule. A container's alerts are limited as described under [Alerts](/guides/events-and-alerts/#alerts).
 
-A well-behaved container never causes `source` or `frame` events: it sends with its own address and MAC, and Docker doesn't set it up to send IPv6 or VLAN frames on a network without IPv6. Such events are a strong sign that a container is compromised, or at least running tools that craft their own packets. They name the container behind the port the frame came from, whatever address or MAC it used, raise alerts, and get the container [quarantined](/policy/limits/#quarantine).
+A well-behaved container never causes `source` or `frame` events: it sends with its own address and MAC, and Docker doesn't set it up to send IPv6 or VLAN frames on a network without IPv6. Such events are a strong sign that a container is compromised, or at least running tools that craft their own packets. They name the container behind the port the frame came from, whatever address or MAC it used, raise alerts, and get the container [quarantined](/policy/limits/#quarantine). A few `source` events don't get it quarantined, because a container sends such packets without crafting them: its own traffic judged before its rules were in place, and its address on another of its networks (see [Quarantine](/policy/limits/#quarantine)).
 
 ## Tests
 

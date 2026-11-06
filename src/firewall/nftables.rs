@@ -1206,6 +1206,17 @@ fn render_unknown_sources(
         (NamedSet::EnforcedBridges, NamedSet::EnforcedPorts)
     };
     let bridges = format!("@{}", bridges.name());
+    if queue.is_some() {
+        // Held before, and the source stayed unknown: Portcullis didn't know the sender in
+        // time, whatever port it came from by now, so it isn't taken for spoofing.
+        render_denied_frames(
+            out,
+            options,
+            monitor,
+            &format!("meta ibrname {bridges} meta mark {HOLD_EXPIRED_MARK:#x}"),
+            "source:held",
+        )?;
+    }
     // From a managed container's port, but not with its own address and MAC: denied at once.
     let networks: BTreeSet<&str> = plan
         .bridges
@@ -1227,16 +1238,10 @@ fn render_unknown_sources(
             options,
             monitor,
             &format!("meta ibrname {bridges} iifname @{}", ports.name()),
+            "source",
         )?;
     }
     if let Some(queue) = queue {
-        // Held before, and the source stayed unknown.
-        render_denied_frames(
-            out,
-            options,
-            monitor,
-            &format!("meta ibrname {bridges} meta mark {HOLD_EXPIRED_MARK:#x}"),
-        )?;
         // A port no managed container has (yet): most likely a container that just started,
         // or that got the address of a removed one, and that Portcullis hasn't applied rules
         // for. Hold the packet until Portcullis knows the container; if the source stays
@@ -1250,7 +1255,13 @@ fn render_unknown_sources(
             )?;
         }
     }
-    render_denied_frames(out, options, monitor, &format!("meta ibrname {bridges}"))
+    render_denied_frames(
+        out,
+        options,
+        monitor,
+        &format!("meta ibrname {bridges}"),
+        "source",
+    )
 }
 
 /// The set of quarantined containers' bridge ports, refilled on every update.
@@ -1458,16 +1469,17 @@ fn render_link_local_ip(
 }
 
 /// Deny (or in monitor mode, report) frames of the bridge base chain matching `selector`:
-/// IPv4 and ARP as using a source that isn't the sender's, anything else as a frame
-/// enforced networks don't carry.
+/// IPv4 and ARP as using a source that isn't the sender's (reported with `reason`), anything
+/// else as a frame enforced networks don't carry.
 fn render_denied_frames(
     out: &mut String,
     options: Options,
     monitor: bool,
     selector: &str,
+    reason: &'static str,
 ) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
-    let source = Outcome::deny(options, monitor, "source").dropped();
+    let source = Outcome::deny(options, monitor, reason).dropped();
     decide(
         out,
         format_args!("add rule {base} {selector} ether type ip"),
@@ -2548,10 +2560,10 @@ mod tests {
     }
 
     /// The de-duplicated log statement of a reported frame decision.
-    fn arp_log_rule(verdict: char) -> String {
+    fn arp_log_rule(verdict: char, reason: &str) -> String {
         let key = "iifname . arp saddr ether . arp saddr ip";
         format!(
-            "{key} != @announced add @announced {{ {key} }} log prefix \"pc:{verdict}:source\" group 7 snaplen 128"
+            "{key} != @announced add @announced {{ {key} }} log prefix \"pc:{verdict}:{reason}\" group 7 snaplen 128"
         )
     }
 
@@ -2571,13 +2583,18 @@ mod tests {
     /// They drop whatever the deny action: a rejection would go to the address the sender
     /// claims, or can't be sent for frames that aren't IP.
     fn denied_frames(selector: &str, verdict: char) -> String {
+        denied_frames_as(selector, verdict, "source")
+    }
+
+    /// `denied_frames`, with IPv4 and ARP reported with `reason`.
+    fn denied_frames_as(selector: &str, verdict: char, reason: &str) -> String {
         let head = format!("add rule bridge portcullis prerouting {selector}");
         let action = if verdict == 'w' { "accept" } else { "drop" };
         [
-            decided(&format!("{head} ether type ip"), verdict, "source", action),
+            decided(&format!("{head} ether type ip"), verdict, reason, action),
             reported(
                 &format!("{head} ether type arp"),
-                &arp_log_rule(verdict),
+                &arp_log_rule(verdict, reason),
                 action,
             ),
             framed(&head, verdict, "frame", action),
@@ -2744,7 +2761,7 @@ flush chain bridge portcullis limit_open
         };
         let script = render_with(&test_support::hostname_state(), options, false);
         let expected = [
-            denied_frames("meta ibrname @enforced_bridges meta mark 0x70630001", 'd'),
+            denied_frames_as("meta ibrname @enforced_bridges meta mark 0x70630001", 'd', "source:held"),
             "add rule bridge portcullis prerouting meta ibrname @enforced_bridges ether type ip queue num 9".to_string(),
             "add rule bridge portcullis prerouting meta ibrname @enforced_bridges ether type arp queue num 9".to_string(),
             denied_frames("meta ibrname @enforced_bridges", 'd'),
@@ -2816,7 +2833,7 @@ flush chain bridge portcullis limit_open
         };
         let script = render_with(&test_support::hostname_state(), options, true);
         let expected = [
-            denied_frames("meta ibrname @monitored_bridges meta mark 0x70630001", 'w'),
+            denied_frames_as("meta ibrname @monitored_bridges meta mark 0x70630001", 'w', "source:held"),
             "add rule bridge portcullis prerouting meta ibrname @monitored_bridges ether type ip queue num 10 bypass".to_string(),
             "add rule bridge portcullis prerouting meta ibrname @monitored_bridges ether type arp queue num 10 bypass".to_string(),
             denied_frames("meta ibrname @monitored_bridges", 'w'),
@@ -3003,6 +3020,14 @@ flush chain bridge portcullis limit_open
         let held = "add rule bridge portcullis prerouting meta ibrname @enforced_bridges ether type ip queue num 9";
         let position = |text: &str| script.find(text).unwrap_or(usize::MAX);
         assert!(position(&known_port) < position(held), "{script}");
+        // Unless it was held before, and its hold ran out before Portcullis knew the port:
+        // that isn't taken for spoofing.
+        let expired = denied_frames_as(
+            "meta ibrname @enforced_bridges meta mark 0x70630001",
+            'd',
+            "source:held",
+        );
+        assert!(position(&expired) < position(&known_port), "{script}");
     }
 
     #[test]
