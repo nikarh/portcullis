@@ -362,11 +362,16 @@ where
     /// The chains and sets of both tables, when both exist.
     fn find_installed(&self) -> Result<Option<Installed>, FirewallError> {
         let tables = self.runner.list("list tables")?;
-        let exists = |table: Table| {
-            let wanted = format!("table {table}");
-            tables.lines().any(|line| line.trim() == wanted)
+        let exists = |family: &str| {
+            tables.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("table ")
+                    .and_then(|line| line.strip_prefix(family))
+                    .and_then(|line| line.strip_prefix(' '))
+                    == Some(TABLE_NAME)
+            })
         };
-        if !(exists(Table::Inet) && exists(Table::Bridge)) {
+        if !(exists("inet") && exists("bridge")) {
             return Ok(None);
         }
         let mut installed = Installed {

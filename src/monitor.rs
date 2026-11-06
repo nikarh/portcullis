@@ -299,7 +299,7 @@ where
         event: DockerEvent,
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         let fetched = fetch(&mut self.api, &event, |network| {
-            state.networks().contains_key(&NetworkId::from(network))
+            state.networks().contains_key(network)
         });
         self.resolve_fetched_event_action(state, event, fetched)
     }

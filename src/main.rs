@@ -114,9 +114,11 @@ enum MainError {
 }
 
 #[derive(Debug)]
+// Nearly every message is an event: boxing it would allocate for each.
+#[allow(clippy::large_enum_variant)]
 enum DockerWorkerEvent {
     /// An event, with what Docker's API says about its container or network.
-    Event(DockerEvent, Box<Fetched>),
+    Event(DockerEvent, Fetched),
     Reconnected,
 }
 
@@ -280,7 +282,7 @@ fn spawn_docker_event_worker(
     thread::spawn(move || {
         let mut since = since;
         let mut missed = false;
-        let mut api = DockerApiConnection::new(docker_socket.clone());
+        let mut api = DockerApiConnection::new(&docker_socket);
         loop {
             let mut event_client = loop {
                 if stop_requested(&stop_rx) {
@@ -308,7 +310,7 @@ fn spawn_docker_event_worker(
                     Ok(Some(event)) => {
                         let fetched = api.fetch(&event, &managed_networks);
                         if event_tx
-                            .send(DockerWorkerEvent::Event(event, Box::new(fetched)))
+                            .send(DockerWorkerEvent::Event(event, fetched))
                             .is_err()
                         {
                             return;
@@ -335,9 +337,25 @@ fn spawn_docker_event_worker(
 struct SharedNetworks(Arc<RwLock<HashSet<String>>>);
 
 impl SharedNetworks {
+    /// Take over the networks of `state`; only those that changed are copied.
     fn update(&self, state: &RuntimeState) {
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) =
-            state.networks().keys().map(ToString::to_string).collect();
+        let networks = state.networks();
+        let unchanged = |known: &HashSet<String>| {
+            known.len() == networks.len()
+                && networks
+                    .keys()
+                    .all(|network| known.contains(network.as_str()))
+        };
+        if unchanged(&self.0.read().unwrap_or_else(PoisonError::into_inner)) {
+            return;
+        }
+        let mut known = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        known.retain(|network| networks.contains_key(network.as_str()));
+        for network in networks.keys() {
+            if !known.contains(network.as_str()) {
+                known.insert(network.to_string());
+            }
+        }
     }
 
     fn contains(&self, network: &str) -> bool {
@@ -349,13 +367,13 @@ impl SharedNetworks {
 }
 
 /// A connection to Docker's API, made when needed, and again after it failed.
-struct DockerApiConnection {
-    socket: String,
+struct DockerApiConnection<'a> {
+    socket: &'a str,
     client: Option<DockerClient>,
 }
 
-impl DockerApiConnection {
-    const fn new(socket: String) -> Self {
+impl<'a> DockerApiConnection<'a> {
+    const fn new(socket: &'a str) -> Self {
         Self {
             socket,
             client: None,
@@ -369,7 +387,7 @@ impl DockerApiConnection {
         for _ in 0..2 {
             let mut client = match self.client.take() {
                 Some(client) => client,
-                None => match DockerClient::connect(&self.socket) {
+                None => match DockerClient::connect(self.socket) {
                     Ok(client) => client,
                     Err(error) => return failed(event, error),
                 },
@@ -907,7 +925,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                         if event.kind == DockerEventKind::Container
                             && event.action == DockerEventAction::Start
                         {
-                            match std::mem::replace(&mut *fetched, Fetched::Nothing) {
+                            match std::mem::replace(&mut fetched, Fetched::Nothing) {
                                 Fetched::Container(inspect) => {
                                     monitor.check_inspected(&runtime_state, &event.id, inspect);
                                 }
@@ -926,7 +944,7 @@ fn run(config: &Config) -> Result<(), MainError> {
                             continue;
                         }
                         let update = monitor
-                            .resolve_fetched_event_action(&runtime_state, event, *fetched)
+                            .resolve_fetched_event_action(&runtime_state, event, fetched)
                             .map(|action| action.is_some_and(|value| runtime_state.apply_action(value)));
                         managed_networks.update(&runtime_state);
                         publish_warnings(&mut monitor, &bus);
