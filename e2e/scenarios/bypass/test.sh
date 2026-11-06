@@ -63,6 +63,12 @@ blocked "a host service through the gateway" tcp attacker "${gateway}" 7777
 blocked "a host service on another host address" tcp attacker 198.51.100.1 7777
 blocked "a published port through the gateway" tcp attacker "${gateway}" 18080
 blocked "a published port on another host address" tcp attacker 198.51.100.1 18080
+# The host gets broadcast to the subnet as well: its copy follows the egress rules, even
+# for a container whose ICC rules let it reach every other container that way.
+unanswered "control: a host service through the subnet's broadcast address" \
+  craft control udp --dst "${subnet_broadcast}" --dport 7778
+allowed "control: other containers through the subnet's broadcast address" \
+  craft control udp --dst "${subnet_broadcast}" --dport 9000
 # A bridge hands frames to link-local group addresses to the host on the container's
 # port, past the bridge's checks. Reverse path filtering would drop them too; turn it off
 # so the check shows Portcullis's rules.

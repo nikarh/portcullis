@@ -2005,12 +2005,15 @@ fn render_rule(
             format_args!("add rule {chain} {}", to.dport(protocol.as_str(), DNS_PORT)),
             deny("dns").snaplen(LOG_SNAPLEN_DNS),
         ),
+        // Only what leaves through a bridge: the chain also checks traffic to the host
+        // (from the input hook, without an output interface), which can have a destination
+        // in the subnet too, its broadcast address.
         Rule::AcceptPeers { subnet, gateway } => {
             write!(out, "add rule {chain} {daddr} {subnet} ")?;
             if let Some(gateway) = gateway {
                 write!(out, "{daddr} != {gateway} ")?;
             }
-            writeln!(out, "accept")
+            writeln!(out, "oifname @{} accept", NamedSet::InetBridges.name())
         }
         Rule::AcceptNet(destination) => decide(
             out,
@@ -2673,8 +2676,10 @@ flush chain bridge portcullis limit_open
                 "add rule inet portcullis input ip saddr vmap @egress4".into(),
                 "add rule inet portcullis input iifname @enforced_bridges drop".into(),
                 "add element inet portcullis enforced_bridges { \"br-net0\" }".into(),
-                // The gateway is the host: traffic to it follows the egress rules.
-                "add rule inet portcullis egress0 ct original ip daddr 172.18.0.0/16 ct original ip daddr != 172.18.0.1 accept".into(),
+                // The gateway is the host: traffic to it follows the egress rules. So does
+                // anything else the host receives, such as broadcast to the subnet: only
+                // what leaves through a bridge is for other containers.
+                "add rule inet portcullis egress0 ct original ip daddr 172.18.0.0/16 ct original ip daddr != 172.18.0.1 oifname @bridges accept".into(),
                 // Reported by the bridge table already.
                 "add rule inet portcullis forward iifname @enforced_bridges drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),

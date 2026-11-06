@@ -57,6 +57,8 @@ services:
 
 With `deny` and `allow-listed`, broadcast (`255.255.255.255`) and multicast (`224.0.0.0/4`) traffic is blocked too, since the bridge delivers it to every container on the network. Broadcast can't be allowed.
 
+The Docker host gets broadcast and multicast of the network as well. Its copy follows the container's [egress labels](/policy/egress/), as all traffic to the host does, whatever the ICC mode: with `allow`, broadcast to the subnet reaches the other containers, but not services on the host unless an egress label allows the host.
+
 ### Multicast
 
 An `allow-listed` container can be let send to multicast groups:

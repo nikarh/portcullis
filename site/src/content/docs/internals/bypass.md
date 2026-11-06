@@ -26,7 +26,7 @@ Portcullis assumes a container may be compromised and actively try to get past i
 
 - Enforced bridges only carry IPv4 and ARP. IPv6, VLAN-tagged frames (the receiving container's kernel could unwrap them past the rules) and anything else are denied. So are frames to the link-local group addresses used by STP and LLDP, which the bridge hands to the host past its usual checks.
 - Traffic between two containers has to be addressed to their shared network. A frame to another container's MAC addressed to that container's address on another network is denied, even with ICC allowed. Broadcast and multicast count as traffic to other containers.
-- Traffic to the Docker host follows the egress labels, and rules see the destination the container asked for, before Docker's DNAT of published ports.
+- Traffic to the Docker host follows the egress labels, and rules see the destination the container asked for, before Docker's DNAT of published ports. That includes the host's copy of broadcast to the network's subnet: the ICC rules decide whether other containers get it, the egress rules whether the host does.
 - Traffic denied for using someone else's address or MAC is dropped, not rejected, whatever `deny-action` says: a rejection would only go back to the sender, addressed to someone else.
 
 ## Timing
@@ -47,6 +47,6 @@ A well-behaved container never causes `source` or `frame` events: it sends with 
 
 ## Tests
 
-These are covered by the `bypass` end-to-end scenario, which sends hand-made frames from a container with scapy: borrowed addresses and MACs, VLAN tags, overlapping fragments, ARP claims, IPv6, link-local group addresses, spoofed traffic into another container's connection, and floods of reports and alerts. See [Development](/project/development/#end-to-end-tests).
+These are covered by the `bypass` end-to-end scenario, which sends hand-made frames from a container with scapy: borrowed addresses and MACs, VLAN tags, overlapping fragments, ARP claims, ARP carrying data, broadcast to the host, IPv6, link-local group addresses, spoofed traffic into another container's connection, and floods of reports and alerts. See [Development](/project/development/#end-to-end-tests).
 
 What a firewall can't prevent is listed under [Limitations](/limits/limitations/).
