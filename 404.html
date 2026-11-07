@@ -3,8 +3,8 @@
 <title>Not found · Portcullis</title>
 <script>
   (function () {
-    var latest = "v0.3.0";
-    var versions = ["main","v0.3.0","v0.2.1","v0.2.0"];
+    var latest = "v0.4.0";
+    var versions = ["main","v0.4.0","v0.3.0","v0.2.1","v0.2.0"];
     var path = location.pathname.slice(1), rest = path.replace(/^portcullis\//, ""), first = rest.split("/")[0];
     var to = rest && versions.indexOf(first) < 0 ? latest + "/" + rest : rest !== path ? rest : null;
     if (to !== null) location.replace("/" + to + location.search + location.hash);
@@ -13,4 +13,4 @@
 <style>body{font:16px/1.6 system-ui,sans-serif;max-width:36rem;margin:15vh auto;padding:0 1rem;color:#1d2b2b}a{color:#0e6b5f}@media (prefers-color-scheme:dark){body{background:#121a1b;color:#e4ecea}a{color:#4cc2ad}}</style>
 <h1>Page not found</h1>
 <p>This page doesn't exist in this version of the Portcullis docs. It may have moved, or belong to another version.</p>
-<p><a href="/v0.3.0/">Go to the documentation of v0.3.0</a> or <a href="/main/">of main</a>.</p>
+<p><a href="/v0.4.0/">Go to the documentation of v0.4.0</a> or <a href="/main/">of main</a>.</p>

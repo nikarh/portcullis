@@ -1,0 +1,395 @@
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-g5ptsecz"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Events | Portcullis</title><link rel="canonical" href="https://portcullis.arhipov.net/v0.4.0/reference/events/"/><link rel="sitemap" href="/v0.4.0/sitemap-index.xml"/><link rel="shortcut icon" href="/v0.4.0/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.4.7"/><meta name="generator" content="Starlight v0.42.9"/><meta property="og:title" content="Events"/><meta property="og:type" content="article"/><meta property="og:url" content="https://portcullis.arhipov.net/v0.4.0/reference/events/"/><meta property="og:locale" content="en"/><meta property="og:description" content="The JSON schema of every event Portcullis writes, with examples and the text format."/><meta property="og:site_name" content="Portcullis"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="The JSON schema of every event Portcullis writes, with examples and the text format."/><script>
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+</script><template id="theme-icons"><svg aria-hidden="true" class="light astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M5 12a1 1 0 0 0-1-1H3a1 1 0 0 0 0 2h1a1 1 0 0 0 1-1Zm.64 5-.71.71a1 1 0 0 0 0 1.41 1 1 0 0 0 1.41 0l.71-.71A1 1 0 0 0 5.64 17ZM12 5a1 1 0 0 0 1-1V3a1 1 0 0 0-2 0v1a1 1 0 0 0 1 1Zm5.66 2.34a1 1 0 0 0 .7-.29l.71-.71a1 1 0 1 0-1.41-1.41l-.66.71a1 1 0 0 0 0 1.41 1 1 0 0 0 .66.29Zm-12-.29a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.71-.71a1.004 1.004 0 1 0-1.43 1.41l.73.71ZM21 11h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2Zm-2.64 6A1 1 0 0 0 17 18.36l.71.71a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.76-.66ZM12 6.5a5.5 5.5 0 1 0 5.5 5.5A5.51 5.51 0 0 0 12 6.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0 3.5a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1Z"/></svg><svg aria-hidden="true" class="dark astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.64 13a1 1 0 0 0-1.05-.14 8.049 8.049 0 0 1-3.37.73 8.15 8.15 0 0 1-8.14-8.1 8.59 8.59 0 0 1 .25-2A1 1 0 0 0 8 2.36a10.14 10.14 0 1 0 14 11.69 1 1 0 0 0-.36-1.05Zm-9.5 6.69A8.14 8.14 0 0 1 7.08 5.22v.27a10.15 10.15 0 0 0 10.14 10.14 9.784 9.784 0 0 0 2.1-.22 8.11 8.11 0 0 1-7.18 4.32v-.04Z"/></svg><svg aria-hidden="true" class="auto astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg></template><link rel="stylesheet" href="/v0.4.0/_astro/print.C9eyqPGL.css" media="print"><link rel="stylesheet" href="/v0.4.0/_astro/common.XOYWr9zB.css"><style>@layer starlight.components{svg:where(.astro-hkc32dio){color:var(--sl-icon-color);font-size:var(--sl-icon-size,1em);width:1em;height:1em;overflow:visible}}
+</style><script type="module" src="/v0.4.0/_astro/page.cNngjUgL.js"></script></head><body class="astro-g5ptsecz"><a class="sl-skip-link astro-qb7clj6f" href="#_top">Skip to content</a><div class="page sl-flex astro-yntsjkba"><header class="header astro-yntsjkba"><div class="header astro-by6fddyj"><div class="title-wrapper sl-flex astro-by6fddyj"><div class="title-group astro-hen6hmfb"><a href="/v0.4.0/" class="site-title astro-hen6hmfb"><svg class="mark astro-hen6hmfb" width="22" height="22" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M3 4.5h26M4 11h24M4 17.5h24M7 4.5v18M12.33 4.5v18M19.67 4.5v18M25 4.5v18"></path><path d="M5.3 22h3.4L7 28zM10.63 22h3.4l-1.7 6zM17.97 22h3.4l-1.7 6zM23.3 22h3.4L25 28z" fill="currentColor" stroke="none"></path></svg><span translate="no" class="astro-hen6hmfb">Portcullis</span></a><portcullis-version-select data-version="v0.4.0" class="astro-jcjov46q"><label class="version astro-jcjov46q"><span class="sr-only astro-jcjov46q">Documentation version</span><select autocomplete="off" aria-label="Documentation version" class="astro-jcjov46q"><option value="v0.4.0" selected class="astro-jcjov46q">v0.4.0</option></select><svg class="caret astro-jcjov46q" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" class="astro-jcjov46q"></path></svg></label></portcullis-version-select><script type="module" src="/v0.4.0/_astro/VersionSelect.astro_astro_type_script_index_0_lang.CDYh2mEM.js"></script></div></div><div class="sl-flex print:hidden astro-by6fddyj"><site-search class="astro-by6fddyj astro-b5kgnn7o" data-translations="{&quot;placeholder&quot;:&quot;Search&quot;}"><button data-open-modal disabled aria-label="Search" aria-keyshortcuts="Control+K" class="astro-b5kgnn7o"><svg aria-hidden="true" class="astro-b5kgnn7o astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.71 20.29 18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a.999.999 0 0 0 1.42 0 1 1 0 0 0 0-1.39ZM11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"/></svg><span class="sl-hidden md:sl-block astro-b5kgnn7o" aria-hidden="true">Search</span><kbd class="sl-hidden md:sl-flex astro-b5kgnn7o" style="display: none"><kbd class="astro-b5kgnn7o">Ctrl</kbd><kbd class="astro-b5kgnn7o">K</kbd></kbd></button><dialog style="padding: 0" aria-label="Search" class="astro-b5kgnn7o"><div class="dialog-frame sl-flex astro-b5kgnn7o"><button data-close-modal class="sl-flex md:sl-hidden astro-b5kgnn7o">Cancel</button><div class="search-container astro-b5kgnn7o"><div id="starlight__search" class="astro-b5kgnn7o"></div></div></div></dialog></site-search><script>
+	(() => {
+		const openBtn = document.querySelector('button[data-open-modal]');
+		const shortcut = openBtn?.querySelector('kbd');
+		if (!openBtn || !(shortcut instanceof HTMLElement)) return;
+		const platformKey = shortcut.querySelector('kbd');
+		if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+			platformKey.textContent = '⌘';
+			openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+		}
+		shortcut.style.display = '';
+	})();
+</script><script type="module" src="/v0.4.0/_astro/Search.astro_astro_type_script_index_0_lang.BKGu7Ezk.js"></script></div><div class="sl-hidden md:sl-flex print:hidden right-group astro-by6fddyj"><div class="sl-flex social-icons astro-by6fddyj"><a href="https://github.com/nikarh/portcullis" rel="me" class="sl-flex astro-n2mnl6yq"><span class="sr-only astro-n2mnl6yq">GitHub</span><svg aria-hidden="true" class="astro-n2mnl6yq astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><starlight-theme-select><label style="--sl-select-width: 6.25em" class="astro-2z5xp7gb"><span class="sr-only astro-2z5xp7gb">Select theme</span><svg aria-hidden="true" class="icon label-icon astro-2z5xp7gb astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg><select autocomplete="off" class="astro-2z5xp7gb"><option value="dark" class="astro-2z5xp7gb">Dark</option><option value="light" class="astro-2z5xp7gb">Light</option><option value="auto" selected class="astro-2z5xp7gb">Auto</option></select><svg aria-hidden="true" class="icon caret astro-2z5xp7gb astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1.002 1.002 0 0 0 1.42 0L17 10.59a1.002 1.002 0 0 0 0-1.42Z"/></svg></label></starlight-theme-select><script>
+	StarlightThemeProvider.updatePickers();
+</script><script type="module">var e=`starlight-theme`,t=e=>e===`auto`||e===`dark`||e===`light`?e:`auto`,n=()=>t(typeof localStorage<`u`&&localStorage.getItem(e));function r(t){typeof localStorage<`u`&&localStorage.setItem(e,t===`light`||t===`dark`?t:``)}var i=()=>matchMedia(`(prefers-color-scheme: light)`).matches?`light`:`dark`;function a(e){StarlightThemeProvider.updatePickers(e),document.documentElement.dataset.theme=e===`auto`?i():e,r(e)}matchMedia(`(prefers-color-scheme: light)`).addEventListener(`change`,()=>{n()===`auto`&&a(`auto`)});var o=class extends HTMLElement{constructor(){super(),a(n()),this.querySelector(`select`)?.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&a(t(e.currentTarget.value))})}};customElements.define(`starlight-theme-select`,o);</script><script type="module">var e=class extends HTMLElement{constructor(){super();let e=this.querySelector(`select`);e&&(e.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&(window.location.pathname=e.currentTarget.value)}),window.addEventListener(`pageshow`,t=>{if(!t.persisted)return;let n=e.querySelector(`option[selected]`)?.index;n!==e.selectedIndex&&(e.selectedIndex=n??0)}))}};customElements.define(`starlight-lang-select`,e);</script></div></div></header><nav class="sidebar print:hidden astro-yntsjkba" aria-label="Main"><button popovertarget="starlight__sidebar" class="sl-menu-button sl-flex md:sl-hidden print:hidden astro-r2osgdlg"><svg aria-hidden="true" class="open-menu astro-r2osgdlg astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M3 8h18a1 1 0 1 0 0-2H3a1 1 0 0 0 0 2Zm18 8H3a1 1 0 0 0 0 2h18a1 1 0 0 0 0-2Zm0-5H3a1 1 0 0 0 0 2h18a1 1 0 0 0 0-2Z"/></svg><svg aria-hidden="true" class="close-menu astro-r2osgdlg astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="m13.41 12 6.3-6.29a1.004 1.004 0 1 0-1.42-1.42L12 10.59l-6.29-6.3a1.004 1.004 0 0 0-1.42 1.42l6.3 6.29-6.3 6.29a1 1 0 0 0 0 1.42.998.998 0 0 0 1.42 0l6.29-6.3 6.29 6.3a.999.999 0 0 0 1.42 0 1 1 0 0 0 0-1.42L13.41 12Z"/></svg><span class="sr-only astro-r2osgdlg">Menu</span></button><script type="module">var e=class extends HTMLElement{constructor(){super();let e=matchMedia(`(min-width: 50em)`),t=()=>{this.popover=e.matches?null:`auto`};t(),e.addEventListener(`change`,()=>t()),this.addEventListener(`toggle`,({newState:e})=>this.trapFocus(e===`open`))}trapFocus(e){document.querySelectorAll(`.main-frame, .sl-skip-link`).forEach(t=>{t.toggleAttribute(`inert`,e)})}};customElements.define(`sl-sidebar-pane`,e);</script><sl-sidebar-pane popover id="starlight__sidebar" class="sidebar-pane astro-yntsjkba"><div class="sidebar-content sl-flex astro-yntsjkba"><sl-sidebar-state-persist data-hash="001guxm" class="astro-ipdry5cl"><script aria-hidden="true">
+		(() => {
+			try {
+				if (!matchMedia('(min-width: 50em)').matches) return;
+				/** @type {HTMLElement | null} */
+				const target = document.querySelector('sl-sidebar-state-persist');
+				const state = JSON.parse(sessionStorage.getItem('sl-sidebar-state') || '0');
+				if (!target || !state || target.dataset.hash !== state.hash) return;
+				window._starlightScrollRestore = state.scroll;
+				customElements.define(
+					'sl-sidebar-restore',
+					class SidebarRestore extends HTMLElement {
+						connectedCallback() {
+							try {
+								const idx = parseInt(this.dataset.index || '');
+								const details = this.closest('details');
+								if (details && typeof state.open[idx] === 'boolean') details.open = state.open[idx];
+							} catch {}
+						}
+					}
+				);
+			} catch {}
+		})();
+	</script><ul class="top-level astro-rmhv4bp6"><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Getting started</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="0"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/start/introduction/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Introduction</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/start/quick-start/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Quick start</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/start/installation/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Installation</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Guides</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="1"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/guides/rollout/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Rolling out a policy</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/guides/service/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Running as a service</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/guides/events-and-alerts/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Events and alerts</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/guides/hardening/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Hardening a host</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Policy labels</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="2"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/overview/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Overview</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/networks/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Enforcing a network</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/egress/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Outbound connections</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/patterns/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Names and patterns</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/hostnames/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Hostname rules</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/icc/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Traffic between containers</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/dns/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">DNS</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/domains/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Limiting lookups</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/limits/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Quarantine and limits</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/policy/checks/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Configuration checks</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Reference</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="3"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/reference/cli/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Command line</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/reference/configuration/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Configuration</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/reference/events/" aria-current="page" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Events</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/reference/host-resources/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Files and kernel resources</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/reference/changelog/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Changelog</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Examples</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="4"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/single-api/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">One external API</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/app-db-cache/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Database and cache</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/multicast-cluster/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Multicast cluster</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/reverse-proxy/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Reverse proxy</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/internet-not-lan/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Internet, not the LAN</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/egress-proxy/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Filtering proxy</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/existing-networks/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Existing networks</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/own-resolver/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Resolvers</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/examples/monitoring/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Prometheus</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">How it works</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="5"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/internals/how-it-works/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Architecture</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/internals/discovery/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Finding new containers</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/internals/bypass/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Containers trying to get around the rules</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Limits and workarounds</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="6"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/limits/limitations/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Limitations</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/limits/escape-hatches/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Workarounds</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Help</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="7"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/help/troubleshooting/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Troubleshooting</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/help/faq/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">FAQ</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Project</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="8"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/v0.4.0/project/docs/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Writing the docs</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/project/development/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Development</span></a></li><li class="astro-rmhv4bp6"><a href="/v0.4.0/project/releasing/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Releasing</span></a></li></ul></details></li></ul><script aria-hidden="true">
+		(() => {
+			const scroller = document.getElementById('starlight__sidebar');
+			if (!window._starlightScrollRestore || !scroller) return;
+			scroller.scrollTop = window._starlightScrollRestore;
+			delete window._starlightScrollRestore;
+		})();
+	</script></sl-sidebar-state-persist><div class="md:sl-hidden"><div class="mobile-preferences sl-flex astro-p4azlveh"><div class="social-icons astro-p4azlveh"><a href="https://github.com/nikarh/portcullis" rel="me" class="sl-flex astro-n2mnl6yq"><span class="sr-only astro-n2mnl6yq">GitHub</span><svg aria-hidden="true" class="astro-n2mnl6yq astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><starlight-theme-select><label style="--sl-select-width: 6.25em" class="astro-2z5xp7gb"><span class="sr-only astro-2z5xp7gb">Select theme</span><svg aria-hidden="true" class="icon label-icon astro-2z5xp7gb astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg><select autocomplete="off" class="astro-2z5xp7gb"><option value="dark" class="astro-2z5xp7gb">Dark</option><option value="light" class="astro-2z5xp7gb">Light</option><option value="auto" selected class="astro-2z5xp7gb">Auto</option></select><svg aria-hidden="true" class="icon caret astro-2z5xp7gb astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1.002 1.002 0 0 0 1.42 0L17 10.59a1.002 1.002 0 0 0 0-1.42Z"/></svg></label></starlight-theme-select><script>
+	StarlightThemeProvider.updatePickers();
+</script></div></div></div></sl-sidebar-pane></nav><div class="main-frame astro-yntsjkba"><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()});</script><div class="lg:sl-flex astro-lrzkfocr"><aside class="right-sidebar-container print:hidden astro-lrzkfocr"><div class="right-sidebar astro-lrzkfocr"><div class="lg:sl-hidden astro-qok35upx"><mobile-starlight-toc data-min-h="2" data-max-h="3" class="astro-66cqc7ze"><nav aria-labelledby="starlight__on-this-page--mobile" class="astro-66cqc7ze"><details id="starlight__mobile-toc" class="astro-66cqc7ze"><summary id="starlight__on-this-page--mobile" class="sl-flex astro-66cqc7ze"><span class="toggle sl-flex astro-66cqc7ze">On this page<svg aria-hidden="true" class="caret astro-66cqc7ze astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></span><span class="display-current astro-66cqc7ze"></span></summary><div class="dropdown astro-66cqc7ze"><ul class="isMobile astro-jugkfwgx" style="--depth: 0;"><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#_top" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Overview</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#connection" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">connection</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#dns" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">dns</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#container" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">container</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#warning" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">warning</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#applied" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">applied</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#apply_failed" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">apply_failed</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#text-format" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Text format</span></a></li></ul></div></details></nav></mobile-starlight-toc><script type="module" src="/v0.4.0/_astro/MobileTableOfContents.astro_astro_type_script_index_0_lang.C3fM4Kra.js"></script></div><div class="right-sidebar-panel sl-hidden lg:sl-block astro-qok35upx"><div class="sl-container astro-qok35upx"><starlight-toc data-min-h="2" data-max-h="3"><nav aria-labelledby="starlight__on-this-page"><h2 id="starlight__on-this-page">On this page</h2><ul class="astro-jugkfwgx" style="--depth: 0;"><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#_top" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Overview</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#connection" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">connection</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#dns" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">dns</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#container" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">container</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#warning" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">warning</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#applied" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">applied</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#apply_failed" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">apply_failed</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#text-format" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Text format</span></a></li></ul></nav></starlight-toc><script type="module" src="/v0.4.0/_astro/TableOfContents.astro_astro_type_script_index_0_lang.BpJaGz7G.js"></script></div></div></div></aside><div class="main-pane astro-lrzkfocr"><main data-pagefind-body class="astro-g5ptsecz" lang="en" dir="ltr"><portcullis-version-notice data-version="v0.4.0" data-pagefind-ignore="true" hidden="true" class="astro-uljtwisc"><p class="astro-uljtwisc"></p></portcullis-version-notice><script type="module" src="/v0.4.0/_astro/Banner.astro_astro_type_script_index_0_lang.C2piExS2.js"></script><div class="content-panel astro-a7po4psb"><div class="sl-container astro-a7po4psb"><h1 id="_top" class="astro-bebwqqxs">Events</h1></div></div><div class="content-panel astro-a7po4psb"><div class="sl-container astro-a7po4psb"><div class="sl-markdown-content"><p>Portcullis writes one event per line to stdout, as text or, with <code dir="auto">log-format = "json"</code>, as JSON. The events socket serves the same events, always as JSON. Where events go and how much is written is in <a href="/v0.4.0/guides/events-and-alerts/">Events and alerts</a>.</p>
+<p>Every JSON event has two common fields, followed by those of its kind:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">time</code></td>
+<td>string</td>
+<td>RFC 3339 UTC timestamp with milliseconds, such as <code dir="auto">2026-11-02T10:15:30.120Z</code></td>
+</tr>
+<tr>
+<td><code dir="auto">event</code></td>
+<td>string</td>
+<td><code dir="auto">connection</code>, <code dir="auto">dns</code>, <code dir="auto">container</code>, <code dir="auto">warning</code>, <code dir="auto">applied</code> or <code dir="auto">apply_failed</code></td>
+</tr>
+</tbody>
+</table>
+<p>Fields that don’t apply are <code dir="auto">null</code>, except <code dir="auto">mid_stream</code>, which is left out unless it is <code dir="auto">true</code>. Consumers should ignore fields they don’t know: new ones may be added.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="connection"><code dir="auto">connection</code></h2><a class="sl-anchor-link" href="#connection"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “connection”</span></a></div>
+<p>A decision about a packet: <span class="v-allowed">allowed</span>, <span class="v-denied">denied</span>, or <span class="v-would">would_deny</span> in monitor mode.</p>
+<div class="expressive-code"><link rel="stylesheet" href="/v0.4.0/_astro/ec.50nch.css"><script type="module" src="/v0.4.0/_astro/ec.0vx5m.js"></script><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#E6EDF3;--1:#1F2328">{</span><span style="--0:#7EE787;--1:#116329">"time"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"2026-11-02T10:15:30.120Z"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"event"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"connection"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"verdict"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"denied"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"reason"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"egress"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"container"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"billing"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"network"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"backend"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"protocol"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"tcp"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"source"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"172.18.0.2"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"source_port"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#79C0FF;--1:#0550AE">40312</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"destination"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"104.18.3.4"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"destination_port"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#79C0FF;--1:#0550AE">443</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"destination_container"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#79C0FF;--1:#0550AE">null</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"domain"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"api.stripe.com"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"domain_source"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"dns"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"query"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#79C0FF;--1:#0550AE">null</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"detail"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#79C0FF;--1:#0550AE">null</span><span style="--0:#E6EDF3;--1:#1F2328">}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{&quot;time&quot;:&quot;2026-11-02T10:15:30.120Z&quot;,&quot;event&quot;:&quot;connection&quot;,&quot;verdict&quot;:&quot;denied&quot;,&quot;reason&quot;:&quot;egress&quot;, &quot;container&quot;:&quot;billing&quot;,&quot;network&quot;:&quot;backend&quot;,&quot;protocol&quot;:&quot;tcp&quot;, &quot;source&quot;:&quot;172.18.0.2&quot;,&quot;source_port&quot;:40312,&quot;destination&quot;:&quot;104.18.3.4&quot;,&quot;destination_port&quot;:443, &quot;destination_container&quot;:null,&quot;domain&quot;:&quot;api.stripe.com&quot;,&quot;domain_source&quot;:&quot;dns&quot;, &quot;query&quot;:null,&quot;detail&quot;:null}"><div></div></button></div></figure></div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">verdict</code></td>
+<td>string</td>
+<td><code dir="auto">allowed</code>, <code dir="auto">denied</code>, or <code dir="auto">would_deny</code> in monitor mode</td>
+</tr>
+<tr>
+<td><code dir="auto">reason</code></td>
+<td>string</td>
+<td>Which part of the policy decided, see below</td>
+</tr>
+<tr>
+<td><code dir="auto">container</code></td>
+<td>string or null</td>
+<td>The container that sent it. For <code dir="auto">source</code> and <code dir="auto">frame</code>, the container behind the bridge port the frame came in on, whatever address or MAC it used.</td>
+</tr>
+<tr>
+<td><code dir="auto">network</code></td>
+<td>string or null</td>
+<td>The network it was sent on</td>
+</tr>
+<tr>
+<td><code dir="auto">protocol</code></td>
+<td>string</td>
+<td><code dir="auto">tcp</code>, <code dir="auto">udp</code>, <code dir="auto">sctp</code>, <code dir="auto">icmp</code>, <code dir="auto">igmp</code>, <code dir="auto">gre</code>, <code dir="auto">esp</code>, <code dir="auto">ah</code>, or the number of another IP protocol; for <code dir="auto">source</code> and <code dir="auto">frame</code>, also <code dir="auto">arp</code>, <code dir="auto">ipv6</code> or <code dir="auto">ether type 0x....</code></td>
+</tr>
+<tr>
+<td><code dir="auto">source</code>, <code dir="auto">destination</code></td>
+<td>string or null</td>
+<td>The addresses the packet claims. For egress, the destination the container asked for, before Docker’s DNAT of published ports. Both are <code dir="auto">null</code> for frames without IP addresses.</td>
+</tr>
+<tr>
+<td><code dir="auto">source_port</code>, <code dir="auto">destination_port</code></td>
+<td>number or null</td>
+<td>Ports, for protocols that have them</td>
+</tr>
+<tr>
+<td><code dir="auto">destination_container</code></td>
+<td>string or null</td>
+<td>For <code dir="auto">icc</code>, the container at the destination</td>
+</tr>
+<tr>
+<td><code dir="auto">domain</code></td>
+<td>string or null</td>
+<td>The destination’s name, if known</td>
+</tr>
+<tr>
+<td><code dir="auto">domain_source</code></td>
+<td>string or null</td>
+<td><code dir="auto">dns</code> when the container looked the name up and Portcullis saw the answer, <code dir="auto">rule</code> when the address belongs to one of the container’s <code dir="auto">host:</code> rules</td>
+</tr>
+<tr>
+<td><code dir="auto">query</code></td>
+<td>string or null</td>
+<td>For denied DNS queries, the name asked for</td>
+</tr>
+<tr>
+<td><code dir="auto">detail</code></td>
+<td>string or null</td>
+<td>For <code dir="auto">source</code>, what’s wrong, such as which container’s address was used. Some details mark packets that aren’t crafted, and don’t get the container quarantined: see <a href="/v0.4.0/help/troubleshooting/#source-or-frame-events">Source or frame events</a>. For <code dir="auto">egress</code> to a network’s gateway, <code dir="auto">the Docker host, the gateway of &lt;network&gt;</code>.</td>
+</tr>
+<tr>
+<td><code dir="auto">mid_stream</code></td>
+<td><code dir="auto">true</code>, or absent</td>
+<td>A TCP packet that doesn’t start a connection: a reply, or the rest of a connection the firewall doesn’t track, because it lost track of it or the packet doesn’t fit the connection. Rules decide new connections; what they say about such a packet doesn’t mean a label is missing.</td>
+</tr>
+</tbody>
+</table>
+<p>Reasons:</p>
+<table>
+<thead>
+<tr>
+<th>Reason</th>
+<th>Decided by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">egress</code></td>
+<td><a href="/v0.4.0/policy/egress/">Egress labels</a>: traffic leaving the network or to the Docker host</td>
+</tr>
+<tr>
+<td><code dir="auto">dns</code></td>
+<td><a href="/v0.4.0/policy/dns/">DNS labels</a> and <a href="/v0.4.0/policy/domains/">domain labels</a>: traffic to port 53</td>
+</tr>
+<tr>
+<td><code dir="auto">icc</code></td>
+<td>The <a href="/v0.4.0/policy/icc/">ICC mode</a>: traffic to a container on the same network</td>
+</tr>
+<tr>
+<td><code dir="auto">source</code></td>
+<td><a href="/v0.4.0/internals/bypass/">Source checks</a>: a container sending with an address or MAC that isn’t its own, ARP included</td>
+</tr>
+<tr>
+<td><code dir="auto">frame</code></td>
+<td>Source checks: a kind of frame enforced networks don’t carry, such as IPv6, VLAN-tagged frames, or ARP that carries data or isn’t for Ethernet and IPv4</td>
+</tr>
+<tr>
+<td><code dir="auto">limit</code></td>
+<td><a href="/v0.4.0/policy/limits/#connection-limits">Connection limits</a></td>
+</tr>
+</tbody>
+</table>
+<p>A flow (container, destination, protocol and port) is reported at most once a minute. Replies and the rest of a connection are never reported.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="dns"><code dir="auto">dns</code></h2><a class="sl-anchor-link" href="#dns"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “dns”</span></a></div>
+<p>A container received a DNS answer. Reported where allowed connections are (<code dir="auto">log-allowed</code>).</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#E6EDF3;--1:#1F2328">{</span><span style="--0:#7EE787;--1:#116329">"time"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"2026-11-02T10:15:30.101Z"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"event"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"dns"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"container"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"billing"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"network"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"backend"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"resolver"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"192.168.1.1"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"name"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"api.stripe.com"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"record_type"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"A"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"response_code"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"No Error"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"aliases"</span><span style="--0:#E6EDF3;--1:#1F2328">:[],</span><span style="--0:#7EE787;--1:#116329">"answers"</span><span style="--0:#E6EDF3;--1:#1F2328">:[</span><span style="--0:#A5D6FF;--1:#0A3069">"104.18.3.4"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#A5D6FF;--1:#0A3069">"104.18.2.4"</span><span style="--0:#E6EDF3;--1:#1F2328">]}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{&quot;time&quot;:&quot;2026-11-02T10:15:30.101Z&quot;,&quot;event&quot;:&quot;dns&quot;,&quot;container&quot;:&quot;billing&quot;,&quot;network&quot;:&quot;backend&quot;, &quot;resolver&quot;:&quot;192.168.1.1&quot;,&quot;name&quot;:&quot;api.stripe.com&quot;,&quot;record_type&quot;:&quot;A&quot;,&quot;response_code&quot;:&quot;No Error&quot;, &quot;aliases&quot;:[],&quot;answers&quot;:[&quot;104.18.3.4&quot;,&quot;104.18.2.4&quot;]}"><div></div></button></div></figure></div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">container</code>, <code dir="auto">network</code></td>
+<td>string or null</td>
+<td>The container that received the answer, and its network</td>
+</tr>
+<tr>
+<td><code dir="auto">resolver</code></td>
+<td>string</td>
+<td>The resolver that answered</td>
+</tr>
+<tr>
+<td><code dir="auto">name</code></td>
+<td>string</td>
+<td>The name asked for</td>
+</tr>
+<tr>
+<td><code dir="auto">record_type</code></td>
+<td>string</td>
+<td><code dir="auto">A</code>, <code dir="auto">AAAA</code>, <code dir="auto">CNAME</code>, <code dir="auto">TXT</code> and so on</td>
+</tr>
+<tr>
+<td><code dir="auto">response_code</code></td>
+<td>string</td>
+<td><code dir="auto">No Error</code>, <code dir="auto">Non-Existent Domain</code>, <code dir="auto">Server Failure</code> and so on</td>
+</tr>
+<tr>
+<td><code dir="auto">aliases</code></td>
+<td>array of strings</td>
+<td>CNAME targets the name resolved through</td>
+</tr>
+<tr>
+<td><code dir="auto">answers</code></td>
+<td>array of strings</td>
+<td>The addresses in the answer</td>
+</tr>
+</tbody>
+</table>
+<p>Denied lookups aren’t <code dir="auto">dns</code> events: they are <code dir="auto">connection</code> events with reason <code dir="auto">dns</code>, and <code dir="auto">query</code> names what was asked.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="container"><code dir="auto">container</code></h2><a class="sl-anchor-link" href="#container"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “container”</span></a></div>
+<p>A container address became managed or stopped being managed.</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#E6EDF3;--1:#1F2328">{</span><span style="--0:#7EE787;--1:#116329">"time"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"2026-11-02T10:15:29.870Z"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"event"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"container"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"action"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"managed"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"container"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"billing"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"network"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"backend"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"address"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"172.18.0.2"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"mode"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"enforce"</span><span style="--0:#E6EDF3;--1:#1F2328">}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{&quot;time&quot;:&quot;2026-11-02T10:15:29.870Z&quot;,&quot;event&quot;:&quot;container&quot;,&quot;action&quot;:&quot;managed&quot;,&quot;container&quot;:&quot;billing&quot;, &quot;network&quot;:&quot;backend&quot;,&quot;address&quot;:&quot;172.18.0.2&quot;,&quot;mode&quot;:&quot;enforce&quot;}"><div></div></button></div></figure></div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">action</code></td>
+<td>string</td>
+<td><code dir="auto">managed</code>: rules now apply to this address. <code dir="auto">released</code>: they no longer do.</td>
+</tr>
+<tr>
+<td><code dir="auto">container</code>, <code dir="auto">network</code>, <code dir="auto">address</code></td>
+<td>string</td>
+<td>The container, the network and its address there</td>
+</tr>
+<tr>
+<td><code dir="auto">mode</code></td>
+<td>string</td>
+<td><code dir="auto">enforce</code> or <code dir="auto">monitor</code></td>
+</tr>
+</tbody>
+</table>
+<div class="sl-heading-wrapper level-h2"><h2 id="warning"><code dir="auto">warning</code></h2><a class="sl-anchor-link" href="#warning"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “warning”</span></a></div>
+<p>Something that needs attention. Every warning raises an alert.</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#E6EDF3;--1:#1F2328">{</span><span style="--0:#7EE787;--1:#116329">"time"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"2026-11-02T10:15:29.902Z"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"event"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"warning"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"kind"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"docker_socket"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"container"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"traefik"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"message"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"..."</span><span style="--0:#E6EDF3;--1:#1F2328">}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{&quot;time&quot;:&quot;2026-11-02T10:15:29.902Z&quot;,&quot;event&quot;:&quot;warning&quot;,&quot;kind&quot;:&quot;docker_socket&quot;,&quot;container&quot;:&quot;traefik&quot;, &quot;message&quot;:&quot;...&quot;}"><div></div></button></div></figure></div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">kind</code></td>
+<td>string</td>
+<td>The warning, see below</td>
+</tr>
+<tr>
+<td><code dir="auto">container</code></td>
+<td>string or null</td>
+<td>The container it is about, if any</td>
+</tr>
+<tr>
+<td><code dir="auto">message</code></td>
+<td>string</td>
+<td>A description for people; its wording may change between versions</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">invalid_label</code></td>
+<td>A container label is invalid and was ignored</td>
+</tr>
+<tr>
+<td><code dir="auto">invalid_network</code></td>
+<td>A network’s configuration prevents enforcing it</td>
+</tr>
+<tr>
+<td><code dir="auto">dns_not_observable</code></td>
+<td>Portcullis can’t see this container’s DNS lookups</td>
+</tr>
+<tr>
+<td><code dir="auto">events_lost</code></td>
+<td>The kernel dropped log entries because they weren’t read fast enough</td>
+</tr>
+<tr>
+<td><code dir="auto">alerts_suppressed</code></td>
+<td>A container raised so many alerts that further ones are held back for a while</td>
+</tr>
+<tr>
+<td><code dir="auto">unenforced_network</code>, <code dir="auto">unused_labels</code>, <code dir="auto">shared_network</code>, <code dir="auto">docker_socket</code>, <code dir="auto">privileged</code>, <code dir="auto">net_admin</code>, <code dir="auto">ipv6_network</code></td>
+<td><a href="/v0.4.0/policy/checks/">Configuration checks</a></td>
+</tr>
+<tr>
+<td><code dir="auto">quarantined</code></td>
+<td>A container misbehaved and was cut off from its networks, or would have been</td>
+</tr>
+</tbody>
+</table>
+<div class="sl-heading-wrapper level-h2"><h2 id="applied"><code dir="auto">applied</code></h2><a class="sl-anchor-link" href="#applied"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “applied”</span></a></div>
+<p>Rules were updated: when containers or networks changed, and when a hostname that didn’t resolve does now. It comes after everything else the update caused.</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#E6EDF3;--1:#1F2328">{</span><span style="--0:#7EE787;--1:#116329">"time"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"2026-11-02T10:15:29.912Z"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"event"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"applied"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"generation"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#79C0FF;--1:#0550AE">42</span><span style="--0:#E6EDF3;--1:#1F2328">,</span></div></div><div class="ec-line"><div class="code"><span class="indent"> </span><span style="--0:#7EE787;--1:#116329">"sources"</span><span style="--0:#E6EDF3;--1:#1F2328">:[</span><span style="--0:#A5D6FF;--1:#0A3069">"172.18.0.2"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#A5D6FF;--1:#0A3069">"172.18.0.3"</span><span style="--0:#E6EDF3;--1:#1F2328">],</span><span style="--0:#7EE787;--1:#116329">"unresolved_hosts"</span><span style="--0:#E6EDF3;--1:#1F2328">:[</span><span style="--0:#A5D6FF;--1:#0A3069">"api.example.com"</span><span style="--0:#E6EDF3;--1:#1F2328">]}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{&quot;time&quot;:&quot;2026-11-02T10:15:29.912Z&quot;,&quot;event&quot;:&quot;applied&quot;,&quot;generation&quot;:42, &quot;sources&quot;:[&quot;172.18.0.2&quot;,&quot;172.18.0.3&quot;],&quot;unresolved_hosts&quot;:[&quot;api.example.com&quot;]}"><div></div></button></div></figure></div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">generation</code></td>
+<td>number</td>
+<td>Increases by one with every successful update</td>
+</tr>
+<tr>
+<td><code dir="auto">sources</code></td>
+<td>array of strings</td>
+<td>The managed container addresses</td>
+</tr>
+<tr>
+<td><code dir="auto">unresolved_hosts</code></td>
+<td>array of strings</td>
+<td>Hostnames of <code dir="auto">host:</code> rules with no known addresses; their rules allow nothing yet</td>
+</tr>
+</tbody>
+</table>
+<div class="sl-heading-wrapper level-h2"><h2 id="apply_failed"><code dir="auto">apply_failed</code></h2><a class="sl-anchor-link" href="#apply_failed"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “apply_failed”</span></a></div>
+<p>Updating the rules failed; the previous rules stay in place, and Portcullis tries again. Raises an alert.</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#E6EDF3;--1:#1F2328">{</span><span style="--0:#7EE787;--1:#116329">"time"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"2026-11-02T10:15:29.912Z"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"event"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"apply_failed"</span><span style="--0:#E6EDF3;--1:#1F2328">,</span><span style="--0:#7EE787;--1:#116329">"error"</span><span style="--0:#E6EDF3;--1:#1F2328">:</span><span style="--0:#A5D6FF;--1:#0A3069">"..."</span><span style="--0:#E6EDF3;--1:#1F2328">}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{&quot;time&quot;:&quot;2026-11-02T10:15:29.912Z&quot;,&quot;event&quot;:&quot;apply_failed&quot;,&quot;error&quot;:&quot;...&quot;}"><div></div></button></div></figure></div>
+<div class="sl-heading-wrapper level-h2"><h2 id="text-format">Text format</h2><a class="sl-anchor-link" href="#text-format"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Text format”</span></a></div>
+<p>With <code dir="auto">log-format = "text"</code> (the default), and in <code dir="auto">portcullis watch</code>, each event is one line, for people:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="text"><code><div class="ec-line"><div class="code"><span style="--0:#e6edf3;--1:#1f2328">2026-11-02T10:15:29.870Z managing billing 172.18.0.2 on backend (enforce)</span></div></div><div class="ec-line"><div class="code"><span style="--0:#e6edf3;--1:#1f2328">2026-11-02T10:15:29.912Z applied rules (generation 42, 2 container addresses), unresolved: api.example.com</span></div></div><div class="ec-line"><div class="code"><span style="--0:#e6edf3;--1:#1f2328">2026-11-02T10:15:30.101Z dns billing A api.stripe.com via 192.168.1.1: No Error 104.18.3.4 104.18.2.4</span></div></div><div class="ec-line"><div class="code"><span style="--0:#e6edf3;--1:#1f2328">2026-11-02T10:15:30.120Z DENIED egress billing 172.18.0.2 -&gt; api.stripe.com (104.18.3.4) tcp/443</span></div></div><div class="ec-line"><div class="code"><span style="--0:#e6edf3;--1:#1f2328">2026-11-02T10:15:31.004Z would deny icc worker 172.18.0.4 -&gt; db (172.18.0.5) tcp/5432</span></div></div><div class="ec-line"><div class="code"><span style="--0:#e6edf3;--1:#1f2328">2026-11-02T10:15:32.450Z warning traefik: ...</span></div></div><div class="ec-line"><div class="code"><span style="--0:#e6edf3;--1:#1f2328">2026-11-02T10:15:33.000Z releasing billing 172.18.0.2 on backend (enforce)</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="2026-11-02T10:15:29.870Z managing billing 172.18.0.2 on backend (enforce)2026-11-02T10:15:29.912Z applied rules (generation 42, 2 container addresses), unresolved: api.example.com2026-11-02T10:15:30.101Z dns billing A api.stripe.com via 192.168.1.1: No Error 104.18.3.4 104.18.2.42026-11-02T10:15:30.120Z DENIED egress billing 172.18.0.2 -> api.stripe.com (104.18.3.4) tcp/4432026-11-02T10:15:31.004Z would deny icc worker 172.18.0.4 -> db (172.18.0.5) tcp/54322026-11-02T10:15:32.450Z warning traefik: ...2026-11-02T10:15:33.000Z releasing billing 172.18.0.2 on backend (enforce)"><div></div></button></div></figure></div>
+<p>The text format isn’t meant for machines and may change. Use JSON for anything that parses events.</p>
+</div><footer class="sl-flex astro-ddtxxk7k"><div class="meta sl-flex astro-ddtxxk7k"><a href="https://github.com/nikarh/portcullis/edit/main/site/src/content/docs/reference/events.md" class="sl-flex print:hidden astro-qlekgd3o"><svg aria-hidden="true" class="astro-qlekgd3o astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a></div><div class="pagination-links print:hidden astro-b5raizh3" dir="ltr"><a href="/v0.4.0/reference/configuration/" rel="prev" class="astro-b5raizh3"><svg aria-hidden="true" class="astro-b5raizh3 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-b5raizh3">Previous<br class="astro-b5raizh3"><span class="link-title astro-b5raizh3">Configuration</span></span></a><a href="/v0.4.0/reference/host-resources/" rel="next" class="astro-b5raizh3"><svg aria-hidden="true" class="astro-b5raizh3 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-b5raizh3">Next<br class="astro-b5raizh3"><span class="link-title astro-b5raizh3">Files and kernel resources</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
