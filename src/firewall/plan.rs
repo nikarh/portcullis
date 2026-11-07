@@ -294,9 +294,18 @@ impl Plan {
             scratch: Vec::new(),
         };
 
-        for container in state.containers().values() {
-            for attachment in &container.attachments {
-                planner.plan_attachment(container, attachment);
+        // A container that is stopping only gets addresses nobody else claims: Docker may
+        // have given them to a new container already, such as the one recreated in its
+        // place, whose events come before those of the stopping one.
+        for stopping in [false, true] {
+            for container in state
+                .containers()
+                .values()
+                .filter(|container| state.is_stopping(&container.id) == stopping)
+            {
+                for attachment in &container.attachments {
+                    planner.plan_attachment(container, attachment);
+                }
             }
         }
 
@@ -726,6 +735,34 @@ mod tests {
 
     fn icc_of(plan: &Plan, address: &str) -> Vec<Rule> {
         plan.icc_rules(source(plan, address)).to_vec()
+    }
+
+    #[test]
+    fn gives_a_contested_address_to_the_container_that_isnt_stopping() {
+        // A recreated container got the address of the one it replaces, which is stopping
+        // (its namespace is gone) but still known. Whichever the state yields first, the
+        // new one gets the address.
+        for (old, new) in [("a-old", "z-new"), ("z-old", "a-new")] {
+            let mut state = RuntimeState::default();
+            test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+            for id in [old, new] {
+                test_support::add_container(
+                    &mut state,
+                    id,
+                    id,
+                    &[("net0", "172.18.0.2", &[])],
+                    crate::model::ContainerPolicy::default(),
+                );
+            }
+            state.set_stopping(HashSet::from([old.to_string().into()]));
+            let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
+            let owners: Vec<&str> = plan
+                .sources
+                .iter()
+                .map(|source| source.container.as_str())
+                .collect();
+            assert_eq!(owners, [new]);
+        }
     }
 
     #[test]

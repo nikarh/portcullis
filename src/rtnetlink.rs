@@ -262,6 +262,8 @@ pub struct Ports {
     /// Containers whose port can't be found, and why: their traffic can only be checked by
     /// address and MAC.
     pub problems: Vec<(ContainerId, PortProblem)>,
+    /// Containers whose network namespace is gone: they are stopping.
+    pub stopping: HashSet<ContainerId>,
 }
 
 /// The bridge port of every address of a running container on a managed network.
@@ -305,6 +307,7 @@ fn match_ports(
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 debug!(container = %container.name, "the container's network namespace is gone; it is stopping");
+                found.stopping.insert(container.id.clone());
                 found.absent.extend(
                     container
                         .attachments

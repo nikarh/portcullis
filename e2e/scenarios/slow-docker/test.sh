@@ -7,7 +7,9 @@
 SLOW_DOCKER=/run/portcullis-e2e-slow-docker.sock
 SLOW_DOCKER_ARM=/run/portcullis-e2e-slow-docker.arm
 rm -f "${SLOW_DOCKER_ARM}"
-python3 "${E2E_DIR}/slow-docker.py" "${SLOW_DOCKER}" /var/run/docker.sock "${SLOW_DOCKER_ARM}" 3 &
+# Inspects wait 3 seconds, and each part of the event stream half a second, so that
+# Portcullis handles the events of a container's stop only after its next start.
+python3 "${E2E_DIR}/slow-docker.py" "${SLOW_DOCKER}" /var/run/docker.sock "${SLOW_DOCKER_ARM}" 3 0.5 &
 SLOW_DOCKER_PID=$!
 deadline=$((SECONDS + 10))
 until [[ -S "${SLOW_DOCKER}" ]] || ((SECONDS >= deadline)); do sleep 0.1; done
@@ -43,6 +45,31 @@ check "its labels allow what they list" multi_allowed
 check "and deny the rest" multi_denied
 check "none of its packets is taken for a spoofed source" no_source_events
 check "it isn't quarantined" not_quarantined
+flush_checks
+
+# The same for a container restarted, then recreated, while it runs: a restarted container
+# has new MACs on networks Portcullis still knows with the old ones, and a recreated one
+# the addresses of the container it replaces, which Docker reports gone only later.
+rm -f "${SLOW_DOCKER_ARM}"
+dc --profile late up -d --no-deps steady >/dev/null 2>&1
+steady_id="$(dc --profile late ps -q steady)"
+wait_managed "$(svc_ip steady one)" "$(svc_ip steady four)"
+touch "${SLOW_DOCKER_ARM}"
+: >"${SLOW_EVENTS}"
+restart_steady() { docker restart -t 1 "${steady_id}" >/dev/null 2>&1; }
+recreate_steady() { dc --profile late up -d --no-deps --force-recreate steady >/dev/null 2>&1; }
+# Each run ends with its denied probe.
+EVENT_SAVE="${SLOW_EVENTS}" EVENT_TIMEOUT=30 expect_event \
+  "event=connection verdict=denied reason=egress destination=198.51.100.4" \
+  restart_steady >/dev/null 2>&1
+EVENT_SAVE="${SLOW_EVENTS}" EVENT_TIMEOUT=30 expect_event \
+  "event=connection verdict=denied reason=egress destination=198.51.100.4" \
+  recreate_steady >/dev/null 2>&1
+rm -f "${SLOW_DOCKER_ARM}"
+steady_allowed() { docker logs "$(dc --profile late ps -q steady)" 2>&1 | grep '^allowed: ' | grep succeeded; }
+check "restarted and recreated: none of its packets is taken for a spoofed source" no_source_events
+check "restarted and recreated: it isn't quarantined" not_quarantined
+check "recreated: its labels allow what they list" steady_allowed
 flush_checks
 
 stop_portcullis
