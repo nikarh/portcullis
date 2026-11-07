@@ -7,11 +7,17 @@ node_b="$(in_svc node-b hostname)"
 mcast() {
   in_svc "$1" sh -c "printf ping | socat -t2 -T2 - UDP4-DATAGRAM:$2:$3,ip-multicast-loop=0" 2>&1
 }
+# The members may not have joined the group yet when their rules are in place: try a few
+# times. A denial fails every try.
 answered_by_b() {
-  local output
-  output="$(mcast "$@")"
-  printf '%s\n' "${output}"
-  grep -qx "${node_b}" <<<"${output}"
+  local output try
+  for try in 1 2 3; do
+    output="$(mcast "$@")"
+    printf '%s\n' "${output}"
+    grep -qx "${node_b}" <<<"${output}" && return 0
+    sleep "${try}"
+  done
+  return 1
 }
 check "allowed: a member reaches the others through its group and port" answered_by_b node-a 224.2.2.3 54327
 event "the group on another port is denied" "event=connection verdict=denied reason=icc container~node-a destination=224.2.2.3 destination_port=54328" \
