@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.4.0] - 2026-11-07
+
+### Fixes
+
+- Close ways around ICC, egress and quarantine found in a bug hunt (#14) by @nikarh in #14
+- Stop quarantining containers for their own traffic, and fix audit suggestions (#16) by @nikarh in #16
+- Don't mix up a restarted or recreated container with its previous run (#17) by @nikarh in #17
+
 ## [0.3.0] - 2026-11-06
 
 ### Features
@@ -237,6 +245,7 @@ All notable changes to this project are documented in this file. The format is b
 - Verifying signed releases, and how releasing works by @nikarh
 - Remove the crates.io badge; portcullis on crates.io is another project by @nikarh
 
+[0.4.0]: https://github.com/nikarh/portcullis/compare/v0.3.0..v0.4.0
 [0.3.0]: https://github.com/nikarh/portcullis/compare/v0.2.1..v0.3.0
 [0.2.1]: https://github.com/nikarh/portcullis/compare/v0.2.0..v0.2.1
 [0.2.0]: https://github.com/nikarh/portcullis/compare/v0.1.5..v0.2.0
