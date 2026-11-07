@@ -478,6 +478,7 @@ impl Applier {
         };
         self.report_port_problems(state, found.problems);
         state.set_ports(found.ports, found.absent);
+        state.set_stopping(found.stopping);
         let state = &*state;
         self.forget_reassigned_connections(state);
         let result = {

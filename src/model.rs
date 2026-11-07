@@ -496,6 +496,8 @@ pub struct RuntimeState {
     ports: HashMap<IpAddr, BridgePort>,
     /// Container addresses known to have no bridge port: their container can't send.
     portless: HashSet<IpAddr>,
+    /// Containers whose network namespace is gone: they are stopping.
+    stopping: HashSet<ContainerId>,
     /// Containers cut off from their networks, see `quarantine`, and whether they were
     /// stopped through Docker since.
     quarantined: HashMap<ContainerId, bool>,
@@ -527,7 +529,9 @@ pub enum RuntimeStateAction {
     /// A container found behind a bridge port before Docker reported it (see
     /// `discovery`): its attachment to that network, its namespace and its DNS servers
     /// replace those known; the rest of a known container stays as Docker reported it.
-    /// (Docker's create event, which comes first, has no DNS servers.)
+    /// (Docker's create event, which comes first, has no DNS servers.) Unless the
+    /// container was restarted: a new MAC on a network it was known on means its other
+    /// attachments, with their MACs, are of its previous run, and are dropped.
     DiscoverContainer {
         container: Box<Container>,
     },
@@ -565,6 +569,17 @@ impl RuntimeState {
             None if self.portless.contains(&address) => PortState::Absent,
             None => PortState::Unknown,
         }
+    }
+
+    /// Containers whose network namespace is gone: they are stopping, and their addresses
+    /// may already be another container's.
+    pub fn set_stopping(&mut self, stopping: HashSet<ContainerId>) {
+        self.stopping = stopping;
+    }
+
+    #[must_use]
+    pub fn is_stopping(&self, container: &ContainerId) -> bool {
+        self.stopping.contains(container)
     }
 
     pub fn set_ports(&mut self, ports: HashMap<IpAddr, BridgePort>, portless: HashSet<IpAddr>) {
@@ -682,6 +697,18 @@ impl RuntimeState {
                     return has_networks;
                 };
                 let before = known.clone();
+                let restarted = container.attachments.iter().any(|found| {
+                    known.attachments.iter().any(|attachment| {
+                        attachment.network_id == found.network_id
+                            && matches!(
+                                (attachment.mac_address, found.mac_address),
+                                (Some(known), Some(found)) if known != found
+                            )
+                    })
+                });
+                if restarted {
+                    known.attachments.clear();
+                }
                 for attachment in container.attachments {
                     known
                         .attachments
@@ -748,6 +775,51 @@ mod tests {
         assert_eq!(addresses, ["n0 172.18.0.2", "n1 172.19.0.9"]);
         // Nothing new.
         assert!(!state.apply_action(discovered(restarted)));
+    }
+
+    #[test]
+    fn a_restarted_container_drops_the_attachments_of_its_previous_run() {
+        let mac = |last: u8| Some(MacAddress::from([2, 0, 0, 0, 0, last]));
+        let with_mac = |network: &str, address: &str, last: u8| {
+            let mut container = container("a", network, address, "/run");
+            if let Some(attachment) = container.attachments.first_mut() {
+                attachment.mac_address = mac(last);
+            }
+            container
+        };
+        let mut state = RuntimeState::default();
+        let mut known = with_mac("n0", "172.18.0.2", 1);
+        known
+            .attachments
+            .extend(with_mac("n1", "172.19.0.2", 2).attachments);
+        state.apply_action(RuntimeStateAction::CreateContainer {
+            container: Box::new(known),
+        });
+        let discovered = |container| RuntimeStateAction::DiscoverContainer {
+            container: Box::new(container),
+        };
+        let attachments = |state: &RuntimeState| -> Vec<(String, Option<MacAddress>)> {
+            state
+                .containers()
+                .get("a")
+                .map(|a| {
+                    a.attachments
+                        .iter()
+                        .map(|attachment| {
+                            (attachment.network_id.to_string(), attachment.mac_address)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // The same MAC on n1: the same run, n0 stays.
+        assert!(!state.apply_action(discovered(with_mac("n1", "172.19.0.2", 2))));
+        assert_eq!(attachments(&state).len(), 2);
+        // A new MAC on n1: restarted. n0's MAC is of the previous run; n0 is found again
+        // from its own port, or reported by Docker.
+        assert!(state.apply_action(discovered(with_mac("n1", "172.19.0.2", 9))));
+        assert_eq!(attachments(&state), [("n1".to_string(), mac(9))]);
     }
 
     #[test]
