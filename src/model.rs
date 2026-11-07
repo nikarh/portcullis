@@ -498,6 +498,10 @@ pub struct RuntimeState {
     portless: HashSet<IpAddr>,
     /// Containers whose network namespace is gone: they are stopping.
     stopping: HashSet<ContainerId>,
+    /// Networks of restarted containers' previous runs, found gone from their ports before
+    /// Docker's events of the stop were handled: these events are of the previous run and
+    /// must not take the network from the new one. See `DiscoverContainer`.
+    previous_run: HashMap<ContainerId, Vec<NetworkId>>,
     /// Containers cut off from their networks, see `quarantine`, and whether they were
     /// stopped through Docker since.
     quarantined: HashMap<ContainerId, bool>,
@@ -531,7 +535,8 @@ pub enum RuntimeStateAction {
     /// replace those known; the rest of a known container stays as Docker reported it.
     /// (Docker's create event, which comes first, has no DNS servers.) Unless the
     /// container was restarted: a new MAC on a network it was known on means its other
-    /// attachments, with their MACs, are of its previous run, and are dropped.
+    /// attachments, with their MACs, are of its previous run, and are dropped; Docker's
+    /// disconnects of these networks that come after are of that run too, and ignored.
     DiscoverContainer {
         container: Box<Container>,
     },
@@ -651,9 +656,13 @@ impl RuntimeState {
             } => {
                 self.containers = containers;
                 self.networks = networks;
+                self.previous_run.clear();
                 true
             }
             RuntimeStateAction::CreateContainer { container } => {
+                // Docker reports all of a stop before anything of the next start: what it
+                // had to report of a previous run is handled by now.
+                self.previous_run.remove(&container.id);
                 let has_networks = !container.attachments.is_empty();
                 self.containers.insert(container.id.clone(), *container);
                 has_networks
@@ -670,6 +679,7 @@ impl RuntimeState {
             }
             RuntimeStateAction::RemoveContainer { container_id } => {
                 self.quarantined.remove(&container_id);
+                self.previous_run.remove(&container_id);
                 if let Some(container) = self.containers.remove(&container_id) {
                     return !container.attachments.is_empty();
                 }
@@ -679,6 +689,13 @@ impl RuntimeState {
                 container_id,
                 network_id,
             } => {
+                if let Some(networks) = self.previous_run.get_mut(&container_id)
+                    && let Some(index) = networks.iter().position(|n| *n == network_id)
+                {
+                    // The previous run left it; the attachment, if any, is the new run's.
+                    networks.swap_remove(index);
+                    return false;
+                }
                 if let Some(container) = self.containers.get_mut(&container_id) {
                     let len = container.attachments.len();
                     container.attachments.retain(|a| a.network_id != network_id);
@@ -707,7 +724,10 @@ impl RuntimeState {
                     })
                 });
                 if restarted {
-                    known.attachments.clear();
+                    // Docker's events of the stop may still be on their way: remember the
+                    // networks they are about.
+                    let networks = self.previous_run.entry(container.id.clone()).or_default();
+                    networks.extend(known.attachments.drain(..).map(|a| a.network_id));
                 }
                 for attachment in container.attachments {
                     known
@@ -820,6 +840,21 @@ mod tests {
         // from its own port, or reported by Docker.
         assert!(state.apply_action(discovered(with_mac("n1", "172.19.0.2", 9))));
         assert_eq!(attachments(&state), [("n1".to_string(), mac(9))]);
+
+        // Docker's events of the stop come late: they don't take n1 from the new run.
+        let disconnect = |network: &str| RuntimeStateAction::RemoveContainerAttachment {
+            container_id: "a".to_string().into(),
+            network_id: network.into(),
+        };
+        assert!(!state.apply_action(disconnect("n1")));
+        assert!(!state.apply_action(disconnect("n0")));
+        assert_eq!(attachments(&state), [("n1".to_string(), mac(9))]);
+        // The start's events come after them all; later disconnects are the new run's.
+        state.apply_action(RuntimeStateAction::CreateContainer {
+            container: Box::new(with_mac("n1", "172.19.0.2", 9)),
+        });
+        assert!(state.apply_action(disconnect("n1")));
+        assert_eq!(attachments(&state).len(), 0);
     }
 
     #[test]
