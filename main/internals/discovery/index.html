@@ -75,7 +75,7 @@
 <ol>
 <li>The kernel tells which bridge the port is on, and which network namespace the other end of the veth pair is in (rtnetlink).</li>
 <li>The container’s interface in that namespace has its MAC and address, as Docker set them up before the container’s process ran. Nothing is run inside the container.</li>
-<li>The container whose processes are in that namespace is found by its cgroup (<code dir="auto">docker-&lt;id&gt;.scope</code>). A container that uses another one’s network (<code dir="auto">network_mode: container:...</code>) isn’t the namespace’s owner and is skipped.</li>
+<li>The container whose processes are in that namespace is found by its cgroup (<code dir="auto">docker-&lt;id&gt;.scope</code>). Portcullis remembers which namespace each cgroup’s processes are in, so it only looks into the cgroups of containers that started since it last looked, however many containers run. A container that uses another one’s network (<code dir="auto">network_mode: container:...</code>) isn’t the namespace’s owner and is skipped.</li>
 <li>Its name and labels come from the files Docker keeps for it, <code dir="auto">config.v2.json</code> and <code dir="auto">hostconfig.json</code> under <code dir="auto">docker-root</code>.</li>
 </ol>
 <p>This takes a few milliseconds. Until the container’s process exists (its interface comes up a moment before), the packets stay held, and Portcullis looks again every 100 milliseconds. Docker’s own report of the container, when it comes, replaces what was found.</p>
