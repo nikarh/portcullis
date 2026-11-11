@@ -83,6 +83,9 @@ const SOURCE_HOLD_GRACE: Duration = Duration::from_secs(2);
 /// How soon a failed rule update is tried again; twice as long after each failure in a
 /// row, up to 64 times as long (about 5 minutes).
 const APPLY_RETRY: Duration = Duration::from_secs(5);
+/// At most this many of Docker's events go into one rule update, so that packets held for
+/// containers found without Docker don't wait behind a long stream of events.
+const DOCKER_EVENTS_PER_UPDATE: usize = 256;
 
 #[derive(Debug, Error)]
 enum MainError {
@@ -447,6 +450,49 @@ struct Applier {
     port_problems: HashSet<(ContainerId, rtnetlink::PortProblem)>,
     /// Updates that failed in a row: the rules are those of an earlier state.
     failures: u32,
+    saver: Saver,
+}
+
+/// Saves the rules of updates for the next start (see `NftablesFirewall::save`), in a
+/// thread of its own: writing all rules takes a while, and the main loop may have the next
+/// update to apply already. Of updates that come faster than that, the latest is saved.
+/// Dropping it waits for the last one to be saved.
+struct Saver {
+    plans: Option<Sender<Plan>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Saver {
+    fn spawn(firewall: Arc<NftablesFirewall>) -> Self {
+        let (plans, received) = unbounded::<Plan>();
+        let thread = thread::spawn(move || {
+            while let Ok(plan) = received.recv() {
+                let plan = received.try_iter().last().unwrap_or(plan);
+                if let Err(error) = firewall.save(&plan) {
+                    warn!(%error, "can't save the rules; the next start begins without them");
+                }
+            }
+        });
+        Self {
+            plans: Some(plans),
+            thread: Some(thread),
+        }
+    }
+
+    fn save(&self, plan: Plan) {
+        if let Some(plans) = &self.plans {
+            let _ = plans.send(plan);
+        }
+    }
+}
+
+impl Drop for Saver {
+    fn drop(&mut self) {
+        self.plans = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Of `current`, what `previous` didn't have; `previous` becomes `current`. What goes away
@@ -508,9 +554,7 @@ impl Applier {
                 self.source_hold.rules_applied();
                 let _ = self.refresh.send(());
                 info!("firewall rules applied");
-                if let Err(error) = self.firewall.save(&plan) {
-                    warn!(%error, "can't save the rules; the next start begins without them");
-                }
+                self.saver.save(plan);
                 Ok(())
             }
             Err(error) => {
@@ -838,6 +882,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         unobservable_reported: HashSet::new(),
         port_problems: HashSet::new(),
         failures: 0,
+        saver: Saver::spawn(Arc::clone(&firewall)),
     };
 
     let (terminate_tx, terminate_rx) = unbounded::<()>();
@@ -919,80 +964,26 @@ fn run(config: &Config) -> Result<(), MainError> {
                 let Ok(message) = message else {
                     break Ok(());
                 };
-                match message {
-                    DockerWorkerEvent::Event(event, mut fetched) => {
-                        trace!(event = ?event, "docker event received");
-                        if event.kind == DockerEventKind::Container
-                            && matches!(event.action, DockerEventAction::Kill | DockerEventAction::Stop)
-                        {
-                            runtime_state.stopped(&event.id.clone().into());
-                        }
-                        if event.kind == DockerEventKind::Container
-                            && event.action == DockerEventAction::Start
-                        {
-                            match std::mem::replace(&mut fetched, Fetched::Nothing) {
-                                Fetched::Container(inspect) => {
-                                    monitor.check_inspected(&runtime_state, &event.id, inspect);
-                                }
-                                _ => monitor.check_container(&runtime_state, &event.id),
-                            }
-                            publish_warnings(&mut monitor, &bus);
-                            // A restart through Docker starts it over from a clean state.
-                            if runtime_state.started(&event.id.clone().into()) {
-                                info!(container = %event.id, "quarantined container restarted; letting it back");
-                                if let Err(error) = applier.apply(&mut runtime_state) {
-                                    error!(%error, "firewall apply failed; continuing");
-                                }
-                            }
-                        }
-                        if !event.is_relevant_for_policy_refresh() {
-                            continue;
-                        }
-                        let update = monitor
-                            .resolve_fetched_event_action(&runtime_state, event, fetched)
-                            .map(|action| action.is_some_and(|value| runtime_state.apply_action(value)));
-                        managed_networks.update(&runtime_state);
-                        publish_warnings(&mut monitor, &bus);
-                        match update {
-                            Ok(false) => trace!("docker event produced no policy state changes"),
-                            Ok(true) => {
-                                if let Err(error) = applier.apply(&mut runtime_state) {
-                                    error!(%error, "firewall apply failed; continuing");
-                                }
-                            }
-                            Err(error) => error!(%error, "runtime state refresh failed; continuing"),
-                        }
-                    }
-                    DockerWorkerEvent::Reconnected => {
-                        info!("docker event stream reconnected; reinitializing monitor state");
-                        match DockerClient::connect(&config.docker_socket) {
-                            Ok(client) => {
-                                monitor = DockerMonitor::new(client)
-                                    .with_monitored_networks(config.monitor_networks.clone())
-                                    .with_policy_dir(config.policy_dir.clone());
-                                match monitor.initialize() {
-                                    Ok(mut state) => {
-                                        // Docker restarting doesn't let quarantined
-                                        // containers back.
-                                        state.keep_quarantine(&runtime_state);
-                                        runtime_state = state;
-                                        managed_networks.update(&runtime_state);
-                                        monitor.check_containers(&runtime_state);
-                                        publish_warnings(&mut monitor, &bus);
-                                        if let Err(error) = applier.apply(&mut runtime_state) {
-                                            error!(%error, "firewall apply failed after reconnect; continuing");
-                                        }
-                                    }
-                                    Err(error) => {
-                                        error!(%error, "monitor reinitialize failed after reconnect");
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                error!(%error, "docker client reconnect for monitor failed");
-                            }
-                        }
-                    }
+                // Docker sends a handful of events for every container that starts or goes,
+                // and many at once when a project starts or stops. Those that queued up
+                // while the last update was applied all go into the next one, rather than
+                // an update each: an update takes longer the more containers there are.
+                let mut changed = false;
+                for message in std::iter::once(message)
+                    .chain(docker_rx.try_iter())
+                    .take(DOCKER_EVENTS_PER_UPDATE)
+                {
+                    changed |= handle_docker_message(
+                        message,
+                        config,
+                        &mut monitor,
+                        &mut runtime_state,
+                        &managed_networks,
+                        &bus,
+                    );
+                }
+                if changed && let Err(error) = applier.apply(&mut runtime_state) {
+                    error!(%error, "firewall apply failed; continuing");
                 }
             }
         }
@@ -1000,10 +991,95 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let _ = docker_stop_tx.send(());
     let _ = docker_thread.join();
+    // The last update is saved before the rules may be removed, and the saved ones with them.
+    drop(applier);
     // A failure leaves the rules in place, whatever --on-exit says: Portcullis is about to
     // be started again.
     outcome?;
     shut_down(config, &firewall)
+}
+
+/// Take in a message of the thread reading Docker's events. Returns whether the rules have
+/// to be updated.
+fn handle_docker_message(
+    message: DockerWorkerEvent,
+    config: &Config,
+    monitor: &mut DockerMonitor<DockerClient>,
+    runtime_state: &mut RuntimeState,
+    managed_networks: &SharedNetworks,
+    bus: &EventBus,
+) -> bool {
+    match message {
+        DockerWorkerEvent::Event(event, mut fetched) => {
+            trace!(event = ?event, "docker event received");
+            if event.kind == DockerEventKind::Container
+                && matches!(
+                    event.action,
+                    DockerEventAction::Kill | DockerEventAction::Stop
+                )
+            {
+                runtime_state.stopped(&event.id.clone().into());
+            }
+            let mut changed = false;
+            if event.kind == DockerEventKind::Container && event.action == DockerEventAction::Start
+            {
+                match std::mem::replace(&mut fetched, Fetched::Nothing) {
+                    Fetched::Container(inspect) => {
+                        monitor.check_inspected(runtime_state, &event.id, inspect);
+                    }
+                    _ => monitor.check_container(runtime_state, &event.id),
+                }
+                publish_warnings(monitor, bus);
+                // A restart through Docker starts it over from a clean state.
+                if runtime_state.started(&event.id.clone().into()) {
+                    info!(container = %event.id, "quarantined container restarted; letting it back");
+                    changed = true;
+                }
+            }
+            if !event.is_relevant_for_policy_refresh() {
+                return changed;
+            }
+            let update = monitor
+                .resolve_fetched_event_action(runtime_state, event, fetched)
+                .map(|action| action.is_some_and(|value| runtime_state.apply_action(value)));
+            managed_networks.update(runtime_state);
+            publish_warnings(monitor, bus);
+            match update {
+                Ok(false) => trace!("docker event produced no policy state changes"),
+                Ok(true) => changed = true,
+                Err(error) => error!(%error, "runtime state refresh failed; continuing"),
+            }
+            changed
+        }
+        DockerWorkerEvent::Reconnected => {
+            info!("docker event stream reconnected; reinitializing monitor state");
+            let client = match DockerClient::connect(&config.docker_socket) {
+                Ok(client) => client,
+                Err(error) => {
+                    error!(%error, "docker client reconnect for monitor failed");
+                    return false;
+                }
+            };
+            *monitor = DockerMonitor::new(client)
+                .with_monitored_networks(config.monitor_networks.clone())
+                .with_policy_dir(config.policy_dir.clone());
+            match monitor.initialize() {
+                Ok(mut state) => {
+                    // Docker restarting doesn't let quarantined containers back.
+                    state.keep_quarantine(runtime_state);
+                    *runtime_state = state;
+                    managed_networks.update(runtime_state);
+                    monitor.check_containers(runtime_state);
+                    publish_warnings(monitor, bus);
+                    true
+                }
+                Err(error) => {
+                    error!(%error, "monitor reinitialize failed after reconnect");
+                    false
+                }
+            }
+        }
+    }
 }
 
 /// Why a thread Portcullis can't do without ended.

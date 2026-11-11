@@ -51,3 +51,12 @@ The `slow-docker` scenario starts a container on four enforced networks while a 
 The `monitor-start` scenario checks that Portcullis finds containers without Docker (see [Finding new containers](https://portcullis.arhipov.net/internals/discovery/)): Portcullis talks to Docker through a `socat` proxy, which the scenario pauses with SIGSTOP while containers start on a monitored and an enforced network. Their first connections must be reported with the container, and the enforced one's labels (read from Docker's files) must decide its traffic. It also checks, on the monitored network, that a veth on the bridge with no container behind it is let through after its hold and reported as an unknown source, that a spoofed address is reported with its sender, and that nothing is held while Portcullis is stopped.
 
 Probes (`tcp`, `udp`, `dns`, `resolve`, `ping_probe`, `from_outside`) run inside a container from `images/tester`, which also serves TCP 5432, 6379, 8080 and UDP 9000 for container-to-container checks. Every server answers with its address or hostname. The checks of a scenario run in parallel; a failed check prints the probe's output.
+
+## Load
+
+`stress.sh` measures Portcullis under load, in the VM with nothing else running: many containers on many networks (`STRESS_CONTAINERS`, default 500, on `STRESS_NETWORKS`, default 20), each with egress, ICC and hostname labels; the time from `docker run` to a container's rules; containers starting and going (`STRESS_CHURN_ROUNDS` rounds of `STRESS_CHURN_BATCH`); and floods of denied connections and DNS lookups from one container. After each phase it prints the number and duration of rule updates, Portcullis's CPU time and memory, and the size of its rules. `STRESS_PERF=1` records a `perf` profile of the updates.
+
+```bash
+e2e/vm.sh up && e2e/vm.sh sync
+e2e/vm.sh ssh sudo STRESS_CONTAINERS=1000 STRESS_NETWORKS=40 /home/debian/portcullis/e2e/stress.sh
+```
