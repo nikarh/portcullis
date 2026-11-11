@@ -1,0 +1,27 @@
+services:
+  # Its policy file is written by test.sh before it starts.
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    profiles: [late]
+    labels:
+      - portcullis.policy-file=pc-e2e-app
+      - portcullis.egress.web=ip:198.51.100.3,tcp:80
+  # Names a file that doesn't exist.
+  broken:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.policy-file=pc-e2e-missing
+      - portcullis.egress.web=ip:198.51.100.3,tcp:80
+  peer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true
