@@ -450,6 +450,49 @@ struct Applier {
     port_problems: HashSet<(ContainerId, rtnetlink::PortProblem)>,
     /// Updates that failed in a row: the rules are those of an earlier state.
     failures: u32,
+    saver: Saver,
+}
+
+/// Saves the rules of updates for the next start (see `NftablesFirewall::save`), in a
+/// thread of its own: writing all rules takes a while, and the main loop may have the next
+/// update to apply already. Of updates that come faster than that, the latest is saved.
+/// Dropping it waits for the last one to be saved.
+struct Saver {
+    plans: Option<Sender<Plan>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Saver {
+    fn spawn(firewall: Arc<NftablesFirewall>) -> Self {
+        let (plans, received) = unbounded::<Plan>();
+        let thread = thread::spawn(move || {
+            while let Ok(plan) = received.recv() {
+                let plan = received.try_iter().last().unwrap_or(plan);
+                if let Err(error) = firewall.save(&plan) {
+                    warn!(%error, "can't save the rules; the next start begins without them");
+                }
+            }
+        });
+        Self {
+            plans: Some(plans),
+            thread: Some(thread),
+        }
+    }
+
+    fn save(&self, plan: Plan) {
+        if let Some(plans) = &self.plans {
+            let _ = plans.send(plan);
+        }
+    }
+}
+
+impl Drop for Saver {
+    fn drop(&mut self) {
+        self.plans = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Of `current`, what `previous` didn't have; `previous` becomes `current`. What goes away
@@ -511,9 +554,7 @@ impl Applier {
                 self.source_hold.rules_applied();
                 let _ = self.refresh.send(());
                 info!("firewall rules applied");
-                if let Err(error) = self.firewall.save(&plan) {
-                    warn!(%error, "can't save the rules; the next start begins without them");
-                }
+                self.saver.save(plan);
                 Ok(())
             }
             Err(error) => {
@@ -841,6 +882,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         unobservable_reported: HashSet::new(),
         port_problems: HashSet::new(),
         failures: 0,
+        saver: Saver::spawn(Arc::clone(&firewall)),
     };
 
     let (terminate_tx, terminate_rx) = unbounded::<()>();
@@ -949,6 +991,8 @@ fn run(config: &Config) -> Result<(), MainError> {
 
     let _ = docker_stop_tx.send(());
     let _ = docker_thread.join();
+    // The last update is saved before the rules may be removed, and the saved ones with them.
+    drop(applier);
     // A failure leaves the rules in place, whatever --on-exit says: Portcullis is about to
     // be started again.
     outcome?;
