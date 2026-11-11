@@ -9,7 +9,7 @@ Docker reports a container that started through its events and API, which can ta
 
 1. The kernel tells which bridge the port is on, and which network namespace the other end of the veth pair is in (rtnetlink).
 2. The container's interface in that namespace has its MAC and address, as Docker set them up before the container's process ran. Nothing is run inside the container.
-3. The container whose processes are in that namespace is found by its cgroup (`docker-<id>.scope`). A container that uses another one's network (`network_mode: container:...`) isn't the namespace's owner and is skipped.
+3. The container whose processes are in that namespace is found by its cgroup (`docker-<id>.scope`). Portcullis remembers which namespace each cgroup's processes are in, so it only looks into the cgroups of containers that started since it last looked, however many containers run. A container that uses another one's network (`network_mode: container:...`) isn't the namespace's owner and is skipped.
 4. Its name and labels come from the files Docker keeps for it, `config.v2.json` and `hostconfig.json` under `docker-root`.
 
 This takes a few milliseconds. Until the container's process exists (its interface comes up a moment before), the packets stay held, and Portcullis looks again every 100 milliseconds. Docker's own report of the container, when it comes, replaces what was found.
