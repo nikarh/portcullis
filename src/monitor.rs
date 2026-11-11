@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use ipnet::IpNet;
@@ -12,11 +13,12 @@ use crate::docker::raw::{
 };
 use crate::docker::{DockerApi, DockerError, DockerEvent, DockerEventAction, DockerEventKind};
 use crate::events::{Warning, WarningKind};
-use crate::labels::{parse_acknowledged, parse_policy};
+use crate::labels::{POLICY_FILE_LABEL, is_policy_label, parse_acknowledged, parse_policy};
 use crate::model::{
     Container, ContainerId, ContainerPolicy, MacAddress, Network, NetworkAttachment, NetworkId,
     RuntimeState, RuntimeStateAction,
 };
+use crate::policy_file;
 
 #[derive(Debug, Error)]
 pub enum MonitorError {
@@ -31,21 +33,91 @@ pub enum MonitorError {
     MissingNetworkSubnet(String),
 }
 
-/// Policy from a container's labels. Invalid labels are logged, reported and skipped.
+/// Policy from a container's labels, and from the policy file in `policy_dir` its
+/// `portcullis.policy-file` label names. Invalid labels are logged, reported and skipped.
+/// A policy file that can't be used denies the container everything.
+///
+/// Values from the policy file are never logged or reported.
 pub fn policy_from_labels(
     container: &str,
     labels: &IndexMap<String, String>,
+    policy_dir: &Path,
     warnings: &mut Vec<Warning>,
 ) -> ContainerPolicy {
     let container = container.trim_start_matches('/');
-    let (policy, errors) = parse_policy(labels);
-    for error in errors {
-        error!(container, %error, "ignoring invalid portcullis label");
+    let invalid = |warnings: &mut Vec<Warning>, message: String| {
+        error!(container, "{message}");
         warnings.push(Warning {
             kind: WarningKind::InvalidLabel,
             container: Some(container.to_string()),
-            message: format!("ignoring invalid label: {error}"),
+            message,
         });
+    };
+    let Some(name) = labels.get(POLICY_FILE_LABEL) else {
+        let (policy, errors) = parse_policy(labels);
+        for error in errors {
+            invalid(warnings, format!("ignoring invalid label: {error}"));
+        }
+        return policy;
+    };
+    let entries = match policy_file::load(policy_dir, name) {
+        Ok(entries) => entries,
+        Err(error) => {
+            error!(container, %error, "denying everything to a container whose policy file can't be used");
+            warnings.push(Warning {
+                kind: WarningKind::PolicyFile,
+                container: Some(container.to_string()),
+                message: format!("denying everything: can't use its policy file: {error}"),
+            });
+            let mut policy = ContainerPolicy::deny_all();
+            policy.acknowledged = parse_acknowledged(labels).0;
+            return policy;
+        }
+    };
+
+    let mut merged = labels.clone();
+    let mut from_file = HashSet::new();
+    for entry in entries {
+        let line = entry.line;
+        if !is_policy_label(&entry.key) {
+            // Not a label to repeat: it may be a value written in the wrong place.
+            invalid(
+                warnings,
+                format!("ignoring line {line} of policy file {name}: not a container policy label"),
+            );
+            continue;
+        }
+        if !from_file.insert(entry.key.clone()) {
+            invalid(
+                warnings,
+                format!(
+                    "{} is set more than once in policy file {name}: line {line} is used",
+                    entry.key
+                ),
+            );
+        } else if merged.contains_key(&entry.key) {
+            invalid(
+                warnings,
+                format!(
+                    "{} is set both as a label and in policy file {name}: the file's value is used",
+                    entry.key
+                ),
+            );
+        }
+        merged.insert(entry.key, entry.value);
+    }
+
+    let (policy, errors) = parse_policy(&merged);
+    for error in errors {
+        let label = error.label();
+        if from_file.contains(label) {
+            invalid(
+                warnings,
+                format!("ignoring invalid {label} in policy file {name}"),
+            );
+        } else {
+            invalid(warnings, format!("ignoring invalid label: {error}"));
+        }
     }
     policy
 }
@@ -191,6 +263,8 @@ pub struct DockerMonitor<A> {
     api: A,
     /// Networks managed in monitor mode without a label, see `Config::monitor_networks`.
     monitored: Vec<String>,
+    /// Where the files of `portcullis.policy-file` labels are.
+    policy_dir: PathBuf,
     /// Configuration problems found since the last `take_warnings`.
     warnings: Vec<Warning>,
 }
@@ -199,12 +273,20 @@ impl<A> DockerMonitor<A>
 where
     A: DockerApi,
 {
-    pub const fn new(api: A) -> Self {
+    pub fn new(api: A) -> Self {
         Self {
             api,
             monitored: Vec::new(),
+            policy_dir: PathBuf::from(policy_file::DEFAULT_POLICY_DIR),
             warnings: Vec::new(),
         }
+    }
+
+    /// Read the files of `portcullis.policy-file` labels from `directory`.
+    #[must_use]
+    pub fn with_policy_dir(mut self, directory: PathBuf) -> Self {
+        self.policy_dir = directory;
+        self
     }
 
     /// Manage the networks named in `monitored` (`*` for all) in monitor mode, unless
@@ -264,8 +346,12 @@ where
         }
         let mut containers_by_id = HashMap::new();
         for summary in containers {
-            let mut container =
-                Self::build_container_from_summary(&networks_by_id, summary, &mut self.warnings);
+            let mut container = Self::build_container_from_summary(
+                &networks_by_id,
+                summary,
+                &self.policy_dir,
+                &mut self.warnings,
+            );
             // The container list doesn't include DNS settings; managed containers need them.
             if !container.attachments.is_empty() {
                 match self.api.inspect_container(&container.id) {
@@ -317,9 +403,11 @@ where
                 DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
                     container_id: event.id.into(),
                 })),
-                DockerEventAction::Create => {
-                    Ok(Self::create_container_action(event, &mut self.warnings))
-                }
+                DockerEventAction::Create => Ok(Self::create_container_action(
+                    event,
+                    &self.policy_dir,
+                    &mut self.warnings,
+                )),
                 DockerEventAction::Rename => {
                     let Some(name) = event.name else {
                         return Ok(None);
@@ -357,9 +445,11 @@ where
     fn build_container_from_inspect(
         state: &RuntimeState,
         inspect: DockerContainerInspect,
+        policy_dir: &Path,
         warnings: &mut Vec<Warning>,
     ) -> Result<Box<Container>, MonitorError> {
-        let policy = policy_from_labels(&inspect.name, &inspect.config.labels, warnings);
+        let policy =
+            policy_from_labels(&inspect.name, &inspect.config.labels, policy_dir, warnings);
         let runtime_dns_servers = runtime_dns_servers(inspect.host_config.as_ref());
 
         let mut attachments = Vec::new();
@@ -413,8 +503,12 @@ where
     ) -> Result<Option<RuntimeStateAction>, MonitorError> {
         match inspect {
             Ok(inspect) => {
-                let container =
-                    Self::build_container_from_inspect(state, inspect, &mut self.warnings)?;
+                let container = Self::build_container_from_inspect(
+                    state,
+                    inspect,
+                    &self.policy_dir,
+                    &mut self.warnings,
+                )?;
                 Ok(Some(RuntimeStateAction::CreateContainer { container }))
             }
             Err(error) => Err(error.into()),
@@ -423,11 +517,13 @@ where
 
     fn create_container_action(
         event: DockerEvent,
+        policy_dir: &Path,
         warnings: &mut Vec<Warning>,
     ) -> Option<RuntimeStateAction> {
         let policy = policy_from_labels(
             event.name.as_deref().unwrap_or(&event.id),
             &event.attributes,
+            policy_dir,
             warnings,
         );
 
@@ -524,10 +620,15 @@ where
     fn build_container_from_summary(
         managed_networks: &HashMap<NetworkId, Network>,
         summary: DockerContainerSummary,
+        policy_dir: &Path,
         warnings: &mut Vec<Warning>,
     ) -> Container {
-        let policy =
-            policy_from_labels(&container_summary_name(&summary), &summary.labels, warnings);
+        let policy = policy_from_labels(
+            &container_summary_name(&summary),
+            &summary.labels,
+            policy_dir,
+            warnings,
+        );
         let runtime_dns_servers = runtime_dns_servers(summary.host_config.as_ref());
 
         let mut attachments = Vec::new();
@@ -1452,5 +1553,174 @@ mod tests {
             panic!("expected create container action");
         };
         assert_eq!(container.policy.icc_mode, crate::model::IccMode::Deny);
+    }
+
+    mod policy_files {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+
+        use indexmap::IndexMap;
+
+        use super::super::*;
+        use crate::model::{DnsTarget, EgressTarget, IccMode};
+
+        const SECRET: &str = "192.0.2.10";
+
+        fn directory(test: &str, files: &[(&str, &str)]) -> PathBuf {
+            let path = std::env::temp_dir()
+                .join(format!("portcullis-monitor-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create directory");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("protect directory");
+            for (name, text) in files {
+                std::fs::write(path.join(name), text).expect("write file");
+                std::fs::set_permissions(path.join(name), std::fs::Permissions::from_mode(0o600))
+                    .expect("protect file");
+            }
+            path
+        }
+
+        fn labels(pairs: &[(&str, &str)]) -> IndexMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect()
+        }
+
+        fn assert_no_secret(warnings: &[Warning]) {
+            for warning in warnings {
+                assert!(!warning.message.contains(SECRET), "{}", warning.message);
+            }
+        }
+
+        #[test]
+        fn file_labels_add_to_container_labels() {
+            let directory = directory(
+                "merge",
+                &[(
+                    "vpn",
+                    "# the VPN endpoint\nportcullis.egress.vpn=ip:192.0.2.10,udp:51820\n",
+                )],
+            );
+            let mut warnings = Vec::new();
+            let policy = policy_from_labels(
+                "/vpn",
+                &labels(&[
+                    ("portcullis.policy-file", "vpn"),
+                    ("portcullis.egress.web", "host:example.com,tcp:443"),
+                    ("portcullis.icc.mode", "deny"),
+                ]),
+                &directory,
+                &mut warnings,
+            );
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(policy.icc_mode, IccMode::Deny);
+            assert_eq!(policy.egress.len(), 2);
+            assert!(
+                policy.egress.iter().any(|rule| rule.target
+                    == EgressTarget::IpCidr("192.0.2.10/32".parse().expect("cidr")))
+            );
+        }
+
+        #[test]
+        fn file_values_win_over_labels_and_later_lines_over_earlier() {
+            let directory = directory(
+                "override",
+                &[(
+                    "vpn",
+                    "portcullis.icc.mode=allow-listed\nportcullis.icc.mode=deny\n",
+                )],
+            );
+            let mut warnings = Vec::new();
+            let policy = policy_from_labels(
+                "vpn",
+                &labels(&[
+                    ("portcullis.policy-file", "vpn"),
+                    ("portcullis.icc.mode", "allow"),
+                ]),
+                &directory,
+                &mut warnings,
+            );
+            assert_eq!(policy.icc_mode, IccMode::Deny);
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|warning| warning.kind == WarningKind::InvalidLabel)
+            );
+        }
+
+        #[test]
+        fn invalid_file_values_are_reported_without_the_value() {
+            let directory = directory(
+                "invalid",
+                &[(
+                    "vpn",
+                    "portcullis.egress.vpn=ip:192.0.2.10,udp:x\n192.0.2.10=tcp:443\nportcullis.egress.ok=ip:198.51.100.1,tcp:443\n",
+                )],
+            );
+            let mut warnings = Vec::new();
+            let policy = policy_from_labels(
+                "vpn",
+                &labels(&[("portcullis.policy-file", "vpn")]),
+                &directory,
+                &mut warnings,
+            );
+            assert_eq!(policy.egress.len(), 1);
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            assert!(warnings[1].message.contains("portcullis.egress.vpn"));
+            assert_no_secret(&warnings);
+        }
+
+        #[test]
+        fn a_file_that_can_t_be_used_denies_everything() {
+            let directory = directory(
+                "broken",
+                &[("vpn", "portcullis.icc.mode=allow\n192.0.2.10\n")],
+            );
+            for name in ["missing", "vpn", "../vpn"] {
+                let mut warnings = Vec::new();
+                let policy = policy_from_labels(
+                    "vpn",
+                    &labels(&[
+                        ("portcullis.policy-file", name),
+                        ("portcullis.egress.web", "ip:*,*"),
+                        ("portcullis.ack", "privileged"),
+                    ]),
+                    &directory,
+                    &mut warnings,
+                );
+                assert_eq!(policy.icc_mode, IccMode::Deny, "{name}");
+                assert!(policy.egress.is_empty(), "{name}");
+                assert!(policy.icc_allow.is_empty(), "{name}");
+                assert_eq!(policy.dns_targets, Vec::<DnsTarget>::new(), "{name}");
+                assert_eq!(policy.domains, Some(Vec::new()), "{name}");
+                assert!(policy.acknowledged.contains(&WarningKind::Privileged));
+                assert_eq!(warnings.len(), 1, "{name}: {warnings:?}");
+                assert_eq!(warnings[0].kind, WarningKind::PolicyFile);
+                assert_no_secret(&warnings);
+            }
+        }
+
+        #[test]
+        fn a_file_can_t_name_another_file() {
+            let directory = directory(
+                "nested",
+                &[
+                    ("vpn", "portcullis.policy-file=other\n"),
+                    ("other", "portcullis.icc.mode=deny\n"),
+                ],
+            );
+            let mut warnings = Vec::new();
+            let policy = policy_from_labels(
+                "vpn",
+                &labels(&[("portcullis.policy-file", "vpn")]),
+                &directory,
+                &mut warnings,
+            );
+            assert_eq!(policy.icc_mode, IccMode::Allow);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+        }
     }
 }

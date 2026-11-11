@@ -343,6 +343,20 @@ pub enum ConnectionLimit {
     At(u32),
 }
 
+impl ContainerPolicy {
+    /// A policy that allows nothing: no other containers, no destinations, no DNS. For a
+    /// container whose policy can't be known.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            icc_mode: IccMode::Deny,
+            dns_targets: Vec::new(),
+            domains: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ContainerPolicy {
     fn default() -> Self {
         Self {

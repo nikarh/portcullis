@@ -16,6 +16,7 @@ SCENARIOS=(
   dns-labels
   published-port
   invalid-labels
+  policy-file
   restart
   spoofing
   bypass

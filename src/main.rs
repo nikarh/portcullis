@@ -21,6 +21,7 @@ mod monitor;
 mod nfnetlink;
 mod owners;
 mod pattern;
+mod policy_file;
 mod quarantine;
 mod rtnetlink;
 mod source_hold;
@@ -246,6 +247,8 @@ OPTIONS:
                                quarantined (default: 1000)
   --state-dir <path>           Where the rules are saved, to be put back first thing at
                                the next start (default: /var/lib/portcullis)
+  --policy-dir <path>          Where the files portcullis.policy-file labels name are
+                               (default: /etc/portcullis/policies)
   --on-exit <keep|remove>      Keep the firewall rules in place when stopping, or remove
                                them (default: keep; remove them later with
                                portcullis cleanup)
@@ -806,6 +809,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     let mut discovery = Discovery::new(
         config.docker_root.clone(),
         discovery::DEFAULT_CGROUP_ROOT.into(),
+        config.policy_dir.clone(),
     )
     .map_err(MainError::SourceHold)?;
 
@@ -963,7 +967,9 @@ fn run(config: &Config) -> Result<(), MainError> {
                         info!("docker event stream reconnected; reinitializing monitor state");
                         match DockerClient::connect(&config.docker_socket) {
                             Ok(client) => {
-                                monitor = DockerMonitor::new(client).with_monitored_networks(config.monitor_networks.clone());
+                                monitor = DockerMonitor::new(client)
+                                    .with_monitored_networks(config.monitor_networks.clone())
+                                    .with_policy_dir(config.policy_dir.clone());
                                 match monitor.initialize() {
                                     Ok(mut state) => {
                                         // Docker restarting doesn't let quarantined
@@ -1037,7 +1043,8 @@ fn wait_for_docker(
             .map_err(MonitorError::from)
             .and_then(|client| {
                 let mut monitor = DockerMonitor::new(client)
-                    .with_monitored_networks(config.monitor_networks.clone());
+                    .with_monitored_networks(config.monitor_networks.clone())
+                    .with_policy_dir(config.policy_dir.clone());
                 monitor.initialize().map(|state| (monitor, state, since))
             });
         match attempt {

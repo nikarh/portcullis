@@ -32,6 +32,7 @@ connection-limit = "none"
 | `--hostname-hold <duration>` | `3600` | How long an address of a `host:` rule stays allowed after DNS last returned it: seconds, or a number with `s`, `m`, `h` or `d`, from 10s to 7d. Containers can set their own with `portcullis.hostname-hold`. See [Hostname rules](/policy/hostnames/#how-long-an-address-stays-allowed). |
 | `--quarantine <isolate\|report\|off>` | `isolate` | What happens to a container that misbehaves, see [Quarantine](/policy/limits/#quarantine). |
 | `--quarantine-denials <n>` | `1000` | Denied connections per minute past which a container is quarantined. |
+| `--policy-dir <path>` | `/etc/portcullis/policies` | Where the files `portcullis.policy-file` labels name are, see [Policy files](/policy/files/#where-files-are). |
 | `--connection-limit <n\|none>` | `16384` | Open connections a container may have at a time, unless its labels say otherwise. At least 1. In the file, a number or `"none"`. See [Connection limits](/policy/limits/#connection-limits). |
 
 ## Events and alerts
@@ -78,6 +79,7 @@ log-level = "info"
 quarantine = "isolate"
 quarantine-denials = 1000
 connection-limit = 16384
+policy-dir = "/etc/portcullis/policies"
 docker-socket = "/var/run/docker.sock"
 docker-root = "/var/lib/docker"
 state-dir = "/var/lib/portcullis"

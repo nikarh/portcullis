@@ -46,3 +46,4 @@ sidebar:
 - Invalid labels are logged and ignored, and the rest of the container's labels still apply. Ignoring a label never opens anything up: an invalid `portcullis.icc.mode` counts as `deny`, invalid `portcullis.dns.*` labels leave the container with no DNS instead of the default, and an invalid `portcullis.enable` value on a network enforces it.
 - An enforced network without a usable subnet is logged and not enforced.
 - Docker labels can't be changed after a container or network is created: changing a policy means recreating the container, and changing `portcullis.enable` means recreating the network.
+- A changed [policy file](/policy/files/) applies to a running container only when it restarts; Portcullis doesn't watch the files. A file that can't be used denies its container everything, and its values are never reported, so a mistake in one shows up as a warning that names the label but not what is wrong with the value.

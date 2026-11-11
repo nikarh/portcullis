@@ -25,6 +25,25 @@ const QUARANTINE_LABEL: &str = "portcullis.quarantine";
 const HOSTNAME_HOLD_LABEL: &str = "portcullis.hostname-hold";
 /// Configuration warnings acknowledged for a container or network, comma-separated.
 pub const ACK_LABEL: &str = "portcullis.ack";
+/// A file in the policy directory with more of a container's policy labels, see
+/// `policy_file`.
+pub const POLICY_FILE_LABEL: &str = "portcullis.policy-file";
+
+/// Whether `key` is one of the labels of a container's policy, which a policy file may set.
+pub fn is_policy_label(key: &str) -> bool {
+    [EGRESS_PREFIX, ICC_ALLOW_PREFIX, DNS_PREFIX, DOMAINS_PREFIX]
+        .iter()
+        .any(|prefix| key.len() > prefix.len() && key.starts_with(prefix))
+        || [
+            ICC_MODE_LABEL,
+            CONNECTION_LIMIT_LABEL,
+            NEW_CONNECTIONS_LABEL,
+            QUARANTINE_LABEL,
+            HOSTNAME_HOLD_LABEL,
+            ACK_LABEL,
+        ]
+        .contains(&key)
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LabelParseError {
@@ -50,6 +69,25 @@ pub enum LabelParseError {
     InvalidValue(&'static str, String, &'static str),
     #[error("unknown warning in {ACK_LABEL}: {0} (expected one of {1})")]
     UnknownAcknowledgement(String, String),
+}
+
+impl LabelParseError {
+    /// The label the error is about.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::InvalidIccMode(_) => ICC_MODE_LABEL,
+            Self::InvalidEgress(key, _)
+            | Self::InvalidIccAllow(key, _)
+            | Self::InvalidCidr(key, _)
+            | Self::InvalidHostname(key, _, _)
+            | Self::InvalidContainerTarget(key, _)
+            | Self::InvalidPortSpec(key, _, _)
+            | Self::MissingPorts(key)
+            | Self::InvalidDnsTarget(key, _) => key,
+            Self::InvalidValue(label, _, _) => label,
+            Self::UnknownAcknowledgement(_, _) => ACK_LABEL,
+        }
+    }
 }
 
 /// The warnings a `portcullis.ack` label acknowledges. Unknown names are returned as errors.
@@ -467,6 +505,53 @@ mod tests {
                 EgressTarget::IpCidr("2001:db8::1/128".parse().expect("cidr")),
             ]
         );
+    }
+
+    #[test]
+    fn errors_name_their_label() {
+        let (_, errors) = parse_policy(&labels(&[
+            ("portcullis.icc.mode", "sometimes"),
+            ("portcullis.egress.vpn", "ip:not-an-ip,udp:51820"),
+            ("portcullis.quarantine", "maybe"),
+            ("portcullis.ack", "nothing"),
+        ]));
+        let named: Vec<_> = errors.iter().map(LabelParseError::label).collect();
+        assert_eq!(
+            named,
+            [
+                "portcullis.ack",
+                "portcullis.icc.mode",
+                "portcullis.egress.vpn",
+                "portcullis.quarantine"
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_labels_are_known() {
+        for key in [
+            "portcullis.egress.vpn",
+            "portcullis.icc.allow.db",
+            "portcullis.dns.0",
+            "portcullis.domains.0",
+            "portcullis.icc.mode",
+            "portcullis.limit.connections",
+            "portcullis.limit.new-connections",
+            "portcullis.quarantine",
+            "portcullis.hostname-hold",
+            "portcullis.ack",
+        ] {
+            assert!(is_policy_label(key), "{key}");
+        }
+        for key in [
+            "portcullis.egres.0",
+            "portcullis.egress.",
+            "portcullis.enable",
+            "portcullis.policy-file",
+            "egress.0",
+        ] {
+            assert!(!is_policy_label(key), "{key}");
+        }
     }
 
     #[test]

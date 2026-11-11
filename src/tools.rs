@@ -158,6 +158,7 @@ impl Report {
                     warning.kind,
                     WarningKind::DnsNotObservable
                         | WarningKind::InvalidLabel
+                        | WarningKind::PolicyFile
                         | WarningKind::InvalidNetwork
                 ) =>
             {
