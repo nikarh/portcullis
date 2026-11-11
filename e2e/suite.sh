@@ -61,6 +61,12 @@ setup() {
   log "setting up the outside network"
   "${E2E_DIR}/outside.sh" up || exit 1
 
+  # The kernel sends at most about six ICMP errors in a row to one address, then one a
+  # second. A batch of checks that are all rejected for the same container would lose
+  # rejections to that, and time out. Checks are about the rules, not the rate limit.
+  ICMP_RATELIMIT="$(sysctl -n net.ipv4.icmp_ratelimit)"
+  sysctl -qw net.ipv4.icmp_ratelimit=0
+
   # Hostname rules in lazy mode resolve on the Docker host.
   sed -i '/# portcullis-e2e$/d' /etc/hosts
   printf '198.51.100.3 api.test # portcullis-e2e\n198.51.100.4 other.test # portcullis-e2e\n' >>/etc/hosts
@@ -73,6 +79,8 @@ teardown() {
   stop_portcullis 2>/dev/null
   "${E2E_DIR}/outside.sh" down
   sed -i '/# portcullis-e2e$/d' /etc/hosts
+  [[ -n "${ICMP_RATELIMIT:-}" ]] && sysctl -qw "net.ipv4.icmp_ratelimit=${ICMP_RATELIMIT}"
+  return 0
 }
 
 # assert_cleaned_up <description>: neither table is left.

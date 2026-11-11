@@ -35,6 +35,7 @@ import argparse
 import ipaddress
 import random
 import sys
+import threading
 import time
 
 from scapy.all import (
@@ -231,9 +232,15 @@ def main():
                 iface=IFACE,
             )
 
-    sniffer = AsyncSniffer(iface=IFACE, prn=answer_arp, store=True, promisc=True)
+    # Send only once the sniffer's socket is open: an answer that comes back before it
+    # is would be missed, and the probe would report nothing.
+    listening = threading.Event()
+    sniffer = AsyncSniffer(
+        iface=IFACE, prn=answer_arp, store=True, promisc=True, started_callback=listening.set
+    )
     sniffer.start()
-    time.sleep(0.3)
+    if not listening.wait(10):
+        raise SystemExit("the sniffer did not start")
     sendp(frame(args, src, src_mac, to_mac, transport), iface=IFACE)
     time.sleep(args.wait)
     packets = sniffer.stop() or []

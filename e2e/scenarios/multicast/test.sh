@@ -7,17 +7,24 @@ node_b="$(in_svc node-b hostname)"
 mcast() {
   in_svc "$1" sh -c "printf ping | socat -t2 -T2 - UDP4-DATAGRAM:$2:$3,ip-multicast-loop=0" 2>&1
 }
-# The members may not have joined the group yet when their rules are in place: try a few
-# times. A denial fails every try.
-answered_by_b() {
-  local output try
-  for try in 1 2 3; do
-    output="$(mcast "$@")"
-    printf '%s\n' "${output}"
-    grep -qx "${node_b}" <<<"${output}" && return 0
-    sleep "${try}"
+# listening <service>: block until the member's discovery server is up: bound to UDP 54327
+# (D437 in /proc/net/udp) and in group 224.2.2.4 (040202E0 in /proc/net/igmp), which only
+# that server joins, together with 224.2.2.3. A container's rules can be in place before
+# its command has got that far.
+listening() {
+  in_svc "$1" sh -c 'for _ in $(seq 100); do
+    grep -q ":D437 " /proc/net/udp && grep -q 040202E0 /proc/net/igmp && exit 0
+    sleep 0.1
   done
-  return 1
+  echo "the discovery server did not start"
+  exit 1'
+}
+answered_by_b() {
+  listening node-a && listening node-b || return 1
+  local output
+  output="$(mcast "$@")"
+  printf '%s\n' "${output}"
+  grep -qx "${node_b}" <<<"${output}"
 }
 check "allowed: a member reaches the others through its group and port" answered_by_b node-a 224.2.2.3 54327
 event "the group on another port is denied" "event=connection verdict=denied reason=icc container~node-a destination=224.2.2.3 destination_port=54328" \
