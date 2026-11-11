@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Write as _};
 use std::fs;
@@ -31,7 +31,7 @@ const HOOK_PRIORITY: i32 = -1;
 /// hook) and traffic to the host itself (input hook), `bridge` sees traffic between containers on the same network, which a bridge
 /// switches without passing the IP hooks unless `br_netfilter` is loaded (prerouting hook:
 /// the bridge family only supports `reject` there).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Table {
     Inet,
     Bridge,
@@ -47,7 +47,7 @@ impl fmt::Display for Table {
 }
 
 /// A chain, displayed as `<family> <table> <chain>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Chain {
     /// The base chain of a table.
     Base(Table),
@@ -64,9 +64,9 @@ enum Chain {
     /// Denies (or in monitor mode, reports) ARP that isn't a plain request or reply, see
     /// `render_arp_check`.
     ArpCheck { monitor: bool },
-    /// Egress rules of the n-th source, in the inet table.
+    /// Egress rules of the source in the n-th slot (see `Slots`), in the inet table.
     Egress(usize),
-    /// ICC rules of the n-th source, in the bridge table.
+    /// ICC rules of the source in the n-th slot, in the bridge table.
     Icc(usize),
 }
 
@@ -248,6 +248,11 @@ struct Installed {
     sets: BTreeSet<String>,
     /// The container of each managed address.
     sources: BTreeMap<IpAddr, ContainerName>,
+    /// The slot of each managed address, which numbers its chains.
+    slots: Slots,
+    /// The rules of each source's chain, as written. A chain whose rules stay the same
+    /// isn't written again.
+    rules: HashMap<Chain, String>,
     /// Found in place at the start, rather than installed by this run.
     found: bool,
     /// Left in place by a previous run that stopped, rather than put back from the saved
@@ -465,8 +470,10 @@ where
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut script = String::with_capacity(plan.rule_count() * 96);
+        // Takes the rules of the installed chains out of `installed`: should the update fail,
+        // the next one writes every chain again.
         let now_installed =
-            render_apply_script(&plan, self.options, installed.as_ref(), &mut script)?;
+            render_apply_script(&plan, self.options, installed.as_mut(), &mut script)?;
         before(&plan);
         let now_installed = match self.runner.run_script(script) {
             Ok(()) => now_installed,
@@ -772,16 +779,18 @@ const LOG_FULL_RATE: &str = "10/second";
 fn render_apply_script(
     plan: &Plan,
     options: Options,
-    previous: Option<&Installed>,
+    previous: Option<&mut Installed>,
     out: &mut String,
 ) -> Result<Installed, fmt::Error> {
     let empty = Installed::default();
-    let previous = if let Some(previous) = previous {
-        previous
+    let (previous, mut previous_rules) = if let Some(previous) = previous {
+        let rules = std::mem::take(&mut previous.rules);
+        (&*previous, rules)
     } else {
         render_table_reset(out)?;
-        &empty
+        (&empty, HashMap::new())
     };
+    let slots = Slots::assign(plan, &previous.slots);
     // Flows are remembered by address: when an address goes to another container, or to
     // none, its flows must be reported again.
     let sources: BTreeMap<IpAddr, ContainerName> = plan
@@ -815,14 +824,38 @@ fn render_apply_script(
         }
     }
 
-    let mut installed = render_objects(out, plan, options, previous)?;
+    let mut installed = render_objects(out, plan, options, previous, &slots)?;
     installed.sources = sources;
-    let ipv4_sources = || {
-        plan.sources
-            .iter()
-            .enumerate()
-            .filter(|(_, source)| source.address.is_ipv4())
-    };
+
+    // The chains of each source, before the maps that lead to them are filled. Only those
+    // whose rules changed are written.
+    let mut rules = String::new();
+    for source in &plan.sources {
+        let chain = Chain::Egress(slots.of(source));
+        rules.clear();
+        render_related(&mut rules, chain, source.address)?;
+        for rule in plan.egress_rules(source) {
+            render_rule(plan, source, chain, rule, options, &mut rules)?;
+        }
+        decide(
+            &mut rules,
+            format_args!("add rule {chain}"),
+            Outcome::deny(options, source.monitor, "egress")
+                .for_address(source.address)
+                .original(),
+        )?;
+        render_chain(out, chain, &rules, &mut previous_rules, &mut installed)?;
+        if source.address.is_ipv4() && icc_chain_needed(plan, source, options) {
+            let chain = Chain::Icc(slots.of(source));
+            rules.clear();
+            writeln!(rules, "add rule {chain} ct state established accept")?;
+            render_related(&mut rules, chain, source.address)?;
+            for rule in plan.icc_rules(source) {
+                render_rule(plan, source, chain, rule, options, &mut rules)?;
+            }
+            render_chain(out, chain, &rules, &mut previous_rules, &mut installed)?;
+        }
+    }
 
     // Routed traffic.
     let base = Chain::Base(Table::Inet);
@@ -854,21 +887,7 @@ fn render_apply_script(
     // ports through Docker's userland proxy) leaves the container's network as much as
     // routed traffic does, and follows the same rules.
     for base in [base, Chain::Input] {
-        render_egress_dispatch(out, plan, options, base)?;
-    }
-    for (index, source) in plan.sources.iter().enumerate() {
-        let chain = Chain::Egress(index);
-        render_related(out, chain, source.address)?;
-        for rule in plan.egress_rules(source) {
-            render_rule(plan, source, chain, rule, options, out)?;
-        }
-        decide(
-            out,
-            format_args!("add rule {chain}"),
-            Outcome::deny(options, source.monitor, "egress")
-                .for_address(source.address)
-                .original(),
-        )?;
+        render_egress_dispatch(out, plan, options, base, &slots)?;
     }
 
     // Everything entering a managed network's bridge from a container: source checks and
@@ -876,21 +895,68 @@ fn render_apply_script(
     // once its source checks out, in the ICC chains: a container could otherwise send with
     // another container's address into that container's connections.
     if !plan.bridges.is_empty() {
-        render_bridge_dispatch(out, plan, options)?;
+        render_bridge_dispatch(out, plan, options, &slots)?;
         render_link_local(out, plan, options)?;
         render_bridged_destinations(out, plan, options)?;
     }
-    for (index, source) in ipv4_sources() {
-        if icc_chain_needed(plan, source, options) {
-            let chain = Chain::Icc(index);
-            writeln!(out, "add rule {chain} ct state established accept")?;
-            render_related(out, chain, source.address)?;
-            for rule in plan.icc_rules(source) {
-                render_rule(plan, source, chain, rule, options, out)?;
+    installed.slots = slots;
+    Ok(installed)
+}
+
+/// Write `chain` with `rules`, unless it holds them already (`previous`, which it is taken
+/// out of). Either way `installed` then has it.
+fn render_chain(
+    out: &mut String,
+    chain: Chain,
+    rules: &str,
+    previous: &mut HashMap<Chain, String>,
+    installed: &mut Installed,
+) -> fmt::Result {
+    let written = match previous.remove(&chain) {
+        Some(written) if written == rules => written,
+        _ => {
+            writeln!(out, "add chain {chain}")?;
+            writeln!(out, "flush chain {chain}")?;
+            out.push_str(rules);
+            rules.to_owned()
+        }
+    };
+    installed.rules.insert(chain, written);
+    Ok(())
+}
+
+/// Which slot each source's chains are numbered by. A source keeps its slot from one
+/// update to the next, so that its chains keep their names, and only those whose rules
+/// changed are written again; a new source takes the lowest free slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Slots(BTreeMap<IpAddr, usize>);
+
+impl Slots {
+    fn assign(plan: &Plan, previous: &Self) -> Self {
+        let mut slots = BTreeMap::new();
+        let mut taken = BTreeSet::new();
+        for source in &plan.sources {
+            if let Some(&slot) = previous.0.get(&source.address)
+                && taken.insert(slot)
+            {
+                slots.insert(source.address, slot);
             }
         }
+        let mut free = (0..).filter(|slot| !taken.contains(slot));
+        for source in &plan.sources {
+            if !slots.contains_key(&source.address)
+                && let Some(slot) = free.next()
+            {
+                slots.insert(source.address, slot);
+            }
+        }
+        Self(slots)
     }
-    Ok(installed)
+
+    /// The slot of a source of the plan the slots were assigned for.
+    fn of(&self, source: &Source) -> usize {
+        self.0.get(&source.address).copied().unwrap_or_default()
+    }
 }
 
 /// Send traffic from containers through their egress chains, from `base`.
@@ -899,6 +965,7 @@ fn render_egress_dispatch(
     plan: &Plan,
     options: Options,
     base: Chain,
+    slots: &Slots,
 ) -> fmt::Result {
     render_link_local_ip(out, plan, options, base)?;
     render_dns_names(out, plan, options, base)?;
@@ -916,9 +983,13 @@ fn render_egress_dispatch(
         let mut entries = plan
             .sources
             .iter()
-            .enumerate()
-            .filter(|(_, source)| is_family(&source.address))
-            .map(|(index, source)| Dispatch(source.address, Verdict::Goto(Chain::Egress(index))))
+            .filter(|source| is_family(&source.address))
+            .map(|source| {
+                Dispatch(
+                    source.address,
+                    Verdict::Goto(Chain::Egress(slots.of(source))),
+                )
+            })
             .peekable();
         if entries.peek().is_none() {
             continue;
@@ -1014,26 +1085,18 @@ fn render_objects(
     plan: &Plan,
     options: Options,
     previous: &Installed,
+    slots: &Slots,
 ) -> Result<Installed, fmt::Error> {
     let mut installed = Installed::default();
-    // Containers are only managed by their IPv4 address on the bridge; see the IPv6
-    // limitation.
-    let ipv4_sources = || {
-        plan.sources
-            .iter()
-            .enumerate()
-            .filter(|(_, source)| source.address.is_ipv4())
-    };
-    let chains = plan
-        .sources
-        .iter()
-        .enumerate()
-        .map(|(index, _)| Chain::Egress(index))
-        .chain(
-            ipv4_sources()
-                .filter(|(_, source)| icc_chain_needed(plan, source, options))
-                .map(|(index, _)| Chain::Icc(index)),
-        );
+    // Written by `render_chain`, if their rules changed. Containers are only managed by
+    // their IPv4 address on the bridge; see the IPv6 limitation.
+    for source in &plan.sources {
+        let slot = slots.of(source);
+        installed.chains.insert(Chain::Egress(slot).to_string());
+        if source.address.is_ipv4() && icc_chain_needed(plan, source, options) {
+            installed.chains.insert(Chain::Icc(slot).to_string());
+        }
+    }
     let limited = (!plan.bridges.is_empty())
         .then_some([false, true])
         .into_iter()
@@ -1044,7 +1107,7 @@ fn render_objects(
         .into_iter()
         .flatten()
         .map(|monitor| Chain::ArpCheck { monitor });
-    for chain in chains.chain(limited).chain(arp_checks) {
+    for chain in limited.chain(arp_checks) {
         writeln!(out, "add chain {chain}")?;
         writeln!(out, "flush chain {chain}")?;
         installed.chains.insert(chain.to_string());
@@ -1127,7 +1190,12 @@ fn render_base_chain(out: &mut String, chain: Chain, hook: &str) -> fmt::Result 
 /// VLAN-tagged ones, are never accepted on enforced bridges: the receiving container's
 /// kernel could unwrap a VLAN tag (even VLAN ID 0) past every check here, and Portcullis
 /// doesn't manage IPv6.
-fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+fn render_bridge_dispatch(
+    out: &mut String,
+    plan: &Plan,
+    options: Options,
+    slots: &Slots,
+) -> fmt::Result {
     let base = Chain::Base(Table::Bridge);
     writeln!(
         out,
@@ -1136,7 +1204,7 @@ fn render_bridge_dispatch(out: &mut String, plan: &Plan, options: Options) -> fm
     )?;
     render_limits(out, plan, options)?;
     render_arp_check(out, plan, options)?;
-    render_known_sources(out, plan, options, base)?;
+    render_known_sources(out, plan, options, base, slots)?;
     for monitor in [true, false] {
         if !plan.bridges.iter().any(|bridge| bridge.monitor == monitor) {
             continue;
@@ -1541,10 +1609,11 @@ fn render_known_sources(
     plan: &Plan,
     options: Options,
     base: Chain,
+    slots: &Slots,
 ) -> fmt::Result {
-    let verdict = |index: usize, source: &Source| {
+    let verdict = |source: &Source| {
         if icc_chain_needed(plan, source, options) {
-            Verdict::Goto(Chain::Icc(index))
+            Verdict::Goto(Chain::Icc(slots.of(source)))
         } else {
             Verdict::Accept
         }
@@ -1552,9 +1621,8 @@ fn render_known_sources(
     let keys = || {
         plan.sources
             .iter()
-            .enumerate()
-            .filter(|(_, source)| source.address.is_ipv4())
-            .filter_map(|(index, source)| Some((index, source, SourceKey::of(source)?)))
+            .filter(|source| source.address.is_ipv4())
+            .filter_map(|source| Some((source, SourceKey::of(source)?)))
     };
     // A raw socket is enough to send with another container's address and MAC, but not
     // from its port.
@@ -1563,10 +1631,10 @@ fn render_known_sources(
         base,
         "iifname . ip saddr . ether saddr",
         NamedSet::SourcesByPort,
-        keys().filter_map(|(index, source, key)| match key {
+        keys().filter_map(|(source, key)| match key {
             SourceKey::Port(port, mac, address) => Some(Dispatch(
                 fmt::from_fn(move |f| write!(f, "{} . {address} . {mac}", Quoted(port))),
-                verdict(index, source),
+                verdict(source),
             )),
             _ => None,
         }),
@@ -1576,10 +1644,10 @@ fn render_known_sources(
         base,
         "ip saddr . ether saddr",
         NamedSet::SourcesByMac,
-        keys().filter_map(|(index, source, key)| match key {
+        keys().filter_map(|(source, key)| match key {
             SourceKey::Mac(mac, address) => Some(Dispatch(
                 fmt::from_fn(move |f| write!(f, "{address} . {mac}")),
-                verdict(index, source),
+                verdict(source),
             )),
             _ => None,
         }),
@@ -1589,8 +1657,8 @@ fn render_known_sources(
         base,
         "ip saddr",
         NamedSet::SourcesByAddress,
-        keys().filter_map(|(index, source, key)| match key {
-            SourceKey::Address(address) => Some(Dispatch(address, verdict(index, source))),
+        keys().filter_map(|(source, key)| match key {
+            SourceKey::Address(address) => Some(Dispatch(address, verdict(source))),
             _ => None,
         }),
     )?;
@@ -1603,7 +1671,7 @@ fn render_known_sources(
         "iifname . ether saddr . arp saddr ether . arp saddr ip",
         NamedSet::ArpByPort,
         keys()
-            .flat_map(|(_, _, key)| match key {
+            .flat_map(|(_, key)| match key {
                 SourceKey::Port(port, mac, address) => [address, unspecified].map(|address| {
                     Some(fmt::from_fn(move |f| {
                         write!(f, "{} . {mac} . {mac} . {address}", Quoted(port))
@@ -1619,7 +1687,7 @@ fn render_known_sources(
         "ether saddr . arp saddr ether . arp saddr ip",
         NamedSet::ArpByMac,
         keys()
-            .flat_map(|(_, _, key)| match key {
+            .flat_map(|(_, key)| match key {
                 SourceKey::Mac(mac, address) => [address, unspecified].map(|address| {
                     Some(fmt::from_fn(move |f| {
                         write!(f, "{mac} . {mac} . {address}")
@@ -1634,7 +1702,7 @@ fn render_known_sources(
         base,
         "arp saddr ip",
         NamedSet::ArpByAddress,
-        keys().filter_map(|(_, _, key)| match key {
+        keys().filter_map(|(_, key)| match key {
             SourceKey::Address(address) => Some(address),
             _ => None,
         }),
@@ -2556,7 +2624,7 @@ mod tests {
             monitor_all,
         );
         let mut script = String::new();
-        render_apply_script(&plan, options, Some(&Installed::default()), &mut script)
+        render_apply_script(&plan, options, Some(&mut Installed::default()), &mut script)
             .expect("script should render");
         script
     }
@@ -2721,10 +2789,6 @@ add set bridge portcullis arp_by_mac { type ether_addr . ether_addr . ipv4_addr;
 flush set bridge portcullis arp_by_mac
 add set bridge portcullis arp_by_address { type ipv4_addr; }
 flush set bridge portcullis arp_by_address
-add chain inet portcullis egress0
-flush chain inet portcullis egress0
-add chain bridge portcullis icc0
-flush chain bridge portcullis icc0
 add chain bridge portcullis limit_open
 flush chain bridge portcullis limit_open
 ";
@@ -2938,6 +3002,140 @@ flush chain bridge portcullis limit_open
             .find(|name| name.contains("pc_h4_"))
             .expect("host set");
         assert!(third.contains(&format!("delete set {set}\n")), "{third}");
+    }
+
+    #[test]
+    fn writes_only_the_chains_whose_rules_changed() {
+        use crate::model::{IccMode, RuntimeStateAction};
+
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
+        let mut resolver = MockResolver::default();
+        let mut state = RuntimeState::default();
+        test_support::add_network(&mut state, "net", "172.18.0.0/16", "172.18.0.1");
+        let add = |state: &mut RuntimeState, name: &str, address: &str| {
+            test_support::add_container(
+                state,
+                name,
+                name,
+                &[("net", address, &[])],
+                test_support::policy(IccMode::Deny, vec![test_support::host_egress()]),
+            );
+        };
+        add(&mut state, "a", "172.18.0.2");
+        add(&mut state, "b", "172.18.0.3");
+        let mut apply = |state: &RuntimeState| {
+            firewall
+                .apply(state, &mut resolver, &[], false)
+                .expect("apply");
+        };
+        apply(&state);
+        add(&mut state, "c", "172.18.0.4");
+        apply(&state);
+        state.apply_action(RuntimeStateAction::RemoveContainer {
+            container_id: "a".to_string().into(),
+        });
+        apply(&state);
+        apply(&state);
+        add(&mut state, "d", "172.18.0.5");
+        apply(&state);
+
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        let [first, added, removed, unchanged, reused] = scripts.as_slice() else {
+            panic!("expected five scripts");
+        };
+        let written = |script: &str, chain: &str| {
+            script.contains(&format!("add chain {chain}\nflush chain {chain}\n"))
+        };
+        // The slot of each of the first two containers, which come in no particular order.
+        let (a, b) = if first.contains("172.18.0.2 : goto egress0") {
+            (0, 1)
+        } else {
+            (1, 0)
+        };
+        // A new container gets chains of its own; the others keep theirs, untouched.
+        assert!(written(added, "inet portcullis egress2"), "{added}");
+        assert!(written(added, "bridge portcullis icc2"), "{added}");
+        assert!(
+            added.contains(&format!("172.18.0.2 : goto egress{a}")),
+            "{added}"
+        );
+        assert!(
+            added.contains(&format!("172.18.0.3 : goto egress{b}")),
+            "{added}"
+        );
+        assert!(added.contains("172.18.0.4 : goto egress2"), "{added}");
+        for chain in ["egress0", "egress1", "icc0", "icc1"] {
+            assert!(!added.contains(&format!("portcullis {chain}\n")), "{added}");
+        }
+        // A removed container's chains go.
+        assert!(
+            removed.contains(&format!(
+                "flush chain inet portcullis egress{a}\ndelete chain inet portcullis egress{a}\n"
+            )),
+            "{removed}"
+        );
+        assert!(
+            removed.contains(&format!("172.18.0.3 : goto egress{b}")),
+            "{removed}"
+        );
+        assert!(
+            !removed.contains(&format!("flush chain inet portcullis egress{b}")),
+            "{removed}"
+        );
+        // Nothing changed: no container's chain is written.
+        assert!(
+            !unchanged.contains("chain inet portcullis egress"),
+            "{unchanged}"
+        );
+        assert!(
+            !unchanged.contains("chain bridge portcullis icc"),
+            "{unchanged}"
+        );
+        assert!(
+            unchanged.contains("172.18.0.4 : goto egress2"),
+            "{unchanged}"
+        );
+        // The next container takes the free slot.
+        assert!(
+            written(reused, &format!("inet portcullis egress{a}")),
+            "{reused}"
+        );
+        assert!(
+            reused.contains(&format!("172.18.0.5 : goto egress{a}")),
+            "{reused}"
+        );
+        assert!(
+            reused.contains(&format!(
+                "add rule inet portcullis egress{a} ct state related ct original ip saddr 172.18.0.5 accept"
+            )),
+            "{reused}"
+        );
+    }
+
+    #[test]
+    fn writes_every_chain_again_after_a_failed_update() {
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
+        let mut resolver = MockResolver::default();
+        let state = test_support::icc_state();
+        firewall
+            .apply(&state, &mut resolver, &[], false)
+            .expect("apply");
+        *firewall.runner.failing.lock().expect("lock") = Some("add table".to_string());
+        firewall
+            .apply(&state, &mut resolver, &[], false)
+            .expect_err("failed apply");
+        *firewall.runner.failing.lock().expect("lock") = None;
+        firewall
+            .apply(&state, &mut resolver, &[], false)
+            .expect("apply");
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        let last = scripts.last().expect("script");
+        assert!(
+            last.contains(
+                "add chain inet portcullis egress0\nflush chain inet portcullis egress0\n"
+            ),
+            "{last}"
+        );
     }
 
     #[test]
