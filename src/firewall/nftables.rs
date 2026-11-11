@@ -14,8 +14,8 @@ use tracing::{info, trace, warn};
 
 use super::FirewallError;
 use super::plan::{
-    DNS_PORT, Destination, HostSet, ICC_BROADCAST_V4, PRIVATE_V4, PRIVATE_V6, Plan, Rule,
-    SET_PREFIX_V4, SET_PREFIX_V6, Source,
+    DNS_PORT, Destination, HostSet, HostSetId, ICC_BROADCAST_V4, PRIVATE_V4, PRIVATE_V6, Plan,
+    Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
 };
 use crate::dns::{HostResolver, MAX_ADDRESSES_PER_HOST};
 use crate::model::{
@@ -301,9 +301,9 @@ impl Installed {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Written {
-    /// The rules of each source's chain. A chain whose rules stay the same isn't written
-    /// again.
-    rules: HashMap<Chain, String>,
+    /// What each source's chain was written from. A chain written from the same isn't
+    /// written again.
+    rules: HashMap<Chain, ChainInputs>,
     /// The elements of each named set, one per line, so that only elements that changed
     /// are added and deleted. `None` when the sets may hold others: found in place at the
     /// start, or after an update failed.
@@ -916,43 +916,126 @@ fn render_apply_script(
 }
 
 /// The chains of each source, before the maps that lead to them are filled. Only those
-/// whose rules changed are written.
+/// whose rules changed are written: whether they did is told from what the rules are
+/// written from ([`ChainInputs`]), without writing them.
 fn render_source_chains(
     out: &mut String,
     plan: &Plan,
     options: Options,
     slots: &Slots,
-    previous_rules: &mut HashMap<Chain, String>,
+    previous: &mut HashMap<Chain, ChainInputs>,
     installed: &mut Installed,
 ) -> fmt::Result {
-    let mut rules = String::new();
     for source in &plan.sources {
         let chain = Chain::Egress(slots.of(source));
-        rules.clear();
-        render_related(&mut rules, chain, source.address)?;
-        for rule in plan.egress_rules(source) {
-            render_rule(plan, source, chain, rule, options, &mut rules)?;
+        let rules = plan.egress_rules(source);
+        let written = Written::chain(plan, source, chain, rules, previous, installed);
+        if !written {
+            begin_chain(out, chain)?;
+            render_related(out, chain, source.address)?;
+            for rule in rules {
+                render_rule(plan, source, chain, rule, options, out)?;
+            }
+            decide(
+                out,
+                format_args!("add rule {chain}"),
+                Outcome::deny(options, source.monitor, "egress")
+                    .for_address(source.address)
+                    .original(),
+            )?;
         }
-        decide(
-            &mut rules,
-            format_args!("add rule {chain}"),
-            Outcome::deny(options, source.monitor, "egress")
-                .for_address(source.address)
-                .original(),
-        )?;
-        render_chain(out, chain, &rules, previous_rules, installed)?;
         if source.address.is_ipv4() && icc_chain_needed(plan, source, options) {
             let chain = Chain::Icc(slots.of(source));
-            rules.clear();
-            writeln!(rules, "add rule {chain} ct state established accept")?;
-            render_related(&mut rules, chain, source.address)?;
-            for rule in plan.icc_rules(source) {
-                render_rule(plan, source, chain, rule, options, &mut rules)?;
+            let rules = plan.icc_rules(source);
+            if !Written::chain(plan, source, chain, rules, previous, installed) {
+                begin_chain(out, chain)?;
+                writeln!(out, "add rule {chain} ct state established accept")?;
+                render_related(out, chain, source.address)?;
+                for rule in rules {
+                    render_rule(plan, source, chain, rule, options, out)?;
+                }
             }
-            render_chain(out, chain, &rules, previous_rules, installed)?;
         }
     }
     Ok(())
+}
+
+/// Create `chain` if it isn't there, and empty it.
+fn begin_chain(out: &mut String, chain: Chain) -> fmt::Result {
+    writeln!(out, "add chain {chain}")?;
+    writeln!(out, "flush chain {chain}")
+}
+
+/// What the rules of a source's chain are written from, besides the chain itself and the
+/// options, which stay the same: the source's address and mode, and its rules, with
+/// hostname sets by their IDs (the plan's indexes of them change from one update to the
+/// next).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainInputs {
+    address: IpAddr,
+    monitor: bool,
+    rules: Vec<(Rule, Option<HostSetId>)>,
+}
+
+impl ChainInputs {
+    fn of(plan: &Plan, source: &Source, rules: &[Rule]) -> Self {
+        Self {
+            address: source.address,
+            monitor: source.monitor,
+            rules: rules.iter().map(|rule| rule_input(plan, *rule)).collect(),
+        }
+    }
+
+    /// Whether the chain of `source` with `rules` is written from these.
+    fn are(&self, plan: &Plan, source: &Source, rules: &[Rule]) -> bool {
+        self.address == source.address
+            && self.monitor == source.monitor
+            && self.rules.len() == rules.len()
+            && self
+                .rules
+                .iter()
+                .zip(rules)
+                .all(|(input, rule)| *input == rule_input(plan, *rule))
+    }
+}
+
+/// A rule as its chain is written from it: a hostname set by its ID, or `None` when the
+/// set isn't there (and the rule isn't written).
+fn rule_input(plan: &Plan, rule: Rule) -> (Rule, Option<HostSetId>) {
+    match rule {
+        Rule::Accept {
+            destination: Destination::HostSet(index),
+            service,
+        } => (
+            Rule::Accept {
+                destination: Destination::HostSet(0),
+                service,
+            },
+            plan.host_set(index).map(|set| set.id),
+        ),
+        rule => (rule, None),
+    }
+}
+
+impl Written {
+    /// Whether `chain` of `source` with `rules` was written from the same inputs before
+    /// (`previous`, which they are taken out of), and needn't be written again. Either way
+    /// `installed` then has its inputs.
+    fn chain(
+        plan: &Plan,
+        source: &Source,
+        chain: Chain,
+        rules: &[Rule],
+        previous: &mut HashMap<Chain, ChainInputs>,
+        installed: &mut Installed,
+    ) -> bool {
+        let (inputs, written) = match previous.remove(&chain) {
+            Some(inputs) if inputs.are(plan, source, rules) => (inputs, true),
+            _ => (ChainInputs::of(plan, source, rules), false),
+        };
+        installed.written.rules.insert(chain, inputs);
+        written
+    }
 }
 
 /// The elements of the named sets in an update, one per line, by set.
@@ -1027,28 +1110,6 @@ impl Elements {
         }
         Ok(())
     }
-}
-
-/// Write `chain` with `rules`, unless it holds them already (`previous`, which it is taken
-/// out of). Either way `installed` then has it.
-fn render_chain(
-    out: &mut String,
-    chain: Chain,
-    rules: &str,
-    previous: &mut HashMap<Chain, String>,
-    installed: &mut Installed,
-) -> fmt::Result {
-    let written = match previous.remove(&chain) {
-        Some(written) if written == rules => written,
-        _ => {
-            writeln!(out, "add chain {chain}")?;
-            writeln!(out, "flush chain {chain}")?;
-            out.push_str(rules);
-            rules.to_owned()
-        }
-    };
-    installed.written.rules.insert(chain, written);
-    Ok(())
 }
 
 /// Which slot each source's chains are numbered by. A source keeps its slot from one
@@ -3256,6 +3317,64 @@ flush chain bridge portcullis limit_open
             ),
             "{reused}"
         );
+    }
+
+    #[test]
+    fn writes_a_chain_again_when_what_it_is_written_from_changes() {
+        use crate::model::{IccMode, RuntimeStateAction};
+
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
+        let mut resolver = MockResolver::default();
+        let mut state = RuntimeState::default();
+        test_support::add_network(&mut state, "net", "172.18.0.0/16", "172.18.0.1");
+        test_support::add_container(
+            &mut state,
+            "a",
+            "a",
+            &[("net", "172.18.0.2", &[])],
+            test_support::policy(IccMode::Deny, vec![test_support::host_egress()]),
+        );
+        let mut apply = |state: &RuntimeState| {
+            firewall
+                .apply(state, &mut resolver, &[], false)
+                .expect("apply");
+        };
+        apply(&state);
+        // Its hostname set is named after the container: renamed, the rule uses another.
+        state.apply_action(RuntimeStateAction::RenameContainer {
+            container_id: "a".to_string().into(),
+            name: "renamed".to_string(),
+        });
+        apply(&state);
+        // Other rules.
+        test_support::add_container(
+            &mut state,
+            "a",
+            "renamed",
+            &[("net", "172.18.0.2", &[])],
+            test_support::policy(IccMode::Deny, vec![]),
+        );
+        apply(&state);
+
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        let [first, renamed, changed] = scripts.as_slice() else {
+            panic!("expected three scripts");
+        };
+        let chain = "inet portcullis egress0";
+        let written =
+            |script: &str| script.contains(&format!("add chain {chain}\nflush chain {chain}\n"));
+        let rules = |script: &str| {
+            script
+                .lines()
+                .filter(|line| line.starts_with(&format!("add rule {chain} ")))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert!(written(first), "{first}");
+        assert!(written(renamed), "{renamed}");
+        assert!(written(changed), "{changed}");
+        assert_ne!(rules(first), rules(renamed));
+        assert!(rules(changed).len() < rules(renamed).len(), "{changed}");
     }
 
     #[test]

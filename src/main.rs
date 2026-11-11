@@ -451,6 +451,8 @@ struct Applier {
     /// Updates that failed in a row: the rules are those of an earlier state.
     failures: u32,
     saver: Saver,
+    /// Finds containers' bridge ports.
+    ports: rtnetlink::PortFinder,
 }
 
 /// Saves the rules of updates for the next start (see `NftablesFirewall::save`), in a
@@ -518,7 +520,7 @@ impl Applier {
         // Re-read on every update, so changes to the host's DNS configuration are picked up.
         let host_resolvers = host_dns::host_resolvers();
         state.set_daemon_dns(host_dns::docker_daemon_dns());
-        let found = match rtnetlink::container_ports(state) {
+        let found = match self.ports.find(state) {
             Ok(found) => found,
             Err(error) => {
                 warn!(%error, "can't find containers' bridge ports; checking their traffic by address and MAC only");
@@ -883,6 +885,7 @@ fn run(config: &Config) -> Result<(), MainError> {
         port_problems: HashSet::new(),
         failures: 0,
         saver: Saver::spawn(Arc::clone(&firewall)),
+        ports: rtnetlink::PortFinder::open().map_err(MainError::SourceHold)?,
     };
 
     let (terminate_tx, terminate_rx) = unbounded::<()>();

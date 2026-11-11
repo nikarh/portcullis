@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::IpAddr;
+use std::os::unix::fs::DirEntryExt as _;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -68,6 +69,17 @@ pub struct Discovery {
     cgroup_root: PathBuf,
     /// Where the files of `portcullis.policy-file` labels are.
     policy_dir: PathBuf,
+    /// The namespace of each container's cgroup, as found when looking for another
+    /// container's, see `container_in`.
+    scopes: HashMap<String, KnownScope>,
+}
+
+/// The namespace ID of the processes of a container's cgroup, found before, and which
+/// cgroup that was (its inode): a container that starts again gets a new cgroup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KnownScope {
+    inode: u64,
+    namespace: i32,
 }
 
 impl Discovery {
@@ -82,6 +94,7 @@ impl Discovery {
             docker_root,
             cgroup_root,
             policy_dir,
+            scopes: HashMap::new(),
         })
     }
 
@@ -166,40 +179,85 @@ impl Discovery {
     /// `namespace` here. Containers that share another container's namespace
     /// (`network_mode: container:...`) are skipped: the namespace is that one's.
     fn container_in(&mut self, namespace: i32) -> Option<(String, u32)> {
-        let mut seen = HashSet::new();
-        for (id, scope) in docker_scopes(&self.cgroup_root) {
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let Some(pid) = first_process(&scope, 3) else {
-                continue;
-            };
-            let path = PathBuf::from(format!("/proc/{pid}/ns/net"));
-            // The process may have ended meanwhile.
-            if self.links.namespace_id(&path).ok().flatten() != Some(namespace) {
-                continue;
-            }
-            let shared = read_json::<DockerHostConfig>(
-                &self
-                    .docker_root
-                    .join("containers")
-                    .join(&id)
-                    .join("hostconfig.json"),
-            )
-            .ok()
-            .and_then(|config| config.network_mode)
-            .is_some_and(|mode| mode.starts_with("container:"));
-            if !shared {
-                return Some((id, pid));
-            }
-        }
-        None
+        let links = &mut self.links;
+        let docker_root = &self.docker_root;
+        find_in_scopes(
+            &docker_scopes(&self.cgroup_root),
+            &mut self.scopes,
+            namespace,
+            |scope| {
+                let pid = first_process(scope, 3)?;
+                // The process may have ended meanwhile.
+                let found = links
+                    .namespace_id(Path::new(&format!("/proc/{pid}/ns/net")))
+                    .ok()
+                    .flatten()?;
+                Some((pid, found))
+            },
+            |id| {
+                read_json::<DockerHostConfig>(
+                    &docker_root
+                        .join("containers")
+                        .join(id)
+                        .join("hostconfig.json"),
+                )
+                .ok()
+                .and_then(|config| config.network_mode)
+                .is_some_and(|mode| mode.starts_with("container:"))
+            },
+        )
     }
 }
 
+/// Of the containers' cgroups `scopes` (ID, directory, inode), the one whose processes
+/// (`process` tells one, and its namespace ID) are in `namespace`, and that doesn't share
+/// another container's namespace (`shared`).
+///
+/// Each cgroup is looked into once: `known` remembers the namespace of each, and a cgroup
+/// found to be in another namespace before is skipped while it stays the same cgroup (a
+/// container that starts again gets a new one). So only the cgroups of containers that
+/// started since the last search are looked into, not all of them, every time.
+fn find_in_scopes(
+    scopes: &[(String, PathBuf, u64)],
+    known: &mut HashMap<String, KnownScope>,
+    namespace: i32,
+    mut process: impl FnMut(&Path) -> Option<(u32, i32)>,
+    mut shared: impl FnMut(&str) -> bool,
+) -> Option<(String, u32)> {
+    let present: HashSet<&str> = scopes.iter().map(|(id, _, _)| id.as_str()).collect();
+    known.retain(|id, _| present.contains(id.as_str()));
+    let mut seen = HashSet::new();
+    for (id, scope, inode) in scopes {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        if let Some(scope) = known.get(id)
+            && scope.inode == *inode
+            && scope.namespace != namespace
+        {
+            continue;
+        }
+        known.remove(id);
+        let Some((pid, found)) = process(scope) else {
+            continue;
+        };
+        known.insert(
+            id.clone(),
+            KnownScope {
+                inode: *inode,
+                namespace: found,
+            },
+        );
+        if found == namespace && !shared(id) {
+            return Some((id.clone(), pid));
+        }
+    }
+    None
+}
+
 /// Docker's containers' cgroups: `system.slice/docker-<id>.scope` with the systemd cgroup
-/// driver, `docker/<id>` with cgroupfs.
-fn docker_scopes(cgroup_root: &Path) -> Vec<(String, PathBuf)> {
+/// driver, `docker/<id>` with cgroupfs. With the inode of each cgroup's directory.
+fn docker_scopes(cgroup_root: &Path) -> Vec<(String, PathBuf, u64)> {
     let mut scopes = Vec::new();
     for (directory, prefix, suffix) in [
         (cgroup_root.join("system.slice"), "docker-", ".scope"),
@@ -218,7 +276,7 @@ fn docker_scopes(cgroup_root: &Path) -> Vec<(String, PathBuf)> {
                 continue;
             };
             if is_container_id(id) {
-                scopes.push((id.to_string(), entry.path()));
+                scopes.push((id.to_string(), entry.path(), entry.ino()));
             }
         }
     }
@@ -281,6 +339,51 @@ mod tests {
     }
 
     #[test]
+    fn looks_into_each_containers_cgroup_once() {
+        let scope = |id: &str, inode: u64| (id.repeat(64), PathBuf::from(id), inode);
+        let mut known = HashMap::new();
+        let mut looked = Vec::new();
+        let mut find = |scopes: &[(String, PathBuf, u64)], known: &mut _, namespace| {
+            find_in_scopes(
+                scopes,
+                known,
+                namespace,
+                |path| {
+                    looked.push(path.to_path_buf());
+                    // The namespace of `a` is 1, of `b` 2, of `c` 3.
+                    let namespace = match path.to_str() {
+                        Some("a") => 1,
+                        Some("b") => 2,
+                        Some("c") => 3,
+                        _ => return None,
+                    };
+                    Some((10, namespace))
+                },
+                |_| false,
+            )
+            .map(|(id, _)| id[..1].to_string())
+        };
+        let scopes = [scope("a", 1), scope("b", 2)];
+        assert_eq!(find(&scopes, &mut known, 2).as_deref(), Some("b"));
+        // `c` started: only its cgroup is looked into.
+        let scopes = [scope("a", 1), scope("b", 2), scope("c", 3)];
+        assert_eq!(find(&scopes, &mut known, 3).as_deref(), Some("c"));
+        // Nothing in namespace 4: nothing is looked into again.
+        assert_eq!(find(&scopes, &mut known, 4), None);
+        // `a` started again, in a new cgroup: looked into again.
+        let scopes = [scope("a", 4), scope("b", 2), scope("c", 3)];
+        assert_eq!(find(&scopes, &mut known, 1).as_deref(), Some("a"));
+        // The one asked for is looked into again: its process may have ended.
+        assert_eq!(find(&scopes, &mut known, 1).as_deref(), Some("a"));
+        drop(find);
+        let names: Vec<_> = looked.iter().filter_map(|path| path.to_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "a", "a"]);
+        // Removed containers are forgotten.
+        find_in_scopes(&[scope("b", 2)], &mut known, 9, |_| None, |_| false);
+        assert_eq!(known.keys().map(|id| &id[..1]).collect::<Vec<_>>(), ["b"]);
+    }
+
+    #[test]
     fn finds_docker_scopes_and_their_processes() {
         let root = std::env::temp_dir().join(format!("portcullis-cgroups-{}", std::process::id()));
         let id = "a".repeat(64);
@@ -292,7 +395,10 @@ mod tests {
         fs::write(nested.join("cgroup.procs"), "42\n43\n").expect("procs");
 
         let scopes = docker_scopes(&root);
-        assert_eq!(scopes, vec![(id, scope.clone())]);
+        let inode = fs::metadata(&scope)
+            .map(|metadata| std::os::unix::fs::MetadataExt::ino(&metadata))
+            .expect("inode");
+        assert_eq!(scopes, vec![(id, scope.clone(), inode)]);
         assert_eq!(first_process(&scope, 3), Some(42));
         assert_eq!(first_process(&scope, 0), None);
         let _ = fs::remove_dir_all(&root);
