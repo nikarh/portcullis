@@ -5,6 +5,12 @@ services:
     pull_policy: never
     cap_add: [NET_ADMIN]
     networks: [net]
+    # The kernel asks ARP for the gateway's MAC with the source address of the first packet
+    # waiting on the lookup. When that is a borrowed address, Portcullis denies the request,
+    # and the container's own connection waits on the same lookup for the next try, or
+    # times out. Always ask from the container's own address, as a spoofing tool would.
+    sysctls:
+      net.ipv4.conf.all.arp_announce: 2
     # Keeps trying after its first spoofed packet (see the flood scenario for quarantine).
     labels:
       - portcullis.quarantine=off
