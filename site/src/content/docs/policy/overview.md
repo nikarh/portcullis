@@ -22,6 +22,7 @@ A policy is a set of Docker labels. Networks get one label that turns Portcullis
 | [`portcullis.quarantine`](/policy/limits/#quarantine) | container | `on`, `off` | `on` |
 | [`portcullis.hostname-hold`](/policy/hostnames/#how-long-an-address-stays-allowed) | container | a duration: `600`, `30m`, `2h`, `1d` | `hostname-hold` setting (1h) |
 | [`portcullis.ack`](/policy/checks/#acknowledging-a-warning) | container, network | warning names, comma separated | none |
+| [`portcullis.policy-file`](/policy/files/) | container | the name of a file with more of these labels | none |
 
 `<name>` in a label key is any string that makes the key unique, such as `0`, `1` or `stripe`. It has no meaning beyond that, and shows up in nothing but the label itself.
 
@@ -77,6 +78,8 @@ The map form works too:
 Docker sets labels when it creates a container or network, and they can't be changed afterwards. A changed policy takes recreating the container (`docker compose up -d` does when labels change), and a changed `portcullis.enable` takes recreating the network.
 :::
 
+Labels that shouldn't be visible in Docker's metadata, such as the address of a VPN endpoint, can be kept in a [policy file](/policy/files/) on the Docker host instead.
+
 A container's policy applies to every enforced network it is on. A container on no enforced network isn't restricted, whatever its labels say; Portcullis warns about that with [`unused_labels`](/policy/checks/).
 
 ## Invalid labels
@@ -86,6 +89,7 @@ Invalid labels are reported with an `invalid_label` warning and ignored; the con
 - an invalid `portcullis.icc.mode` counts as `deny`;
 - invalid `portcullis.dns.*` labels leave the container with no DNS, instead of the default;
 - an invalid `portcullis.domains.*` label still limits the container's lookups, to the names of its valid ones;
-- an invalid `portcullis.enable` value on a network enforces it.
+- an invalid `portcullis.enable` value on a network enforces it;
+- a [policy file](/policy/files/#when-the-file-cant-be-used) that can't be used denies the container everything.
 
 Label keys Portcullis doesn't know are ignored without a warning, so check the spelling of keys: `portcullis.egres.0` does nothing.

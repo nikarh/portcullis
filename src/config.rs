@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::dns;
 use crate::firewall::{self, DenyAction, LogAllowed};
 use crate::logging::{LogFormat, LogLevel};
+use crate::policy_file;
 use crate::tools;
 
 /// Read when it exists, unless `--config` names another file.
@@ -41,6 +42,8 @@ pub struct Config {
     pub quarantine: QuarantineMode,
     pub quarantine_denials: usize,
     pub state_dir: PathBuf,
+    /// Where the files of `portcullis.policy-file` labels are.
+    pub policy_dir: PathBuf,
 }
 
 /// What happens to a container that misbehaves, see `quarantine`.
@@ -86,6 +89,7 @@ impl Default for Config {
             quarantine: QuarantineMode::Isolate,
             quarantine_denials: 1000,
             state_dir: PathBuf::from(DEFAULT_STATE_DIR),
+            policy_dir: PathBuf::from(policy_file::DEFAULT_POLICY_DIR),
         }
     }
 }
@@ -136,6 +140,7 @@ struct Settings {
     quarantine: Option<String>,
     quarantine_denials: Option<usize>,
     state_dir: Option<PathBuf>,
+    policy_dir: Option<PathBuf>,
 }
 
 /// A number, or a word such as `none`.
@@ -269,26 +274,38 @@ fn flags(args: &mut Arguments) -> Result<Settings, ConfigError> {
         quarantine: args.opt_value_from_str("--quarantine")?,
         quarantine_denials: args.opt_value_from_str("--quarantine-denials")?,
         state_dir: args.opt_value_from_str("--state-dir")?,
+        policy_dir: args.opt_value_from_str("--policy-dir")?,
     })
 }
 
 impl Config {
-    fn apply(&mut self, settings: Settings, origin: &Origin<'_>) -> Result<(), ConfigError> {
+    /// The settings that are paths, which any value is valid for.
+    fn apply_paths(&mut self, settings: &mut Settings) {
+        if let Some(socket) = settings.docker_socket.take() {
+            self.docker_socket = socket;
+        }
+        if let Some(directory) = settings.docker_root.take() {
+            self.docker_root = directory;
+        }
+        if let Some(socket) = settings.events_socket.take() {
+            self.events_socket = Some(socket);
+        }
+        if let Some(directory) = settings.state_dir.take() {
+            self.state_dir = directory;
+        }
+        if let Some(directory) = settings.policy_dir.take() {
+            self.policy_dir = directory;
+        }
+    }
+
+    fn apply(&mut self, mut settings: Settings, origin: &Origin<'_>) -> Result<(), ConfigError> {
         let invalid = |key: &str, value: String, expected: &'static str| ConfigError::Invalid {
             setting: origin.setting(key),
             value,
             expected,
         };
 
-        if let Some(socket) = settings.docker_socket {
-            self.docker_socket = socket;
-        }
-        if let Some(directory) = settings.docker_root {
-            self.docker_root = directory;
-        }
-        if let Some(socket) = settings.events_socket {
-            self.events_socket = Some(socket);
-        }
+        self.apply_paths(&mut settings);
         if let Some(value) = settings.deny_action {
             self.deny_action = match value.as_str() {
                 "reject" => DenyAction::Reject,
@@ -371,9 +388,6 @@ impl Config {
         if let Some(count) = settings.quarantine_denials {
             self.quarantine_denials = count;
         }
-        if let Some(directory) = settings.state_dir {
-            self.state_dir = directory;
-        }
         Ok(())
     }
 }
@@ -420,6 +434,7 @@ mod tests {
             quarantine: QuarantineMode::Report,
             quarantine_denials: 5,
             state_dir: PathBuf::from("/tmp/portcullis"),
+            policy_dir: PathBuf::from("/srv/policies"),
         }
     }
 
@@ -486,6 +501,8 @@ mod tests {
             "5",
             "--state-dir",
             "/tmp/portcullis",
+            "--policy-dir",
+            "/srv/policies",
         ]);
         assert_eq!(config.ok(), Some(all_set()));
     }
@@ -511,6 +528,7 @@ mod tests {
             quarantine = "report"
             quarantine-denials = 5
             state-dir = "/tmp/portcullis"
+            policy-dir = "/srv/policies"
             "#,
         );
         assert_eq!(config.ok(), Some(all_set()));

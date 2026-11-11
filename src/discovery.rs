@@ -66,15 +66,22 @@ pub struct Discovery {
     addresses: RouteSocket,
     docker_root: PathBuf,
     cgroup_root: PathBuf,
+    /// Where the files of `portcullis.policy-file` labels are.
+    policy_dir: PathBuf,
 }
 
 impl Discovery {
-    pub fn new(docker_root: PathBuf, cgroup_root: PathBuf) -> io::Result<Self> {
+    pub fn new(
+        docker_root: PathBuf,
+        cgroup_root: PathBuf,
+        policy_dir: PathBuf,
+    ) -> io::Result<Self> {
         Ok(Self {
             links: RouteSocket::open()?,
             addresses: RouteSocket::open_strict()?,
             docker_root,
             cgroup_root,
+            policy_dir,
         })
     }
 
@@ -137,6 +144,7 @@ impl Discovery {
         let policy = policy_from_labels(
             &name,
             &file.config.labels.unwrap_or_default(),
+            &self.policy_dir,
             &mut Vec::new(),
         );
         Ok(Some(Container {
@@ -245,6 +253,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy_file;
 
     #[test]
     fn reads_the_name_labels_and_aliases_docker_keeps() {
@@ -314,8 +323,12 @@ mod tests {
             monitor: true,
         };
         let networks = HashMap::from([(network.id.clone(), network)]);
-        let mut discovery = Discovery::new("/var/lib/docker".into(), DEFAULT_CGROUP_ROOT.into())
-            .expect("discovery");
+        let mut discovery = Discovery::new(
+            "/var/lib/docker".into(),
+            DEFAULT_CGROUP_ROOT.into(),
+            policy_file::DEFAULT_POLICY_DIR.into(),
+        )
+        .expect("discovery");
         let started = std::time::Instant::now();
         let container = discovery.container(index, &networks).expect("lookup");
         let elapsed = started.elapsed();

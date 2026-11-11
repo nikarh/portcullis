@@ -128,6 +128,8 @@ pub struct Dns {
 pub enum WarningKind {
     /// A container label is invalid and was ignored.
     InvalidLabel,
+    /// A container's policy file can't be used; the container is denied everything.
+    PolicyFile,
     /// A network's configuration prevents enforcing it.
     InvalidNetwork,
     /// Portcullis can't see this container's DNS lookups.

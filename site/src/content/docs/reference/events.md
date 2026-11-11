@@ -112,6 +112,7 @@ Something that needs attention. Every warning raises an alert.
 | Kind | Meaning |
 | --- | --- |
 | `invalid_label` | A container label is invalid and was ignored |
+| `policy_file` | A container's [policy file](/policy/files/) can't be used; the container is denied everything |
 | `invalid_network` | A network's configuration prevents enforcing it |
 | `dns_not_observable` | Portcullis can't see this container's DNS lookups |
 | `events_lost` | The kernel dropped log entries because they weren't read fast enough |

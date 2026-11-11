@@ -50,6 +50,10 @@ events-socket = "/run/portcullis.sock"
 # number, or "none".
 #connection-limit = 16384
 
+# Where the files portcullis.policy-file labels name are: labels kept off the containers,
+# such as a VPN endpoint's address. Readable and writable by root only.
+#policy-dir = "/etc/portcullis/policies"
+
 # Docker API socket.
 #docker-socket = "/var/run/docker.sock"
 
