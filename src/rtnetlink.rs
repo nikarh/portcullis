@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
@@ -266,15 +267,86 @@ pub struct Ports {
     pub stopping: HashSet<ContainerId>,
 }
 
-/// The bridge port of every address of a running container on a managed network.
-pub fn container_ports(state: &RuntimeState) -> io::Result<Ports> {
-    let mut socket = RouteSocket::open()?;
-    let links = socket.links()?;
-    Ok(match_ports(state, &links, |path| socket.namespace_id(path)))
+/// Finds the bridge port of every address of a running container on a managed network,
+/// on every update.
+///
+/// Asking the kernel for the ID of each container's namespace takes a request per
+/// container. A namespace keeps its ID for as long as it exists, so the ID is remembered
+/// per container, with the identity (device and inode) of the namespace file it was asked
+/// for: a container whose file is the same namespace as before isn't asked for again. A
+/// container that is restarted, or whose namespace is replaced, has a file of another
+/// namespace, and is asked for again.
+pub struct PortFinder {
+    socket: RouteSocket,
+    namespaces: HashMap<ContainerId, KnownNamespace>,
 }
 
-/// `container_ports` for the host's `links`, with `namespace_id` telling the ID of a
-/// namespace file.
+/// The namespace ID of a container, and the namespace file it is of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KnownNamespace {
+    file: (u64, u64),
+    id: i32,
+}
+
+impl PortFinder {
+    pub fn open() -> io::Result<Self> {
+        Ok(Self {
+            socket: RouteSocket::open()?,
+            namespaces: HashMap::new(),
+        })
+    }
+
+    /// The bridge ports of the containers of `state`.
+    pub fn find(&mut self, state: &RuntimeState) -> io::Result<Ports> {
+        let links = self.socket.links()?;
+        let socket = &mut self.socket;
+        Ok(match_ports(
+            state,
+            &links,
+            &mut self.namespaces,
+            namespace_file,
+            |path| socket.namespace_id(path),
+        ))
+    }
+}
+
+/// The device and inode of a namespace file: which namespace it is.
+fn namespace_file(path: &Path) -> io::Result<(u64, u64)> {
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// The ID of `container`'s namespace, whose file is `path`: remembered in `namespaces`
+/// while the file stays the same namespace (`file` tells which), otherwise asked for
+/// (`namespace_id`).
+fn container_namespace(
+    namespaces: &mut HashMap<ContainerId, KnownNamespace>,
+    container: &ContainerId,
+    path: &Path,
+    file: impl FnOnce(&Path) -> io::Result<(u64, u64)>,
+    namespace_id: impl FnOnce(&Path) -> io::Result<Option<i32>>,
+) -> io::Result<Option<i32>> {
+    let file = file(path)?;
+    if let Some(known) = namespaces.get(container)
+        && known.file == file
+    {
+        return Ok(Some(known.id));
+    }
+    let id = namespace_id(path)?;
+    match id {
+        Some(id) => {
+            namespaces.insert(container.clone(), KnownNamespace { file, id });
+        }
+        None => {
+            namespaces.remove(container);
+        }
+    }
+    Ok(id)
+}
+
+/// The ports of `state`'s containers among the host's `links`, with `file` telling which
+/// namespace a namespace file is and `namespace_id` the ID of one not in `namespaces`
+/// (see [`PortFinder`]). Containers no longer in `state` are forgotten from `namespaces`.
 ///
 /// A container that is stopping has no port: Docker takes its interfaces back to the host
 /// and removes them, and its namespace, before it reports the container gone. The kernel
@@ -284,8 +356,21 @@ pub fn container_ports(state: &RuntimeState) -> io::Result<Ports> {
 fn match_ports(
     state: &RuntimeState,
     links: &[Link],
+    namespaces: &mut HashMap<ContainerId, KnownNamespace>,
+    mut file: impl FnMut(&Path) -> io::Result<(u64, u64)>,
     mut namespace_id: impl FnMut(&Path) -> io::Result<Option<i32>>,
 ) -> Ports {
+    namespaces.retain(|container, _| state.containers().contains_key(container));
+    // By name, and ports by bridge and the namespace of their peer: the first of each, as
+    // a search through the list would find.
+    let mut by_name: HashMap<&str, u32> = HashMap::with_capacity(links.len());
+    let mut by_peer: HashMap<(u32, i32), &Link> = HashMap::with_capacity(links.len());
+    for link in links {
+        by_name.entry(link.name.as_str()).or_insert(link.index);
+        if let (Some(master), Some(peer)) = (link.master, link.peer_namespace) {
+            by_peer.entry((master, peer)).or_insert(link);
+        }
+    }
     let mut found = Ports::default();
     for container in state.containers().values() {
         if container.attachments.is_empty() {
@@ -297,7 +382,13 @@ fn match_ports(
                 .push((container.id.clone(), PortProblem::NoNamespace));
             continue;
         };
-        let namespace = match namespace_id(Path::new(sandbox)) {
+        let namespace = match container_namespace(
+            namespaces,
+            &container.id,
+            Path::new(sandbox),
+            &mut file,
+            &mut namespace_id,
+        ) {
             Ok(Some(namespace)) => namespace,
             Ok(None) => {
                 found
@@ -328,12 +419,10 @@ fn match_ports(
             let Some(network) = state.networks().get(&attachment.network_id) else {
                 continue;
             };
-            let Some(bridge) = links.iter().find(|link| link.name == network.bridge) else {
+            let Some(&bridge) = by_name.get(network.bridge.as_str()) else {
                 continue;
             };
-            if let Some(port) = links.iter().find(|link| {
-                link.master == Some(bridge.index) && link.peer_namespace == Some(namespace)
-            }) {
+            if let Some(port) = by_peer.get(&(bridge, namespace)) {
                 found.ports.insert(
                     attachment.ip_address,
                     BridgePort {
@@ -445,13 +534,82 @@ mod tests {
             links
         }
 
+        /// The ports found, with no namespace IDs known before, and every namespace file
+        /// a namespace of its own.
+        fn ports_of(
+            state: &RuntimeState,
+            links: &[Link],
+            namespace_id: impl FnMut(&Path) -> io::Result<Option<i32>>,
+        ) -> Ports {
+            match_ports(
+                state,
+                links,
+                &mut HashMap::new(),
+                |_| Ok((0, 1)),
+                namespace_id,
+            )
+        }
+
+        #[test]
+        fn remembers_namespace_ids_while_the_namespace_file_stays_the_same() {
+            let address = test_support::ip("172.18.0.2");
+            let links = bridge_with(&[
+                link(7, "veth-old", Some(1), Some(4)),
+                link(8, "veth-app", Some(1), Some(5)),
+            ]);
+            let mut namespaces = HashMap::new();
+            let mut asked = 0;
+            let mut find = |namespaces: &mut _, inode: u64, id: i32| {
+                match_ports(
+                    &state(),
+                    &links,
+                    namespaces,
+                    |_| Ok((0, inode)),
+                    |_| {
+                        asked += 1;
+                        Ok(Some(id))
+                    },
+                )
+                .ports
+                .get(&address)
+                .map(|port| port.name.clone())
+            };
+            assert_eq!(find(&mut namespaces, 1, 4).as_deref(), Some("veth-old"));
+            // The same namespace: not asked again, even if the kernel would now answer
+            // otherwise.
+            assert_eq!(find(&mut namespaces, 1, 5).as_deref(), Some("veth-old"));
+            // Another namespace (the container was restarted): asked again.
+            assert_eq!(find(&mut namespaces, 2, 5).as_deref(), Some("veth-app"));
+            assert_eq!(find(&mut namespaces, 2, 4).as_deref(), Some("veth-app"));
+            assert_eq!(asked, 2);
+        }
+
+        #[test]
+        fn forgets_namespace_ids_of_removed_containers_and_doesnt_remember_none() {
+            let links = bridge_with(&[link(8, "veth-app", Some(1), Some(5))]);
+            let mut namespaces = HashMap::new();
+            let file = |_: &Path| Ok((0, 1));
+            match_ports(&state(), &links, &mut namespaces, file, |_| Ok(None));
+            assert!(namespaces.is_empty());
+            match_ports(&state(), &links, &mut namespaces, file, |_| Ok(Some(5)));
+            assert_eq!(namespaces.len(), 1);
+            match_ports(
+                &RuntimeState::default(),
+                &links,
+                &mut namespaces,
+                file,
+                |_| Ok(Some(5)),
+            );
+            assert!(namespaces.is_empty());
+        }
+
         #[test]
         fn finds_the_port_whose_peer_is_in_the_containers_namespace() {
             let links = bridge_with(&[
                 link(7, "veth-other", Some(1), Some(4)),
                 link(8, "veth-app", Some(1), Some(5)),
             ]);
-            let found = match_ports(&state(), &links, |_| Ok(Some(5)));
+            let found = ports_of(&state(), &links, |_| Ok(Some(5)));
             assert_eq!(
                 found
                     .ports
@@ -469,7 +627,9 @@ mod tests {
             // Its namespace is gone...
             let links = bridge_with(&[link(8, "veth-app", Some(1), Some(5))]);
             let gone = |_: &Path| Err(io::Error::from(io::ErrorKind::NotFound));
-            let found = match_ports(&state(), &links, gone);
+            let found = match_ports(&state(), &links, &mut HashMap::new(), gone, |_| {
+                unreachable!("the namespace file is gone")
+            });
             assert!(found.ports.is_empty());
             assert_eq!(found.absent, HashSet::from([address]));
             assert_eq!(found.problems, []);
@@ -479,7 +639,7 @@ mod tests {
                 link(7, "veth-other", Some(1), Some(4)),
                 link(8, "veth-app", Some(1), None),
             ]);
-            let found = match_ports(&state(), &links, |_| Ok(Some(5)));
+            let found = ports_of(&state(), &links, |_| Ok(Some(5)));
             assert!(found.ports.is_empty());
             assert_eq!(found.absent, HashSet::from([address]));
             assert_eq!(found.problems, []);
@@ -489,12 +649,12 @@ mod tests {
         fn reports_what_keeps_a_port_from_being_found() {
             let id = ContainerId::from("a".to_string());
             let links = bridge_with(&[link(8, "veth-app", Some(1), Some(5))]);
-            let found = match_ports(&state(), &links, |_| Ok(None));
+            let found = ports_of(&state(), &links, |_| Ok(None));
             assert_eq!(found.problems, [(id.clone(), PortProblem::NoNamespaceId)]);
             // Not known to be absent: it may send, checked by address and MAC.
             assert!(found.absent.is_empty());
             let denied = |_: &Path| Err(io::Error::from(io::ErrorKind::PermissionDenied));
-            let found = match_ports(&state(), &links, denied);
+            let found = ports_of(&state(), &links, denied);
             assert!(matches!(
                 found.problems.as_slice(),
                 [(container, PortProblem::Namespace(_))] if *container == id
@@ -507,7 +667,7 @@ mod tests {
             state.apply_action(RuntimeStateAction::CreateContainer {
                 container: Box::new(app),
             });
-            let found = match_ports(&state, &links, |_| Ok(Some(5)));
+            let found = ports_of(&state, &links, |_| Ok(Some(5)));
             assert_eq!(found.problems, [(id, PortProblem::NoNamespace)]);
             assert!(found.ports.is_empty());
             assert!(found.absent.is_empty());
