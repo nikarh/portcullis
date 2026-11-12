@@ -23,6 +23,8 @@ export default defineConfig({
 			description:
 				'Limits what Docker containers can connect to, from labels on containers and networks, with nftables.',
 			favicon: '/favicon.svg',
+			// The site has its own dark theme: Dark Reader leaves it alone
+			head: [{ tag: 'meta', attrs: { name: 'darkreader-lock' } }],
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/nikarh/portcullis' }],
 			editLink: { baseUrl: 'https://github.com/nikarh/portcullis/edit/main/site/' },
 			lastUpdated: false,
