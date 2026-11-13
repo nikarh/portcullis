@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.5.1] - 2026-11-13
+
+### Fixes
+
+- Keep libnftables from reading other tables' sets on every DNS answer (#28) by @nikarh in #28
+- Keep a recreated container's connections and ICC aliases across Docker's event lag (#29) by @nikarh in #29
+- Give an address two running containers claim to the same one on every update (#30) by @nikarh in #30
+
 ## [0.5.0] - 2026-11-13
 
 ### Features
@@ -260,6 +268,7 @@ All notable changes to this project are documented in this file. The format is b
 - Verifying signed releases, and how releasing works by @nikarh
 - Remove the crates.io badge; portcullis on crates.io is another project by @nikarh
 
+[0.5.1]: https://github.com/nikarh/portcullis/compare/v0.5.0..v0.5.1
 [0.5.0]: https://github.com/nikarh/portcullis/compare/v0.4.0..v0.5.0
 [0.4.0]: https://github.com/nikarh/portcullis/compare/v0.3.0..v0.4.0
 [0.3.0]: https://github.com/nikarh/portcullis/compare/v0.2.1..v0.3.0
