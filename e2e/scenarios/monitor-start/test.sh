@@ -6,23 +6,6 @@
 
 # --- Docker's API paused ------------------------------------------------------------------
 
-# Portcullis talks to Docker through this proxy, which can be paused (SIGSTOP of its process
-# group, the connections it forked included).
-DOCKER_PROXY=/run/portcullis-e2e-docker.sock
-start_docker_proxy() {
-  rm -f "${DOCKER_PROXY}"
-  setsid socat "UNIX-LISTEN:${DOCKER_PROXY},fork" UNIX-CONNECT:/var/run/docker.sock 2>/dev/null &
-  DOCKER_PROXY_PID=$!
-  local deadline=$((SECONDS + 10))
-  until [[ -S "${DOCKER_PROXY}" ]] || ((SECONDS >= deadline)); do sleep 0.1; done
-}
-stop_docker_proxy() {
-  kill -CONT -- "-${DOCKER_PROXY_PID}" 2>/dev/null
-  kill -- "-${DOCKER_PROXY_PID}" 2>/dev/null
-  wait "${DOCKER_PROXY_PID}" 2>/dev/null
-  rm -f "${DOCKER_PROXY}"
-}
-
 stop_portcullis
 start_docker_proxy
 start_portcullis --docker-socket "${DOCKER_PROXY}"

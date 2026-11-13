@@ -46,9 +46,12 @@ impl Owners {
     /// every address when Portcullis starts for the first time.
     ///
     /// Docker's events of a removed container can come after a new container with its
-    /// address was found: both claim the address for a while. Rules are only applied for
-    /// one of them, so the address counts as changing hands once when it becomes
-    /// contested, and once more when one owner is left.
+    /// address was found: both claim the address for a while. The owner is the one the
+    /// rules are applied for (see `Plan::build`): the one that isn't stopping. A container
+    /// recreated in its predecessor's place takes the address over once, when it is found,
+    /// and not again when the predecessor is removed: by then it may have connections of
+    /// its own, made under its own rules. When more than one claimant isn't stopping,
+    /// nobody owns the address, and it changes hands again when one owner is left.
     pub fn update(&mut self, state: &RuntimeState) -> HashSet<IpAddr> {
         let current = owners(state);
         let reassigned = self
@@ -84,21 +87,44 @@ impl Owners {
 }
 
 fn owners(state: &RuntimeState) -> HashMap<IpAddr, Option<Owner>> {
-    let mut owners: HashMap<IpAddr, Option<Owner>> = HashMap::new();
+    /// Who owns an address so far, and whether its claimants are stopping. `owner` is
+    /// `None` for more than one claimant of a kind.
+    struct Claim {
+        owner: Option<Owner>,
+        stopping: bool,
+    }
+    let mut claims: HashMap<IpAddr, Claim> = HashMap::new();
     for container in state.containers().values() {
+        let stopping = state.is_stopping(&container.id);
         for attachment in &container.attachments {
             let owner = (container.id.clone(), attachment.mac_address);
-            owners
+            claims
                 .entry(attachment.ip_address)
-                .and_modify(|known| {
-                    if known.as_ref() != Some(&owner) {
-                        *known = None;
+                .and_modify(|claim| {
+                    if claim.owner.as_ref() == Some(&owner) {
+                        return;
+                    }
+                    match (claim.stopping, stopping) {
+                        // One that isn't stopping gets the rules over stopping ones.
+                        (true, false) => {
+                            claim.owner = Some(owner.clone());
+                            claim.stopping = false;
+                        }
+                        (false, true) => {}
+                        // Two of a kind: which one the rules are for isn't known.
+                        _ => claim.owner = None,
                     }
                 })
-                .or_insert(Some(owner));
+                .or_insert(Claim {
+                    owner: Some(owner),
+                    stopping,
+                });
         }
     }
-    owners
+    claims
+        .into_iter()
+        .map(|(address, claim)| (address, claim.owner))
+        .collect()
 }
 
 /// One line per address: the address, then the container's ID and MAC (`-` without one),
@@ -192,19 +218,81 @@ mod tests {
         assert_eq!(owners.update(&state), addresses(&["172.18.0.3"]));
     }
 
+    fn stopping(state: &mut RuntimeState, ids: &[&str]) {
+        state.set_stopping(ids.iter().map(|id| id.to_string().into()).collect());
+    }
+
     #[test]
-    fn a_contested_address_changes_hands_when_contested_and_when_settled() {
+    fn a_recreated_container_takes_the_address_over_once() {
         let mut owners = Owners::default();
         let mut state = RuntimeState::default();
         state.apply_action(container("a", "172.18.0.2", "02:42:ac:12:00:02"));
         owners.update(&state);
-        // c found with a's address before Docker reported a gone.
+        // a stops; it still owns its address.
+        stopping(&mut state, &["a"]);
+        assert_eq!(owners.update(&state), addresses(&[]));
+        // c, recreated in its place, is found with a's address before Docker reported a
+        // gone: the rules are c's from now on, and a's connections go.
+        state.apply_action(container("c", "172.18.0.2", "02:42:ac:12:00:04"));
+        assert_eq!(owners.update(&state), addresses(&["172.18.0.2"]));
+        assert_eq!(owners.update(&state), addresses(&[]));
+        // a is removed: the connections c made meanwhile stay.
+        state.apply_action(remove("a"));
+        stopping(&mut state, &[]);
+        assert_eq!(owners.update(&state), addresses(&[]));
+    }
+
+    #[test]
+    fn a_recreated_container_found_first_takes_the_address_over_once() {
+        // The state yields containers in any order: the new one may come first.
+        for (old, new) in [("a-old", "z-new"), ("z-old", "a-new")] {
+            let mut owners = Owners::default();
+            let mut state = RuntimeState::default();
+            state.apply_action(container(old, "172.18.0.2", "02:42:ac:12:00:02"));
+            owners.update(&state);
+            stopping(&mut state, &[old]);
+            state.apply_action(container(new, "172.18.0.2", "02:42:ac:12:00:04"));
+            assert_eq!(owners.update(&state), addresses(&["172.18.0.2"]));
+            state.apply_action(remove(old));
+            stopping(&mut state, &[]);
+            assert_eq!(owners.update(&state), addresses(&[]));
+        }
+    }
+
+    #[test]
+    fn an_address_two_running_containers_claim_changes_hands_when_claimed_and_when_settled() {
+        let mut owners = Owners::default();
+        let mut state = RuntimeState::default();
+        state.apply_action(container("a", "172.18.0.2", "02:42:ac:12:00:02"));
+        owners.update(&state);
+        // c found with a's address while a's namespace is still there: which of them
+        // the rules are for isn't known.
         state.apply_action(container("c", "172.18.0.2", "02:42:ac:12:00:04"));
         assert_eq!(owners.update(&state), addresses(&["172.18.0.2"]));
         // Still contested: nothing new.
         assert_eq!(owners.update(&state), addresses(&[]));
-        state.apply_action(remove("a"));
+        // a stops: c's from now on, and what was made meanwhile may have been under a's
+        // rules.
+        stopping(&mut state, &["a"]);
         assert_eq!(owners.update(&state), addresses(&["172.18.0.2"]));
+        state.apply_action(remove("a"));
+        stopping(&mut state, &[]);
+        assert_eq!(owners.update(&state), addresses(&[]));
+    }
+
+    #[test]
+    fn an_address_of_a_removed_container_given_to_another_changes_hands() {
+        let mut owners = Owners::default();
+        let mut state = RuntimeState::default();
+        state.apply_action(container("a", "172.18.0.2", "02:42:ac:12:00:02"));
+        owners.update(&state);
+        stopping(&mut state, &["a"]);
+        owners.update(&state);
+        state.apply_action(remove("a"));
+        stopping(&mut state, &[]);
+        assert_eq!(owners.update(&state), addresses(&["172.18.0.2"]));
+        state.apply_action(container("c", "172.18.0.2", "02:42:ac:12:00:04"));
+        assert_eq!(owners.update(&state), addresses(&[]));
     }
 
     #[test]

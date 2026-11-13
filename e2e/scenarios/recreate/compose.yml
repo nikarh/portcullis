@@ -1,0 +1,39 @@
+# A container recreated with the address of the one it replaces, and a backend it holds a
+# connection to, which may answer on it but not open connections of its own.
+services:
+  proxy:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks:
+      net:
+        ipv4_address: 10.250.77.10
+    labels:
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.backend=container:backend,tcp:7000
+  backend:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=deny
+    # Echoes the first line at once; then, once /tmp/go exists, sends "push" unasked.
+    command:
+      - sh
+      - -c
+      - |
+        exec socat TCP-LISTEN:7000,fork,reuseaddr SYSTEM:'read line; echo "$$line"; while [ ! -e /tmp/go ]; do sleep 0.05; done; echo push; sleep 10'
+  # Started last: once its rules are in place, Portcullis has handled every Docker event
+  # before its start.
+  marker:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    profiles: [late]
+    networks: [net]
+
+networks:
+  net:
+    ipam:
+      config:
+        - subnet: 10.250.77.0/24
+    labels:
+      - portcullis.enable=true

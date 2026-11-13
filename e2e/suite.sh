@@ -23,6 +23,8 @@ SCENARIOS=(
   fast-start
   monitor-start
   slow-docker
+  recreate
+  default-bridge
   dns-inspection
   hostname-refresh
   monitor

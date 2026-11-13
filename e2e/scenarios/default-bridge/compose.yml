@@ -1,0 +1,7 @@
+# The scenario runs its container on Docker's default bridge itself (compose can't attach
+# a service to it by name); this only gives run_scenario a project.
+services:
+  idle:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    network_mode: none
