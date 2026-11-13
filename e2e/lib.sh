@@ -384,6 +384,24 @@ start_portcullis() {
   return 1
 }
 
+# A proxy to Docker's API for Portcullis (start_portcullis --docker-socket
+# "${DOCKER_PROXY}"), which can be paused: kill -STOP -- "-${DOCKER_PROXY_PID}" stops its
+# process group, the connections it forked included, and -CONT resumes it.
+DOCKER_PROXY=/run/portcullis-e2e-docker.sock
+start_docker_proxy() {
+  rm -f "${DOCKER_PROXY}"
+  setsid socat "UNIX-LISTEN:${DOCKER_PROXY},fork" UNIX-CONNECT:/var/run/docker.sock 2>/dev/null &
+  DOCKER_PROXY_PID=$!
+  local deadline=$((SECONDS + 10))
+  until [[ -S "${DOCKER_PROXY}" ]] || ((SECONDS >= deadline)); do sleep 0.1; done
+}
+stop_docker_proxy() {
+  kill -CONT -- "-${DOCKER_PROXY_PID}" 2>/dev/null
+  kill -- "-${DOCKER_PROXY_PID}" 2>/dev/null
+  wait "${DOCKER_PROXY_PID}" 2>/dev/null
+  rm -f "${DOCKER_PROXY}"
+}
+
 # start_portcullis_before_docker: start Portcullis as systemd would before Docker (with a
 # notification socket), and wait until it reports itself ready, not for rules.
 start_portcullis_before_docker() {
