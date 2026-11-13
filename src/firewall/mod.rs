@@ -1,3 +1,4 @@
+mod elements;
 mod nftables;
 mod plan;
 #[cfg(test)]
@@ -27,6 +28,8 @@ pub enum FirewallError {
     LibCommandFailure { code: i32, stderr: String },
     #[error("libnftables context lock poisoned")]
     LibContextLock,
+    #[error("nftables netlink request failed: {0}")]
+    Netlink(std::io::Error),
     #[error("saved rules: {0}")]
     Saved(std::io::Error),
 }

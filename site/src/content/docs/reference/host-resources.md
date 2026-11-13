@@ -38,7 +38,7 @@ sudo nft list table bridge portcullis
 
 Don't edit them: every update rewrites what changed, and an edit in a chain it leaves alone may stay. `--log-level trace` logs every script Portcullis applies.
 
-Portcullis doesn't touch Docker's rules or anyone else's, and works next to Docker using iptables or nftables.
+Portcullis doesn't touch Docker's rules or anyone else's, and works next to Docker using iptables or nftables. Large sets in other tables, such as another firewall's block lists, don't slow it down: it never asks libnftables to add or delete single set elements, which makes libnftables read every such set first (see [DNS inspection](/internals/how-it-works/#dns-inspection)).
 
 ## Netfilter numbers
 
