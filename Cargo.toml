@@ -1,6 +1,6 @@
 [package]
 name = "portcullis"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "Limits what Docker containers can connect to, from labels on containers and networks, with nftables."
 license = "MIT OR Apache-2.0"
