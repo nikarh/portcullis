@@ -23,7 +23,7 @@ The rules are nftables rules, kept in two tables of its own:
 
 A Linux bridge passes traffic between containers directly, without the IP-level hooks Docker's own rules use, so only the bridge table can see it. The bridge table is also where Portcullis checks that each frame really comes from the container it claims to come from. Both work next to Docker's rules whether Docker itself uses iptables or nftables.
 
-Each update changes the rules in one atomic step, so there is never a moment with half-applied rules. Each container has chains of its own, and an update only writes those of containers whose rules changed, and only adds and deletes the set elements that changed; a container starting leaves the chains of containers whose rules don't mention it as they are. Packets that pass while the kernel puts new rules in place are never misjudged: an established connection isn't denied, nor reported as sent from an unknown source, and nothing gets past a check meanwhile. Starting Portcullis updates the rules a previous run left in place the same way, instead of creating them again.
+Each update changes the rules in one atomic step, so there is never a moment with half-applied rules. Each container has chains of its own, and an update only writes those of containers whose rules changed, and only adds the set elements that are new; a set that loses elements is emptied and filled again in the same step. A container starting leaves the chains of containers whose rules don't mention it as they are. Packets that pass while the kernel puts new rules in place are never misjudged: an established connection isn't denied, nor reported as sent from an unknown source, and nothing gets past a check meanwhile. Starting Portcullis updates the rules a previous run left in place the same way, instead of creating them again.
 
 Portcullis only removes access. Traffic that a policy allows still goes through Docker's own rules afterwards, so things Docker blocks (internal networks, isolation between networks) stay blocked.
 
@@ -45,7 +45,9 @@ The rules log what they allow and deny to an NFLOG group, which Portcullis reads
 
 Portcullis looks at the DNS answers containers receive. The firewall holds each answer to a managed container until Portcullis has read it, then releases it unchanged. That gives events their domains, and gives [hostname rules](/policy/hostnames/) the exact addresses each container was told. If Portcullis isn't running or falls behind, answers go through uninspected rather than being lost.
 
-Portcullis also looks the hostnames of `host:` rules up itself, through the host's resolver, a few times per hold, and adds what it gets to the rules of every container that uses the name, without a rule update. That keeps an address allowed while DNS still returns it, also for applications that resolved it once and kept it.
+Portcullis also looks the hostnames of `host:` rules up itself, through the host's resolver, a few times per hold, and adds what it gets to the rules of every container that uses the name, without a rule update.
+
+Addresses from DNS answers and Portcullis's own lookups go into the hostname sets through netlink directly, not through libnftables: before it adds or deletes set elements, libnftables reads the elements of every set of ranges in the kernel, in every table. On a host with another firewall that keeps large block or country lists, that took tens of megabytes and a good part of a second for each DNS answer, while the answer was held. For the same reason, rule updates never delete set elements one by one. That keeps an address allowed while DNS still returns it, also for applications that resolved it once and kept it.
 
 For containers with [`portcullis.domains`](/policy/domains/) labels, queries are held too, until Portcullis has checked the names they ask for. Those are denied, not let through, when Portcullis can't check them.
 

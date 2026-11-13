@@ -13,6 +13,7 @@ use std::time::Duration;
 use tracing::{info, trace, warn};
 
 use super::FirewallError;
+use super::elements::{ElementSocket, TimeoutSet};
 use super::plan::{
     DNS_PORT, Destination, HostSet, HostSetId, ICC_BROADCAST_V4, PRIVATE_V4, PRIVATE_V6, Plan,
     Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
@@ -128,6 +129,13 @@ pub trait NftRunner {
     fn run_script(&self, script: String) -> Result<(), FirewallError>;
     /// Run a listing command (`list ...`), and return what it printed, without set elements.
     fn list(&self, command: &str) -> Result<String, FirewallError>;
+    /// Set how much longer each address stays in the hostname sets of the inet table that
+    /// hold its family, in one transaction (see [`render_timeouts`]).
+    fn set_timeouts(
+        &self,
+        sets: &[TimeoutSet<'_>],
+        addresses: &[(IpAddr, Duration)],
+    ) -> Result<(), FirewallError>;
 }
 
 /// What happens to traffic a policy doesn't allow.
@@ -259,6 +267,17 @@ struct Installed {
     /// Left in place by a previous run that stopped, rather than put back from the saved
     /// rules: the addresses in its hostname sets are as current as that run left them.
     kept: bool,
+    /// Hostname sets whose addresses to renew once the update is in place.
+    renewals: Vec<Renewal>,
+}
+
+/// The addresses Portcullis knows for a hostname set it kept from a previous run, to renew
+/// in it: the update only adds those the set doesn't hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Renewal {
+    set: String,
+    ipv6: bool,
+    addresses: Vec<(IpAddr, Duration)>,
 }
 
 impl Installed {
@@ -489,7 +508,7 @@ where
         let now_installed =
             render_apply_script(&plan, self.options, installed.as_mut(), &mut script)?;
         before(&plan);
-        let now_installed = match self.runner.run_script(script) {
+        let mut now_installed = match self.runner.run_script(script) {
             Ok(()) => now_installed,
             // Tables another version left may not fit these rules (a set of another type):
             // start from empty ones.
@@ -502,6 +521,15 @@ where
             }
             Err(error) => return Err(error),
         };
+        for renewal in std::mem::take(&mut now_installed.renewals) {
+            let set = TimeoutSet {
+                name: &renewal.set,
+                ipv6: renewal.ipv6,
+            };
+            if let Err(error) = self.runner.set_timeouts(&[set], &renewal.addresses) {
+                warn!(%error, set = renewal.set, "can't renew the addresses of a hostname set");
+            }
+        }
         *installed = Some(now_installed);
         drop(installed);
         Ok(plan)
@@ -514,30 +542,27 @@ where
         set: &HostSet,
         addresses: &[(IpAddr, Duration)],
     ) -> Result<(), FirewallError> {
-        let mut script = String::new();
-        for (prefix, used, is_family) in [
-            (
-                SET_PREFIX_V4,
-                set.used_v4,
-                IpAddr::is_ipv4 as fn(&IpAddr) -> bool,
-            ),
-            (SET_PREFIX_V6, set.used_v6, IpAddr::is_ipv6),
-        ] {
-            let family = || {
-                addresses
-                    .iter()
-                    .copied()
-                    .filter(|(address, _)| is_family(address))
-            };
-            if used {
-                let (table, name) = (Table::Inet, set.id.name(prefix));
-                render_timeouts(&mut script, format_args!("{table} {name}"), family)?;
-            }
-        }
-        if script.is_empty() {
+        let (v4, v6) = (set.id.name(SET_PREFIX_V4), set.id.name(SET_PREFIX_V6));
+        let both = [
+            TimeoutSet {
+                name: &v4,
+                ipv6: false,
+            },
+            TimeoutSet {
+                name: &v6,
+                ipv6: true,
+            },
+        ];
+        let used = match (set.used_v4, set.used_v6) {
+            (true, true) => &both[..],
+            (true, false) => &both[..1],
+            (false, true) => &both[1..],
+            (false, false) => return Ok(()),
+        };
+        if addresses.is_empty() {
             return Ok(());
         }
-        self.runner.run_script(script)
+        self.runner.set_timeouts(used, addresses)
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
@@ -1057,8 +1082,9 @@ impl Elements {
     }
 
     /// Change the sets from the elements an update wrote before (`previous`, none when they
-    /// aren't known) to these: delete what they don't hold anymore and add what's new. A
-    /// verdict map's element whose verdict changed is deleted and added again.
+    /// aren't known) to these: add what's new; a set that lost elements, or a verdict map
+    /// with an element whose verdict changed, is emptied and filled again instead (see
+    /// [`render_added`] for why nothing is deleted one by one).
     fn render(
         &self,
         out: &mut String,
@@ -1068,45 +1094,32 @@ impl Elements {
         let mut new_lines = Vec::new();
         for set in NamedSet::ALL {
             let new = self.0.get(&set).map_or("", String::as_str);
-            let (table, name) = (set.table(), set.name());
-            let kind = if set.is_map() { "map" } else { "set" };
-            let Some(previous) = previous else {
-                writeln!(out, "flush {kind} {table} {name}")?;
-                render_elements(
-                    out,
-                    format_args!("add element {table} {name}"),
-                    new.lines(),
-                    "",
-                )?;
-                continue;
-            };
-            let old = previous.get(&set).map_or("", String::as_str);
-            if old == new {
+            let old = previous.map(|previous| previous.get(&set).map_or("", String::as_str));
+            if old == Some(new) {
                 continue;
             }
             old_lines.clear();
-            old_lines.extend(old.lines());
+            old_lines.extend(old.unwrap_or_default().lines());
             old_lines.sort_unstable();
             new_lines.clear();
             new_lines.extend(new.lines());
             new_lines.sort_unstable();
-            render_elements(
-                out,
-                format_args!("delete element {table} {name}"),
-                old_lines
+            let refill = old.is_none()
+                || old_lines
                     .iter()
-                    .filter(|line| new_lines.binary_search(line).is_err())
-                    .map(|line| line.split_once(" : ").map_or(*line, |(key, _)| key)),
-                "",
-            )?;
-            render_elements(
-                out,
-                format_args!("add element {table} {name}"),
-                new_lines
-                    .iter()
-                    .filter(|line| old_lines.binary_search(line).is_err()),
-                "",
-            )?;
+                    .any(|line| new_lines.binary_search(line).is_err());
+            if refill {
+                writeln!(out, "flush {} {} {}", set.kind(), set.table(), set.name())?;
+                render_added(out, set.declaration(), new.lines())?;
+            } else {
+                render_added(
+                    out,
+                    set.declaration(),
+                    new_lines
+                        .iter()
+                        .filter(|line| old_lines.binary_search(line).is_err()),
+                )?;
+            }
         }
         Ok(())
     }
@@ -1325,11 +1338,10 @@ fn render_objects(
         let name = format!("{} {}", Table::Bridge, limit.ports_name());
         writeln!(out, "add set {name} {{ type ifname; }}")?;
         writeln!(out, "flush set {name}")?;
-        render_elements(
+        render_added(
             out,
-            format_args!("add element {name}"),
+            format_args!("add set {name} {{ type ifname"),
             ports.into_iter().map(Quoted),
-            "",
         )?;
         installed.sets.insert(name);
     }
@@ -1537,9 +1549,9 @@ fn render_quarantined_set(out: &mut String, plan: &Plan) -> fmt::Result {
     let name = fmt::from_fn(|f| write!(f, "{} {QUARANTINED_SET}", Table::Bridge));
     writeln!(out, "add set {name} {{ type ifname; }}")?;
     writeln!(out, "flush set {name}")?;
-    render_elements(
+    render_added(
         out,
-        format_args!("add element {name}"),
+        format_args!("add set {name} {{ type ifname"),
         plan.sources
             .iter()
             .filter(|source| source.quarantined && !source.monitor)
@@ -1548,7 +1560,6 @@ fn render_quarantined_set(out: &mut String, plan: &Plan) -> fmt::Result {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .map(Quoted),
-        "",
     )
 }
 
@@ -2052,20 +2063,28 @@ impl NamedSet {
         )
     }
 
+    const fn kind(self) -> &'static str {
+        if self.is_map() { "map" } else { "set" }
+    }
+
+    /// `add <kind> <table> <name> { type <type>`, without the closing brace.
+    fn declaration(self) -> impl fmt::Display {
+        fmt::from_fn(move |f| {
+            let value = if self.is_map() { " : verdict" } else { "" };
+            write!(
+                f,
+                "add {} {} {} {{ type {}{value}",
+                self.kind(),
+                self.table(),
+                self.name(),
+                self.key_type()
+            )
+        })
+    }
+
     /// Create the set if needed.
     fn render_declaration(self, out: &mut String) -> fmt::Result {
-        let (kind, value) = if self.is_map() {
-            ("map", " : verdict")
-        } else {
-            ("set", "")
-        };
-        let name = self.name();
-        let table = self.table();
-        writeln!(
-            out,
-            "add {kind} {table} {name} {{ type {}{value}; }}",
-            self.key_type()
-        )
+        writeln!(out, "{}; }}", self.declaration())
     }
 }
 
@@ -2089,6 +2108,29 @@ fn render_elements<T: fmt::Display>(
     }
     writeln!(out, " }}{tail}")?;
     Ok(())
+}
+
+/// Add elements to a set: `{declaration}; elements = { e1, e2, ... }; }` and a newline,
+/// where `declaration` is the set's `add set ... { type ...` as it was created, without the
+/// closing brace. Writes nothing without elements.
+///
+/// Elements are never added with `add element`, nor deleted with `delete element`: before
+/// either, libnftables loads the elements of every set with `flags interval` in the
+/// kernel, in every table, its own or not. Another firewall's large sets of ranges (block
+/// lists, country lists) then cost tens of megabytes and a good part of a second per
+/// update. Declaring the set again with its elements doesn't. A set that loses elements is
+/// flushed and filled again, in the same transaction, so lookups see it before or after.
+fn render_added<T: fmt::Display>(
+    out: &mut String,
+    declaration: impl fmt::Display,
+    elements: impl Iterator<Item = T>,
+) -> fmt::Result {
+    render_elements(
+        out,
+        format_args!("{declaration}; elements ="),
+        elements,
+        "; }",
+    )
 }
 
 /// Writes the hostname sets of an update.
@@ -2137,20 +2179,23 @@ impl HostSetUpdate<'_> {
             _ => {
                 // Bounded in the kernel too: addresses are added from DNS answers between
                 // updates.
-                writeln!(
-                    out,
-                    "add set {name} {{ type {type_name}; flags timeout; size {HOST_SET_SIZE}; }}"
-                )?;
+                let declaration = format_args!(
+                    "add set {name} {{ type {type_name}; flags timeout; size {HOST_SET_SIZE}"
+                );
+                writeln!(out, "{declaration}; }}")?;
+                let timed = || addresses().map(|(address, timeout)| Timed(address, timeout));
                 if self.previous.kept && self.previous.sets.contains(&name) {
-                    render_timeouts(out, format_args!("{name}"), addresses)?;
+                    // Adding doesn't renew the addresses the set holds already: that's done
+                    // once the update is in place.
+                    render_added(out, declaration, timed())?;
+                    self.installed.renewals.push(Renewal {
+                        set: set.id.name(prefix).to_string(),
+                        ipv6: prefix == SET_PREFIX_V6,
+                        addresses: addresses().collect(),
+                    });
                 } else {
                     writeln!(out, "flush set {name}")?;
-                    render_elements(
-                        out,
-                        format_args!("add element {name}"),
-                        addresses().map(|(address, timeout)| Timed(address, timeout)),
-                        "",
-                    )?;
+                    render_added(out, declaration, timed())?;
                 }
                 self.listed.clone()
             }
@@ -2172,6 +2217,10 @@ impl HostSetUpdate<'_> {
 /// when it was first due. Each address is added, deleted and added again in one
 /// transaction instead: the add before the delete makes sure there is something to delete,
 /// and packets only ever see the set before or after, never without an address it keeps.
+///
+/// The firewall sends this as a netlink batch (see [`super::elements`]), not as a script;
+/// tests record it as the script that does the same.
+#[cfg(test)]
 fn render_timeouts<I>(
     out: &mut String,
     name: fmt::Arguments<'_>,
@@ -2594,6 +2643,8 @@ unsafe impl Send for NftContext<RealNftApi> {}
 
 pub struct LibNftablesRunner {
     context: Mutex<NftContext<RealNftApi>>,
+    /// Opened at the first renewal.
+    elements: Mutex<Option<ElementSocket>>,
 }
 
 impl LibNftablesRunner {
@@ -2601,6 +2652,7 @@ impl LibNftablesRunner {
         let context = NftContext::new(RealNftApi)?;
         Ok(Self {
             context: Mutex::new(context),
+            elements: Mutex::new(None),
         })
     }
 }
@@ -2621,6 +2673,24 @@ impl NftRunner for LibNftablesRunner {
             .lock()
             .map_err(|_| FirewallError::LibContextLock)?;
         guard.list(command)
+    }
+
+    fn set_timeouts(
+        &self,
+        sets: &[TimeoutSet<'_>],
+        addresses: &[(IpAddr, Duration)],
+    ) -> Result<(), FirewallError> {
+        let mut guard = self.elements.lock().unwrap_or_else(PoisonError::into_inner);
+        let socket = match &mut *guard {
+            Some(socket) => socket,
+            empty => empty.insert(ElementSocket::open().map_err(FirewallError::Netlink)?),
+        };
+        let result = socket.set_timeouts(TABLE_NAME, sets, addresses);
+        if result.is_err() {
+            // Answers of a batch that failed half way may still be queued.
+            *guard = None;
+        }
+        result.map_err(FirewallError::Netlink)
     }
 }
 
@@ -3004,7 +3074,7 @@ flush chain bridge portcullis limit_open
         assert_lines(
             &script,
             &[
-                "add element inet portcullis egress4 { 172.18.0.2 : goto egress0 }".into(), "add rule inet portcullis forward iifname @bridges ip saddr vmap @egress4".into(),
+                "add map inet portcullis egress4 { type ipv4_addr : verdict; elements = { 172.18.0.2 : goto egress0 }; }".into(), "add rule inet portcullis forward iifname @bridges ip saddr vmap @egress4".into(),
                 // Traffic to the host follows the same rules.
                 "add rule inet portcullis input ct state established accept".into(),
                 // ICMP errors only from an end of the connection they are about.
@@ -3012,7 +3082,7 @@ flush chain bridge portcullis limit_open
                 "add rule inet portcullis egress0 ct state related ct reply ip saddr 172.18.0.2 accept".into(),
                 "add rule inet portcullis input iifname @bridges ip saddr vmap @egress4".into(),
                 "add rule inet portcullis input iifname @enforced_bridges drop".into(),
-                "add element inet portcullis enforced_bridges { \"br-net0\" }".into(),
+                "add set inet portcullis enforced_bridges { type ifname; elements = { \"br-net0\" }; }".into(),
                 // The gateway is the host: traffic to it follows the egress rules. So does
                 // anything else the host receives, such as broadcast to the subnet: only
                 // what leaves through a bridge is for other containers.
@@ -3023,11 +3093,11 @@ flush chain bridge portcullis limit_open
                 // Reported by the bridge table already.
                 "add rule inet portcullis forward iifname @enforced_bridges drop".into(),
                 decided("add rule inet portcullis egress0", 'd', "egress", "drop"),
-                "add element bridge portcullis bridges { \"br-net0\" }".into(),
+                "add set bridge portcullis bridges { type ifname; elements = { \"br-net0\" }; }".into(),
                 "add rule bridge portcullis prerouting meta ibrname != @bridges accept".into(),
-                "add element bridge portcullis sources_by_mac { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }".into(), "add rule bridge portcullis prerouting ip saddr . ether saddr vmap @sources_by_mac".into(),
+                "add map bridge portcullis sources_by_mac { type ipv4_addr . ether_addr : verdict; elements = { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc0 }; }".into(), "add rule bridge portcullis prerouting ip saddr . ether saddr vmap @sources_by_mac".into(),
                 // ARP may only announce the container's own address and MAC.
-                "add element bridge portcullis arp_by_mac { 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 }".into(), "add rule bridge portcullis prerouting ether saddr . arp saddr ether . arp saddr ip @arp_by_mac accept".into(),
+                "add set bridge portcullis arp_by_mac { type ether_addr . ether_addr . ipv4_addr; elements = { 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 }; }".into(), "add rule bridge portcullis prerouting ether saddr . arp saddr ether . arp saddr ip @arp_by_mac accept".into(),
                 // Everything else is denied: IPv4 and ARP as a source that isn't the
                 // sender's, other frames (IPv6, VLAN tags) as frames.
                 denied_frames("meta ibrname @enforced_bridges", 'd'),
@@ -3209,6 +3279,32 @@ flush chain bridge portcullis limit_open
         assert!(third.contains(&format!("delete set {set}\n")), "{third}");
     }
 
+    /// A removed container's elements go, the map emptied and filled again without them,
+    /// then its chains (slot `a`); the other container's (slot `b`) stay.
+    fn assert_removed(removed: &str, a: usize, b: usize) {
+        let deleted = "flush map inet portcullis egress4\n";
+        let chain = format!(
+            "flush chain inet portcullis egress{a}\ndelete chain inet portcullis egress{a}\n"
+        );
+        let (Some(deleted), Some(chain)) = (removed.find(deleted), removed.find(&chain)) else {
+            panic!("{removed}");
+        };
+        assert!(deleted < chain, "{removed}");
+        let refilled = removed
+            .lines()
+            .find(|line| {
+                line.starts_with(
+                    "add map inet portcullis egress4 { type ipv4_addr : verdict; elements = ",
+                )
+            })
+            .expect("refilled map");
+        assert!(
+            refilled.contains(&format!("172.18.0.3 : goto egress{b}")),
+            "{removed}"
+        );
+        assert!(!refilled.contains("172.18.0.2"), "{removed}");
+    }
+
     #[test]
     fn writes_only_the_chains_whose_rules_changed() {
         use crate::model::{IccMode, RuntimeStateAction};
@@ -3264,7 +3360,7 @@ flush chain bridge portcullis limit_open
         assert!(
             has_line(
                 added,
-                "add element inet portcullis egress4 { 172.18.0.4 : goto egress2 }"
+                "add map inet portcullis egress4 { type ipv4_addr : verdict; elements = { 172.18.0.4 : goto egress2 }; }"
             ),
             "{added}"
         );
@@ -3272,17 +3368,9 @@ flush chain bridge portcullis limit_open
             assert!(!added.contains(&format!("portcullis {chain}\n")), "{added}");
             assert!(!added.contains(&format!("goto {chain}")), "{added}");
         }
-        assert!(!added.contains("delete element"), "{added}");
-        // A removed container's elements go, then its chains.
-        let deleted = "delete element inet portcullis egress4 { 172.18.0.2 }\n";
-        let chain = format!(
-            "flush chain inet portcullis egress{a}\ndelete chain inet portcullis egress{a}\n"
-        );
-        let (Some(deleted), Some(chain)) = (removed.find(deleted), removed.find(&chain)) else {
-            panic!("{removed}");
-        };
-        assert!(deleted < chain, "{removed}");
-        assert!(!removed.contains("172.18.0.3"), "{removed}");
+        assert!(!added.contains("flush map"), "{added}");
+        assert_removed(removed, a, b);
+        assert!(!removed.contains("delete element"), "{removed}");
         assert!(
             !removed.contains(&format!("flush chain inet portcullis egress{b}")),
             "{removed}"
@@ -3300,10 +3388,8 @@ flush chain bridge portcullis limit_open
             "inet portcullis egress4",
             "bridge portcullis sources_by_mac",
         ] {
-            assert!(
-                !unchanged.contains(&format!("element {set}")),
-                "{unchanged}"
-            );
+            let touched = |line: &str| line.contains(set) && !line.ends_with("verdict; }");
+            assert!(!unchanged.lines().any(touched), "{unchanged}");
         }
         // The next container takes the free slot.
         assert!(
@@ -3313,7 +3399,9 @@ flush chain bridge portcullis limit_open
         assert!(
             has_line(
                 reused,
-                &format!("add element inet portcullis egress4 {{ 172.18.0.5 : goto egress{a} }}")
+                &format!(
+                    "add map inet portcullis egress4 {{ type ipv4_addr : verdict; elements = {{ 172.18.0.5 : goto egress{a} }}; }}"
+                )
             ),
             "{reused}"
         );
@@ -3417,7 +3505,7 @@ flush chain bridge portcullis limit_open
         let set = format!("inet portcullis {name}");
         assert!(
             first.contains(&format!(
-                "flush set {set}\nadd element {set} {{ 1.1.1.1 timeout 3600s }}\n"
+                "flush set {set}\nadd set {set} {{ type ipv4_addr; flags timeout; size 8192; elements = {{ 1.1.1.1 timeout 3600s }}; }}\n"
             )),
             "{first}"
         );
@@ -3425,7 +3513,7 @@ flush chain bridge portcullis limit_open
         assert!(!same.contains(&set), "{same}");
         assert!(
             changed.contains(&format!(
-                "flush set {set}\nadd element {set} {{ 1.1.1.1 timeout 3600s, 1.0.0.1 timeout 3600s }}\n"
+                "flush set {set}\nadd set {set} {{ type ipv4_addr; flags timeout; size 8192; elements = {{ 1.1.1.1 timeout 3600s, 1.0.0.1 timeout 3600s }}; }}\n"
             )),
             "{changed}"
         );
@@ -3535,7 +3623,7 @@ flush chain bridge portcullis limit_open
         };
         // web's address and MAC only count from its own port...
         assert!(
-            line("add element bridge portcullis sources_by_port")
+            line("add map bridge portcullis sources_by_port { type ifname . ipv4_addr . ether_addr : verdict; elements =")
                 .contains("\"veth0a1b2c3\" . 172.18.0.2 . 02:42:ac:12:00:02 : goto icc"),
             "{script}"
         );
@@ -3545,7 +3633,9 @@ flush chain bridge portcullis limit_open
         ));
         // ...and not without it; containers whose port isn't known are checked by address
         // and MAC.
-        let by_mac = line("add element bridge portcullis sources_by_mac");
+        let by_mac = line(
+            "add map bridge portcullis sources_by_mac { type ipv4_addr . ether_addr : verdict; elements =",
+        );
         assert!(!by_mac.contains("172.18.0.2 "), "{script}");
         assert!(
             by_mac.contains("172.18.0.3 . 02:42:ac:12:00:03"),
@@ -3554,7 +3644,7 @@ flush chain bridge portcullis limit_open
         // ARP may only announce web's own address and MAC, from its port.
         assert_lines(
             &script,
-            &["add element bridge portcullis arp_by_port { \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 }".into(), "add rule bridge portcullis prerouting iifname . ether saddr . arp saddr ether . arp saddr ip @arp_by_port accept".into()],
+            &["add set bridge portcullis arp_by_port { type ifname . ether_addr . ether_addr . ipv4_addr; elements = { \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 172.18.0.2, \"veth0a1b2c3\" . 02:42:ac:12:00:02 . 02:42:ac:12:00:02 . 0.0.0.0 }; }".into(), "add rule bridge portcullis prerouting iifname . ether saddr . arp saddr ether . arp saddr ip @arp_by_port accept".into()],
         );
         // Anything else from web's port is denied at once, not held.
         let options = Options {
@@ -3564,7 +3654,7 @@ flush chain bridge portcullis limit_open
         let script = render_with(&state, options, false);
         assert_lines(
             &script,
-            &["add element bridge portcullis enforced_ports { \"veth0a1b2c3\" }".into()],
+            &["add set bridge portcullis enforced_ports { type ifname; elements = { \"veth0a1b2c3\" }; }".into()],
         );
         let known_port = denied_frames(
             "meta ibrname @enforced_bridges iifname @enforced_ports",
@@ -3653,16 +3743,16 @@ flush chain bridge portcullis limit_open
             &script,
             &[
                 // Quarantined ports get nowhere, before anything else is checked.
-                "add element bridge portcullis quarantined { \"veth3\" }".into(),
+                "add set bridge portcullis quarantined { type ifname; elements = { \"veth3\" }; }".into(),
                 "add rule bridge portcullis prerouting meta ibrname != @bridges accept\nadd rule bridge portcullis prerouting iifname @quarantined drop".into(),
                 "add rule bridge portcullis input iifname @quarantined drop".into(),
                 // Open connections: the label's limit, or the default.
-                "add element bridge portcullis ports_conns10 { \"veth2\" }".into(),
+                "add set bridge portcullis ports_conns10 { type ifname; elements = { \"veth2\" }; }".into(),
                 "add rule bridge portcullis prerouting iifname @ports_conns10 ct state new add @conns10 { iifname ct count over 10 } goto limit_open".into(),
-                "add element bridge portcullis ports_conns1000 { \"veth3\" }".into(),
+                "add set bridge portcullis ports_conns1000 { type ifname; elements = { \"veth3\" }; }".into(),
                 "add rule bridge portcullis prerouting iifname @ports_conns1000 ct state new add @conns1000 { iifname ct count over 1000 } goto limit_open".into(),
                 // New connections per second, only where a label asks for it.
-                "add element bridge portcullis ports_new5 { \"veth2\" }".into(),
+                "add set bridge portcullis ports_new5 { type ifname; elements = { \"veth2\" }; }".into(),
                 "add rule bridge portcullis prerouting iifname @ports_new5 ct state new add @new5 { iifname limit rate over 5/second burst 5 packets } goto limit_rate".into(),
                 "add set bridge portcullis conns10 { type ifname; flags dynamic; size 65536; }".into(),
                 "add set bridge portcullis new5 { type ifname; flags dynamic,timeout; timeout 60s; size 65536; }".into(),
@@ -3714,7 +3804,7 @@ flush chain bridge portcullis limit_open
         }
         assert!(has_line(
             &script,
-            "add element inet portcullis name_limited { 172.18.0.2 }"
+            "add set inet portcullis name_limited { type ipv4_addr; elements = { 172.18.0.2 }; }"
         ));
     }
 
@@ -3841,9 +3931,17 @@ flush chain bridge portcullis limit_open
     #[test]
     fn renders_hostname_sets_with_timeouts_once_per_container_and_host() {
         let script = render(&test_support::shared_hostname_state());
-        assert_eq!(script.matches("add set inet portcullis pc_h4_").count(), 2);
+        let declarations = script
+            .lines()
+            .filter(|line| line.starts_with("add set inet portcullis pc_h4_"));
+        assert_eq!(
+            declarations
+                .filter(|line| line.ends_with("size 8192; }"))
+                .count(),
+            2
+        );
         assert!(script.contains("{ type ipv4_addr; flags timeout; size 8192; }"));
-        assert!(script.contains(" { 1.1.1.1 timeout 3600s }\n"));
+        assert!(script.contains("; elements = { 1.1.1.1 timeout 3600s }; }\n"));
         assert_eq!(script.matches("ct original ip daddr @pc_h4_").count(), 2);
         // no IPv6 source references the host, so no IPv6 set is created
         assert!(!script.contains("pc_h6_"));
@@ -3853,7 +3951,7 @@ flush chain bridge portcullis limit_open
     fn renders_ipv6_rules_and_sets() {
         let script = render(&test_support::ipv6_state());
         assert!(script.contains("add set inet portcullis pc_h6_"));
-        assert!(script.contains(" { 2606:4700::1111 timeout 3600s }\n"));
+        assert!(script.contains("; elements = { 2606:4700::1111 timeout 3600s }; }\n"));
         assert!(!script.contains("pc_h4_"));
         assert!(has_line(
             &script,
@@ -3861,7 +3959,7 @@ flush chain bridge portcullis limit_open
         ));
         assert!(has_line(
             &script,
-            "add element inet portcullis egress6 { fd00::2 : goto egress0 }"
+            "add map inet portcullis egress6 { type ipv6_addr : verdict; elements = { fd00::2 : goto egress0 }; }"
         ));
         assert!(has_line(
             &script,
@@ -4059,6 +4157,31 @@ flush chain bridge portcullis limit_open
                 .get(command)
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        /// Recorded as the script that does the same.
+        fn set_timeouts(
+            &self,
+            sets: &[TimeoutSet<'_>],
+            addresses: &[(IpAddr, Duration)],
+        ) -> Result<(), FirewallError> {
+            let mut script = String::new();
+            for set in sets {
+                render_timeouts(
+                    &mut script,
+                    format_args!("{} {}", Table::Inet, set.name),
+                    || {
+                        addresses
+                            .iter()
+                            .copied()
+                            .filter(|(address, _)| address.is_ipv6() == set.ipv6)
+                    },
+                )?;
+            }
+            if !script.is_empty() {
+                self.run_script(script)?;
+            }
+            Ok(())
         }
     }
 
@@ -4274,9 +4397,10 @@ flush chain bridge portcullis limit_open
              delete element inet portcullis {name} {{ 1.1.1.1 }}\n\
              add element inet portcullis {name} {{ 1.1.1.1 timeout 3600s }}\n"
         );
-        let flushed = format!(
-            "flush set inet portcullis {name}\nadd element inet portcullis {name} {{ 1.1.1.1 timeout 3600s }}\n"
+        let added = format!(
+            "add set inet portcullis {name} {{ type ipv4_addr; flags timeout; size 8192; elements = {{ 1.1.1.1 timeout 3600s }}; }}\n"
         );
+        let flushed = format!("flush set inet portcullis {name}\n{added}");
 
         // Left in place by a run that stopped: what the set has stays, the update renews
         // what Portcullis knows.
@@ -4289,14 +4413,16 @@ flush chain bridge portcullis limit_open
                 .expect("apply");
         }
         let scripts = firewall.runner.scripts.lock().expect("lock");
-        assert!(scripts[0].contains(&renewed), "{}", scripts[0]);
+        // Added where missing, then renewed once the update is in place.
+        assert!(scripts[0].contains(&added), "{}", scripts[0]);
         assert!(!scripts[0].contains(&format!("flush set inet portcullis {name}")));
+        assert_eq!(scripts[1], renewed);
         // A later update with the same addresses leaves the set alone: what the previous run
         // learned still runs out as it would have.
         assert!(
-            !scripts[1].contains(&format!("inet portcullis {name}")),
+            !scripts[2].contains(&format!("inet portcullis {name}")),
             "{}",
-            scripts[1]
+            scripts[2]
         );
         drop(scripts);
 
