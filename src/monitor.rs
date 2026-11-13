@@ -352,14 +352,35 @@ where
                 &self.policy_dir,
                 &mut self.warnings,
             );
-            // The container list doesn't include DNS settings; managed containers need them.
+            // The container list doesn't include DNS settings or network aliases (such as
+            // Compose's service names, which ICC rules name containers by); managed
+            // containers need them.
             if !container.attachments.is_empty() {
                 match self.api.inspect_container(&container.id) {
                     Ok(inspect) => {
                         container.runtime_dns_servers =
                             runtime_dns_servers(inspect.host_config.as_ref());
-                        container.sandbox = inspect
-                            .network_settings
+                        let settings = inspect.network_settings;
+                        for (_, endpoint) in settings
+                            .iter()
+                            .filter_map(|settings| settings.networks.as_ref())
+                            .flatten()
+                        {
+                            let Some(attachment) =
+                                container.attachments.iter_mut().find(|attachment| {
+                                    endpoint.network_id.as_deref()
+                                        == Some(attachment.network_id.as_str())
+                                })
+                            else {
+                                continue;
+                            };
+                            if attachment.aliases.is_empty()
+                                && let Some(aliases) = &endpoint.aliases
+                            {
+                                attachment.aliases.clone_from(aliases);
+                            }
+                        }
+                        container.sandbox = settings
                             .and_then(|settings| settings.sandbox_key)
                             .filter(|key| !key.is_empty());
                     }
@@ -403,6 +424,13 @@ where
                 DockerEventAction::Destroy => Ok(Some(RuntimeStateAction::RemoveContainer {
                     container_id: event.id.into(),
                 })),
+                // Already found behind a bridge port before Docker's events caught up: the
+                // create event has none of the networks it is on by now, and taking them
+                // away would take its address, its rules and the connections it made
+                // under them, until the events of its start.
+                DockerEventAction::Create if state.containers().contains_key(event.id.as_str()) => {
+                    Ok(None)
+                }
                 DockerEventAction::Create => Ok(Self::create_container_action(
                     event,
                     &self.policy_dir,
@@ -1064,6 +1092,52 @@ mod tests {
     }
 
     #[test]
+    fn collect_state_takes_network_aliases_from_the_inspect() {
+        let mut api = MockDockerApi::default();
+        api.networks_list.push(network_inspect(
+            "net0",
+            "managed",
+            "172.20.0.0/16",
+            Some("172.20.0.1"),
+            DockerNetworkDriver::Bridge,
+            Some("true"),
+        ));
+        // Docker's container list has no aliases; its inspect has them.
+        let mut summary =
+            container_summary("abc", "/web", &[], &[("managed", "net0", "172.20.0.2")]);
+        for endpoint in summary
+            .network_settings
+            .iter_mut()
+            .filter_map(|settings| settings.networks.as_mut())
+            .flat_map(|networks| networks.values_mut())
+        {
+            endpoint.aliases = None;
+        }
+        api.containers_list.push(summary);
+        let mut inspect =
+            container_inspect("abc", "/web", &[], &[("managed", "net0", "172.20.0.2")]);
+        for endpoint in inspect
+            .network_settings
+            .iter_mut()
+            .filter_map(|settings| settings.networks.as_mut())
+            .flat_map(|networks| networks.values_mut())
+        {
+            endpoint.aliases = Some(vec!["frontend".to_string()]);
+        }
+        api.containers.insert("abc".to_string(), inspect);
+
+        let mut monitor = DockerMonitor::new(api);
+        let state = monitor.initialize().expect("collect_state should succeed");
+
+        let web = state
+            .containers()
+            .get("abc")
+            .expect("abc should be present");
+        assert_eq!(web.attachments.len(), 1);
+        assert_eq!(web.attachments[0].aliases, ["frontend"]);
+    }
+
+    #[test]
     fn network_connect_uses_single_container_inspect_without_network_inspect() {
         let mut api = MockDockerApi::default();
         api.containers.insert(
@@ -1246,6 +1320,41 @@ mod tests {
             Some(RuntimeStateAction::CreateContainer { .. })
         ));
         assert!(monitor.api.inspect_container_requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn create_event_of_a_container_found_already_keeps_its_networks() {
+        let mut monitor = DockerMonitor::new(MockDockerApi::default());
+        let mut state = RuntimeState::default();
+        state.apply_action(RuntimeStateAction::DiscoverContainer {
+            container: Box::new(Container {
+                id: "abc".to_string().into(),
+                name: "web".to_string().into(),
+                attachments: vec![NetworkAttachment {
+                    network_id: "n0".into(),
+                    ip_address: "172.18.0.2".parse().expect("address"),
+                    mac_address: None,
+                    aliases: Vec::new(),
+                }],
+                runtime_dns_servers: HashSet::new(),
+                policy: ContainerPolicy::default(),
+                sandbox: Some("/run/docker/netns/abc".to_string()),
+            }),
+        });
+
+        // Docker's create event comes after the container was found behind its port.
+        let event = DockerEvent {
+            id: "abc".to_string(),
+            action: DockerEventAction::Create,
+            name: Some("web".to_string()),
+            kind: DockerEventKind::Container,
+            attributes: IndexMap::new(),
+        };
+        let action = monitor
+            .resolve_event_action(&state, event)
+            .expect("create action should resolve");
+
+        assert!(action.is_none());
     }
 
     #[test]
