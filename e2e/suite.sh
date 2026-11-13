@@ -24,6 +24,7 @@ SCENARIOS=(
   monitor-start
   slow-docker
   recreate
+  shared-namespace
   default-bridge
   dns-inspection
   hostname-refresh
