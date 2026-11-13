@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.5.0] - 2026-11-13
+
+### Features
+
+- Read container policy labels from a file (#22) by @nikarh in #22
+
+### Performance
+
+- Faster rule updates with many containers (#23) by @nikarh in #23
+- Less work per update and per new container (#24) by @nikarh in #24
+
+### Documentation
+
+- Dark Reader leaves the website alone, it has its own dark theme (#26) by @nikarh in #26
+
 ## [0.4.0] - 2026-11-07
 
 ### Fixes
@@ -245,6 +260,7 @@ All notable changes to this project are documented in this file. The format is b
 - Verifying signed releases, and how releasing works by @nikarh
 - Remove the crates.io badge; portcullis on crates.io is another project by @nikarh
 
+[0.5.0]: https://github.com/nikarh/portcullis/compare/v0.4.0..v0.5.0
 [0.4.0]: https://github.com/nikarh/portcullis/compare/v0.3.0..v0.4.0
 [0.3.0]: https://github.com/nikarh/portcullis/compare/v0.2.1..v0.3.0
 [0.2.1]: https://github.com/nikarh/portcullis/compare/v0.2.0..v0.2.1
