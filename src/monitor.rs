@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -344,7 +344,7 @@ where
                 networks_by_id.insert(data.id.clone(), data);
             }
         }
-        let mut containers_by_id = HashMap::new();
+        let mut containers_by_id = BTreeMap::new();
         for summary in containers {
             let mut container = Self::build_container_from_summary(
                 &networks_by_id,

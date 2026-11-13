@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
@@ -502,7 +503,9 @@ pub struct BridgePort {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeState {
-    containers: HashMap<ContainerId, Container>,
+    /// By ID, so that everything that goes through them does it in the same order every
+    /// time: when stale state has two containers claim one address, the same one gets it.
+    containers: BTreeMap<ContainerId, Container>,
     networks: HashMap<NetworkId, Network>,
     /// DNS servers set daemon-wide in Docker's `daemon.json`.
     daemon_dns: Vec<IpAddr>,
@@ -524,7 +527,7 @@ pub struct RuntimeState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeStateAction {
     Initialize {
-        containers: HashMap<ContainerId, Container>,
+        containers: BTreeMap<ContainerId, Container>,
         networks: HashMap<NetworkId, Network>,
     },
     CreateContainer {
@@ -561,7 +564,7 @@ pub enum RuntimeStateAction {
 
 impl RuntimeState {
     #[must_use]
-    pub fn containers(&self) -> &HashMap<ContainerId, Container> {
+    pub fn containers(&self) -> &BTreeMap<ContainerId, Container> {
         &self.containers
     }
 
