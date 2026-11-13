@@ -423,13 +423,17 @@ fn match_ports(
                 continue;
             };
             if let Some(port) = by_peer.get(&(bridge, namespace)) {
-                found.ports.insert(
-                    attachment.ip_address,
-                    BridgePort {
+                // Should stale state have two running containers with the address, the
+                // first one gets its port, as it gets the address in the plan (see
+                // `Plan::build`): a port and a MAC of different containers would match
+                // neither.
+                found
+                    .ports
+                    .entry(attachment.ip_address)
+                    .or_insert_with(|| BridgePort {
                         name: port.name.clone(),
                         index: port.index,
-                    },
-                );
+                    });
             } else {
                 debug!(container = %container.name, bridge = %network.bridge, "the container has no port on the bridge; it is stopping, or not attached yet");
                 found.absent.insert(attachment.ip_address);
@@ -601,6 +605,45 @@ mod tests {
                 |_| Ok(Some(5)),
             );
             assert!(namespaces.is_empty());
+        }
+
+        #[test]
+        fn gives_a_contested_address_the_port_of_the_first_running_container_by_id() {
+            // Stale state: two running containers with one address, each with a port.
+            // The address gets the port of the one the plan gives it to, the first by ID,
+            // whichever came first.
+            let links = bridge_with(&[
+                link(7, "veth-a", Some(1), Some(4)),
+                link(8, "veth-z", Some(1), Some(5)),
+            ]);
+            for order in [["a", "z"], ["z", "a"]] {
+                let mut state = RuntimeState::default();
+                test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+                for id in order {
+                    test_support::add_container(
+                        &mut state,
+                        id,
+                        id,
+                        &[("net0", "172.18.0.2", &[])],
+                        ContainerPolicy::default(),
+                    );
+                    let mut container = state.containers().get(id).cloned().expect("container");
+                    container.sandbox = Some(format!("/ns/{id}"));
+                    state.apply_action(RuntimeStateAction::CreateContainer {
+                        container: Box::new(container),
+                    });
+                }
+                let found = ports_of(&state, &links, |file| {
+                    Ok(Some(if file == Path::new("/ns/a") { 4 } else { 5 }))
+                });
+                assert_eq!(
+                    found
+                        .ports
+                        .get(&test_support::ip("172.18.0.2"))
+                        .map(|port| port.name.as_str()),
+                    Some("veth-a")
+                );
+            }
         }
 
         #[test]

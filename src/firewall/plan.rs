@@ -375,7 +375,8 @@ where
     fn plan_attachment(&mut self, container: &'s Container, attachment: &'s NetworkAttachment) {
         let source = attachment.ip_address;
         // An address can only belong to one container at a time. Should stale state ever
-        // contain it twice, the first owner wins, as it would in a linear rule list.
+        // contain it twice, the first owner wins, as it would in a linear rule list:
+        // containers come by ID, so it is the same one on every update.
         if !self.seen_sources.insert(source) {
             return;
         }
@@ -762,6 +763,32 @@ mod tests {
                 .map(|source| source.container.as_str())
                 .collect();
             assert_eq!(owners, [new]);
+        }
+    }
+
+    #[test]
+    fn gives_an_address_two_running_containers_claim_to_the_first_by_id() {
+        // Stale state: neither is stopping. The same one gets the address on every
+        // update, whichever came first.
+        for order in [["a", "z"], ["z", "a"]] {
+            let mut state = RuntimeState::default();
+            test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+            for id in order {
+                test_support::add_container(
+                    &mut state,
+                    id,
+                    id,
+                    &[("net0", "172.18.0.2", &[])],
+                    crate::model::ContainerPolicy::default(),
+                );
+            }
+            let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
+            let owners: Vec<&str> = plan
+                .sources
+                .iter()
+                .map(|source| source.container.as_str())
+                .collect();
+            assert_eq!(owners, ["a"]);
         }
     }
 

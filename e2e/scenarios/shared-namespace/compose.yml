@@ -1,0 +1,54 @@
+# A container others share the network namespace of (network_mode: service:<it>), such as
+# a VPN client with an app and a proxy in its namespace, recreated together with them as
+# Compose does it.
+services:
+  vpn:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    # Stops at once, so a recreate doesn't wait for the stop timeout.
+    init: true
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=allow-listed
+      - portcullis.icc.allow.peer=container:peer,tcp:8080
+  app:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    init: true
+    network_mode: service:vpn
+    # vpn's servers already listen in the namespace.
+    command: [sleep, infinity]
+    depends_on: [vpn]
+    labels:
+      - portcullis.ack=shared-network
+  proxy:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    init: true
+    network_mode: service:vpn
+    # vpn's servers already listen in the namespace.
+    command: [sleep, infinity]
+    depends_on: [vpn]
+    labels:
+      - portcullis.ack=shared-network
+  peer:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.icc.mode=deny
+  # Started last: once its rules are in place, Portcullis has handled every Docker event
+  # before its start.
+  marker:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    profiles: [late]
+    networks: [net]
+
+networks:
+  net:
+    ipam:
+      config:
+        - subnet: 10.250.78.0/24
+    labels:
+      - portcullis.enable=true
