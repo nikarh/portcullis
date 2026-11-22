@@ -33,7 +33,7 @@ Every update is also saved to the state directory, so the rules can be put back 
 
 A container can start sending before Portcullis has seen it start. Its first packets then come from an address the rules don't know yet. Portcullis doesn't deny them: the firewall holds them (NFQUEUE) until the container's rules are in place and then runs them through those rules, so they are allowed or denied as if the rules had been there all along. TCP and UDP are only delayed, not lost.
 
-Portcullis doesn't wait for Docker to report the container. It finds it from the packet's bridge port, through the kernel and the files Docker keeps for each container, usually within milliseconds; see [Finding new containers](/internals/discovery/).
+Portcullis doesn't wait for Docker to report the container. It finds it from its bridge port as soon as the port comes up, or from the port a held packet came in on, through the kernel and the files Docker keeps for each container, usually within milliseconds; see [Finding new containers](/internals/discovery/). Its rules are then usually in place before it has sent anything.
 
 Packets whose source is still unknown after 2 seconds are denied as spoofed: normally they belong to no container. On networks in monitor mode such packets are held the same way, so that they are reported with their container, and let through once the hold expires.
 

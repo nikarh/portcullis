@@ -57,7 +57,7 @@ use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored, 
 use crate::logging::LoggingError;
 use crate::model::{ContainerId, RuntimeState, RuntimeStateAction};
 use crate::monitor::{DockerMonitor, Fetched, MonitorError};
-use crate::nfnetlink::QueueOverflow;
+use crate::nfnetlink::{Overruns, QueueOverflow, is_overrun};
 use crate::owners::Owners;
 use crate::source_hold::SourceHold;
 
@@ -737,6 +737,48 @@ fn discover(
     }
 }
 
+/// Ask on `discover` for the container behind each bridge port to be found whenever the
+/// kernel reports a change of the port (Docker attaches it, then it comes up once the
+/// container's interface is up with its address), before the container sends anything:
+/// its rules are then usually in place before its first packet, which isn't held at all. Packets held from
+/// a port still ask for it (see `source_hold`), so this only makes it sooner: if the
+/// container has no process yet, or the kernel's reports can't be read, its first packet
+/// asks again.
+fn watch_ports(discover: Sender<u32>) {
+    let mut watch = match rtnetlink::PortWatch::open() {
+        Ok(watch) => watch,
+        Err(error) => {
+            warn!(%error, "can't watch for new bridge ports; containers are found once they send");
+            return;
+        }
+    };
+    thread::spawn(move || {
+        let mut overruns = Overruns::default();
+        loop {
+            match watch.receive() {
+                Ok(ports) => {
+                    for port in ports {
+                        if discover.send(port).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(error) if is_overrun(&error) => {
+                    if overruns.report() {
+                        debug!(
+                            "bridge ports changed faster than they could be read; containers whose ports were missed are found once they send"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "can't watch for new bridge ports anymore; containers are found once they send");
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// Cut a misbehaving container off from its networks, or report that it would be.
 fn quarantine_container(
     mode: QuarantineMode,
@@ -868,6 +910,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     .map_err(MainError::DnsInspection)?;
 
     let (discover_tx, discover_rx) = unbounded::<u32>();
+    watch_ports(discover_tx.clone());
     let source_hold = source_hold::spawn(
         SOURCE_QUEUE,
         QueueOverflow::Drop,
