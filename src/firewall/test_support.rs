@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ipnet::IpNet;
 
-use crate::dns::{DnsError, HostResolver};
+use crate::dns::HostResolver;
 use crate::model::{
     Container, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
     IccTarget, MacAddress, Network, NetworkAttachment, RuntimeState, RuntimeStateAction, Service,
@@ -36,16 +36,12 @@ impl HostResolver for MockResolver {
         _container: &str,
         host: &str,
         hold: Duration,
-    ) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
+    ) -> Vec<(IpAddr, Duration)> {
         self.calls += 1;
         if host == HOST {
-            return Ok(vec![(ip("1.1.1.1"), hold), (ip("2606:4700::1111"), hold)]);
+            return vec![(ip("1.1.1.1"), hold), (ip("2606:4700::1111"), hold)];
         }
-        Err(DnsError::LookupFailed {
-            host: host.to_string(),
-            message: "host not found".to_string(),
-            missing: true,
-        })
+        Vec::new()
     }
 }
 

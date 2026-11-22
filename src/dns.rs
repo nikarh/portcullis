@@ -91,12 +91,10 @@ pub trait HostResolver {
     /// The hold of containers without a `portcullis.hostname-hold` label.
     fn default_hold(&self) -> Duration;
 
-    fn addresses(
-        &mut self,
-        container: &str,
-        host: &str,
-        hold: Duration,
-    ) -> Result<Vec<(IpAddr, Duration)>, DnsError>;
+    /// The addresses `container` may reach for `host` now, and how long each stays
+    /// allowed. Never looks anything up: a rule update doesn't wait for DNS.
+    fn addresses(&mut self, container: &str, host: &str, hold: Duration)
+    -> Vec<(IpAddr, Duration)>;
 }
 
 /// The host's resolver (`getaddrinfo`).
@@ -329,8 +327,17 @@ where
         }
     }
 
+    /// Whether `host` was looked up before.
+    #[must_use]
+    pub fn looked_up_before(&self, host: &str) -> bool {
+        self.lookups
+            .get(host)
+            .is_some_and(|lookups| lookups.attempted.is_some())
+    }
+
     /// Record the result of looking `host` up. Returns whether it resolved where the
-    /// lookup before it had failed.
+    /// lookup before it had failed, or where it is the first: rule updates don't wait for
+    /// a hostname's first lookup, so one that came before it listed the name as unresolved.
     pub fn record_lookup(
         &mut self,
         host: &str,
@@ -338,7 +345,7 @@ where
         now: Instant,
     ) -> bool {
         let lookups = self.lookups.entry(host.to_string()).or_default();
-        let failed_before = lookups.failure.is_some();
+        let failed_before = lookups.failure.is_some() || lookups.attempted.is_none();
         lookups.attempted = Some(now);
         match result {
             Ok(addresses) => {
@@ -365,29 +372,18 @@ where
             .unwrap_or_default()
     }
 
+    /// What DNS answers to `container` and Portcullis's lookups said about `host`, as of
+    /// `now`. A hostname no lookup has been made for yet has what answers to the container
+    /// said: lookups go through the host's resolver and can take seconds, so they are made
+    /// in `host_refresh`, right after the rule update that first needs the hostname.
     fn addresses_at(
         &mut self,
         container: &str,
         host: &str,
         hold: Duration,
         now: Instant,
-    ) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
+    ) -> Vec<(IpAddr, Duration)> {
         let host = normalize(host);
-        // A pattern (`*.example.com`) can't be looked up: only answers to the container fill
-        // it. A hostname is looked up the first time a rule needs it, then on a schedule.
-        let exact = !host.contains('*');
-        let mut failed = None;
-        if exact
-            && self
-                .lookups
-                .get(&host)
-                .is_none_or(|lookups| lookups.attempted.is_none())
-        {
-            let result = self.resolver.resolve_host(&host);
-            failed = result.as_ref().err().cloned();
-            self.record_lookup(&host, result, now);
-        }
-
         let mut addresses: HashMap<IpAddr, Instant> = self
             .observed
             .get_mut(&(container.to_string(), host.clone()))
@@ -404,20 +400,12 @@ where
                 *current = (*current).max(until);
             }
         }
-        // Only the lookup that failed reports it; until a later one succeeds, the hostname
-        // just has no addresses, which every rule update lists.
-        if addresses.is_empty()
-            && let Some(error) = failed
-        {
-            return Err(error);
-        }
-
         let mut addresses: Vec<_> = addresses
             .into_iter()
             .map(|(address, expires)| (address, expires.saturating_duration_since(now)))
             .collect();
         addresses.sort_unstable();
-        Ok(addresses)
+        addresses
     }
 }
 
@@ -434,7 +422,7 @@ where
         container: &str,
         host: &str,
         hold: Duration,
-    ) -> Result<Vec<(IpAddr, Duration)>, DnsError> {
+    ) -> Vec<(IpAddr, Duration)> {
         self.addresses_at(container, host, hold, Instant::now())
     }
 }
@@ -540,74 +528,65 @@ mod tests {
     }
 
     #[test]
-    fn looks_up_unknown_hostnames_once() {
+    fn rule_updates_never_look_hostnames_up() {
         let resolver = resolving(&["1.1.1.1"]);
         let mut hosts = HostAddresses::new(resolver.clone(), HOLD);
         let now = Instant::now();
+        assert!(!hosts.looked_up_before("api.example.com"));
+        assert_eq!(hosts.addresses_at("web", "API.example.com.", HOLD, now), []);
+        assert_eq!(*resolver.calls.lock().expect("lock"), 0);
+        // The first lookup, made after the update: a rule update reports it resolved.
+        assert!(hosts.record_lookup("api.example.com", Ok(vec![ip("1.1.1.1")]), now));
+        assert!(hosts.looked_up_before("api.example.com"));
         assert_eq!(
-            hosts
-                .addresses_at("web", "API.example.com.", HOLD, now)
-                .expect("addresses"),
-            vec![(ip("1.1.1.1"), HOLD)]
+            hosts.addresses_at("web", "API.example.com.", HOLD, now),
+            [(ip("1.1.1.1"), HOLD)]
         );
-        hosts
-            .addresses_at("db", "api.example.com", HOLD, now)
-            .expect("addresses");
-        assert_eq!(*resolver.calls.lock().expect("lock"), 1);
+        // The next ones only when it had failed.
+        assert!(!hosts.record_lookup("api.example.com", Ok(vec![ip("1.1.1.1")]), now));
     }
 
     #[test]
-    fn reports_a_failed_lookup_once_and_leaves_retrying_to_the_schedule() {
-        let resolver = MockResolver::default();
-        let mut hosts = HostAddresses::new(resolver.clone(), HOLD);
+    fn retries_a_failed_lookup_on_a_schedule_and_reports_when_it_resolves() {
+        let mut hosts = HostAddresses::new(MockResolver::default(), HOLD);
         let now = Instant::now();
-        assert!(
-            hosts
-                .addresses_at("web", "missing.test", HOLD, now)
-                .is_err()
-        );
-        assert_eq!(
-            hosts
-                .addresses_at("web", "missing.test", HOLD, now + RETRY_AFTER)
-                .expect("no addresses"),
-            []
-        );
-        assert_eq!(*resolver.calls.lock().expect("lock"), 1);
+        let failed = |missing| {
+            Err(DnsError::LookupFailed {
+                host: "missing.test".to_string(),
+                message: "not found".to_string(),
+                missing,
+            })
+        };
         // The resolver didn't answer: soon.
+        assert!(!hosts.record_lookup("missing.test", failed(false), now));
+        assert_eq!(hosts.addresses_at("web", "missing.test", HOLD, now), []);
         assert_eq!(
             hosts.lookup_due("missing.test", HOLD, now),
             now + RETRY_AFTER
         );
         // It said the name doesn't exist: at the usual pace.
-        let error = DnsError::LookupFailed {
-            host: "missing.test".to_string(),
-            message: "not found".to_string(),
-            missing: true,
-        };
-        hosts.record_lookup("missing.test", Err(error), now);
+        assert!(!hosts.record_lookup("missing.test", failed(true), now));
         assert_eq!(
             hosts.lookup_due("missing.test", HOLD, now),
             now + refresh_interval(HOLD)
         );
+        assert!(hosts.record_lookup("missing.test", Ok(vec![ip("1.1.1.1")]), now));
     }
 
     #[test]
     fn lookups_count_for_every_container_with_its_own_hold() {
         let mut hosts = HostAddresses::new(resolving(&["1.1.1.1"]), HOLD);
         let now = Instant::now();
+        hosts.record_lookup("api.test", Ok(vec![ip("1.1.1.1")]), now);
         // A container with answers of its own gets the lookups too.
         hosts.observe("web", "api.test", ip("2.2.2.2"), TTL, HOLD, now);
         let short = Duration::from_secs(600);
         assert_eq!(
-            hosts
-                .addresses_at("web", "api.test", HOLD, now)
-                .expect("addresses"),
+            hosts.addresses_at("web", "api.test", HOLD, now),
             vec![(ip("1.1.1.1"), HOLD), (ip("2.2.2.2"), HOLD)]
         );
         assert_eq!(
-            hosts
-                .addresses_at("job", "api.test", short, now)
-                .expect("addresses"),
+            hosts.addresses_at("job", "api.test", short, now),
             vec![(ip("1.1.1.1"), short)]
         );
         let later = now + short;
@@ -619,15 +598,11 @@ mod tests {
     fn a_lookup_renews_what_it_returns_and_lets_the_rest_run_out() {
         let mut hosts = HostAddresses::new(resolving(&["1.1.1.1"]), HOLD);
         let now = Instant::now();
-        hosts
-            .addresses_at("web", "api.test", HOLD, now)
-            .expect("addresses");
+        hosts.record_lookup("api.test", Ok(vec![ip("1.1.1.1")]), now);
         let later = now + Duration::from_mins(15);
         hosts.record_lookup("api.test", Ok(vec![ip("2.2.2.2")]), later);
         assert_eq!(
-            hosts
-                .addresses_at("web", "api.test", HOLD, later)
-                .expect("addresses"),
+            hosts.addresses_at("web", "api.test", HOLD, later),
             vec![
                 (ip("1.1.1.1"), HOLD.saturating_sub(Duration::from_mins(15))),
                 (ip("2.2.2.2"), HOLD)
@@ -642,9 +617,7 @@ mod tests {
         for (missing, until) in [(false, 2 * HOLD), (true, HOLD)] {
             let mut hosts = HostAddresses::new(resolving(&["1.1.1.1"]), HOLD);
             let now = Instant::now();
-            hosts
-                .addresses_at("web", "api.test", HOLD, now)
-                .expect("addresses");
+            hosts.record_lookup("api.test", Ok(vec![ip("1.1.1.1")]), now);
             let error = DnsError::LookupFailed {
                 host: "api.test".to_string(),
                 message: "failed".to_string(),
@@ -673,9 +646,7 @@ mod tests {
             Some(long)
         );
         assert_eq!(
-            hosts
-                .addresses_at("web", "*.api.test", HOLD, now)
-                .expect("addresses"),
+            hosts.addresses_at("web", "*.api.test", HOLD, now),
             vec![(ip("1.1.1.1"), HOLD), (ip("2.2.2.2"), long)]
         );
         // A TTL of years counts for no more than the longest hold.
@@ -685,9 +656,7 @@ mod tests {
             Some(MAX_HOLD)
         );
         assert_eq!(
-            hosts
-                .addresses_at("web", "*.api.test", HOLD, now + MAX_HOLD)
-                .expect("addresses"),
+            hosts.addresses_at("web", "*.api.test", HOLD, now + MAX_HOLD),
             []
         );
     }
@@ -718,9 +687,7 @@ mod tests {
     fn an_answer_never_shortens_what_a_lookup_allows() {
         let mut hosts = HostAddresses::new(resolving(&["1.1.1.1"]), HOLD);
         let now = Instant::now();
-        hosts
-            .addresses_at("web", "api.test", HOLD, now)
-            .expect("addresses");
+        hosts.record_lookup("api.test", Ok(vec![ip("1.1.1.1")]), now);
         let error = DnsError::LookupFailed {
             host: "api.test".to_string(),
             message: "failed".to_string(),
@@ -764,17 +731,10 @@ mod tests {
         let resolver = resolving(&["1.1.1.1"]);
         let mut hosts = HostAddresses::new(resolver.clone(), HOLD);
         let now = Instant::now();
-        assert_eq!(
-            hosts
-                .addresses_at("web", "*.api.test", HOLD, now)
-                .expect("addresses"),
-            []
-        );
+        assert_eq!(hosts.addresses_at("web", "*.api.test", HOLD, now), []);
         hosts.observe("web", "*.api.test", ip("2.2.2.2"), HOLD, HOLD, now);
         assert_eq!(
-            hosts
-                .addresses_at("web", "*.api.test", HOLD, now)
-                .expect("addresses"),
+            hosts.addresses_at("web", "*.api.test", HOLD, now),
             vec![(ip("2.2.2.2"), HOLD)]
         );
         assert_eq!(*resolver.calls.lock().expect("lock"), 0);
@@ -798,10 +758,9 @@ mod tests {
         hosts.observe("rogue", "api.test", ip("6.6.6.6"), HOLD, HOLD, now);
         assert!(hosts.allows("rogue", "api.test", ip("6.6.6.6"), HOLD, now));
         assert!(!hosts.allows("web", "api.test", ip("6.6.6.6"), HOLD, now));
+        hosts.record_lookup("api.test", Ok(vec![ip("1.1.1.1")]), now);
         assert_eq!(
-            hosts
-                .addresses_at("web", "api.test", HOLD, now)
-                .expect("addresses"),
+            hosts.addresses_at("web", "api.test", HOLD, now),
             vec![(ip("1.1.1.1"), HOLD)]
         );
         // Portcullis's own lookups count for everyone.

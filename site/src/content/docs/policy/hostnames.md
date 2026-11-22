@@ -21,7 +21,9 @@ This needs Docker to forward the container's lookups from its own address; see [
 
 ## From Portcullis's own lookups
 
-Portcullis also resolves every hostname of a `host:` rule itself, through the host's resolver: when a rule first needs it, then again four times per [hold](#how-long-an-address-stays-allowed) (every 15 minutes with the default hold of an hour). What a lookup returns is allowed for every container with a rule for the name, right away.
+Portcullis also resolves every hostname of a `host:` rule itself, through the host's resolver: right after the rule update that first needs it, then again four times per [hold](#how-long-an-address-stays-allowed) (every 15 minutes with the default hold of an hour). What a lookup returns is allowed for every container with a rule for the name, right away.
+
+A rule update never waits for a lookup, which can take seconds: a container that starts with a rule for a name no other rule has gets its rules at once, and the name's addresses a moment later, usually within milliseconds. Until then, the rule allows what DNS answers to the container say. A container whose lookups Portcullis sees has its answer held until the addresses in it are allowed, so it doesn't notice.
 
 That covers what the container's own answers can't:
 

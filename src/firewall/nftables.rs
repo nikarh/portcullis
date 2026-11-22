@@ -3523,8 +3523,8 @@ flush chain bridge portcullis limit_open
                 _container: &str,
                 _host: &str,
                 hold: Duration,
-            ) -> Result<Vec<(IpAddr, Duration)>, crate::dns::DnsError> {
-                Ok(self.0.iter().map(|address| (*address, hold)).collect())
+            ) -> Vec<(IpAddr, Duration)> {
+                self.0.iter().map(|address| (*address, hold)).collect()
             }
         }
 
@@ -3594,8 +3594,8 @@ flush chain bridge portcullis limit_open
                 _container: &str,
                 _host: &str,
                 _hold: Duration,
-            ) -> Result<Vec<(IpAddr, Duration)>, crate::dns::DnsError> {
-                Ok(vec![(test_support::ip("1.1.1.1"), self.left)])
+            ) -> Vec<(IpAddr, Duration)> {
+                vec![(test_support::ip("1.1.1.1"), self.left)]
             }
         }
 

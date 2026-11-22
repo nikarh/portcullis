@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
@@ -117,13 +117,17 @@ where
     let mut outcome = Outcome::default();
     for name in due {
         let result = resolver.resolve_host(name);
-        if let Err(error) = &result {
-            debug!(%error, "looking a hostname up again failed");
-        }
         let now = clock();
         let mut updates = Vec::new();
         {
             let mut hosts = lock();
+            if let Err(error) = &result {
+                if hosts.looked_up_before(name) {
+                    debug!(%error, "looking a hostname up again failed");
+                } else {
+                    warn!(host = name, %error, "can't resolve a hostname; its rules allow nothing until it resolves, or a container looks it up");
+                }
+            }
             outcome.resolved |= hosts.record_lookup(name, result, now);
             let looked_up = hosts.looked_up(name);
             for set in sets
@@ -278,8 +282,28 @@ mod tests {
         fn planned(&self, container: &str, hold: Duration) -> Vec<(IpAddr, Duration)> {
             let mut hosts = self.hosts.lock().expect("lock");
             // A rule update at the harness's time: only the lookup time matters here.
-            hosts.addresses(container, HOST, hold).unwrap_or_default()
+            hosts.addresses(container, HOST, hold)
         }
+    }
+
+    #[test]
+    fn looks_a_new_hostname_up_after_the_rule_update_and_reports_it() {
+        let harness = Harness::new(vec![set("web", HOST, HOLD)]);
+        // The rule update that first needs the hostname doesn't look it up...
+        assert_eq!(harness.at(0).planned("web", HOLD), []);
+        assert_eq!(harness.resolver.calls(), 0);
+        // ...this thread does, right after it, and fills the set.
+        let (outcome, updates) = harness.refresh();
+        assert_eq!(updates["web"], [(ip("192.0.2.1"), HOLD)]);
+        assert!(outcome.resolved, "a rule update reports it resolved");
+        let planned = harness.planned("web", HOLD);
+        assert_eq!(
+            planned
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<Vec<_>>(),
+            [ip("192.0.2.1")]
+        );
     }
 
     #[test]
