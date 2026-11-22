@@ -8,7 +8,7 @@ use thiserror::Error;
 
 pub use nftables::{
     DEFAULT_CONNECTION_LIMIT, DNS_ALLOWED_MARK, DNS_DENIED_MARK, DenyAction, HOLD_EXPIRED_MARK,
-    LOG_PREFIX, LogAllowed, NftablesFirewall, Options, Restored,
+    LOG_PREFIX, LogAllowed, NftablesFirewall, Options, Restored, Update,
 };
 #[cfg(test)]
 pub use plan::HostSetId;

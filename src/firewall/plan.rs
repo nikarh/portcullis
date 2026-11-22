@@ -225,6 +225,32 @@ pub struct HostSet {
 }
 
 impl HostSet {
+    /// Whether `other` is the same set with the same addresses, however long each has left.
+    fn same_addresses(&self, other: &Self) -> bool {
+        let Self {
+            id,
+            container,
+            host,
+            pattern,
+            addresses,
+            hold,
+            used_v4,
+            used_v6,
+        } = self;
+        *id == other.id
+            && *container == other.container
+            && *host == other.host
+            && *pattern == other.pattern
+            && *hold == other.hold
+            && *used_v4 == other.used_v4
+            && *used_v6 == other.used_v6
+            && addresses.len() == other.addresses.len()
+            && addresses
+                .iter()
+                .zip(&other.addresses)
+                .all(|((address, _), (other, _))| address == other)
+    }
+
     pub fn v4(&self) -> impl Iterator<Item = (IpAddr, Duration)> + '_ {
         self.addresses
             .iter()
@@ -326,6 +352,30 @@ impl Plan {
             .sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
         planner.plan
+    }
+
+    /// Whether `other` puts the same rules in place: the same plan, except for how much
+    /// longer each address of a hostname set stays allowed. An update leaves a set alone
+    /// while it holds the same addresses (DNS answers and Portcullis's own lookups renew
+    /// them in place), so that alone changes nothing.
+    #[must_use]
+    pub fn same_rules(&self, other: &Self) -> bool {
+        let Self {
+            sources,
+            rules,
+            host_sets,
+            bridges,
+            unresolved_hosts,
+        } = self;
+        *sources == other.sources
+            && *rules == other.rules
+            && *bridges == other.bridges
+            && *unresolved_hosts == other.unresolved_hosts
+            && host_sets.len() == other.host_sets.len()
+            && host_sets
+                .iter()
+                .zip(&other.host_sets)
+                .all(|(set, other)| set.same_addresses(other))
     }
 
     /// Rules for traffic of `source` leaving its network (routed traffic), in evaluation

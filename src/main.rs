@@ -52,7 +52,7 @@ use crate::docker::{
 use crate::events::{
     ContainerAction, ContainerChange, Event, EventBus, Mode, Sinks, Warning, WarningKind,
 };
-use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored};
+use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored, Update};
 use crate::logging::LoggingError;
 use crate::model::{ContainerId, RuntimeState, RuntimeStateAction};
 use crate::monitor::{DockerMonitor, Fetched, MonitorError};
@@ -544,7 +544,16 @@ impl Applier {
             )
         };
         match result {
-            Ok(plan) => {
+            Ok(Update {
+                plan,
+                changed: false,
+            }) => {
+                self.failures = 0;
+                // Nothing to report but warnings about containers.
+                self.report_changes(state, &plan);
+                Ok(())
+            }
+            Ok(Update { plan, .. }) => {
                 self.failures = 0;
                 self.directory.update(&plan);
                 // "applied" closes an update: everything it caused comes before it.

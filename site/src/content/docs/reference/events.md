@@ -122,7 +122,7 @@ Something that needs attention. Every warning raises an alert.
 
 ## `applied`
 
-Rules were updated: when containers or networks changed, and when a hostname that didn't resolve does now. It comes after everything else the update caused.
+Rules were updated: when containers or networks changed, and when a hostname that didn't resolve does now. It comes after everything else the update caused. A change that leaves the rules as they are, such as Docker's report of a container [found before it](/internals/discovery/), updates nothing and has no `applied` event.
 
 ```json
 {"time":"2026-11-02T10:15:29.912Z","event":"applied","generation":42,
