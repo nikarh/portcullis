@@ -530,6 +530,7 @@ fn apply_retry(failures: u32) -> Option<Duration> {
 
 impl Applier {
     fn apply(&mut self, state: &mut RuntimeState) -> Result<(), MainError> {
+        let started = Instant::now();
         // Re-read on every update, so changes to the host's DNS configuration are picked up.
         let host_resolvers = host_dns::host_resolvers();
         state.set_daemon_dns(host_dns::docker_daemon_dns());
@@ -544,7 +545,10 @@ impl Applier {
         state.set_ports(found.ports, found.absent);
         state.set_stopping(found.stopping);
         let state = &*state;
+        let ports = started.elapsed();
+        let forgetting = Instant::now();
         self.forget_reassigned_connections(state);
+        let connections = forgetting.elapsed();
         let result = {
             let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
             let directory = &self.directory;
@@ -582,6 +586,12 @@ impl Applier {
                 self.source_hold.rules_applied();
                 let _ = self.refresh.send(());
                 info!("firewall rules applied");
+                debug!(
+                    total = ?started.elapsed(),
+                    ports = ?ports,
+                    connections = ?connections,
+                    "rule update timings"
+                );
                 self.saver.save(plan);
                 Ok(())
             }

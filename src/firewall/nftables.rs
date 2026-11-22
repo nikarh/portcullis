@@ -8,7 +8,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, trace, warn};
 
@@ -505,7 +505,9 @@ where
     where
         Hosts: HostResolver,
     {
+        let started = Instant::now();
         let plan = Plan::build(state, hosts, host_resolvers, monitor_all);
+        let planned = started.elapsed();
         let mut installed = self
             .installed
             .lock()
@@ -567,6 +569,7 @@ where
         now_installed.applied = Some(plan.clone());
         *installed = Some(now_installed);
         drop(installed);
+        debug!(plan = ?planned, total = ?started.elapsed(), "nftables update timings");
         Ok(Update {
             plan,
             changed: true,
