@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_look_patterns_up_and_forgets_hostnames_no_rule_uses() {
+    fn does_not_look_patterns_up_and_forgets_hostnames_no_rule_uses_once_they_run_out() {
         let mut harness = Harness::new(vec![set("web", "*.api.test", HOLD)]);
         let (outcome, updates) = harness.at(0).refresh();
         assert!(updates.is_empty());
@@ -471,8 +471,22 @@ mod tests {
 
         harness.sets = vec![set("web", HOST, HOLD)];
         harness.at(0).refresh();
+        // The container goes, and is created again: what the lookup returned still counts,
+        // without another one.
         harness.sets = Vec::new();
         harness.at(1).refresh();
+        assert_eq!(
+            harness.hosts.lock().expect("lock").looked_up(HOST),
+            [ip("192.0.2.1")]
+        );
+        harness.sets = vec![set("web", HOST, HOLD)];
+        let (outcome, updates) = harness.at(2).refresh();
+        assert!(updates.is_empty());
+        assert!(!outcome.resolved);
+        assert_eq!(harness.resolver.calls(), 1);
+        // Once its addresses ran out, a name no rule uses is forgotten.
+        harness.sets = Vec::new();
+        harness.at(3600).refresh();
         assert_eq!(
             harness.hosts.lock().expect("lock").looked_up(HOST),
             [] as [std::net::IpAddr; 0]

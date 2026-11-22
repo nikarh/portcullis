@@ -281,7 +281,9 @@ where
     }
 
     /// Forget expired addresses and containers without any left, given the longest hold
-    /// any container has, and the lookups of hostnames no rule uses anymore.
+    /// any container has, and the lookups of hostnames no rule uses anymore, once none of
+    /// their addresses is allowed anymore: a container recreated with the same rules (its
+    /// old one gone a moment before) gets them at once, without a lookup of its own.
     pub fn prune(&mut self, now: Instant, longest_hold: Duration, hosts: &HashSet<String>) {
         self.observed.retain(|_, addresses| {
             addresses.retain(|_, expires| *expires > now);
@@ -296,7 +298,7 @@ where
                 .map(|(address, confirmed)| (*address, *confirmed))
                 .collect();
             lookups.addresses = live;
-            hosts.contains(host)
+            hosts.contains(host) || !lookups.addresses.is_empty()
         });
     }
 
