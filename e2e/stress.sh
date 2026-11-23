@@ -7,7 +7,9 @@
 #   STRESS_CONTAINERS=1000 STRESS_NETWORKS=40 ... stress.sh
 #
 # Prints the time and number of updates, Portcullis's CPU time and memory, and the size of
-# its rules after each phase.
+# its rules after each phase. With the debug log (the default, STRESS_LOG_LEVEL), also how
+# long Portcullis took to put each update in place, from planning it to the kernel's answer
+# ("nftables update timings"): median, 95th percentile and worst.
 set -uo pipefail
 
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,22 +40,35 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Counts updates and their duration from the log ("applying" to "applied").
+# Counts updates and their duration from the log ("applying" to "applied"), and how long
+# each took to put in place ("nftables update timings", in the debug log).
 updates_since() {
   local from="$1"
   tail -n "+${from}" "${LOG}" | python3 -c '
-import json, sys, datetime
-start = None; n = 0; total = 0.0; worst = 0.0
+import json, re, sys, datetime
+start = None; n = 0; total = 0.0; worst = 0.0; timings = []
+units = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1e3}
+def millis(text):
+    match = re.fullmatch(r"([0-9.]+)(ns|µs|us|ms|s)", text or "")
+    return float(match.group(1)) * units[match.group(2)] if match else None
 for line in sys.stdin:
     try: e = json.loads(line)
     except ValueError: continue
-    msg = e.get("fields", {}).get("message", "")
+    fields = e.get("fields", {})
+    msg = fields.get("message", "")
     t = datetime.datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
     if msg == "applying nftables changes": start = t
     elif msg == "firewall rules applied" and start is not None:
         d = t - start; n += 1; total += d; worst = max(worst, d); start = None
+    elif msg == "nftables update timings" and millis(fields.get("total")) is not None:
+        timings.append(millis(fields.get("total")))
 avg = total / n * 1000 if n else 0
-print(f"updates={n} total={total:.2f}s avg={avg:.1f}ms max={worst*1000:.1f}ms")
+line = f"updates={n} total={total:.2f}s avg={avg:.1f}ms max={worst*1000:.1f}ms"
+if timings:
+    timings.sort()
+    p = lambda q: timings[min(len(timings) - 1, int(q * len(timings)))]
+    line += f"; put in place: median={p(0.5):.2f}ms p95={p(0.95):.2f}ms max={timings[-1]:.2f}ms"
+print(line)
 '
 }
 
@@ -71,7 +86,7 @@ usage() {
 rules() {
   printf 'rules: inet=%s lines, bridge=%s lines, saved=%s KiB' \
     "$(nft list table inet portcullis | wc -l)" "$(nft list table bridge portcullis | wc -l)" \
-    "$(( $(stat -c %s "${WORK}/state/rules.nft") / 1024 ))"
+    "$(( $(cat "${WORK}"/state/rules.* | wc -c) / 1024 ))"
 }
 
 report() {
@@ -120,7 +135,7 @@ main() {
       --label "${PREFIX}=1" --label portcullis.enable=true "${PREFIX}-net${i}" >/dev/null
   done
 
-  "${BIN}" --log-format json --log-level info --events-socket "${SOCKET}" \
+  "${BIN}" --log-format json --log-level "${STRESS_LOG_LEVEL:-debug}" --events-socket "${SOCKET}" \
     --state-dir "${WORK}/state" --quarantine report >"${WORK}/events.log" 2>"${LOG}" &
   PID=$!
   until [[ -S "${SOCKET}" ]]; do sleep 0.1; done

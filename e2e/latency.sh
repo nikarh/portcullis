@@ -196,6 +196,16 @@ for line in open(f"{work}/rounds"):
                        "sent": ms(sent), "answered": ms(answered),
                        "held": None if not (sent and answered) else (answered - sent) * 1000})
 
+# How long each update took to put in place, from planning it to the kernel's answer.
+units = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1e3}
+def millis(text):
+    match = re.fullmatch(r"([0-9.]+)(ns|µs|us|ms|s)", text or "")
+    return float(match.group(1)) * units[match.group(2)] if match else None
+timings = sorted(m for m in (millis(f.get("total")) for _, f in logs if f.get("message") == "nftables update timings") if m is not None)
+if timings:
+    quantile = lambda q: timings[min(len(timings) - 1, int(q * len(timings)))]
+    print(f"updates put in place: {len(timings)}, median {quantile(0.5):.2f} ms, p95 {quantile(0.95):.2f} ms, max {timings[-1]:.2f} ms (with the first)")
+
 def show(value):
     return f"{value:9.1f}" if value is not None else "        -"
 for kind, columns in (("send", ["started", "sent", "found", "applied", "answered", "held"]),
