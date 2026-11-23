@@ -44,7 +44,7 @@ connection-limit = "none"
 | `--alert-exec <command>` | off | Run a command with `sh -c` for every denial and warning, the event as JSON on stdin, see [Alerts](/guides/events-and-alerts/#alerts). |
 | `--alert-interval <seconds>` | `600` | Raise the same alert at most once per interval. |
 | `--log-format <text\|json>` | `text` | Format of events (stdout) and diagnostic logs (stderr). |
-| `--log-level <error\|warn\|info\|debug\|trace>` | `info` | Level of diagnostic logs. `trace` logs every firewall script that gets applied. |
+| `--log-level <error\|warn\|info\|debug\|trace>` | `info` | Level of diagnostic logs. `trace` logs every rule update, as the nft script that does the same. |
 
 ## Docker and the host
 

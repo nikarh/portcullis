@@ -18,7 +18,7 @@ ignore = []
 version = 2
 confidence-threshold = 0.93
 # Apache-2.0, BSD-3-Clause and ISC come with the build-time bindgen.
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
 
 [bans]
 multiple-versions = "deny"

@@ -12,7 +12,7 @@ sidebar:
 | `/usr/bin/portcullis` | The binary, from the packages (`/usr/local/bin/portcullis` when installed by hand) |
 | `/etc/portcullis/config.toml` | The config file, see [Configuration](/reference/configuration/) |
 | `portcullis.service` | The systemd unit, see [The systemd unit](/guides/service/#the-systemd-unit) |
-| `/var/lib/portcullis/rules.nft` | The rules of the last update, put back at the next start (`state-dir`) |
+| `/var/lib/portcullis/rules.batch` | The rules of the last update, as the netlink batch that puts them in place, put back at the next start (`state-dir`). Earlier versions saved them as `rules.nft`, an nft script, which Portcullis removes when it starts |
 | `/var/lib/portcullis/owners` | Which container each container address belonged to at the last update, to tell at the next start which addresses changed hands meanwhile (`state-dir`) |
 | `/run/portcullis.sock` | The events socket, when `events-socket` is set (it is in the packaged config) |
 | `/var/run/docker.sock` | Docker's API, read (`docker-socket`) |
@@ -36,9 +36,9 @@ sudo nft list table inet portcullis
 sudo nft list table bridge portcullis
 ```
 
-Don't edit them: every update rewrites what changed, and an edit in a chain it leaves alone may stay. A change of containers that leaves the rules as they are writes nothing at all, so an edit stays until the rules change. `--log-level trace` logs every script Portcullis applies.
+Don't edit them: every update rewrites what changed, and an edit in a chain it leaves alone may stay. A change of containers that leaves the rules as they are writes nothing at all, so an edit stays until the rules change. `--log-level trace` logs every update, as the nft script that does the same.
 
-Portcullis doesn't touch Docker's rules or anyone else's, and works next to Docker using iptables or nftables. Large sets in other tables, such as another firewall's block lists, don't slow it down: it never asks libnftables to add or delete single set elements, which makes libnftables read every such set first (see [DNS inspection](/internals/how-it-works/#dns-inspection)).
+Portcullis doesn't touch Docker's rules or anyone else's, and works next to Docker using iptables or nftables. Large sets in other tables, such as another firewall's block lists, don't slow it down: it sends its changes to the kernel without reading anything of the rules first (see [DNS inspection](/internals/how-it-works/#dns-inspection)).
 
 ## Netfilter numbers
 

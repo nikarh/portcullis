@@ -7,7 +7,7 @@ sidebar:
 
 ## Building and checks
 
-Building needs Rust (the toolchain in `rust-toolchain.toml`), the libnftables development headers and clang; see [Building from source](/start/installation/#building-from-source).
+Building needs Rust (the toolchain in `rust-toolchain.toml`); see [Building from source](/start/installation/#building-from-source).
 
 ```bash
 cargo fmt
@@ -30,6 +30,8 @@ KEEP_VM=1 e2e/run.sh                # leave the VM running for the next run
 ```
 
 The host needs `qemu-system-x86_64`, `genisoimage` (or `mkisofs`), `ssh`, `rsync` and read/write access to `/dev/kvm`; no root and no daemons. The first run downloads a Debian cloud image and provisions the VM with Docker and Rust, which takes a few minutes.
+
+Before the suite, `e2e/kernel.sh` runs the root-only tests of `src/firewall/kernel_tests.rs` in the VM: for a few hundred generated plans and changes to them, the kernel must hold the same rules, sets and elements, byte for byte, after Portcullis's updates over netlink as after `nft` puts the same rules in place.
 
 Each scenario in `e2e/scenarios/<name>/` is a Compose project on an enforced network, plus a `test.sh` with checks that wait on Portcullis's event stream rather than on timeouts. [`e2e/README.md`](https://github.com/nikarh/portcullis/blob/main/e2e/README.md) describes the harness, the probes and every scenario.
 

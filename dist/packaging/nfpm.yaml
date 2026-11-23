@@ -17,7 +17,6 @@ overrides:
   deb:
     depends:
       - libc6 (>= 2.35)
-      - libnftables1
     scripts:
       postinstall: dist/packaging/deb/postinst
       preremove: dist/packaging/deb/prerm
@@ -25,7 +24,6 @@ overrides:
   archlinux:
     depends:
       - glibc
-      - nftables
     scripts:
       postinstall: dist/packaging/arch/post_install.sh
       preremove: dist/packaging/arch/pre_remove.sh

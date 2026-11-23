@@ -1,11 +1,6 @@
-//! Renewing addresses in hostname sets over nfnetlink, without libnftables.
-//!
-//! Before it runs a command that adds or deletes set elements, libnftables loads the
-//! elements of every set with `flags interval` the kernel holds, in every table, not just
-//! the one the command is about. On a host whose other firewall keeps large sets of ranges
-//! (block lists, country lists) that takes tens of megabytes and a good part of a second,
-//! for every DNS answer that renews a hostname's addresses, while the answer is held.
-//! Renewals go to the kernel directly instead: one batch, applied atomically like a script.
+//! Renewing addresses in hostname sets over nfnetlink: a batch of its own for each DNS
+//! answer (or lookup of Portcullis's) that renews a hostname's addresses, sent while the
+//! answer is held, without a rule update.
 
 use std::fmt::Write as _;
 use std::net::IpAddr;

@@ -71,7 +71,7 @@ const DNS_QUEUE: u16 = 4242;
 const SOURCE_QUEUE: u16 = 4243;
 /// File in the state directory the rules of every update are saved to.
 const SAVED_RULES: &str = "rules.batch";
-/// Where versions before 0.6 saved their rules, as an nft script.
+/// Where earlier versions saved their rules, as an nft script.
 const LEGACY_SAVED_RULES: &str = "rules.nft";
 /// File in the state directory who each container address belongs to is saved to.
 const SAVED_OWNERS: &str = "owners";
