@@ -1,6 +1,7 @@
 mod elements;
 mod nftables;
 mod plan;
+mod ruleset;
 #[cfg(test)]
 pub mod test_support;
 
