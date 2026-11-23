@@ -3374,14 +3374,17 @@ flush chain bridge portcullis limit_open
             container_id: "a".to_string().into(),
         });
         apply(&state);
+        // The same state again puts nothing in place.
+        apply(&state);
+        // A network without containers: the update changes none of the containers' rules.
+        test_support::add_network(&mut state, "other", "172.30.0.0/16", "172.30.0.1");
         apply(&state);
         add(&mut state, "d", "172.18.0.5");
         apply(&state);
 
         let scripts = firewall.runner.scripts.lock().expect("lock");
-        // The same state again puts nothing in place.
-        let [first, added, removed, reused] = scripts.as_slice() else {
-            panic!("expected four scripts");
+        let [first, added, removed, unchanged, reused] = scripts.as_slice() else {
+            panic!("expected five scripts");
         };
         let written = |script: &str, chain: &str| {
             script.contains(&format!("add chain {chain}\nflush chain {chain}\n"))
@@ -3414,6 +3417,22 @@ flush chain bridge portcullis limit_open
             !removed.contains(&format!("flush chain inet portcullis egress{b}")),
             "{removed}"
         );
+        // Nothing of the containers changed: nothing of theirs is written.
+        assert!(
+            !unchanged.contains("chain inet portcullis egress"),
+            "{unchanged}"
+        );
+        assert!(
+            !unchanged.contains("chain bridge portcullis icc"),
+            "{unchanged}"
+        );
+        for set in [
+            "inet portcullis egress4",
+            "bridge portcullis sources_by_mac",
+        ] {
+            let touched = |line: &str| line.contains(set) && !line.ends_with("verdict; }");
+            assert!(!unchanged.lines().any(touched), "{unchanged}");
+        }
         // The next container takes the free slot.
         assert!(
             written(reused, &format!("inet portcullis egress{a}")),
@@ -4508,9 +4527,12 @@ flush chain bridge portcullis limit_open
         let firewall =
             NftablesFirewall::new(RecordingRunner::with_tables(&inet, BRIDGE_LISTING), OPTIONS);
         assert_eq!(firewall.restore().expect("restore"), Restored::Kept);
-        for _ in 0..2 {
+        // Then a network without containers: an update that changes nothing of the set.
+        let mut more = state.clone();
+        test_support::add_network(&mut more, "other", "172.30.0.0/16", "172.30.0.1");
+        for state in [&state, &more] {
             firewall
-                .apply(&state, &mut MockResolver::default(), &[], false)
+                .apply(state, &mut MockResolver::default(), &[], false)
                 .expect("apply");
         }
         let scripts = firewall.runner.scripts.lock().expect("lock");
@@ -4519,8 +4541,13 @@ flush chain bridge portcullis limit_open
         assert!(!scripts[0].contains(&format!("flush set inet portcullis {name}")));
         assert_eq!(scripts[1], renewed);
         // A later update with the same addresses leaves the set alone: what the previous run
-        // learned still runs out as it would have. Here nothing else changed either.
-        assert_eq!(scripts.len(), 2);
+        // learned still runs out as it would have.
+        assert_eq!(scripts.len(), 3);
+        assert!(
+            !scripts[2].contains(&format!("inet portcullis {name}")),
+            "{}",
+            scripts[2]
+        );
         drop(scripts);
 
         // Put back from the saved rules after a reboot: those addresses may be days old.
