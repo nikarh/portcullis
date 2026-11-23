@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write as _};
@@ -239,10 +239,15 @@ struct Written {
     /// What each source's chain was written from. A chain written from the same isn't
     /// written again.
     rules: HashMap<Chain, ChainInputs>,
-    /// The elements of each named set, so that only elements that changed are added and
-    /// deleted. `None` when the sets may hold others: found in place at the start, or
-    /// after an update failed.
-    elements: Option<HashMap<NamedSet, Vec<Element>>>,
+    /// The rules of the chains written from the plan as a whole: base chains, limits and
+    /// ARP checks. A chain with the same rules isn't written again.
+    fixed: HashMap<Chain, Vec<Vec<Expr>>>,
+    /// The tables, chains and sets declared, which needn't be again.
+    declared: HashSet<Declaration>,
+    /// The elements of each set besides those of hostnames and reports, so that only
+    /// elements that changed are added and deleted. `None` when the sets may hold others:
+    /// found in place at the start, or after an update failed.
+    elements: Option<HashMap<ElementSet, Vec<Element>>>,
     /// The addresses each hostname set was filled with, by set.
     host_addresses: HashMap<String, String>,
 }
@@ -707,7 +712,7 @@ const LOGGED_TIMEOUT: Duration = Duration::from_secs(60);
 const LOGGED_SIZE: u32 = 65_536;
 
 /// Create the sets of reported flows; with `flush`, forget the flows reported so far.
-fn render_logged_sets(out: &mut Batch, table: Table, flush: bool) {
+fn render_logged_sets(out: &mut Batch, declared: &mut Declarations, table: Table, flush: bool) {
     const FLOW_V4: &[KeyType] = &[
         KeyType::Ipv4,
         KeyType::Ipv4,
@@ -740,7 +745,7 @@ fn render_logged_sets(out: &mut Batch, table: Table, flush: bool) {
             size: Some(LOGGED_SIZE),
             ..SetDecl::set(table, name, key)
         };
-        out.push(Command::AddSet(decl.clone()));
+        declared.declare(out, Declaration::Set(decl.clone()));
         if flush {
             out.push(Command::FlushSet(decl));
         }
@@ -830,12 +835,15 @@ const ACCEPT: Expr = Expr::Verdict(Verdict::Accept);
 /// the inet table after letting established traffic through. A packet costs one hash
 /// lookup plus the rules of its own source, regardless of how many containers are managed.
 ///
-/// The tables, base chains and log sets are created once and kept: an update flushes and
-/// refills chains and sets, and deletes those of the previous update it doesn't need, in
-/// one atomic transaction. Deleting a base chain would unregister its hook, and the kernel
-/// drops every packet held in a queue from that hook: DNS answers being inspected, and
-/// packets of new containers waiting for their rules. Only the first update, without
-/// `previous`, starts from empty tables, removing whatever a previous run left behind.
+/// The tables, base chains and log sets are created once and kept: an update writes only
+/// what changed, in one atomic transaction. It empties and refills the chains whose rules
+/// changed (of sources whose rules changed, and base chains only when the networks or
+/// options change), deletes and adds the set elements that changed, and deletes the chains
+/// and sets of the previous update it doesn't need. Deleting a base chain would unregister
+/// its hook, and the kernel drops every packet held in a queue from that hook: DNS answers
+/// being inspected, and packets of new containers waiting for their rules. Only the first
+/// update, without `previous`, starts from empty tables, removing whatever a previous run
+/// left behind. After an update failed, the next one writes everything again.
 fn render_apply_script(
     plan: &Plan,
     options: Options,
@@ -877,7 +885,11 @@ fn render_update(
         .sources
         .iter()
         .any(|(address, container)| sources.get(address) != Some(container));
-    render_declarations(out, plan, reassigned);
+    let mut declared = Declarations {
+        previous: std::mem::take(&mut written.declared),
+        now: HashSet::new(),
+    };
+    render_declarations(out, &mut declared, reassigned);
 
     let mut installed = render_objects(
         out,
@@ -886,6 +898,8 @@ fn render_update(
         previous,
         &slots,
         &mut written.host_addresses,
+        &mut declared,
+        &mut elements,
     );
     installed.sources = sources;
 
@@ -898,6 +912,44 @@ fn render_update(
         &mut installed,
     );
 
+    let mut fixed = Batch::default();
+    render_fixed_chains(&mut fixed, plan, options, &slots, &mut elements);
+    installed.written.fixed = write_changed_chains(out, plan, fixed, &written.fixed);
+    elements.fill(
+        ElementSet::Quarantined,
+        plan.sources
+            .iter()
+            .filter(|source| source.quarantined && !source.monitor)
+            .filter_map(|source| source.port.known())
+            .map(|port| port.name.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|port| Element::of(&[Part::Ifname(port)])),
+    );
+    elements.render(out, written.elements.as_ref());
+    installed.written.elements = Some(elements.0);
+    installed.written.declared = declared.now;
+    // Nothing references them anymore: their map elements are gone, and the chains whose
+    // rules used the sets were written again.
+    for chain in previous.chains.difference(&installed.chains) {
+        out.push(Command::DeleteChain(chain.clone()));
+    }
+    for set in previous.sets.difference(&installed.sets) {
+        out.push(Command::DeleteSet(set.clone()));
+    }
+    installed.slots = slots;
+    installed
+}
+
+/// The rules of the chains written from the plan as a whole: base chains, limits and ARP
+/// checks.
+fn render_fixed_chains(
+    out: &mut Batch,
+    plan: &Plan,
+    options: Options,
+    slots: &Slots,
+    elements: &mut Elements,
+) {
     // Routed traffic.
     let base = Chain::Base(Table::Inet);
     let bridges = |mode: Option<bool>| {
@@ -936,7 +988,7 @@ fn render_update(
     // ports through Docker's userland proxy) leaves the container's network as much as
     // routed traffic does, and follows the same rules.
     for base in [base, Chain::Input] {
-        render_egress_dispatch(out, plan, options, base, &slots, &mut elements);
+        render_egress_dispatch(out, plan, options, base, slots, elements);
     }
 
     // Everything entering a managed network's bridge from a container: source checks and
@@ -944,45 +996,112 @@ fn render_update(
     // once its source checks out, in the ICC chains: a container could otherwise send with
     // another container's address into that container's connections.
     if !plan.bridges.is_empty() {
-        render_bridge_dispatch(out, plan, options, &slots, &mut elements);
+        render_bridge_dispatch(out, plan, options, slots, elements);
         render_link_local(out, plan, options);
         render_bridged_destinations(out, plan, options);
     }
-    elements.render(out, written.elements.as_ref());
-    installed.written.elements = Some(elements.0);
-    // Nothing references them anymore: their map elements are gone, and the chains whose
-    // rules used the sets were written again.
-    for chain in previous.chains.difference(&installed.chains) {
-        out.push(Command::DeleteChain(chain.clone()));
-    }
-    for set in previous.sets.difference(&installed.sets) {
-        out.push(Command::DeleteSet(set.clone()));
-    }
-    installed.slots = slots;
-    installed
 }
 
-/// Create the tables, base chains and fixed sets, and empty the base chains.
-fn render_declarations(out: &mut Batch, plan: &Plan, reassigned: bool) {
+/// The chains written from the plan as a whole, as an update with `plan` has them.
+fn fixed_chains(plan: &Plan) -> impl Iterator<Item = Chain> {
+    let bridged = !plan.bridges.is_empty();
+    [
+        Chain::Base(Table::Inet),
+        Chain::Input,
+        Chain::Base(Table::Bridge),
+        Chain::BridgeInput,
+        Chain::BridgeForward,
+    ]
+    .into_iter()
+    .chain(
+        [false, true]
+            .into_iter()
+            .flat_map(|rate| [false, true].map(|monitor| Chain::Limited { rate, monitor }))
+            .chain([false, true].map(|monitor| Chain::ArpCheck { monitor }))
+            .filter(move |_| bridged),
+    )
+}
+
+/// Write the chains of `fixed` (rules of the chains written from the plan as a whole) whose
+/// rules aren't those `previous` wrote: emptied and filled again. Returns the rules of
+/// each.
+///
+/// A base chain is never deleted, see [`render_apply_script`]; nor is it written again
+/// when its rules stay the same, which they do while the networks and options do.
+fn write_changed_chains(
+    out: &mut Batch,
+    plan: &Plan,
+    fixed: Batch,
+    previous: &HashMap<Chain, Vec<Vec<Expr>>>,
+) -> HashMap<Chain, Vec<Vec<Expr>>> {
+    let mut rules: HashMap<Chain, Vec<Vec<Expr>>> = fixed_chains(plan)
+        .map(|chain| (chain, Vec::new()))
+        .collect();
+    for command in fixed.commands {
+        if let Command::AddRule(chain, exprs) = command {
+            rules.entry(chain).or_default().push(exprs);
+        }
+    }
+    for chain in fixed_chains(plan) {
+        let Some(new) = rules.get(&chain) else {
+            continue;
+        };
+        if previous.get(&chain) == Some(new) {
+            continue;
+        }
+        out.push(Command::FlushChain(chain));
+        for exprs in new {
+            out.rule(chain, exprs.clone());
+        }
+    }
+    rules
+}
+
+/// A table, chain or set an update declares: created if it isn't there.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Declaration {
+    Table(Table),
+    Chain(Chain),
+    Set(SetDecl),
+}
+
+/// The declarations of an update: those it needs (`now`), of which it writes those the last
+/// update didn't declare (`previous`).
+struct Declarations {
+    previous: HashSet<Declaration>,
+    now: HashSet<Declaration>,
+}
+
+impl Declarations {
+    fn declare(&mut self, out: &mut Batch, declaration: Declaration) {
+        if !self.previous.contains(&declaration) {
+            out.push(match &declaration {
+                Declaration::Table(table) => Command::AddTable(*table),
+                Declaration::Chain(chain) => Command::AddChain(*chain),
+                Declaration::Set(decl) => Command::AddSet(decl.clone()),
+            });
+        }
+        self.now.insert(declaration);
+    }
+}
+
+/// Create the tables, base chains and fixed sets.
+fn render_declarations(out: &mut Batch, declared: &mut Declarations, reassigned: bool) {
     for table in Table::ALL {
-        out.push(Command::AddTable(table));
-        out.push(Command::AddChain(Chain::Base(table)));
+        declared.declare(out, Declaration::Table(table));
+        declared.declare(out, Declaration::Chain(Chain::Base(table)));
         let input = match table {
             Table::Inet => Chain::Input,
             Table::Bridge => Chain::BridgeInput,
         };
-        out.push(Command::AddChain(input));
-        out.push(Command::FlushChain(input));
+        declared.declare(out, Declaration::Chain(input));
         if table == Table::Bridge {
-            out.push(Command::AddChain(Chain::BridgeForward));
-            out.push(Command::FlushChain(Chain::BridgeForward));
-            render_quarantined_set(out, plan);
+            declared.declare(out, Declaration::Chain(Chain::BridgeForward));
+            declared.declare(out, Declaration::Set(ElementSet::Quarantined.declaration()));
         }
-        render_logged_sets(out, table, reassigned);
-        out.push(Command::FlushChain(Chain::Base(table)));
-        // Changed at the end, see `Elements::render`.
+        render_logged_sets(out, declared, table, reassigned);
         for set in NamedSet::ALL.iter().filter(|set| set.table() == table) {
-            out.push(Command::AddSet(set.declaration()));
+            declared.declare(out, Declaration::Set(set.declaration()));
         }
     }
 }
@@ -1116,50 +1235,97 @@ impl Written {
     }
 }
 
-/// The elements of the named sets in an update, by set.
+/// A set whose elements updates change one by one: those of [`NamedSet`], quarantined
+/// ports, and ports under a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ElementSet {
+    Named(NamedSet),
+    Quarantined,
+    Ports(Limit),
+}
+
+impl From<NamedSet> for ElementSet {
+    fn from(set: NamedSet) -> Self {
+        Self::Named(set)
+    }
+}
+
+impl ElementSet {
+    fn declaration(self) -> SetDecl {
+        match self {
+            Self::Named(set) => set.declaration(),
+            Self::Quarantined => SetDecl::set(Table::Bridge, QUARANTINED_SET, &[KeyType::Ifname]),
+            Self::Ports(limit) => limit.ports(),
+        }
+    }
+}
+
+/// The elements of the sets of an update, by set.
 #[derive(Default)]
-struct Elements(HashMap<NamedSet, Vec<Element>>);
+struct Elements(HashMap<ElementSet, Vec<Element>>);
 
 impl Elements {
-    /// Set the elements of `set`.
-    fn fill(&mut self, set: NamedSet, elements: impl Iterator<Item = Element>) {
-        self.0.entry(set).or_default().extend(elements);
+    /// Add elements to `set`.
+    fn fill(&mut self, set: impl Into<ElementSet>, elements: impl Iterator<Item = Element>) {
+        self.0.entry(set.into()).or_default().extend(elements);
     }
 
     /// Change the sets from the elements an update wrote before (`previous`, none when they
-    /// aren't known) to these: add what's new; a set that lost elements, or a verdict map
-    /// with an element whose verdict changed, is emptied and filled again instead.
-    fn render(&self, out: &mut Batch, previous: Option<&HashMap<NamedSet, Vec<Element>>>) {
+    /// aren't known, and the sets are emptied and filled again) to these: delete what's gone
+    /// and add what's new, in the same transaction, so that lookups of the others never
+    /// miss. A map element whose verdict changed is deleted and added again.
+    fn render(&self, out: &mut Batch, previous: Option<&HashMap<ElementSet, Vec<Element>>>) {
+        let mut sets: Vec<ElementSet> = NamedSet::ALL
+            .into_iter()
+            .map(ElementSet::Named)
+            .chain([ElementSet::Quarantined])
+            .collect();
+        let mut ports: Vec<ElementSet> = self
+            .0
+            .keys()
+            .filter(|set| matches!(set, ElementSet::Ports(_)))
+            .copied()
+            .collect();
+        ports.sort_unstable();
+        sets.extend(ports);
         let mut old_sorted = Vec::new();
         let mut new_sorted = Vec::new();
-        for set in NamedSet::ALL {
+        for set in sets {
             let new = self.0.get(&set).map_or(&[][..], Vec::as_slice);
             let old = previous.map(|previous| previous.get(&set).map_or(&[][..], Vec::as_slice));
             if old == Some(new) {
                 continue;
             }
+            let decl = set.declaration();
+            let Some(old) = old else {
+                out.push(Command::FlushSet(decl.clone()));
+                render_added(out, decl, new.to_vec());
+                continue;
+            };
             old_sorted.clear();
-            old_sorted.extend_from_slice(old.unwrap_or_default());
+            old_sorted.extend_from_slice(old);
             old_sorted.sort_unstable();
+            old_sorted.dedup();
             new_sorted.clear();
             new_sorted.extend_from_slice(new);
             new_sorted.sort_unstable();
-            let refill = old.is_none()
-                || old_sorted
-                    .iter()
-                    .any(|element| new_sorted.binary_search(element).is_err());
-            let decl = set.declaration();
-            if refill {
-                out.push(Command::FlushSet(decl.clone()));
-                render_added(out, decl, new.to_vec());
-            } else {
-                let added = new
-                    .iter()
-                    .filter(|element| old_sorted.binary_search(element).is_err())
-                    .copied()
-                    .collect();
-                render_added(out, decl, added);
+            new_sorted.dedup();
+            // An element is there once, however many sources have it.
+            let mut deleted: Vec<Element> = old_sorted
+                .iter()
+                .filter(|element| new_sorted.binary_search(element).is_err())
+                .copied()
+                .collect();
+            deleted.dedup_by(|a, b| a.key() == b.key());
+            if !deleted.is_empty() {
+                out.push(Command::DeleteElements(decl.clone(), deleted));
             }
+            let added = new_sorted
+                .iter()
+                .filter(|element| old_sorted.binary_search(element).is_err())
+                .copied()
+                .collect();
+            render_added(out, decl, added);
         }
     }
 }
@@ -1362,6 +1528,7 @@ fn render_dns_names(
 
 /// Create or flush the chains and sets of `plan`, and remove those of `previous` it doesn't
 /// need. Returns what is installed afterwards.
+#[allow(clippy::too_many_arguments)]
 fn render_objects(
     out: &mut Batch,
     plan: &Plan,
@@ -1369,6 +1536,8 @@ fn render_objects(
     previous: &Installed,
     slots: &Slots,
     previous_host_addresses: &mut HashMap<String, String>,
+    declared: &mut Declarations,
+    elements: &mut Elements,
 ) -> Installed {
     let mut installed = Installed::default();
     // Written by `render_chain`, if their rules changed. Containers are only managed by
@@ -1391,34 +1560,30 @@ fn render_objects(
         .flatten()
         .map(|monitor| Chain::ArpCheck { monitor });
     for chain in limited.chain(arp_checks) {
-        out.push(Command::AddChain(chain));
-        out.push(Command::FlushChain(chain));
+        declared.declare(out, Declaration::Chain(chain));
         installed.chains.insert(chain.object());
     }
-    for limit in limits(plan, options).into_keys() {
+    let limits = limits(plan, options);
+    for limit in limits.keys() {
         let decl = limit.set();
         installed.sets.insert(Object {
             table: decl.table,
             name: decl.name.to_string(),
         });
-        out.push(Command::AddSet(decl));
+        declared.declare(out, Declaration::Set(decl));
     }
-    for (limit, ports) in limits(plan, options) {
-        // Kept in `installed`.
+    for (limit, ports) in limits {
         let decl = limit.ports();
         installed.sets.insert(Object {
             table: decl.table,
             name: decl.name.to_string(),
         });
-        out.push(Command::AddSet(decl.clone()));
-        out.push(Command::FlushSet(decl.clone()));
-        render_added(
-            out,
-            decl,
+        declared.declare(out, Declaration::Set(decl));
+        elements.fill(
+            ElementSet::Ports(limit),
             ports
                 .into_iter()
-                .map(|port| Element::of(&[Part::Ifname(port)]))
-                .collect(),
+                .map(|port| Element::of(&[Part::Ifname(port)])),
         );
     }
     let mut listed = String::new();
@@ -1645,30 +1810,11 @@ fn render_unknown_sources(
     render_denied_frames(out, options, monitor, &[on_bridges()], "source");
 }
 
-/// The set of quarantined containers' bridge ports, refilled on every update.
+/// The set of quarantined containers' bridge ports.
 const QUARANTINED_SET: &str = "quarantined";
 
-fn render_quarantined_set(out: &mut Batch, plan: &Plan) {
-    let decl = SetDecl::set(Table::Bridge, QUARANTINED_SET, &[KeyType::Ifname]);
-    out.push(Command::AddSet(decl.clone()));
-    out.push(Command::FlushSet(decl.clone()));
-    render_added(
-        out,
-        decl,
-        plan.sources
-            .iter()
-            .filter(|source| source.quarantined && !source.monitor)
-            .filter_map(|source| source.port.known())
-            .map(|port| port.name.as_str())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|port| Element::of(&[Part::Ifname(port)]))
-            .collect(),
-    );
-}
-
 /// A limit shared by some containers: open connections or new connections per second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Limit {
     rate: bool,
     value: u32,
@@ -2109,7 +2255,7 @@ fn render_dispatch(
 /// unknown source. A named set lives on: an update deletes the elements it doesn't hold
 /// anymore and adds the new ones, which lookups of the others don't notice. Sets of ranges
 /// (`flags interval`) can miss as well, so rules match ranges one prefix at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum NamedSet {
     /// Bridges of managed networks, for the inet table.
     InetBridges,
@@ -2906,10 +3052,8 @@ mod tests {
 add table inet portcullis
 add chain inet portcullis forward { type filter hook forward priority -1; policy accept; }
 add chain inet portcullis input { type filter hook input priority -1; policy accept; }
-flush chain inet portcullis input
 add set inet portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set inet portcullis logged6 { type ipv6_addr . ipv6_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
-flush chain inet portcullis forward
 add set inet portcullis bridges { type ifname; }
 add set inet portcullis enforced_bridges { type ifname; }
 add map inet portcullis egress4 { type ipv4_addr : verdict; }
@@ -2918,15 +3062,11 @@ add set inet portcullis name_limited { type ipv4_addr; }
 add table bridge portcullis
 add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }
 add chain bridge portcullis input { type filter hook input priority -1; policy accept; }
-flush chain bridge portcullis input
 add chain bridge portcullis forward { type filter hook forward priority -1; policy accept; }
-flush chain bridge portcullis forward
 add set bridge portcullis quarantined { type ifname; }
-flush set bridge portcullis quarantined
 add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis frames { type ifname . ether_addr . ether_type; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis announced { type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout 60s; size 65536; }
-flush chain bridge portcullis prerouting
 add set bridge portcullis bridges { type ifname; }
 add set bridge portcullis monitored_bridges { type ifname; }
 add set bridge portcullis enforced_bridges { type ifname; }
@@ -2939,7 +3079,11 @@ add set bridge portcullis arp_by_port { type ifname . ether_addr . ether_addr . 
 add set bridge portcullis arp_by_mac { type ether_addr . ether_addr . ipv4_addr; }
 add set bridge portcullis arp_by_address { type ipv4_addr; }
 add chain bridge portcullis limit_open
-flush chain bridge portcullis limit_open
+add chain bridge portcullis limit_open_monitor
+add chain bridge portcullis limit_rate
+add chain bridge portcullis limit_rate_monitor
+add chain bridge portcullis arp_check
+add chain bridge portcullis arp_check_monitor
 ";
         assert!(
             script.starts_with(expected_head),
@@ -3126,19 +3270,18 @@ flush chain bridge portcullis limit_open
         }
 
         // What the previous update created and this one doesn't need is removed; the rest
-        // is flushed and refilled.
-        let removed: Vec<_> = chains(first).difference(&chains(second)).copied().collect();
+        // stays, rewritten where its rules changed.
+        let removed: Vec<&str> = second
+            .lines()
+            .filter_map(|line| line.strip_prefix("delete chain "))
+            .collect();
         assert_ne!(removed, [] as [&str; 0]);
         for chain in removed {
+            assert!(chains(first).contains(chain), "{chain}:\n{first}");
+            assert!(!chains(second).contains(chain), "{chain}:\n{second}");
             assert!(
                 second.contains(&format!("flush chain {chain}\ndelete chain {chain}\n")),
                 "{chain} not removed:\n{second}"
-            );
-        }
-        for chain in chains(second) {
-            assert!(
-                !second.contains(&format!("delete chain {chain}\n")),
-                "{second}"
             );
         }
         assert!(!second.contains("delete set"), "{second}");
@@ -3155,8 +3298,11 @@ flush chain bridge portcullis limit_open
 
     /// A removed container's elements go, the map emptied and filled again without them,
     /// then its chains (slot `a`); the other container's (slot `b`) stay.
-    fn assert_removed(removed: &str, a: usize, b: usize) {
-        let deleted = "flush map inet portcullis egress4\n";
+    /// The container at 172.18.0.2, with chains of slot `a`, was removed, and the one at
+    /// 172.18.0.3 kept.
+    fn assert_removed(removed: &str, a: usize) {
+        // Its map element is deleted before its chain, which it leads to.
+        let deleted = "delete element inet portcullis egress4 { 172.18.0.2 }\n";
         let chain = format!(
             "flush chain inet portcullis egress{a}\ndelete chain inet portcullis egress{a}\n"
         );
@@ -3164,19 +3310,9 @@ flush chain bridge portcullis limit_open
             panic!("{removed}");
         };
         assert!(deleted < chain, "{removed}");
-        let refilled = removed
-            .lines()
-            .find(|line| {
-                line.starts_with(
-                    "add map inet portcullis egress4 { type ipv4_addr : verdict; elements = ",
-                )
-            })
-            .expect("refilled map");
-        assert!(
-            refilled.contains(&format!("172.18.0.3 : goto egress{b}")),
-            "{removed}"
-        );
-        assert!(!refilled.contains("172.18.0.2"), "{removed}");
+        // The others stay as they are.
+        assert!(!removed.contains("flush map"), "{removed}");
+        assert!(!removed.contains("172.18.0.3 :"), "{removed}");
     }
 
     #[test]
@@ -3247,8 +3383,7 @@ flush chain bridge portcullis limit_open
             assert!(!added.contains(&format!("goto {chain}")), "{added}");
         }
         assert!(!added.contains("flush map"), "{added}");
-        assert_removed(removed, a, b);
-        assert!(!removed.contains("delete element"), "{removed}");
+        assert_removed(removed, a);
         assert!(
             !removed.contains(&format!("flush chain inet portcullis egress{b}")),
             "{removed}"
@@ -3283,6 +3418,90 @@ flush chain bridge portcullis limit_open
             ),
             "{reused}"
         );
+    }
+
+    #[test]
+    fn deletes_an_element_two_sources_had_once() {
+        let port = Element::of(&[Part::Ifname("veth1")]);
+        let set = ElementSet::Named(NamedSet::EnforcedPorts);
+        let previous = HashMap::from([(set, vec![port, port])]);
+        let mut batch = Batch::default();
+        Elements::default().render(&mut batch, Some(&previous));
+        assert_eq!(
+            batch.to_string(),
+            "delete element bridge portcullis enforced_ports { \"veth1\" }\n"
+        );
+        let mut batch = Batch::default();
+        let mut elements = Elements::default();
+        elements.fill(set, [port, port].into_iter());
+        elements.render(&mut batch, Some(&HashMap::new()));
+        assert_eq!(
+            batch.to_string(),
+            "add set bridge portcullis enforced_ports { type ifname; elements = { \"veth1\" }; }\n"
+        );
+    }
+
+    #[test]
+    fn writes_base_chains_and_sets_only_when_they_change() {
+        use crate::model::IccMode;
+
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
+        let mut resolver = MockResolver::default();
+        let mut state = RuntimeState::default();
+        test_support::add_network(&mut state, "net", "172.18.0.0/16", "172.18.0.1");
+        let add = |state: &mut RuntimeState, name: &str, address: &str, icc: IccMode| {
+            test_support::add_container(
+                state,
+                name,
+                name,
+                &[("net", address, &[])],
+                test_support::policy(icc, Vec::new()),
+            );
+        };
+        add(&mut state, "a", "172.18.0.2", IccMode::Allow);
+        let mut apply = |state: &RuntimeState| {
+            firewall
+                .apply(state, &mut resolver, &[], false)
+                .expect("apply");
+        };
+        apply(&state);
+        add(&mut state, "b", "172.18.0.3", IccMode::Allow);
+        apply(&state);
+        // Its traffic to other containers now goes through ICC rules of its own.
+        add(&mut state, "a", "172.18.0.2", IccMode::Deny);
+        apply(&state);
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        let [_, added, changed] = scripts.as_slice() else {
+            panic!("expected three scripts");
+        };
+        for script in [added, changed] {
+            // The tables, base chains and sets are there already, and the base chains'
+            // rules stay the same while the networks do.
+            for line in script.lines() {
+                assert!(!line.starts_with("add table"), "{script}");
+                assert!(!line.ends_with("verdict; }"), "{script}");
+                assert!(!line.contains("portcullis logged4 {"), "{script}");
+                assert!(!line.contains("portcullis forward"), "{script}");
+                assert!(!line.contains("portcullis prerouting"), "{script}");
+                assert!(!line.contains("portcullis input"), "{script}");
+            }
+        }
+        // A new container: its chain, and its elements, added to those there.
+        assert_lines(
+            added,
+            &["add map bridge portcullis sources_by_mac { type ipv4_addr . ether_addr : verdict; elements = { 172.18.0.3 . 02:42:ac:12:00:03 : accept }; }".into()],
+        );
+        assert!(!added.contains("delete element"), "{added}");
+        // A verdict that changed: the element is deleted and added again, in one step.
+        assert!(
+            changed.contains(
+                "delete element bridge portcullis sources_by_mac { 172.18.0.2 . 02:42:ac:12:00:02 }\n\
+                 add map bridge portcullis sources_by_mac { type ipv4_addr . ether_addr : verdict; elements = { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc"
+            ),
+            "{changed}"
+        );
+        assert!(!changed.contains("172.18.0.3 . "), "{changed}");
+        assert!(!changed.contains("flush map"), "{changed}");
     }
 
     #[test]
@@ -3490,7 +3709,7 @@ flush chain bridge portcullis limit_open
         firewall
             .apply(&state, &mut resolver, &[], false)
             .expect("apply");
-        *firewall.runner.failing.lock().expect("lock") = Some("add table".to_string());
+        *firewall.runner.failing.lock().expect("lock") = Some("add rule".to_string());
         firewall
             .apply(&test_support::hostname_state(), &mut resolver, &[], false)
             .expect_err("failed apply");
@@ -3503,9 +3722,15 @@ flush chain bridge portcullis limit_open
         assert_eq!(firewall.runner.scripts.lock().expect("lock").len(), 2);
         let scripts = firewall.runner.scripts.lock().expect("lock");
         let last = scripts.last().expect("script");
-        // The sets too: what they hold isn't known.
+        // The sets too: what they hold isn't known. So are the tables, base chains and
+        // sets declared.
         assert!(
             has_line(last, "flush map inet portcullis egress4"),
+            "{last}"
+        );
+        assert!(has_line(last, "add table inet portcullis"), "{last}");
+        assert!(
+            has_line(last, "flush chain inet portcullis forward"),
             "{last}"
         );
         assert!(
