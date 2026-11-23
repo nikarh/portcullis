@@ -1,4 +1,5 @@
 mod elements;
+mod netlink;
 mod nftables;
 mod plan;
 mod ruleset;
@@ -17,20 +18,16 @@ pub use plan::{Destination, HostSet, PRIVATE_V4, PRIVATE_V6, Plan, Rule};
 
 #[derive(Debug, Error)]
 pub enum FirewallError {
-    #[error("failed to format firewall script: {0}")]
-    ScriptFormat(#[from] std::fmt::Error),
-    #[error("failed to create libnftables context")]
-    LibContextCreate,
-    #[error("failed to configure libnftables {buffer}: return code {code}")]
-    LibBufferConfig { buffer: &'static str, code: i32 },
-    #[error("script contains NUL byte and cannot be passed to libnftables")]
-    ScriptContainsNul,
-    #[error("libnftables command failed with code {code}: {stderr}")]
-    LibCommandFailure { code: i32, stderr: String },
-    #[error("libnftables context lock poisoned")]
-    LibContextLock,
     #[error("nftables netlink request failed: {0}")]
     Netlink(std::io::Error),
+    #[error("the kernel refused `{command}`: {error}{}", reason.as_ref().map(|reason| format!(" ({reason})")).unwrap_or_default())]
+    Refused {
+        /// The command, as an nft script would have it.
+        command: String,
+        error: std::io::Error,
+        /// The kernel's explanation, if any.
+        reason: Option<String>,
+    },
     #[error("saved rules: {0}")]
     Saved(std::io::Error),
 }

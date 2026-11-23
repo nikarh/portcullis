@@ -1,13 +1,11 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write as _};
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
-use std::ptr::NonNull;
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -15,7 +13,8 @@ use ipnet::IpNet;
 use tracing::{debug, info, trace, warn};
 
 use super::FirewallError;
-use super::elements::{ElementSocket, TimeoutSet};
+use super::elements::{TimeoutSet, encode_timeouts};
+use super::netlink::{self, Encoder, NftSocket};
 use super::plan::{
     DNS_PORT, Destination, HostSet, HostSetId, ICC_BROADCAST_V4, PRIVATE_V4, PRIVATE_V6, Plan,
     Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
@@ -32,10 +31,11 @@ use crate::model::{
 pub trait NftRunner {
     /// Put the commands of `batch` in place, as a single atomic transaction.
     fn run(&self, batch: &Batch) -> Result<(), FirewallError>;
-    /// Run a saved script as a single atomic transaction.
-    fn run_script(&self, script: String) -> Result<(), FirewallError>;
-    /// Run a listing command (`list ...`), and return what it printed, without set elements.
-    fn list(&self, command: &str) -> Result<String, FirewallError>;
+    /// Put a batch saved as encoded (see [`NftablesFirewall::save`]) in place, as a single
+    /// atomic transaction.
+    fn run_encoded(&self, batch: &mut [u8]) -> Result<(), FirewallError>;
+    /// The chains and sets of the managed tables, or `None` unless both exist.
+    fn installed(&self) -> Result<Option<Found>, FirewallError>;
     /// Set how much longer each address stays in the hostname sets of the inet table that
     /// hold its family, in one transaction (see [`render_timeouts`]).
     fn set_timeouts(
@@ -43,6 +43,13 @@ pub trait NftRunner {
         sets: &[TimeoutSet<'_>],
         addresses: &[(IpAddr, Duration)],
     ) -> Result<(), FirewallError>;
+}
+
+/// The chains (and whether each is a base chain) and sets of the managed tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    pub chains: Vec<(Object, bool)>,
+    pub sets: Vec<Object>,
 }
 
 /// What happens to traffic a policy doesn't allow.
@@ -145,7 +152,7 @@ const LOG_SNAPLEN: u16 = 128;
 /// Bytes copied of denied DNS queries, so their name can be reported.
 const LOG_SNAPLEN_DNS: u16 = 512;
 
-pub struct NftablesFirewall<R = LibNftablesRunner> {
+pub struct NftablesFirewall<R = NetlinkRunner> {
     runner: R,
     options: Options,
     /// What the last successful update installed; `None` before the first one and after a
@@ -198,43 +205,31 @@ struct Renewal {
 }
 
 impl Installed {
-    /// Add the chains and sets of a terse listing of `table`, except the base chains and
-    /// the sets every update creates anyway.
-    fn add_listed(&mut self, table: Table, listing: &str) {
-        let fixed: BTreeSet<&str> = NamedSet::ALL
-            .iter()
-            .filter(|set| set.table() == table)
-            .map(|set| set.name())
-            .chain([
-                QUARANTINED_SET,
-                LOGGED_SET_V4,
-                LOGGED_SET_V6,
-                LOGGED_SET_FRAMES,
-                LOGGED_SET_ARP,
-            ])
-            .collect();
-        let mut lines = listing.lines().map(str::trim).peekable();
-        while let Some(line) = lines.next() {
-            let Some((kind, rest)) = line.split_once(' ') else {
-                continue;
-            };
-            let Some(name) = rest.strip_suffix(" {") else {
-                continue;
-            };
-            let object = || Object {
-                table,
-                name: name.to_string(),
-            };
-            match kind {
-                // A base chain says so on its first line.
-                "chain" if !lines.peek().is_some_and(|next| next.starts_with("type ")) => {
-                    self.chains.insert(object());
-                }
-                "set" | "map" if !fixed.contains(name) => {
-                    self.sets.insert(object());
-                }
-                _ => {}
-            }
+    /// What an update needs to know of `found`: the chains and sets it may delete, all
+    /// but the base chains and the sets every update creates anyway.
+    fn of(found: Found) -> Self {
+        let fixed = |set: &Object| {
+            NamedSet::ALL
+                .iter()
+                .any(|named| named.table() == set.table && named.name() == set.name)
+                || [
+                    QUARANTINED_SET,
+                    LOGGED_SET_V4,
+                    LOGGED_SET_V6,
+                    LOGGED_SET_FRAMES,
+                    LOGGED_SET_ARP,
+                ]
+                .contains(&set.name.as_str())
+        };
+        Self {
+            chains: found
+                .chains
+                .into_iter()
+                .filter_map(|(chain, base)| (!base).then_some(chain))
+                .collect(),
+            sets: found.sets.into_iter().filter(|set| !fixed(set)).collect(),
+            found: true,
+            ..Self::default()
         }
     }
 }
@@ -304,13 +299,22 @@ where
         let Some(path) = &self.saved else {
             return Ok(Restored::Nothing);
         };
-        let script = match fs::read_to_string(path) {
-            Ok(script) => script,
+        let mut saved = match fs::read(path) {
+            Ok(saved) => saved,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Restored::Nothing),
             Err(error) => return Err(FirewallError::Saved(error)),
         };
-        self.runner.run_script(script)?;
-        // What the script installed is known by name only from the kernel.
+        let current = saved.starts_with(SAVED_HEADER);
+        let Some(batch) = saved.get_mut(SAVED_HEADER.len()..).filter(|_| current) else {
+            warn!(
+                path = %path.display(),
+                "the saved rules aren't in a format this version reads; the first update \
+                 puts the rules in place"
+            );
+            return Ok(Restored::Nothing);
+        };
+        self.runner.run_encoded(batch)?;
+        // What the batch installed is known by name only from the kernel.
         *self
             .installed
             .lock()
@@ -320,28 +324,7 @@ where
 
     /// The chains and sets of both tables, when both exist.
     fn find_installed(&self) -> Result<Option<Installed>, FirewallError> {
-        let tables = self.runner.list("list tables")?;
-        let exists = |family: &str| {
-            tables.lines().any(|line| {
-                line.trim()
-                    .strip_prefix("table ")
-                    .and_then(|line| line.strip_prefix(family))
-                    .and_then(|line| line.strip_prefix(' '))
-                    == Some(TABLE_NAME)
-            })
-        };
-        if !(exists("inet") && exists("bridge")) {
-            return Ok(None);
-        }
-        let mut installed = Installed {
-            found: true,
-            ..Installed::default()
-        };
-        for table in Table::ALL {
-            let listing = self.runner.list(&format!("list table {table}"))?;
-            installed.add_listed(table, &listing);
-        }
-        Ok(Some(installed))
+        Ok(self.runner.installed()?.map(Installed::of))
     }
 
     /// Forget the saved rules, so the next start doesn't restore them.
@@ -354,18 +337,16 @@ where
         }
     }
 
-    /// Save the rules of `plan`, just applied, for `restore` at the next start, as a script
-    /// that installs them from scratch. Written to a temporary file first and renamed, so a
-    /// crash never leaves half a script. Not part of `apply`: writing them can take a while,
-    /// and what the new rules report should be attributed (`Directory::update`) as soon as
-    /// they are in place.
+    /// Save the rules of `plan`, just applied, for `restore` at the next start, as the
+    /// netlink batch that installs them from scratch. Written to a temporary file first and
+    /// renamed, so a crash never leaves half a batch. Not part of `apply`: writing them can
+    /// take a while, and what the new rules report should be attributed
+    /// (`Directory::update`) as soon as they are in place.
     pub fn save(&self, plan: &Plan) -> Result<(), FirewallError> {
         let Some(path) = &self.saved else {
             return Ok(());
         };
-        let mut batch = Batch::default();
-        render_apply_script(plan, self.options, None, &mut batch);
-        let script = batch.to_string();
+        let saved = encode_saved(&fresh_batch(plan, self.options));
         let temporary = path.with_extension("tmp");
         let write = || -> io::Result<()> {
             if let Some(directory) = path.parent() {
@@ -377,7 +358,7 @@ where
                 .truncate(true)
                 .mode(0o600)
                 .open(&temporary)?;
-            file.write_all(script.as_bytes())?;
+            file.write_all(&saved)?;
             file.sync_all()?;
             fs::rename(&temporary, path)
         };
@@ -531,11 +512,32 @@ where
     }
 }
 
-impl NftablesFirewall<LibNftablesRunner> {
-    pub fn with_libnftables(options: Options) -> Result<Self, FirewallError> {
-        let runner = LibNftablesRunner::new()?;
+impl NftablesFirewall<NetlinkRunner> {
+    pub fn with_netlink(options: Options) -> Result<Self, FirewallError> {
+        let runner = NetlinkRunner::new()?;
         Ok(Self::new(runner, options))
     }
+}
+
+/// What a saved batch starts with: its format, which a later version may change.
+const SAVED_HEADER: &[u8] = b"portcullis nf_tables batch 1
+";
+
+/// The saved form of `batch`: the header, then the encoded batch.
+fn encode_saved(batch: &Batch) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    Encoder::new(&mut encoded).batch(batch);
+    let mut saved = Vec::with_capacity(SAVED_HEADER.len() + encoded.len());
+    saved.extend_from_slice(SAVED_HEADER);
+    saved.extend_from_slice(&encoded);
+    saved
+}
+
+/// The commands that put the rules of `plan` in place from scratch.
+pub(super) fn fresh_batch(plan: &Plan, options: Options) -> Batch {
+    let mut batch = Batch::default();
+    render_apply_script(plan, options, None, &mut batch);
+    batch
 }
 
 /// Remove the managed tables, whether or not they exist, so neither cleanup nor apply
@@ -816,7 +818,21 @@ fn render_apply_script(
     previous: Option<&mut Installed>,
     out: &mut Batch,
 ) -> Installed {
-    let empty = Installed::default();
+    render_update(plan, options, previous, Slots::default(), out)
+}
+
+/// [`render_apply_script`], with the slots sources keep from scratch (without `previous`).
+fn render_update(
+    plan: &Plan,
+    options: Options,
+    previous: Option<&mut Installed>,
+    slots: Slots,
+    out: &mut Batch,
+) -> Installed {
+    let empty = Installed {
+        slots,
+        ..Installed::default()
+    };
     let (previous, mut written) = if let Some(previous) = previous {
         let written = std::mem::take(&mut previous.written);
         (&*previous, written)
@@ -2561,213 +2577,145 @@ fn render_rule(
     }
 }
 
-#[allow(unsafe_code, warnings)]
-mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/libnftables_bindings.rs"));
+/// Puts rule updates in place over nfnetlink (see [`super::netlink`]).
+pub struct NetlinkRunner {
+    /// Opened at the first update, and again after one failed: answers of a batch that
+    /// failed half way may still be queued.
+    updates: Mutex<Option<NftSocket>>,
+    /// The encoded batch, reused from one update to the next.
+    buffer: Mutex<Vec<u8>>,
+    /// For renewals of hostname sets, which come from DNS answers held meanwhile: they don't
+    /// wait for an update.
+    elements: Mutex<Option<(NftSocket, Vec<u8>, String)>>,
 }
 
-trait NftApi {
-    type Handle: Copy;
-
-    fn new_context(&self) -> Option<Self::Handle>;
-    fn free_context(&self, handle: Self::Handle);
-    fn buffer_output(&self, handle: Self::Handle) -> i32;
-    fn buffer_error(&self, handle: Self::Handle) -> i32;
-    fn run_script(&self, handle: Self::Handle, script: &CStr) -> i32;
-    fn error_output(&self, handle: Self::Handle) -> Option<String>;
-    /// What the last command listed.
-    fn output(&self, handle: Self::Handle) -> Option<String>;
-    /// List sets without their elements.
-    fn set_terse(&self, handle: Self::Handle);
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RealNftApi;
-
-#[allow(unsafe_code)]
-impl NftApi for RealNftApi {
-    type Handle = NonNull<bindings::nft_ctx>;
-
-    fn new_context(&self) -> Option<Self::Handle> {
-        // SAFETY: `nft_ctx_new` is an FFI constructor that returns either null or a valid
-        // pointer to an allocated context when passed a valid flags value.
-        let pointer = unsafe { bindings::nft_ctx_new(bindings::NFT_CTX_DEFAULT) };
-        NonNull::new(pointer)
-    }
-
-    fn free_context(&self, handle: Self::Handle) {
-        // SAFETY: `handle` comes from `nft_ctx_new` and is freed exactly once in `Drop`.
-        unsafe { bindings::nft_ctx_free(handle.as_ptr()) };
-    }
-
-    fn buffer_output(&self, handle: Self::Handle) -> i32 {
-        // SAFETY: `handle` points to a valid live context.
-        unsafe { bindings::nft_ctx_buffer_output(handle.as_ptr()) }
-    }
-
-    fn buffer_error(&self, handle: Self::Handle) -> i32 {
-        // SAFETY: `handle` points to a valid live context.
-        unsafe { bindings::nft_ctx_buffer_error(handle.as_ptr()) }
-    }
-
-    fn run_script(&self, handle: Self::Handle, script: &CStr) -> i32 {
-        // SAFETY: both pointers are valid for the duration of this call.
-        unsafe { bindings::nft_run_cmd_from_buffer(handle.as_ptr(), script.as_ptr()) }
-    }
-
-    fn error_output(&self, handle: Self::Handle) -> Option<String> {
-        // SAFETY: pointer is owned by libnftables for this context and may be null.
-        let pointer = unsafe { bindings::nft_ctx_get_error_buffer(handle.as_ptr()) };
-        if pointer.is_null() {
-            return None;
-        }
-
-        // SAFETY: non-null C string pointer returned by libnftables.
-        let cstr = unsafe { CStr::from_ptr(pointer) };
-        Some(cstr.to_string_lossy().trim().to_string())
-    }
-
-    fn output(&self, handle: Self::Handle) -> Option<String> {
-        // SAFETY: pointer is owned by libnftables for this context and may be null.
-        let pointer = unsafe { bindings::nft_ctx_get_output_buffer(handle.as_ptr()) };
-        if pointer.is_null() {
-            return None;
-        }
-        // SAFETY: non-null C string pointer returned by libnftables.
-        let cstr = unsafe { CStr::from_ptr(pointer) };
-        Some(cstr.to_string_lossy().into_owned())
-    }
-
-    fn set_terse(&self, handle: Self::Handle) {
-        // SAFETY: `handle` points to a valid live context.
-        unsafe {
-            let flags = bindings::nft_ctx_output_get_flags(handle.as_ptr());
-            bindings::nft_ctx_output_set_flags(
-                handle.as_ptr(),
-                flags | bindings::NFT_CTX_OUTPUT_TERSE,
-            );
-        }
-    }
-}
-
-struct NftContext<A>
-where
-    A: NftApi,
-{
-    api: A,
-    handle: A::Handle,
-}
-
-impl<A> NftContext<A>
-where
-    A: NftApi,
-{
-    fn new(api: A) -> Result<Self, FirewallError> {
-        let Some(handle) = api.new_context() else {
-            return Err(FirewallError::LibContextCreate);
-        };
-
-        let output_rc = api.buffer_output(handle);
-        if output_rc != 0 {
-            api.free_context(handle);
-            return Err(FirewallError::LibBufferConfig {
-                buffer: "output",
-                code: output_rc,
-            });
-        }
-
-        let error_rc = api.buffer_error(handle);
-        if error_rc != 0 {
-            api.free_context(handle);
-            return Err(FirewallError::LibBufferConfig {
-                buffer: "error",
-                code: error_rc,
-            });
-        }
-
-        api.set_terse(handle);
-        Ok(Self { api, handle })
-    }
-
-    /// Run a listing command and return what it printed.
-    fn list(&mut self, command: &str) -> Result<String, FirewallError> {
-        self.run_script(command)?;
-        Ok(self.api.output(self.handle).unwrap_or_default())
-    }
-
-    /// Run `script`. Taking ownership of a `String` lets the NUL terminator be appended
-    /// without copying the script.
-    fn run_script(&mut self, script: impl Into<Vec<u8>>) -> Result<(), FirewallError> {
-        let c_script = CString::new(script).map_err(|_| FirewallError::ScriptContainsNul)?;
-        let result = self.api.run_script(self.handle, &c_script);
-        if result == 0 {
-            return Ok(());
-        }
-
-        let stderr = self
-            .api
-            .error_output(self.handle)
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| "unknown libnftables error".to_string());
-
-        Err(FirewallError::LibCommandFailure {
-            code: result,
-            stderr,
-        })
-    }
-}
-
-impl<A> Drop for NftContext<A>
-where
-    A: NftApi,
-{
-    fn drop(&mut self) {
-        self.api.free_context(self.handle);
-    }
-}
-
-// SAFETY: a libnftables context isn't tied to the thread that created it, and
-// `LibNftablesRunner` only touches it while holding its mutex, so it's never used from two
-// threads at once.
-#[allow(unsafe_code)]
-unsafe impl Send for NftContext<RealNftApi> {}
-
-pub struct LibNftablesRunner {
-    context: Mutex<NftContext<RealNftApi>>,
-    /// Opened at the first renewal.
-    elements: Mutex<Option<ElementSocket>>,
-}
-
-impl LibNftablesRunner {
+impl NetlinkRunner {
     pub fn new() -> Result<Self, FirewallError> {
-        let context = NftContext::new(RealNftApi)?;
         Ok(Self {
-            context: Mutex::new(context),
+            updates: Mutex::new(Some(NftSocket::open().map_err(FirewallError::Netlink)?)),
+            buffer: Mutex::new(Vec::new()),
             elements: Mutex::new(None),
         })
     }
+
+    /// Send an encoded batch on the update socket; `describe` names the command of a
+    /// message the kernel refused.
+    fn send(
+        &self,
+        batch: &mut [u8],
+        describe: impl Fn(Option<usize>) -> String,
+    ) -> Result<(), FirewallError> {
+        let mut guard = self.updates.lock().unwrap_or_else(PoisonError::into_inner);
+        let socket = match &mut *guard {
+            Some(socket) => socket,
+            empty => empty.insert(NftSocket::open().map_err(FirewallError::Netlink)?),
+        };
+        socket.send_batch(batch).map_err(|refusal| {
+            *guard = None;
+            FirewallError::Refused {
+                command: describe(refusal.message),
+                error: refusal.error,
+                reason: refusal.reason,
+            }
+        })
+    }
+
+    /// Dump the objects of `kind` of the managed table of `table`'s family.
+    fn dump(&self, kind: u16, table: Table, each: impl FnMut(&[u8])) -> Result<(), FirewallError> {
+        let mut guard = self.updates.lock().unwrap_or_else(PoisonError::into_inner);
+        let socket = match &mut *guard {
+            Some(socket) => socket,
+            empty => empty.insert(NftSocket::open().map_err(FirewallError::Netlink)?),
+        };
+        let filter = |out: &mut netlink::Writer<'_>| {
+            if kind == netlink::NFT_MSG_GETSET {
+                out.string(netlink::NFTA_SET_TABLE, TABLE_NAME);
+            }
+        };
+        socket
+            .dump(kind, netlink::family(table), filter, each)
+            .map_err(FirewallError::Netlink)
+    }
 }
 
-impl NftRunner for LibNftablesRunner {
+/// The text of a command, short enough for a log line.
+fn short(command: &Command) -> String {
+    const LONGEST: usize = 300;
+    let mut text = command.to_string();
+    if text.len() > LONGEST {
+        let mut end = LONGEST;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("...");
+    }
+    text
+}
+
+impl NftRunner for NetlinkRunner {
     fn run(&self, batch: &Batch) -> Result<(), FirewallError> {
-        self.run_script(batch.to_string())
+        if tracing::enabled!(tracing::Level::TRACE) {
+            trace!(script = %batch, "putting rules in place");
+        }
+        let mut buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        let origins = Encoder::new(&mut buffer).batch(batch);
+        self.send(&mut buffer, |message| {
+            message
+                .and_then(|message| origins.get(message))
+                .and_then(|origin| batch.commands.get(*origin))
+                .map_or_else(|| "the batch".to_string(), short)
+        })
     }
 
-    fn run_script(&self, script: String) -> Result<(), FirewallError> {
-        trace!(program = "nft", script, "executing firewall script");
-        let mut guard = self
-            .context
-            .lock()
-            .map_err(|_| FirewallError::LibContextLock)?;
-        guard.run_script(script)
+    fn run_encoded(&self, batch: &mut [u8]) -> Result<(), FirewallError> {
+        self.send(batch, |message| {
+            message.map_or_else(
+                || "the saved batch".to_string(),
+                |message| format!("message {message} of the saved batch"),
+            )
+        })
     }
 
-    fn list(&self, command: &str) -> Result<String, FirewallError> {
-        let mut guard = self
-            .context
-            .lock()
-            .map_err(|_| FirewallError::LibContextLock)?;
-        guard.list(command)
+    fn installed(&self) -> Result<Option<Found>, FirewallError> {
+        let mut found = Found::default();
+        for table in Table::ALL {
+            let mut exists = false;
+            self.dump(netlink::NFT_MSG_GETTABLE, table, |attributes| {
+                exists |= netlink::string_attribute(attributes, netlink::NFTA_TABLE_NAME)
+                    == Some(TABLE_NAME);
+            })?;
+            if !exists {
+                return Ok(None);
+            }
+            self.dump(netlink::NFT_MSG_GETCHAIN, table, |attributes| {
+                if netlink::string_attribute(attributes, netlink::NFTA_CHAIN_TABLE)
+                    != Some(TABLE_NAME)
+                {
+                    return;
+                }
+                if let Some(name) = netlink::string_attribute(attributes, netlink::NFTA_CHAIN_NAME)
+                {
+                    let base = netlink::has_attribute(attributes, netlink::NFTA_CHAIN_HOOK);
+                    found.chains.push((
+                        Object {
+                            table,
+                            name: name.to_string(),
+                        },
+                        base,
+                    ));
+                }
+            })?;
+            self.dump(netlink::NFT_MSG_GETSET, table, |attributes| {
+                if let Some(name) = netlink::string_attribute(attributes, netlink::NFTA_SET_NAME) {
+                    found.sets.push(Object {
+                        table,
+                        name: name.to_string(),
+                    });
+                }
+            })?;
+        }
+        Ok(Some(found))
     }
 
     fn set_timeouts(
@@ -2776,213 +2724,21 @@ impl NftRunner for LibNftablesRunner {
         addresses: &[(IpAddr, Duration)],
     ) -> Result<(), FirewallError> {
         let mut guard = self.elements.lock().unwrap_or_else(PoisonError::into_inner);
-        let socket = match &mut *guard {
-            Some(socket) => socket,
-            empty => empty.insert(ElementSocket::open().map_err(FirewallError::Netlink)?),
+        let (socket, buffer, name) = match &mut *guard {
+            Some(open) => open,
+            empty => empty.insert((
+                NftSocket::open().map_err(FirewallError::Netlink)?,
+                Vec::new(),
+                String::new(),
+            )),
         };
-        let result = socket.set_timeouts(TABLE_NAME, sets, addresses);
+        encode_timeouts(buffer, name, TABLE_NAME, sets, addresses);
+        let result = socket.send_batch(buffer);
         if result.is_err() {
             // Answers of a batch that failed half way may still be queued.
             *guard = None;
         }
-        result.map_err(FirewallError::Netlink)
-    }
-}
-
-#[cfg(test)]
-mod libnftables_tests {
-    use std::ffi::CStr;
-    use std::sync::{Arc, Mutex};
-
-    use super::*;
-
-    #[derive(Clone, Debug)]
-    struct MockState {
-        next_context: Option<usize>,
-        output_rc: i32,
-        error_rc: i32,
-        run_rc: i32,
-        error_message: String,
-        freed: usize,
-        scripts: Vec<String>,
-    }
-
-    #[derive(Clone)]
-    struct MockApi {
-        state: Arc<Mutex<MockState>>,
-    }
-
-    impl MockApi {
-        fn new(state: MockState) -> Self {
-            Self {
-                state: Arc::new(Mutex::new(state)),
-            }
-        }
-
-        fn state(&self) -> MockState {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.clone()
-        }
-    }
-
-    impl NftApi for MockApi {
-        type Handle = usize;
-
-        fn new_context(&self) -> Option<Self::Handle> {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.next_context
-        }
-
-        fn free_context(&self, _handle: Self::Handle) {
-            let mut guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.freed += 1;
-        }
-
-        fn buffer_output(&self, _handle: Self::Handle) -> i32 {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.output_rc
-        }
-
-        fn buffer_error(&self, _handle: Self::Handle) -> i32 {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.error_rc
-        }
-
-        fn run_script(&self, _handle: Self::Handle, script: &CStr) -> i32 {
-            let mut guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.scripts.push(script.to_string_lossy().to_string());
-            guard.run_rc
-        }
-
-        fn error_output(&self, _handle: Self::Handle) -> Option<String> {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            Some(guard.error_message.clone())
-        }
-
-        fn output(&self, _handle: Self::Handle) -> Option<String> {
-            None
-        }
-
-        fn set_terse(&self, _handle: Self::Handle) {}
-    }
-
-    fn base_state() -> MockState {
-        MockState {
-            next_context: Some(1),
-            output_rc: 0,
-            error_rc: 0,
-            run_rc: 0,
-            error_message: String::new(),
-            freed: 0,
-            scripts: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn wrapper_runs_script_successfully() {
-        let api = MockApi::new(base_state());
-        let mut context = match NftContext::new(api.clone()) {
-            Ok(value) => value,
-            Err(error) => panic!("expected context creation to succeed: {error}"),
-        };
-
-        let result = context.run_script("add table inet portcullis");
-        assert!(result.is_ok());
-
-        let state = api.state();
-        assert_eq!(state.scripts.len(), 1);
-    }
-
-    #[test]
-    fn wrapper_reports_script_failure() {
-        let mut state = base_state();
-        state.run_rc = -1;
-        state.error_message = "syntax error".to_string();
-        let api = MockApi::new(state);
-        let mut context = match NftContext::new(api) {
-            Ok(value) => value,
-            Err(error) => panic!("expected context creation to succeed: {error}"),
-        };
-
-        let result = context.run_script("invalid");
-        assert!(matches!(
-            result,
-            Err(FirewallError::LibCommandFailure { code: -1, .. })
-        ));
-    }
-
-    #[test]
-    fn wrapper_rejects_nul_byte_scripts() {
-        let api = MockApi::new(base_state());
-        let mut context = match NftContext::new(api) {
-            Ok(value) => value,
-            Err(error) => panic!("expected context creation to succeed: {error}"),
-        };
-
-        let result = context.run_script("bad\0script");
-        assert!(matches!(result, Err(FirewallError::ScriptContainsNul)));
-    }
-
-    #[test]
-    fn wrapper_frees_context_on_drop() {
-        let api = MockApi::new(base_state());
-        {
-            let context = match NftContext::new(api.clone()) {
-                Ok(value) => value,
-                Err(error) => panic!("expected context creation to succeed: {error}"),
-            };
-            let _ = context;
-        }
-
-        let state = api.state();
-        assert_eq!(state.freed, 1);
-    }
-
-    #[test]
-    fn wrapper_fails_when_context_creation_fails() {
-        let mut state = base_state();
-        state.next_context = None;
-        let api = MockApi::new(state);
-
-        let result = NftContext::new(api);
-        assert!(matches!(result, Err(FirewallError::LibContextCreate)));
-    }
-
-    #[test]
-    fn wrapper_fails_when_output_buffering_fails() {
-        let mut state = base_state();
-        state.output_rc = -1;
-        let api = MockApi::new(state);
-
-        let result = NftContext::new(api);
-        assert!(matches!(
-            result,
-            Err(FirewallError::LibBufferConfig {
-                buffer: "output",
-                code: -1
-            })
-        ));
+        result.map_err(|refusal| FirewallError::Netlink(refusal.error))
     }
 }
 
@@ -4280,72 +4036,58 @@ flush chain bridge portcullis limit_open
     #[derive(Default)]
     struct RecordingRunner {
         scripts: Mutex<Vec<String>>,
-        /// What listing commands print.
-        listings: Mutex<BTreeMap<String, String>>,
-        /// Scripts fail while they contain this.
+        /// Saved batches put in place.
+        encoded: Mutex<Vec<Vec<u8>>>,
+        /// What the tables hold, if they exist.
+        found: Mutex<Option<Found>>,
+        /// Batches fail while they contain this.
         failing: Mutex<Option<String>>,
-        /// Listings the next script makes appear, as if it created the tables.
-        creates: Mutex<Option<BTreeMap<String, String>>>,
+        /// What the next batch makes appear, as if it created the tables.
+        creates: Mutex<Option<Found>>,
     }
 
     impl RecordingRunner {
         /// Pretend both tables exist, as a previous run left them.
-        fn with_tables(inet: &str, bridge: &str) -> Self {
+        fn with_tables(found: Found) -> Self {
             let runner = Self::default();
-            runner
-                .listings
-                .lock()
-                .expect("lock")
-                .extend(Self::tables(inet, bridge));
+            *runner.found.lock().expect("lock") = Some(found);
             runner
         }
 
-        fn tables(inet: &str, bridge: &str) -> BTreeMap<String, String> {
-            BTreeMap::from([
-                (
-                    "list tables".to_string(),
-                    "table inet portcullis\ntable ip nat\ntable bridge portcullis\n".to_string(),
-                ),
-                ("list table inet portcullis".to_string(), inet.to_string()),
-                (
-                    "list table bridge portcullis".to_string(),
-                    bridge.to_string(),
-                ),
-            ])
+        fn created(&self) {
+            if let Some(created) = self.creates.lock().expect("lock").take() {
+                *self.found.lock().expect("lock") = Some(created);
+            }
         }
     }
 
     impl NftRunner for RecordingRunner {
         fn run(&self, batch: &Batch) -> Result<(), FirewallError> {
-            self.run_script(batch.to_string())
-        }
-
-        fn run_script(&self, script: String) -> Result<(), FirewallError> {
+            let script = batch.to_string();
             let failing = self.failing.lock().expect("lock");
             if failing
                 .as_ref()
                 .is_some_and(|text| script.contains(text.as_str()))
             {
-                return Err(FirewallError::LibCommandFailure {
-                    code: 1,
-                    stderr: "Device or resource busy".to_string(),
+                return Err(FirewallError::Refused {
+                    command: script,
+                    error: io::Error::from_raw_os_error(16),
+                    reason: None,
                 });
             }
             self.scripts.lock().expect("lock").push(script);
-            if let Some(created) = self.creates.lock().expect("lock").take() {
-                self.listings.lock().expect("lock").extend(created);
-            }
+            self.created();
             Ok(())
         }
 
-        fn list(&self, command: &str) -> Result<String, FirewallError> {
-            Ok(self
-                .listings
-                .lock()
-                .expect("lock")
-                .get(command)
-                .cloned()
-                .unwrap_or_default())
+        fn run_encoded(&self, batch: &mut [u8]) -> Result<(), FirewallError> {
+            self.encoded.lock().expect("lock").push(batch.to_vec());
+            self.created();
+            Ok(())
+        }
+
+        fn installed(&self) -> Result<Option<Found>, FirewallError> {
+            Ok(self.found.lock().expect("lock").clone())
         }
 
         /// Recorded as the script that does the same.
@@ -4370,60 +4112,38 @@ flush chain bridge portcullis limit_open
         }
     }
 
-    const INET_LISTING: &str = "table inet portcullis {
-	set logged4 {
-		type ipv4_addr . ipv4_addr . inet_proto . inet_service
-		size 65536
-		flags dynamic,timeout
-		timeout 1m
-	}
-	map egress4 {
-		type ipv4_addr : verdict
-	}
-	set pc_h4_00000000000000aa {
-		type ipv4_addr
-		size 8192
-		flags timeout
-	}
-	chain forward {
-		type filter hook forward priority -1; policy accept;
-		ct state established accept
-	}
-	chain egress0 {
-		ct state related ct original ip saddr 172.18.0.2 accept
-	}
-	chain egress7 {
-	}
-}
-";
+    fn object(table: Table, name: &str) -> Object {
+        Object {
+            table,
+            name: name.to_string(),
+        }
+    }
 
-    const BRIDGE_LISTING: &str = "table bridge portcullis {
-	set quarantined {
-		type ifname
-	}
-	set conns16384 {
-		type ifname
-		size 65536
-		flags dynamic
-	}
-	chain prerouting {
-		type filter hook prerouting priority -1; policy accept;
-	}
-	chain icc3 {
-		ct state established accept
-	}
-	chain limit_open {
-		drop
-	}
-}
-";
+    /// The tables a previous run left: base chains, chains of sources, sets every update
+    /// creates, and sets of hostnames and limits.
+    fn previous_run() -> Found {
+        Found {
+            chains: vec![
+                (object(Table::Inet, "forward"), true),
+                (object(Table::Inet, "egress0"), false),
+                (object(Table::Inet, "egress7"), false),
+                (object(Table::Bridge, "prerouting"), true),
+                (object(Table::Bridge, "icc3"), false),
+                (object(Table::Bridge, "limit_open"), false),
+            ],
+            sets: vec![
+                object(Table::Inet, "logged4"),
+                object(Table::Inet, "egress4"),
+                object(Table::Inet, "pc_h4_00000000000000aa"),
+                object(Table::Bridge, "quarantined"),
+                object(Table::Bridge, "conns16384"),
+            ],
+        }
+    }
 
     #[test]
     fn keeps_the_rules_a_previous_run_left_in_place() {
-        let firewall = NftablesFirewall::new(
-            RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING),
-            OPTIONS,
-        );
+        let firewall = NftablesFirewall::new(RecordingRunner::with_tables(previous_run()), OPTIONS);
         assert_eq!(firewall.restore().expect("restore"), Restored::Kept);
         firewall
             .apply(
@@ -4468,7 +4188,7 @@ flush chain bridge portcullis limit_open
 
     #[test]
     fn replaces_rules_found_in_place_that_updates_cant_change() {
-        let runner = RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING);
+        let runner = RecordingRunner::with_tables(previous_run());
         *runner.failing.lock().expect("lock") = Some("delete chain inet portcullis egress7".into());
         let firewall = NftablesFirewall::new(runner, OPTIONS);
         firewall.restore().expect("restore");
@@ -4491,38 +4211,22 @@ flush chain bridge portcullis limit_open
 
     #[test]
     fn lists_installed_chains_and_sets() {
-        let mut installed = Installed::default();
-        installed.add_listed(Table::Inet, INET_LISTING);
-        installed.add_listed(Table::Bridge, BRIDGE_LISTING);
+        let installed = Installed::of(previous_run());
         assert_eq!(
-            installed
-                .chains
-                .iter()
-                .map(ToString::to_string)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(
-                [
-                    "inet portcullis egress0",
-                    "inet portcullis egress7",
-                    "bridge portcullis icc3",
-                    "bridge portcullis limit_open",
-                ]
-                .map(String::from)
-            )
+            installed.chains,
+            BTreeSet::from([
+                object(Table::Inet, "egress0"),
+                object(Table::Inet, "egress7"),
+                object(Table::Bridge, "icc3"),
+                object(Table::Bridge, "limit_open"),
+            ])
         );
         assert_eq!(
-            installed
-                .sets
-                .iter()
-                .map(ToString::to_string)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(
-                [
-                    "inet portcullis pc_h4_00000000000000aa",
-                    "bridge portcullis conns16384"
-                ]
-                .map(String::from)
-            )
+            installed.sets,
+            BTreeSet::from([
+                object(Table::Inet, "pc_h4_00000000000000aa"),
+                object(Table::Bridge, "conns16384"),
+            ])
         );
     }
 
@@ -4583,9 +4287,18 @@ flush chain bridge portcullis limit_open
         let state = test_support::hostname_state();
         let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
         let name = plan.host_set(0).expect("host set").id.name(SET_PREFIX_V4);
-        let inet = format!(
-            "table inet portcullis {{\n\tset {name} {{\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}}\n}}\n"
-        );
+        let tables = || Found {
+            chains: vec![
+                (object(Table::Bridge, "prerouting"), true),
+                (object(Table::Bridge, "icc3"), false),
+                (object(Table::Bridge, "limit_open"), false),
+            ],
+            sets: vec![
+                object(Table::Inet, &name.to_string()),
+                object(Table::Bridge, "quarantined"),
+                object(Table::Bridge, "conns16384"),
+            ],
+        };
         let renewed = format!(
             "add set inet portcullis {name} {{ type ipv4_addr; elements = {{ 1.1.1.1 timeout 3600s }}; }}\n\
              delete element inet portcullis {name} {{ 1.1.1.1 }}\n\
@@ -4598,8 +4311,7 @@ flush chain bridge portcullis limit_open
 
         // Left in place by a run that stopped: what the set has stays, the update renews
         // what Portcullis knows.
-        let firewall =
-            NftablesFirewall::new(RecordingRunner::with_tables(&inet, BRIDGE_LISTING), OPTIONS);
+        let firewall = NftablesFirewall::new(RecordingRunner::with_tables(tables()), OPTIONS);
         assert_eq!(firewall.restore().expect("restore"), Restored::Kept);
         // Then a network without containers: an update that changes nothing of the set.
         let mut more = state.clone();
@@ -4626,28 +4338,29 @@ flush chain bridge portcullis limit_open
 
         // Put back from the saved rules after a reboot: those addresses may be days old.
         let path = std::env::temp_dir().join(format!(
-            "portcullis-saved-hosts-{}/rules.nft",
+            "portcullis-saved-hosts-{}/rules.batch",
             std::process::id()
         ));
         fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, "# saved\n").expect("save");
+        fs::write(&path, encode_saved(&Batch::default())).expect("save");
         let restored =
             NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
-        *restored.runner.creates.lock().expect("lock") =
-            Some(RecordingRunner::tables(&inet, BRIDGE_LISTING));
+        *restored.runner.creates.lock().expect("lock") = Some(tables());
         assert_eq!(restored.restore().expect("restore"), Restored::Saved);
         restored
             .apply(&state, &mut MockResolver::default(), &[], false)
             .expect("apply");
         let scripts = restored.runner.scripts.lock().expect("lock");
-        assert!(scripts[1].contains(&flushed), "{}", scripts[1]);
+        assert!(scripts[0].contains(&flushed), "{}", scripts[0]);
         let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn saves_rules_to_restore_them_at_the_next_start() {
-        let path =
-            std::env::temp_dir().join(format!("portcullis-saved-{}/rules.nft", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "portcullis-saved-{}/rules.batch",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         let firewall =
             NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
@@ -4657,45 +4370,57 @@ flush chain bridge portcullis limit_open
             "nothing saved yet"
         );
         let mut resolver = MockResolver::default();
+        let mut last = None;
         for state in [test_support::icc_state(), test_support::hostname_state()] {
             let plan = firewall
                 .apply(&state, &mut resolver, &[], false)
                 .expect("apply");
             firewall.save(&plan).expect("save");
+            last = Some(plan);
         }
-        // The saved script installs the last update's rules from scratch, unlike the
-        // update itself.
-        let saved = fs::read_to_string(&path).expect("saved");
-        assert!(saved.starts_with("add table inet portcullis\ndelete table inet portcullis\n"));
+        // The saved batch installs the last update's rules from scratch, unlike the update
+        // itself.
+        let fresh = fresh_batch(&last.expect("plan"), OPTIONS);
+        let script = fresh.to_string();
+        assert!(script.starts_with("add table inet portcullis\ndelete table inet portcullis\n"));
         // ...with nothing of the update before it.
-        assert!(saved.contains("ct original ip daddr @pc_h4_"));
-        assert!(!saved.contains("delete chain"), "{saved}");
+        assert!(script.contains("ct original ip daddr @pc_h4_"));
+        assert!(!script.contains("delete chain"), "{script}");
+        let saved = fs::read(&path).expect("saved");
+        assert_eq!(saved, encode_saved(&fresh));
 
-        // Without tables in place (after a reboot), restoring runs it, and the next update
-        // changes what it installed in place.
-        *firewall.runner.creates.lock().expect("lock") =
-            Some(RecordingRunner::tables(INET_LISTING, BRIDGE_LISTING));
+        // Without tables in place (after a reboot), restoring puts it in place, and the next
+        // update changes what it installed in place.
+        *firewall.runner.creates.lock().expect("lock") = Some(previous_run());
         assert_eq!(firewall.restore().expect("restore"), Restored::Saved);
+        assert_eq!(
+            firewall.runner.encoded.lock().expect("lock").as_slice(),
+            [saved[SAVED_HEADER.len()..].to_vec()]
+        );
         firewall
             .apply(&test_support::icc_state(), &mut resolver, &[], false)
             .expect("apply");
         let scripts = firewall.runner.scripts.lock().expect("lock");
-        assert_eq!(scripts.get(2), Some(&saved));
         assert!(
             scripts
-                .get(3)
+                .get(2)
                 .is_some_and(|script| !script.contains("delete table"))
         );
         drop(scripts);
 
+        // Rules an earlier version saved as an nft script aren't run.
+        fs::write(&path, "add table inet portcullis\n").expect("save");
+        let earlier =
+            NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
+        assert_eq!(earlier.restore().expect("restore"), Restored::Nothing);
+        assert!(earlier.runner.encoded.lock().expect("lock").is_empty());
+
         // With tables in place, they are kept, and the saved script isn't run.
-        let kept = NftablesFirewall::new(
-            RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING),
-            OPTIONS,
-        )
-        .saving_to(path.clone());
+        let kept = NftablesFirewall::new(RecordingRunner::with_tables(previous_run()), OPTIONS)
+            .saving_to(path.clone());
         assert_eq!(kept.restore().expect("restore"), Restored::Kept);
         assert!(kept.runner.scripts.lock().expect("lock").is_empty());
+        assert!(kept.runner.encoded.lock().expect("lock").is_empty());
 
         firewall.forget_saved().expect("forget");
         assert!(!path.exists());
