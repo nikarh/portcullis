@@ -14,6 +14,8 @@ The host needs `qemu-system-x86_64`, `genisoimage` (or `mkisofs`), `ssh`, `rsync
 
 CI runs the suite the same way on every push (`.github/workflows/ci.yml`), on a GitHub runner with KVM.
 
+Before the suite, `run.sh` runs `kernel.sh` (not with `E2E_SCENARIOS`): the root-only tests of `src/firewall/kernel_tests.rs`, which compare what the kernel holds after Portcullis's rule updates over netlink with what it holds after `nft` puts the same rules in place, rule for rule and byte for byte, for a few hundred generated plans and changes to them, each in network namespaces of its own. `e2e/vm.sh ssh /home/debian/portcullis/e2e/kernel.sh` runs them alone.
+
 `e2e/vm.sh` manages the VM on its own: `up`, `sync` (copy the working tree and build), `ssh [command]`, `down`, and `destroy` (delete the disk). To run the suite against another build (an older version, to see a check fail), set `PORTCULLIS_BIN` to its path in the VM for `suite.sh`.
 
 ## How it works

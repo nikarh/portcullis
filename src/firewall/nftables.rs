@@ -469,6 +469,17 @@ where
         })
     }
 
+    /// The slot of each source, which numbers its chains.
+    #[cfg(test)]
+    pub fn slots(&self) -> BTreeMap<IpAddr, usize> {
+        self.installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|installed| installed.slots.0.clone())
+            .unwrap_or_default()
+    }
+
     /// Set how much longer each of `addresses` stays allowed in a hostname set of the
     /// current rules, whether it is in the set already or not; zero removes it.
     pub fn update_host_addresses(
@@ -537,6 +548,19 @@ fn encode_saved(batch: &Batch) -> Vec<u8> {
 pub(super) fn fresh_batch(plan: &Plan, options: Options) -> Batch {
     let mut batch = Batch::default();
     render_apply_script(plan, options, None, &mut batch);
+    batch
+}
+
+/// [`fresh_batch`], with sources' chains numbered by `slots`, as an update that kept them
+/// numbers them.
+#[cfg(test)]
+pub(super) fn fresh_batch_with_slots(
+    plan: &Plan,
+    options: Options,
+    slots: &BTreeMap<IpAddr, usize>,
+) -> Batch {
+    let mut batch = Batch::default();
+    render_update(plan, options, None, Slots(slots.clone()), &mut batch);
     batch
 }
 

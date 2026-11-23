@@ -3,7 +3,7 @@
 #
 #   e2e/run.sh
 #   KEEP_VM=1 e2e/run.sh       leave the VM running afterwards
-#   E2E_SCENARIOS=icc e2e/run.sh   run only some scenarios
+#   E2E_SCENARIOS=icc e2e/run.sh   run only some scenarios (and not kernel.sh)
 set -euo pipefail
 
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,4 +13,7 @@ if [[ -z "${KEEP_VM:-}" ]]; then
   trap '"${E2E_DIR}/vm.sh" down' EXIT
 fi
 "${E2E_DIR}/vm.sh" sync
+if [[ -z "${E2E_SCENARIOS:-}" ]]; then
+  "${E2E_DIR}/vm.sh" ssh /home/debian/portcullis/e2e/kernel.sh
+fi
 "${E2E_DIR}/vm.sh" ssh sudo E2E_SCENARIOS="'${E2E_SCENARIOS:-}'" /home/debian/portcullis/e2e/suite.sh "$@"

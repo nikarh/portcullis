@@ -45,11 +45,15 @@ const NFT_MSG_NEWCHAIN: u16 = 3;
 pub const NFT_MSG_GETCHAIN: u16 = 4;
 const NFT_MSG_DELCHAIN: u16 = 5;
 const NFT_MSG_NEWRULE: u16 = 6;
+#[cfg(test)]
+pub const NFT_MSG_GETRULE: u16 = 7;
 const NFT_MSG_DELRULE: u16 = 8;
 const NFT_MSG_NEWSET: u16 = 9;
 pub const NFT_MSG_GETSET: u16 = 10;
 const NFT_MSG_DELSET: u16 = 11;
 pub const NFT_MSG_NEWSETELEM: u16 = 12;
+#[cfg(test)]
+pub const NFT_MSG_GETSETELEM: u16 = 13;
 pub const NFT_MSG_DELSETELEM: u16 = 14;
 
 // Families.

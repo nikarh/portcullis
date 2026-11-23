@@ -52,3 +52,6 @@ undocumented_unsafe_blocks = "deny"
 
 [build-dependencies]
 bindgen = "0.73.2"
+
+[dev-dependencies]
+nix = { version = "0.31.3", features = ["sched"] }

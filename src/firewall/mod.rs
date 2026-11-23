@@ -1,4 +1,6 @@
 mod elements;
+#[cfg(test)]
+mod kernel_tests;
 mod netlink;
 mod nftables;
 mod plan;
