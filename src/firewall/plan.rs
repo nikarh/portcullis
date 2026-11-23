@@ -645,7 +645,8 @@ where
 
     /// Index of the set for `host` in `container`'s rules. A hostname that can't be
     /// resolved gets an empty set, so its rules allow nothing while the rest of the policy
-    /// still applies. A pattern's set only holds what DNS answers to the container said.
+    /// still applies; it is listed as unresolved once Portcullis looked it up. A pattern's
+    /// set only holds what DNS answers to the container said.
     fn host_set(
         &mut self,
         container: &'s ContainerName,
@@ -661,6 +662,7 @@ where
         let addresses = self.resolver.addresses(container, &normalized, hold);
         if addresses.is_empty()
             && host.is_exact()
+            && self.resolver.looked_up_before(&normalized)
             && !self.plan.unresolved_hosts.contains(&normalized)
         {
             self.plan.unresolved_hosts.push(normalized.clone());

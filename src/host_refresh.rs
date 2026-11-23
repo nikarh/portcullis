@@ -19,21 +19,68 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use tracing::{debug, warn};
 
 use crate::connection_log::SharedHosts;
 use crate::directory::Directory;
-use crate::dns::{HostAddresses, HostResolver, UpstreamResolver};
+use crate::dns::{DnsError, HostAddresses, HostResolver, UpstreamResolver};
 use crate::firewall::{HostSet, NftablesFirewall};
 
 /// How long the thread sleeps when no hostname is due, until a rule update wakes it.
 const IDLE: Duration = Duration::from_secs(3600);
 
 /// Look the hostnames of the current rules up whenever they are due. A message on `wake`
-/// says the rules changed; one is sent on `resolved` when a hostname that failed to
-/// resolve has addresses now, for a rule update to report it.
+/// says the rules changed; one is sent on `resolved` when what a rule update reports about
+/// a hostname changed (see [`HostAddresses::record_lookup`]), for one to report it.
+///
+/// Hostnames no lookup has been made for yet are looked up by a thread of their own, each
+/// in parallel, as soon as a rule update needs them: a new container's rules shouldn't wait
+/// behind lookups that are only due, of names whose resolver doesn't answer.
 pub fn spawn(
+    firewall: Arc<NftablesFirewall>,
+    directory: Arc<Directory>,
+    hosts: SharedHosts,
+    wake: Receiver<()>,
+    resolved: Sender<()>,
+) {
+    let (first_wake, first_woken) = unbounded::<()>();
+    let (later_wake, later_woken) = unbounded::<()>();
+    thread::spawn(move || {
+        while wake.recv().is_ok() {
+            let _ = first_wake.send(());
+            let _ = later_wake.send(());
+        }
+    });
+    run(
+        Lookups::First,
+        Arc::clone(&firewall),
+        Arc::clone(&directory),
+        Arc::clone(&hosts),
+        first_woken,
+        resolved.clone(),
+    );
+    run(
+        Lookups::Later,
+        firewall,
+        directory,
+        hosts,
+        later_woken,
+        resolved,
+    );
+}
+
+/// Which lookups a thread makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookups {
+    /// Of hostnames never looked up, all at once.
+    First,
+    /// Of hostnames looked up before, one at a time, when they are due.
+    Later,
+}
+
+fn run(
+    lookups: Lookups,
     firewall: Arc<NftablesFirewall>,
     directory: Arc<Directory>,
     hosts: SharedHosts,
@@ -43,6 +90,7 @@ pub fn spawn(
     thread::spawn(move || {
         loop {
             let outcome = refresh(
+                lookups,
                 &directory.host_sets(),
                 &hosts,
                 Instant::now,
@@ -73,20 +121,22 @@ pub fn spawn(
 struct Outcome {
     /// When the next hostname is due, if any is used.
     next: Option<Instant>,
-    /// A hostname that failed to resolve did.
+    /// What a rule update reports about a hostname changed: it resolved after failing, or
+    /// its first lookup failed.
     resolved: bool,
 }
 
-/// Look up the hostnames of `sets` that are due, and set what each lookup returned in the
-/// sets of every container that uses the hostname with `update`.
+/// Look up the hostnames of `sets` that `lookups` makes and that are due, and set what each
+/// lookup returned in the sets of every container that uses the hostname with `update`.
 fn refresh<R>(
+    lookups: Lookups,
     sets: &[HostSet],
     hosts: &Mutex<HostAddresses<R>>,
     clock: impl Fn() -> Instant,
     mut update: impl FnMut(&HostSet, &[(IpAddr, Duration)]),
 ) -> Outcome
 where
-    R: UpstreamResolver + Clone,
+    R: UpstreamResolver + Clone + Sync,
 {
     // Each hostname with the shortest hold of the containers that use it.
     let mut names: HashMap<&str, Duration> = HashMap::new();
@@ -108,6 +158,7 @@ where
         hosts.prune(now, longest, &used);
         let due: Vec<&str> = names
             .iter()
+            .filter(|(name, _)| hosts.looked_up_before(name) == (lookups == Lookups::Later))
             .filter(|(name, hold)| hosts.lookup_due(name, **hold, now) <= now)
             .map(|(name, _)| *name)
             .collect();
@@ -115,8 +166,7 @@ where
     };
 
     let mut outcome = Outcome::default();
-    for name in due {
-        let result = resolver.resolve_host(name);
+    let mut record = |name: &str, result: Result<Vec<IpAddr>, DnsError>| {
         let now = clock();
         let mut updates = Vec::new();
         {
@@ -147,14 +197,38 @@ where
         for (set, addresses) in updates {
             update(set, &addresses);
         }
+    };
+    match lookups {
+        Lookups::First => thread::scope(|scope| {
+            // Each result is put in place as soon as it comes, not after the slowest.
+            let (results, received) = unbounded();
+            for name in due {
+                let (results, resolver) = (results.clone(), &resolver);
+                scope.spawn(move || {
+                    let _ = results.send((name, resolver.resolve_host(name)));
+                });
+            }
+            drop(results);
+            for (name, result) in received {
+                record(name, result);
+            }
+        }),
+        Lookups::Later => {
+            for name in due {
+                record(name, resolver.resolve_host(name));
+            }
+        }
     }
 
-    let now = clock();
-    let hosts = lock();
-    outcome.next = names
-        .iter()
-        .map(|(name, hold)| hosts.lookup_due(name, *hold, now))
-        .min();
+    if lookups == Lookups::Later {
+        let now = clock();
+        let hosts = lock();
+        outcome.next = names
+            .iter()
+            .filter(|(name, _)| hosts.looked_up_before(name))
+            .map(|(name, hold)| hosts.lookup_due(name, *hold, now))
+            .min();
+    }
     outcome
 }
 
@@ -262,10 +336,14 @@ mod tests {
             self
         }
 
-        /// What `refresh` set, by container.
-        fn refresh(&self) -> (Outcome, HashMap<String, Vec<(IpAddr, Duration)>>) {
+        /// What `refresh` set, by container, with `lookups`.
+        fn refresh_only(
+            &self,
+            lookups: Lookups,
+        ) -> (Outcome, HashMap<String, Vec<(IpAddr, Duration)>>) {
             let mut updates = HashMap::new();
             let outcome = refresh(
+                lookups,
                 &self.sets,
                 &self.hosts,
                 || self.now.get(),
@@ -275,6 +353,18 @@ mod tests {
                     updates.insert(set.container.to_string(), addresses);
                 },
             );
+            (outcome, updates)
+        }
+
+        /// What both threads set, by container: first lookups, then those due.
+        fn refresh(&self) -> (Outcome, HashMap<String, Vec<(IpAddr, Duration)>>) {
+            let (first, mut updates) = self.refresh_only(Lookups::First);
+            let (later, more) = self.refresh_only(Lookups::Later);
+            updates.extend(more);
+            let outcome = Outcome {
+                next: later.next,
+                resolved: first.resolved || later.resolved,
+            };
             (outcome, updates)
         }
 
@@ -295,7 +385,8 @@ mod tests {
         // ...this thread does, right after it, and fills the set.
         let (outcome, updates) = harness.refresh();
         assert_eq!(updates["web"], [(ip("192.0.2.1"), HOLD)]);
-        assert!(outcome.resolved, "a rule update reports it resolved");
+        // No rule update listed it as unresolved: nothing to report.
+        assert!(!outcome.resolved);
         let planned = harness.planned("web", HOLD);
         assert_eq!(
             planned
@@ -304,6 +395,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ip("192.0.2.1")]
         );
+    }
+
+    #[test]
+    fn first_lookups_dont_wait_for_each_other_nor_for_lookups_that_are_due() {
+        /// `slow.test` answers only once the set of `fast.test` was updated.
+        #[derive(Clone)]
+        struct Waiting(crossbeam_channel::Receiver<()>);
+        impl UpstreamResolver for Waiting {
+            fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
+                if host == "slow.test" {
+                    self.0
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("fast.test first");
+                }
+                Ok(vec![ip("192.0.2.1")])
+            }
+        }
+        let (fast_done, waiting) = unbounded();
+        let hosts = Mutex::new(HostAddresses::new(Waiting(waiting), HOLD));
+        let now = Instant::now();
+        // Looked up before and due: only the other thread looks it up.
+        hosts
+            .lock()
+            .expect("lock")
+            .record_lookup("due.test", Ok(vec![ip("192.0.2.9")]), now);
+        let now = now + refresh_interval(HOLD);
+        let sets = [
+            set("a", "slow.test", HOLD),
+            set("b", "fast.test", HOLD),
+            set("c", "due.test", HOLD),
+        ];
+        let mut order = Vec::new();
+        refresh(
+            Lookups::First,
+            &sets,
+            &hosts,
+            || now,
+            |set, _| {
+                if set.host == "fast.test" {
+                    let _ = fast_done.send(());
+                }
+                order.push(set.host.clone());
+            },
+        );
+        assert_eq!(order, ["fast.test", "slow.test"]);
+        let mut later = Vec::new();
+        let outcome = refresh(
+            Lookups::Later,
+            &sets,
+            &hosts,
+            || now,
+            |set, _| {
+                later.push(set.host.clone());
+            },
+        );
+        assert_eq!(later, ["due.test"]);
+        assert!(outcome.next.is_some());
     }
 
     #[test]
@@ -366,15 +514,19 @@ mod tests {
     #[test]
     fn retries_failed_lookups_and_reports_when_they_resolve() {
         let harness = Harness::new(vec![set("web", HOST, HOLD)]);
-        // The resolver doesn't answer: soon.
+        // The resolver doesn't answer: a rule update reports it, and it is asked again soon.
         harness.resolver.fail(false);
         let (outcome, updates) = harness.at(0).refresh();
         assert_eq!(updates["web"], []);
-        assert!(!outcome.resolved);
+        assert!(
+            outcome.resolved,
+            "a rule update reports the hostname unresolved"
+        );
         assert_eq!(outcome.next, Some(harness.start + RETRY_AFTER));
         // It says the name doesn't exist: at the usual pace.
         harness.resolver.fail(true);
         let (outcome, _) = harness.at(30).refresh();
+        assert!(!outcome.resolved);
         assert_eq!(
             outcome.next,
             Some(harness.start + Duration::from_secs(30) + refresh_interval(HOLD))

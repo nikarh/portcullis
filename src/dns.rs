@@ -95,6 +95,9 @@ pub trait HostResolver {
     /// allowed. Never looks anything up: a rule update doesn't wait for DNS.
     fn addresses(&mut self, container: &str, host: &str, hold: Duration)
     -> Vec<(IpAddr, Duration)>;
+
+    /// Whether Portcullis has looked `host` up yet.
+    fn looked_up_before(&self, host: &str) -> bool;
 }
 
 /// The host's resolver (`getaddrinfo`).
@@ -337,9 +340,11 @@ where
             .is_some_and(|lookups| lookups.attempted.is_some())
     }
 
-    /// Record the result of looking `host` up. Returns whether it resolved where the
-    /// lookup before it had failed, or where it is the first: rule updates don't wait for
-    /// a hostname's first lookup, so one that came before it listed the name as unresolved.
+    /// Record the result of looking `host` up. Returns whether a rule update should report
+    /// it: the name resolved where the lookup before had failed, or its first lookup gave
+    /// nothing. Rule updates only list a name as unresolved once it was looked up (they
+    /// don't wait for the first lookup), so a first lookup that resolves changes nothing
+    /// they report.
     pub fn record_lookup(
         &mut self,
         host: &str,
@@ -347,7 +352,8 @@ where
         now: Instant,
     ) -> bool {
         let lookups = self.lookups.entry(host.to_string()).or_default();
-        let failed_before = lookups.failure.is_some() || lookups.attempted.is_none();
+        let first = lookups.attempted.is_none();
+        let failed_before = lookups.failure.is_some();
         lookups.attempted = Some(now);
         match result {
             Ok(addresses) => {
@@ -356,11 +362,11 @@ where
                 for address in addresses {
                     lookups.addresses.insert(address, now);
                 }
-                resolved && failed_before
+                if resolved { failed_before } else { first }
             }
             Err(error) => {
                 lookups.failure = Some(error);
-                false
+                first
             }
         }
     }
@@ -426,6 +432,10 @@ where
         hold: Duration,
     ) -> Vec<(IpAddr, Duration)> {
         self.addresses_at(container, host, hold, Instant::now())
+    }
+
+    fn looked_up_before(&self, host: &str) -> bool {
+        Self::looked_up_before(self, host)
     }
 }
 
@@ -537,8 +547,9 @@ mod tests {
         assert!(!hosts.looked_up_before("api.example.com"));
         assert_eq!(hosts.addresses_at("web", "API.example.com.", HOLD, now), []);
         assert_eq!(*resolver.calls.lock().expect("lock"), 0);
-        // The first lookup, made after the update: a rule update reports it resolved.
-        assert!(hosts.record_lookup("api.example.com", Ok(vec![ip("1.1.1.1")]), now));
+        // The first lookup, made after the update: rule updates didn't list the name as
+        // unresolved, so there is nothing to report.
+        assert!(!hosts.record_lookup("api.example.com", Ok(vec![ip("1.1.1.1")]), now));
         assert!(hosts.looked_up_before("api.example.com"));
         assert_eq!(
             hosts.addresses_at("web", "API.example.com.", HOLD, now),
@@ -559,8 +570,9 @@ mod tests {
                 missing,
             })
         };
-        // The resolver didn't answer: soon.
-        assert!(!hosts.record_lookup("missing.test", failed(false), now));
+        // The resolver didn't answer: a rule update lists the name as unresolved, and it is
+        // asked for again soon.
+        assert!(hosts.record_lookup("missing.test", failed(false), now));
         assert_eq!(hosts.addresses_at("web", "missing.test", HOLD, now), []);
         assert_eq!(
             hosts.lookup_due("missing.test", HOLD, now),

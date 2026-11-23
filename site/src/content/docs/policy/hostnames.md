@@ -23,7 +23,7 @@ This needs Docker to forward the container's lookups from its own address; see [
 
 Portcullis also resolves every hostname of a `host:` rule itself, through the host's resolver: right after the rule update that first needs it, then again four times per [hold](#how-long-an-address-stays-allowed) (every 15 minutes with the default hold of an hour). What a lookup returns is allowed for every container with a rule for the name, right away.
 
-A rule update never waits for a lookup, which can take seconds: a container that starts with a rule for a name no other rule has gets its rules at once, and the name's addresses a moment later, usually within milliseconds. Until then, the rule allows what DNS answers to the container say. A container whose lookups Portcullis sees has its answer held until the addresses in it are allowed, so it doesn't notice. What lookups returned outlasts the rules that needed it for as long as it stays allowed, so a container recreated with the same rules gets it at once.
+A rule update never waits for a lookup, which can take seconds: a container that starts with a rule for a name no other rule has gets its rules at once, and the name's addresses a moment later, usually within milliseconds: first lookups are made each on their own, and don't wait for lookups of other names, such as names whose resolver doesn't answer. Until then, the rule allows what DNS answers to the container say. A container whose lookups Portcullis sees has its answer held until the addresses in it are allowed, so it doesn't notice. What lookups returned outlasts the rules that needed it for as long as it stays allowed, so a container recreated with the same rules gets it at once.
 
 That covers what the container's own answers can't:
 
@@ -31,7 +31,7 @@ That covers what the container's own answers can't:
 - Containers whose lookups Portcullis can't see, such as those using DNS over HTTPS or TLS.
 - Containers that looked the name up before Portcullis started.
 
-When the resolver doesn't answer, Portcullis tries again every 30 seconds. When it answers that the name doesn't exist, Portcullis asks again at the usual pace: the name may only exist for the resolver the container uses. Until a name has addresses, its rules allow nothing; everything else is applied as usual. The [`applied` event](/reference/events/#applied) lists such names as `unresolved_hosts`, and a new `applied` event follows as soon as one resolves.
+When the resolver doesn't answer, Portcullis tries again every 30 seconds. When it answers that the name doesn't exist, Portcullis asks again at the usual pace: the name may only exist for the resolver the container uses. Until a name has addresses, its rules allow nothing; everything else is applied as usual. The [`applied` event](/reference/events/#applied) lists such names as `unresolved_hosts` once a lookup of them failed, and a new `applied` event follows as soon as one resolves.
 
 Lookups go through the host's resolver (`/etc/resolv.conf`, `/etc/hosts`), not the container's. The host's resolver can give other addresses for the same name than the container's does, for names that resolve differently by location or network. The container's own answers still count for it.
 

@@ -43,6 +43,10 @@ impl HostResolver for MockResolver {
         }
         Vec::new()
     }
+
+    fn looked_up_before(&self, _host: &str) -> bool {
+        true
+    }
 }
 
 /// The host's DNS servers in tests.

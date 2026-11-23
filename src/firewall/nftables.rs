@@ -3526,6 +3526,9 @@ flush chain bridge portcullis limit_open
             ) -> Vec<(IpAddr, Duration)> {
                 self.0.iter().map(|address| (*address, hold)).collect()
             }
+            fn looked_up_before(&self, _host: &str) -> bool {
+                true
+            }
         }
 
         let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
@@ -3596,6 +3599,9 @@ flush chain bridge portcullis limit_open
                 _hold: Duration,
             ) -> Vec<(IpAddr, Duration)> {
                 vec![(test_support::ip("1.1.1.1"), self.left)]
+            }
+            fn looked_up_before(&self, _host: &str) -> bool {
+                true
             }
         }
 
