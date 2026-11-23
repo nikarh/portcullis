@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,7 +53,7 @@ use crate::docker::{
 use crate::events::{
     ContainerAction, ContainerChange, Event, EventBus, Mode, Sinks, Warning, WarningKind,
 };
-use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored};
+use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored, Update};
 use crate::logging::LoggingError;
 use crate::model::{ContainerId, RuntimeState, RuntimeStateAction};
 use crate::monitor::{DockerMonitor, Fetched, MonitorError};
@@ -462,15 +463,21 @@ struct Applier {
 struct Saver {
     plans: Option<Sender<Plan>>,
     thread: Option<thread::JoinHandle<()>>,
+    /// The last save failed: the rules in place aren't saved yet.
+    failed: Arc<AtomicBool>,
 }
 
 impl Saver {
     fn spawn(firewall: Arc<NftablesFirewall>) -> Self {
         let (plans, received) = unbounded::<Plan>();
+        let failed = Arc::new(AtomicBool::new(false));
+        let failing = Arc::clone(&failed);
         let thread = thread::spawn(move || {
             while let Ok(plan) = received.recv() {
                 let plan = received.try_iter().last().unwrap_or(plan);
-                if let Err(error) = firewall.save(&plan) {
+                let result = firewall.save(&plan);
+                failing.store(result.is_err(), Ordering::Relaxed);
+                if let Err(error) = result {
                     warn!(%error, "can't save the rules; the next start begins without them");
                 }
             }
@@ -478,7 +485,13 @@ impl Saver {
         Self {
             plans: Some(plans),
             thread: Some(thread),
+            failed,
         }
+    }
+
+    /// Whether the last save failed, and the rules in place should be saved again.
+    fn unsaved(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 
     fn save(&self, plan: Plan) {
@@ -544,7 +557,20 @@ impl Applier {
             )
         };
         match result {
-            Ok(plan) => {
+            Ok(Update {
+                plan,
+                changed: false,
+            }) => {
+                self.failures = 0;
+                // Nothing to report but warnings about containers.
+                self.report_changes(state, &plan);
+                // A save that failed is tried again on every update, changed or not.
+                if self.saver.unsaved() {
+                    self.saver.save(plan);
+                }
+                Ok(())
+            }
+            Ok(Update { plan, .. }) => {
                 self.failures = 0;
                 self.directory.update(&plan);
                 // "applied" closes an update: everything it caused comes before it.

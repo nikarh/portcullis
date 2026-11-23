@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::FirewallError;
 use super::elements::{ElementSocket, TimeoutSet};
@@ -269,6 +269,16 @@ struct Installed {
     kept: bool,
     /// Hostname sets whose addresses to renew once the update is in place.
     renewals: Vec<Renewal>,
+    /// The plan of the last update, once it is in place.
+    applied: Option<Plan>,
+}
+
+/// What [`NftablesFirewall::apply_with`] did.
+#[derive(Debug)]
+pub struct Update {
+    pub plan: Plan,
+    /// Whether anything was put in place: not when the rules were those of the plan already.
+    pub changed: bool,
 }
 
 /// The addresses Portcullis knows for a hostname set it kept from a previous run, to renew
@@ -475,9 +485,15 @@ where
         Hosts: HostResolver,
     {
         self.apply_with(state, hosts, host_resolvers, monitor_all, |_| {})
+            .map(|update| update.plan)
     }
 
     /// `apply`, calling `before` with the plan just before its rules are put in place.
+    ///
+    /// When the rules in place are those of the plan already (the last update put them in
+    /// place, see [`Plan::same_rules`]), nothing is put in place and `before` isn't called:
+    /// changes of the state that don't change the rules, such as Docker's report of a
+    /// container found before it, cost no update.
     pub fn apply_with<Hosts>(
         &self,
         state: &RuntimeState,
@@ -485,11 +501,33 @@ where
         host_resolvers: &[IpAddr],
         monitor_all: bool,
         before: impl FnOnce(&Plan),
-    ) -> Result<Plan, FirewallError>
+    ) -> Result<Update, FirewallError>
     where
         Hosts: HostResolver,
     {
         let plan = Plan::build(state, hosts, host_resolvers, monitor_all);
+        let mut installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(current) = installed.as_mut() {
+            // Taken out: should this update fail, the next one isn't skipped.
+            if current
+                .applied
+                .take()
+                .is_some_and(|applied| applied.same_rules(&plan))
+            {
+                current.applied = Some(plan.clone());
+                debug!(
+                    container_count = state.containers().len(),
+                    "the rules in place are the same; nothing to change"
+                );
+                return Ok(Update {
+                    plan,
+                    changed: false,
+                });
+            }
+        }
         info!(
             source_count = plan.sources.len(),
             rule_count = plan.rule_count(),
@@ -498,10 +536,6 @@ where
             "applying nftables changes"
         );
 
-        let mut installed = self
-            .installed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         let mut script = String::with_capacity(plan.rule_count() * 96);
         // Takes the rules of the installed chains out of `installed`: should the update fail,
         // the next one writes every chain again.
@@ -530,9 +564,13 @@ where
                 warn!(%error, set = renewal.set, "can't renew the addresses of a hostname set");
             }
         }
+        now_installed.applied = Some(plan.clone());
         *installed = Some(now_installed);
         drop(installed);
-        Ok(plan)
+        Ok(Update {
+            plan,
+            changed: true,
+        })
     }
 
     /// Set how much longer each of `addresses` stays allowed in a hostname set of the
@@ -3336,6 +3374,10 @@ flush chain bridge portcullis limit_open
             container_id: "a".to_string().into(),
         });
         apply(&state);
+        // The same state again puts nothing in place.
+        apply(&state);
+        // A network without containers: the update changes none of the containers' rules.
+        test_support::add_network(&mut state, "other", "172.30.0.0/16", "172.30.0.1");
         apply(&state);
         add(&mut state, "d", "172.18.0.5");
         apply(&state);
@@ -3375,7 +3417,7 @@ flush chain bridge portcullis limit_open
             !removed.contains(&format!("flush chain inet portcullis egress{b}")),
             "{removed}"
         );
-        // Nothing changed: nothing of the containers is written.
+        // Nothing of the containers changed: nothing of theirs is written.
         assert!(
             !unchanged.contains("chain inet portcullis egress"),
             "{unchanged}"
@@ -3485,6 +3527,15 @@ flush chain bridge portcullis limit_open
 
         let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
         let state = test_support::hostname_state();
+        // Another container, for an update that changes something but the set.
+        let mut more = state.clone();
+        test_support::add_container(
+            &mut more,
+            "more",
+            "more",
+            &[("net0", "172.18.0.9", &[])],
+            crate::model::ContainerPolicy::default(),
+        );
         let mut answers = Answers(vec![test_support::ip("1.1.1.1")]);
         let name = Plan::build(&state, &mut answers, &[], false)
             .host_set(0)
@@ -3492,10 +3543,14 @@ flush chain bridge portcullis limit_open
             .id
             .name(SET_PREFIX_V4)
             .to_string();
-        for addresses in [&["1.1.1.1"][..], &["1.1.1.1"], &["1.1.1.1", "1.0.0.1"]] {
+        for (state, addresses) in [
+            (&state, &["1.1.1.1"][..]),
+            (&more, &["1.1.1.1"]),
+            (&more, &["1.1.1.1", "1.0.0.1"]),
+        ] {
             answers.0 = addresses.iter().map(|a| test_support::ip(a)).collect();
             firewall
-                .apply(&state, &mut answers, &[], false)
+                .apply(state, &mut answers, &[], false)
                 .expect("apply");
         }
         let scripts = firewall.runner.scripts.lock().expect("lock");
@@ -3520,6 +3575,72 @@ flush chain bridge portcullis limit_open
     }
 
     #[test]
+    fn puts_nothing_in_place_when_the_rules_stay_the_same() {
+        use crate::model::{Container, RuntimeStateAction};
+
+        /// Resolves every name to 1.1.1.1, for as long as `left` says.
+        struct Answers {
+            left: Duration,
+        }
+        impl HostResolver for Answers {
+            fn default_hold(&self) -> Duration {
+                test_support::HOLD
+            }
+            fn addresses(
+                &mut self,
+                _container: &str,
+                _host: &str,
+                _hold: Duration,
+            ) -> Result<Vec<(IpAddr, Duration)>, crate::dns::DnsError> {
+                Ok(vec![(test_support::ip("1.1.1.1"), self.left)])
+            }
+        }
+
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
+        let mut answers = Answers {
+            left: test_support::HOLD,
+        };
+        let apply = |state: &RuntimeState, answers: &mut Answers| {
+            let mut before = false;
+            let update = firewall
+                .apply_with(state, answers, &[], false, |_| before = true)
+                .expect("apply");
+            assert_eq!(before, update.changed);
+            update.changed
+        };
+        let state = test_support::hostname_state();
+        assert!(apply(&state, &mut answers));
+        // Again: Docker's report of a container found before it, with the same rules.
+        let mut reported = state.clone();
+        let web = reported.containers().get("abc").cloned().expect("web");
+        reported.apply_action(RuntimeStateAction::CreateContainer {
+            container: Box::new(Container {
+                sandbox: Some("/var/run/docker/netns/0123456789ab".to_string()),
+                ..web
+            }),
+        });
+        assert!(!apply(&reported, &mut answers));
+        // The hostname's address has less time left: lookups and DNS answers renew it in
+        // the set, which the update leaves alone.
+        answers.left = Duration::from_secs(60);
+        assert!(!apply(&reported, &mut answers));
+        // Anything else is put in place: another container...
+        let mut more = reported.clone();
+        test_support::add_container(
+            &mut more,
+            "more",
+            "more",
+            &[("net0", "172.18.0.9", &[])],
+            crate::model::ContainerPolicy::default(),
+        );
+        assert!(apply(&more, &mut answers));
+        // ...or its going.
+        assert!(apply(&reported, &mut answers));
+        assert!(!apply(&reported, &mut answers));
+        assert_eq!(firewall.runner.scripts.lock().expect("lock").len(), 3);
+    }
+
+    #[test]
     fn writes_every_chain_again_after_a_failed_update() {
         let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
         let mut resolver = MockResolver::default();
@@ -3529,12 +3650,15 @@ flush chain bridge portcullis limit_open
             .expect("apply");
         *firewall.runner.failing.lock().expect("lock") = Some("add table".to_string());
         firewall
-            .apply(&state, &mut resolver, &[], false)
+            .apply(&test_support::hostname_state(), &mut resolver, &[], false)
             .expect_err("failed apply");
         *firewall.runner.failing.lock().expect("lock") = None;
+        // The rules in place are those of `state` or not, depending on how far the failed
+        // update got: they are put in place again.
         firewall
             .apply(&state, &mut resolver, &[], false)
             .expect("apply");
+        assert_eq!(firewall.runner.scripts.lock().expect("lock").len(), 2);
         let scripts = firewall.runner.scripts.lock().expect("lock");
         let last = scripts.last().expect("script");
         // The sets too: what they hold isn't known.
@@ -3560,7 +3684,6 @@ flush chain bridge portcullis limit_open
                 .expect("apply");
         };
         let state = test_support::icc_state();
-        apply(&state);
         apply(&state);
         // web's address goes to another container.
         let mut reassigned = test_support::icc_state();
@@ -3592,11 +3715,7 @@ flush chain bridge portcullis limit_open
                 .map(|table| script.contains(&format!("flush set {table} portcullis logged4\n")))
         };
         let flushed: Vec<_> = scripts.iter().skip(1).map(flushes).collect();
-        assert_eq!(
-            flushed,
-            [[false, false], [true, true], [false, false]],
-            "{scripts:#?}"
-        );
+        assert_eq!(flushed, [[true, true], [false, false]], "{scripts:#?}");
     }
 
     #[test]
@@ -4299,7 +4418,8 @@ flush chain bridge portcullis limit_open
         );
         // Only the first update does: rules this run installed stay updated in place.
         *firewall.runner.failing.lock().expect("lock") = Some("add rule".into());
-        assert!(firewall.apply(&state, &mut resolver, &[], false).is_err());
+        let changed = test_support::shared_hostname_state();
+        assert!(firewall.apply(&changed, &mut resolver, &[], false).is_err());
         assert_eq!(firewall.runner.scripts.lock().expect("lock").len(), 1);
     }
 
@@ -4407,9 +4527,12 @@ flush chain bridge portcullis limit_open
         let firewall =
             NftablesFirewall::new(RecordingRunner::with_tables(&inet, BRIDGE_LISTING), OPTIONS);
         assert_eq!(firewall.restore().expect("restore"), Restored::Kept);
-        for _ in 0..2 {
+        // Then a network without containers: an update that changes nothing of the set.
+        let mut more = state.clone();
+        test_support::add_network(&mut more, "other", "172.30.0.0/16", "172.30.0.1");
+        for state in [&state, &more] {
             firewall
-                .apply(&state, &mut MockResolver::default(), &[], false)
+                .apply(state, &mut MockResolver::default(), &[], false)
                 .expect("apply");
         }
         let scripts = firewall.runner.scripts.lock().expect("lock");
@@ -4419,6 +4542,7 @@ flush chain bridge portcullis limit_open
         assert_eq!(scripts[1], renewed);
         // A later update with the same addresses leaves the set alone: what the previous run
         // learned still runs out as it would have.
+        assert_eq!(scripts.len(), 3);
         assert!(
             !scripts[2].contains(&format!("inet portcullis {name}")),
             "{}",
