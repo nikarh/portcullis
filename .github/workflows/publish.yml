@@ -75,7 +75,7 @@ jobs:
           cp target/release/portcullis out/portcullis-${{ matrix.arch }}-linux-gnu
           cp target/release/portcullis dist/portcullis.service dist/config.toml README.md LICENSE-MIT LICENSE-APACHE portcullis/
           tar -czf out/portcullis-${{ matrix.arch }}-linux-gnu.tar.gz portcullis
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
           install_args: nfpm
       - name: Packages
@@ -117,7 +117,7 @@ jobs:
           gpg --batch --yes --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
           cat SHA256SUMS
       - name: Generate GitHub token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         id: generate-token
         with:
           client-id: ${{ secrets.APP_CLIENT_ID }}
@@ -175,7 +175,7 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: gpg --batch --import <<<"$GPG_PRIVATE_KEY"
       - name: Generate GitHub token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         id: generate-token
         with:
           client-id: ${{ secrets.APP_CLIENT_ID }}
@@ -229,7 +229,7 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: gpg --batch --import <<<"$GPG_PRIVATE_KEY"
       - name: Generate GitHub token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         id: generate-token
         with:
           client-id: ${{ secrets.APP_CLIENT_ID }}
