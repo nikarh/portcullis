@@ -534,6 +534,7 @@ impl Applier {
         // Re-read on every update, so changes to the host's DNS configuration are picked up.
         let host_resolvers = host_dns::host_resolvers();
         state.set_daemon_dns(host_dns::docker_daemon_dns());
+        let finding = Instant::now();
         let found = match self.ports.find(state) {
             Ok(found) => found,
             Err(error) => {
@@ -545,7 +546,7 @@ impl Applier {
         state.set_ports(found.ports, found.absent);
         state.set_stopping(found.stopping);
         let state = &*state;
-        let ports = started.elapsed();
+        let ports = finding.elapsed();
         let forgetting = Instant::now();
         self.forget_reassigned_connections(state);
         let connections = forgetting.elapsed();

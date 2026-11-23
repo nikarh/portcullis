@@ -120,9 +120,13 @@ time.sleep(60)')
         --label portcullis.egress.echo=ip:198.51.100.3,udp:9000 \
         --label "portcullis.egress.name=host:${host},tcp:443" \
         "${TESTER_IMAGE}" "${command[@]}" >/dev/null
-      python3 "${E2E_DIR}/wait-applied.py" "${SOCKET}" 10 "$(address_of "${name}")" >/dev/null
+      python3 "${E2E_DIR}/wait-applied.py" "${SOCKET}" 10 "$(address_of "${name}")" >/dev/null ||
+        log "${name}: no rules within 10 s"
       if [[ ${kind} == send ]]; then
-        until docker logs "${name}" 2>/dev/null | grep -q .; do sleep 0.05; done
+        local deadline=$((SECONDS + 10))
+        until docker logs "${name}" 2>/dev/null | grep -q . || ((SECONDS > deadline)); do
+          sleep 0.05
+        done
       fi
       printf '%s %s %s %s\n' "${kind}" "${name}" \
         "$(docker inspect -f '{{.State.StartedAt}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${name}")" \
