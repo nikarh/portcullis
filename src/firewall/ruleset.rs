@@ -864,19 +864,54 @@ impl fmt::Display for Command {
     }
 }
 
+/// Takes the commands of a batch as they come, instead of keeping them.
+pub type Sink = Box<dyn FnMut(Command)>;
+
 /// The commands of an update, in order, applied as one transaction.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct Batch {
     pub commands: Vec<Command>,
+    /// Where commands go instead of `commands`, if anywhere.
+    sink: Option<Sink>,
+}
+
+impl fmt::Debug for Batch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Batch")
+            .field("commands", &self.commands)
+            .field("sink", &self.sink.is_some())
+            .finish()
+    }
 }
 
 impl Batch {
+    /// A batch whose commands go to `sink` as they come: one that is written out without
+    /// keeping all of it.
+    pub fn streaming(sink: Sink) -> Self {
+        Self {
+            commands: Vec::new(),
+            sink: Some(sink),
+        }
+    }
+
+    /// A batch of `commands`.
+    #[cfg(test)]
+    pub fn of(commands: Vec<Command>) -> Self {
+        Self {
+            commands,
+            sink: None,
+        }
+    }
+
     pub fn push(&mut self, command: Command) {
-        self.commands.push(command);
+        match &mut self.sink {
+            Some(sink) => sink(command),
+            None => self.commands.push(command),
+        }
     }
 
     pub fn rule(&mut self, chain: Chain, exprs: Vec<Expr>) {
-        self.commands.push(Command::AddRule(chain, exprs));
+        self.push(Command::AddRule(chain, exprs));
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

@@ -324,9 +324,7 @@ fn encodes_rules_as_nft_does() {
 /// A set as the kernel holds it, as nft created it: flags, key type and length, data type,
 /// timeout, size and user data.
 fn set_attributes(decl: &SetDecl) -> Vec<(u16, Vec<u8>)> {
-    let batch = Batch {
-        commands: vec![Command::AddSet(decl.clone())],
-    };
+    let batch = Batch::of(vec![Command::AddSet(decl.clone())]);
     let (encoded, _) = encode(&batch);
     let (_, _, message) = messages(&encoded).swap_remove(1);
     attributes(&message)
@@ -442,9 +440,7 @@ fn encodes_elements_with_padded_keys() {
         element.key(),
         hex("76657468320000000000000000000000ac1200020242ac1200020000")
     );
-    let batch = Batch {
-        commands: vec![Command::AddElements(decl, vec![element])],
-    };
+    let batch = Batch::of(vec![Command::AddElements(decl, vec![element])]);
     let (encoded, _) = encode(&batch);
     let (kind, _, message) = messages(&encoded).swap_remove(1);
     assert_eq!(kind, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM);
@@ -468,9 +464,7 @@ fn splits_many_elements_over_messages() {
         .iter()
         .map(|name| Element::of(&[Part::Ifname(name)]))
         .collect();
-    let batch = Batch {
-        commands: vec![Command::AddElements(decl, elements)],
-    };
+    let batch = Batch::of(vec![Command::AddElements(decl, elements)]);
     let (encoded, origins) = encode(&batch);
     let messages = messages(&encoded);
     assert!(messages.len() > 4, "{}", messages.len());
@@ -486,12 +480,10 @@ fn splits_many_elements_over_messages() {
 
 #[test]
 fn frames_batches() {
-    let (encoded, origins) = encode(&Batch {
-        commands: vec![
-            Command::ResetTable(Table::Inet),
-            Command::AddChain(Chain::Base(Table::Inet)),
-        ],
-    });
+    let (encoded, origins) = encode(&Batch::of(vec![
+        Command::ResetTable(Table::Inet),
+        Command::AddChain(Chain::Base(Table::Inet)),
+    ]));
     let kinds: Vec<u16> = messages(&encoded).iter().map(|message| message.0).collect();
     let nft = |kind| (NFNL_SUBSYS_NFTABLES << 8) | kind;
     assert_eq!(

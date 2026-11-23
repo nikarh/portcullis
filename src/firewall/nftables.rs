@@ -1,11 +1,13 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -351,19 +353,20 @@ where
         let Some(path) = &self.saved else {
             return Ok(());
         };
-        let saved = encode_saved(&fresh_batch(plan, self.options));
         let temporary = path.with_extension("tmp");
         let write = || -> io::Result<()> {
             if let Some(directory) = path.parent() {
                 fs::create_dir_all(directory)?;
             }
-            let mut file = fs::OpenOptions::new()
+            let file = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
                 .open(&temporary)?;
-            file.write_all(&saved)?;
+            let file = write_saved(plan, self.options, io::BufWriter::new(file))?
+                .into_inner()
+                .map_err(io::IntoInnerError::into_error)?;
             file.sync_all()?;
             fs::rename(&temporary, path)
         };
@@ -539,17 +542,65 @@ impl NftablesFirewall<NetlinkRunner> {
 const SAVED_HEADER: &[u8] = b"portcullis nf_tables batch 1
 ";
 
-/// The saved form of `batch`: the header, then the encoded batch.
-fn encode_saved(batch: &Batch) -> Vec<u8> {
-    let mut encoded = Vec::new();
-    Encoder::new(&mut encoded).batch(batch);
-    let mut saved = Vec::with_capacity(SAVED_HEADER.len() + encoded.len());
-    saved.extend_from_slice(SAVED_HEADER);
-    saved.extend_from_slice(&encoded);
-    saved
+/// A saved batch being written.
+struct Saving<W> {
+    out: W,
+    /// One command, encoded.
+    buffer: Vec<u8>,
+    set_id: u32,
+    error: Option<io::Error>,
+}
+
+/// Write the saved form of the rules of `plan` to `out`: the header, then the batch that
+/// puts them in place from scratch. Each command is written as it is rendered, so that
+/// neither the commands nor the batch are ever all in memory.
+fn write_saved<W: io::Write + 'static>(plan: &Plan, options: Options, out: W) -> io::Result<W> {
+    let mut saving = Saving {
+        out,
+        buffer: Vec::with_capacity(1 << 16),
+        set_id: 0,
+        error: None,
+    };
+    saving.out.write_all(SAVED_HEADER)?;
+    netlink::batch_marker(&mut saving.buffer, false);
+    saving.out.write_all(&saving.buffer)?;
+    let saving = Rc::new(RefCell::new(saving));
+    let sink = Rc::clone(&saving);
+    let mut batch = Batch::streaming(Box::new(move |command| {
+        let mut saving = sink.borrow_mut();
+        let saving = &mut *saving;
+        if saving.error.is_some() {
+            return;
+        }
+        saving.buffer.clear();
+        let mut encoder = Encoder::resume(&mut saving.buffer, saving.set_id);
+        encoder.command(0, &command);
+        saving.set_id = encoder.set_id();
+        if let Err(error) = saving.out.write_all(&saving.buffer) {
+            saving.error = Some(error);
+        }
+    }));
+    render_update(plan, options, None, Slots::default(), &mut batch);
+    drop(batch);
+    let Saving {
+        mut out,
+        mut buffer,
+        error,
+        ..
+    } = Rc::try_unwrap(saving)
+        .map_err(|_| io::Error::other("the saved batch is still being written"))?
+        .into_inner();
+    if let Some(error) = error {
+        return Err(error);
+    }
+    buffer.clear();
+    netlink::batch_marker(&mut buffer, true);
+    out.write_all(&buffer)?;
+    Ok(out)
 }
 
 /// The commands that put the rules of `plan` in place from scratch.
+#[cfg(test)]
 pub(super) fn fresh_batch(plan: &Plan, options: Options) -> Batch {
     let mut batch = Batch::default();
     render_apply_script(plan, options, None, &mut batch);
@@ -2808,6 +2859,9 @@ impl NetlinkRunner {
     }
 }
 
+/// How much of the buffer of encoded batches is kept from one update to the next.
+const KEPT_BUFFER: usize = 1 << 20;
+
 /// The text of a command, short enough for a log line.
 fn short(command: &Command) -> String {
     const LONGEST: usize = 300;
@@ -2830,12 +2884,17 @@ impl NftRunner for NetlinkRunner {
         }
         let mut buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
         let origins = Encoder::new(&mut buffer).batch(batch);
-        self.send(&mut buffer, |message| {
+        let result = self.send(&mut buffer, |message| {
             message
                 .and_then(|message| origins.get(message))
                 .and_then(|origin| batch.commands.get(*origin))
                 .map_or_else(|| "the batch".to_string(), short)
-        })
+        });
+        // Most updates are small: the room a large one (the first) took isn't kept.
+        if buffer.capacity() > KEPT_BUFFER {
+            *buffer = Vec::new();
+        }
+        result
     }
 
     fn run_encoded(&self, batch: &mut [u8]) -> Result<(), FirewallError> {
@@ -4591,7 +4650,10 @@ add chain bridge portcullis arp_check_monitor
             std::process::id()
         ));
         fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, encode_saved(&Batch::default())).expect("save");
+        let mut empty = SAVED_HEADER.to_vec();
+        netlink::batch_marker(&mut empty, false);
+        netlink::batch_marker(&mut empty, true);
+        fs::write(&path, empty).expect("save");
         let restored =
             NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
         *restored.runner.creates.lock().expect("lock") = Some(tables());
@@ -4636,7 +4698,11 @@ add chain bridge portcullis arp_check_monitor
         assert!(script.contains("ct original ip daddr @pc_h4_"));
         assert!(!script.contains("delete chain"), "{script}");
         let saved = fs::read(&path).expect("saved");
-        assert_eq!(saved, encode_saved(&fresh));
+        let mut encoded = SAVED_HEADER.to_vec();
+        let mut whole = Vec::new();
+        Encoder::new(&mut whole).batch(&fresh);
+        encoded.extend_from_slice(&whole);
+        assert_eq!(saved, encoded);
 
         // Without tables in place (after a reboot), restoring puts it in place, and the next
         // update changes what it installed in place.

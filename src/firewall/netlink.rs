@@ -285,6 +285,22 @@ impl<'a> Encoder<'a> {
         }
     }
 
+    /// Go on encoding a batch in `out`, the commands of which `new` and earlier encoders
+    /// wrote, and whose sets are numbered up to `set_id`; see [`Self::set_id`]. Without
+    /// the end marker: a batch written in parts ends with [`end_marker`].
+    pub fn resume(out: &'a mut Vec<u8>, set_id: u32) -> Self {
+        Self {
+            out: Writer(out),
+            origins: Vec::new(),
+            set_id,
+        }
+    }
+
+    /// The number of the last set created.
+    pub const fn set_id(&self) -> u32 {
+        self.set_id
+    }
+
     /// Encode all commands of `batch`.
     pub fn batch(mut self, batch: &Batch) -> Vec<usize> {
         for (index, command) in batch.commands.iter().enumerate() {
@@ -462,6 +478,18 @@ impl<'a> Encoder<'a> {
             self.out.finish(message);
         }
     }
+}
+
+/// The beginning (or with `end`, the end) of a batch.
+pub fn batch_marker(out: &mut Vec<u8>, end: bool) {
+    let mut out = Writer(out);
+    let kind = if end {
+        NFNL_MSG_BATCH_END
+    } else {
+        NFNL_MSG_BATCH_BEGIN
+    };
+    let marker = out.begin(kind, 0, 0, AF_UNSPEC);
+    out.finish(marker);
 }
 
 /// The type of a key, as nft numbers its data types; a concatenation's combines those of its
