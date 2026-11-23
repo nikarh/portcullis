@@ -57,7 +57,7 @@ use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored, 
 use crate::logging::LoggingError;
 use crate::model::{ContainerId, RuntimeState, RuntimeStateAction};
 use crate::monitor::{DockerMonitor, Fetched, MonitorError};
-use crate::nfnetlink::QueueOverflow;
+use crate::nfnetlink::{Overruns, QueueOverflow, is_overrun};
 use crate::owners::Owners;
 use crate::source_hold::SourceHold;
 
@@ -530,9 +530,11 @@ fn apply_retry(failures: u32) -> Option<Duration> {
 
 impl Applier {
     fn apply(&mut self, state: &mut RuntimeState) -> Result<(), MainError> {
+        let started = Instant::now();
         // Re-read on every update, so changes to the host's DNS configuration are picked up.
         let host_resolvers = host_dns::host_resolvers();
         state.set_daemon_dns(host_dns::docker_daemon_dns());
+        let finding = Instant::now();
         let found = match self.ports.find(state) {
             Ok(found) => found,
             Err(error) => {
@@ -544,7 +546,10 @@ impl Applier {
         state.set_ports(found.ports, found.absent);
         state.set_stopping(found.stopping);
         let state = &*state;
+        let ports = finding.elapsed();
+        let forgetting = Instant::now();
         self.forget_reassigned_connections(state);
+        let connections = forgetting.elapsed();
         let result = {
             let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
             let directory = &self.directory;
@@ -582,6 +587,12 @@ impl Applier {
                 self.source_hold.rules_applied();
                 let _ = self.refresh.send(());
                 info!("firewall rules applied");
+                debug!(
+                    total = ?started.elapsed(),
+                    ports = ?ports,
+                    connections = ?connections,
+                    "rule update timings"
+                );
                 self.saver.save(plan);
                 Ok(())
             }
@@ -727,6 +738,48 @@ fn discover(
     }
 }
 
+/// Ask on `discover` for the container behind each bridge port to be found whenever the
+/// kernel reports a change of the port (Docker attaches it, then it comes up once the
+/// container's interface is up with its address), before the container sends anything:
+/// its rules are then usually in place before its first packet, which isn't held at all. Packets held from
+/// a port still ask for it (see `source_hold`), so this only makes it sooner: if the
+/// container has no process yet, or the kernel's reports can't be read, its first packet
+/// asks again.
+fn watch_ports(discover: Sender<u32>) {
+    let mut watch = match rtnetlink::PortWatch::open() {
+        Ok(watch) => watch,
+        Err(error) => {
+            warn!(%error, "can't watch for new bridge ports; containers are found once they send");
+            return;
+        }
+    };
+    thread::spawn(move || {
+        let mut overruns = Overruns::default();
+        loop {
+            match watch.receive() {
+                Ok(ports) => {
+                    for port in ports {
+                        if discover.send(port).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(error) if is_overrun(&error) => {
+                    if overruns.report() {
+                        debug!(
+                            "bridge ports changed faster than they could be read; containers whose ports were missed are found once they send"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "can't watch for new bridge ports anymore; containers are found once they send");
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// Cut a misbehaving container off from its networks, or report that it would be.
 fn quarantine_container(
     mode: QuarantineMode,
@@ -858,6 +911,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     .map_err(MainError::DnsInspection)?;
 
     let (discover_tx, discover_rx) = unbounded::<u32>();
+    watch_ports(discover_tx.clone());
     let source_hold = source_hold::spawn(
         SOURCE_QUEUE,
         QueueOverflow::Drop,

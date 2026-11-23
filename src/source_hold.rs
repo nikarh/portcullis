@@ -116,6 +116,10 @@ pub fn spawn(
                     return;
                 }
             };
+            debug!(
+                count = packets.len(),
+                "holding packets from unknown sources"
+            );
             let now = Instant::now();
             receiving
                 .lock()

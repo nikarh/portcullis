@@ -133,7 +133,7 @@ Rules were updated: when containers or networks changed, and when a hostname tha
 | --- | --- | --- |
 | `generation` | number | Increases by one with every successful update |
 | `sources` | array of strings | The managed container addresses |
-| `unresolved_hosts` | array of strings | Hostnames of `host:` rules with no known addresses; their rules allow nothing yet |
+| `unresolved_hosts` | array of strings | Hostnames of `host:` rules that Portcullis looked up without getting addresses, and that have none from DNS answers either; their rules allow nothing yet |
 
 ## `apply_failed`
 

@@ -24,7 +24,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use ipnet::{IpNet, Ipv4Net};
-use tracing::{error, trace};
+use tracing::trace;
 
 use crate::dns::{HostResolver, normalize};
 use crate::model::{
@@ -296,7 +296,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Build the plan for `state`, resolving every distinct hostname exactly once.
+    /// Build the plan for `state`, with the addresses known for each hostname so far.
     /// `host_resolvers` are the host's DNS servers, see [`crate::host_dns`]. With
     /// `monitor_all`, every network is in monitor mode.
     pub fn build<R>(
@@ -645,7 +645,8 @@ where
 
     /// Index of the set for `host` in `container`'s rules. A hostname that can't be
     /// resolved gets an empty set, so its rules allow nothing while the rest of the policy
-    /// still applies. A pattern's set only holds what DNS answers to the container said.
+    /// still applies; it is listed as unresolved once Portcullis looked it up. A pattern's
+    /// set only holds what DNS answers to the container said.
     fn host_set(
         &mut self,
         container: &'s ContainerName,
@@ -658,15 +659,10 @@ where
 
         let normalized = normalize(host.as_str());
         let hold = hold.unwrap_or_else(|| self.resolver.default_hold());
-        let addresses = match self.resolver.addresses(container, &normalized, hold) {
-            Ok(addresses) => addresses,
-            Err(error) => {
-                error!(%host, %error, "failed to resolve hostname; its rules allow nothing until it resolves");
-                Vec::new()
-            }
-        };
+        let addresses = self.resolver.addresses(container, &normalized, hold);
         if addresses.is_empty()
             && host.is_exact()
+            && self.resolver.looked_up_before(&normalized)
             && !self.plan.unresolved_hosts.contains(&normalized)
         {
             self.plan.unresolved_hosts.push(normalized.clone());

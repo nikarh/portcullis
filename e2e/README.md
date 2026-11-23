@@ -66,3 +66,9 @@ Probes (`tcp`, `udp`, `dns`, `resolve`, `ping_probe`, `from_outside`) run inside
 e2e/vm.sh up && e2e/vm.sh sync
 e2e/vm.sh ssh sudo STRESS_CONTAINERS=1000 STRESS_NETWORKS=40 /home/debian/portcullis/e2e/stress.sh
 ```
+
+`latency.sh` measures how long a container that just started waits for its rules, next to `LATENCY_BACKGROUND` other containers (default 50): in each of `LATENCY_ROUNDS` rounds (default 20) it starts a container that sends a packet as soon as it runs, and one that sends nothing, each with a `host:` rule for a hostname no rule had before. For each it prints, from the moment its bridge port came up (the earliest it can send anything), when Portcullis found it, when its rules were in place, and how long its first packet took to get an answer, which includes the time it was held. `LATENCY_MODE=monitor` measures a monitored network, `LATENCY_QUIET=1` one where Docker doesn't announce a container's address as its interface comes up (as before Docker 28), and `--log-level debug` (`LATENCY_LOG_LEVEL`) logs how long each part of an update took.
+
+```bash
+e2e/vm.sh ssh sudo LATENCY_ROUNDS=50 /home/debian/portcullis/e2e/latency.sh
+```

@@ -223,6 +223,50 @@ impl RouteSocket {
     }
 }
 
+/// rtnetlink's multicast group of interface changes.
+const RTNLGRP_LINK: u32 = 1;
+
+/// Reports interfaces as the kernel attaches them to a bridge: a container's bridge port
+/// (with its peer in another namespace) appears as soon as Docker sets the container's
+/// network up, before the container's process runs and sends anything.
+pub struct PortWatch {
+    socket: Socket,
+    buffer: Vec<u8>,
+}
+
+impl PortWatch {
+    pub fn open() -> io::Result<Self> {
+        let mut socket = Socket::new(NETLINK_ROUTE)?;
+        socket.bind_auto()?;
+        socket.add_membership(RTNLGRP_LINK)?;
+        Ok(Self {
+            socket,
+            buffer: Vec::with_capacity(1 << 16),
+        })
+    }
+
+    /// Block until the kernel reports changes of interfaces, and return the indexes of
+    /// those that are on a bridge with their peer in another namespace. Docker changes a
+    /// new port several times as it sets it up, so one may come more than once. Fails
+    /// with `ENOBUFS` when changes came faster than they were read, and some were lost.
+    pub fn receive(&mut self) -> io::Result<Vec<u32>> {
+        self.buffer.clear();
+        self.socket.recv(&mut self.buffer, 0)?;
+        Ok(bridge_ports(&self.buffer))
+    }
+}
+
+/// The interfaces that interface changes in `buffer` report on a bridge with their peer in
+/// another namespace.
+fn bridge_ports(buffer: &[u8]) -> Vec<u32> {
+    messages(buffer)
+        .filter(|message| message.message_type == RTM_NEWLINK)
+        .filter_map(|message| parse_link(message.body))
+        .filter(|link| link.master.is_some() && link.peer_namespace.is_some())
+        .map(|link| link.index)
+        .collect()
+}
+
 /// Why a container's traffic can't be bound to its bridge port, and is only checked by
 /// address and MAC.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -737,6 +781,43 @@ mod tests {
                 mac: Some(MacAddress::new([2, 0x42, 0xac, 0x12, 0, 2])),
             })
         );
+    }
+
+    #[test]
+    fn reports_interfaces_attached_to_a_bridge_with_their_peer_elsewhere() {
+        const RTM_DELLINK: u16 = 17;
+        let change = |message_type: u16, index: u32, master: Option<u32>, peer: Option<i32>| {
+            let mut body = vec![0_u8; IFINFOMSG_LEN];
+            body.splice(4..8, index.to_ne_bytes());
+            body.extend(attribute(IFLA_IFNAME, b"veth0\0"));
+            if let Some(master) = master {
+                body.extend(attribute(IFLA_MASTER, &master.to_ne_bytes()));
+            }
+            if let Some(peer) = peer {
+                body.extend(attribute(IFLA_LINK_NETNSID, &peer.to_ne_bytes()));
+            }
+            let mut message = Vec::new();
+            let length = u32::try_from(NLMSG_HDRLEN + body.len()).expect("length");
+            message.extend(length.to_ne_bytes());
+            message.extend(message_type.to_ne_bytes());
+            message.extend(0_u16.to_ne_bytes());
+            message.extend([0; 8]);
+            message.extend(body);
+            message.resize(align4(message.len()), 0);
+            message
+        };
+        let buffer: Vec<u8> = [
+            // A container's port, on bridge 3, its peer in namespace 2.
+            change(RTM_NEWLINK, 7, Some(3), Some(2)),
+            // Not on a bridge yet.
+            change(RTM_NEWLINK, 8, None, Some(2)),
+            // On a bridge, its peer gone (the container is stopping) or on the host.
+            change(RTM_NEWLINK, 9, Some(3), None),
+            // Removed.
+            change(RTM_DELLINK, 10, Some(3), Some(2)),
+        ]
+        .concat();
+        assert_eq!(bridge_ports(&buffer), [7]);
     }
 
     #[test]
