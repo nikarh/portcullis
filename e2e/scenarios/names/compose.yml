@@ -1,0 +1,30 @@
+# Name checks of host: rules. api.test resolves to 198.51.100.3 on the Docker host, whose
+# servers on 8081 (HTTP) and 8443 (HTTPS) answer for any name, as a CDN serves many sites
+# from one address.
+services:
+  lenient:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.api=host:api.test,tcp:8081,8443,udp:9000
+  strict:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [net]
+    labels:
+      - portcullis.egress.api=host:api.test,tcp:8081,8443,udp:9000,strict
+  monitored:
+    image: portcullis-e2e-tester
+    pull_policy: never
+    networks: [monitored]
+    labels:
+      - portcullis.egress.api=host:api.test,tcp:8443
+
+networks:
+  net:
+    labels:
+      - portcullis.enable=true
+  monitored:
+    labels:
+      - portcullis.enable=monitor

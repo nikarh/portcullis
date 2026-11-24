@@ -3,7 +3,9 @@
 # traffic from containers to it is forwarded (and filtered) like real outbound traffic.
 #
 # Addresses (all inside the namespace):
-#   198.51.100.2  DNS (dnsmasq, udp+tcp/53), TCP 80/443/8080, UDP echo 9000
+#   198.51.100.2  DNS (dnsmasq, udp+tcp/53), TCP 80/443/8080, UDP echo 9000, and two
+#                 servers that wait for the client: HTTP with keep-alive on 8081 and
+#                 HTTPS on 8443, for any name (as a CDN serves many sites from one address)
 #   198.51.100.3  same services, the address of api.test
 #   198.51.100.4  same services, the address of other.test, and a DNS server that lies:
 #                 it resolves api.test to 198.51.100.5
@@ -51,6 +53,17 @@ up() {
     ip netns exec "${NS}" setsid socat -T2 "TCP-LISTEN:${port},fork,reuseaddr" \
       SYSTEM:'echo $SOCAT_SOCKADDR' >/dev/null 2>&1 &
   done
+  # Servers that read a request first, and answer with the address it was sent to: plain
+  # HTTP, and HTTPS with a certificate for any name.
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+    -subj /CN=outside.test -keyout "${RUN_DIR}/tls.key" -out "${RUN_DIR}/tls.crt" 2>/dev/null
+  local echo
+  echo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/http-echo.sh"
+  ip netns exec "${NS}" setsid python3 "$(dirname "${echo}")/http-server.py" 8081 \
+    >/dev/null 2>&1 &
+  ip netns exec "${NS}" setsid socat -T2 \
+    "OPENSSL-LISTEN:8443,fork,reuseaddr,cert=${RUN_DIR}/tls.crt,key=${RUN_DIR}/tls.key,verify=0" \
+    "EXEC:${echo}" >/dev/null 2>&1 &
   # One UDP socket per address, so replies come from the address the client sent to.
   for address in "${ADDRESSES[@]}" "${PUBLIC_ADDRESSES[@]}"; do
     ip netns exec "${NS}" setsid socat -T2 "UDP-RECVFROM:9000,bind=${address},fork" \
@@ -72,6 +85,8 @@ up() {
   # Wait until the services listen.
   for _ in $(seq 50); do
     if ip netns exec "${NS}" ss -ltn | grep -q ':8080 ' \
+      && ip netns exec "${NS}" ss -ltn | grep -q ':8443 ' \
+      && ip netns exec "${NS}" ss -ltn | grep -q ':8081 ' \
       && ip netns exec "${NS}" ss -lun | grep -q '198.51.100.2:53 ' \
       && ip netns exec "${NS}" ss -lun | grep -q '198.51.100.4:53 '; then
       return 0
