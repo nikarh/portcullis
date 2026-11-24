@@ -27,7 +27,8 @@ overrides:
   archlinux:
     depends:
       - glibc
-    optdepends:
+    # Arch's optdepends.
+    suggests:
       - "nftables: inspecting the rules with nft"
     scripts:
       postinstall: dist/packaging/arch/post_install.sh
