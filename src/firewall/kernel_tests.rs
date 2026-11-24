@@ -931,8 +931,11 @@ const COVERED: &[&str] = &[
 ];
 
 fn compare(scenarios: Vec<Scenario>, covered: &[&str]) {
+    // One directory per comparison: the tests run at once, and each removes its own.
+    static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut seen = vec![false; covered.len()];
-    let root = std::env::temp_dir().join(format!("portcullis-kernel-{}", std::process::id()));
+    let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("portcullis-kernel-{}-{run}", std::process::id()));
     let mut failures = Vec::new();
     let mut steps = 0;
     for (number, scenario) in scenarios.into_iter().enumerate() {

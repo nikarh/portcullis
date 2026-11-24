@@ -17,6 +17,9 @@ overrides:
   deb:
     depends:
       - libc6 (>= 2.35)
+    # To look at the rules with nft; Portcullis itself doesn't need it.
+    recommends:
+      - nftables
     scripts:
       postinstall: dist/packaging/deb/postinst
       preremove: dist/packaging/deb/prerm
@@ -24,6 +27,8 @@ overrides:
   archlinux:
     depends:
       - glibc
+    optdepends:
+      - "nftables: inspecting the rules with nft"
     scripts:
       postinstall: dist/packaging/arch/post_install.sh
       preremove: dist/packaging/arch/pre_remove.sh

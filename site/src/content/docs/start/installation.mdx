@@ -11,7 +11,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 - Linux, with Portcullis running as root: it manages the firewall and reads the Docker socket.
 - Docker with bridge networks.
-- nftables in the kernel (`nf_tables`, with its bridge family). Portcullis talks to the kernel over netlink: it needs no nftables library, and the `nft` command only to look at its rules.
+- nftables in the kernel (`nf_tables`, with its bridge family). Portcullis talks to the kernel over netlink: it needs no nftables library, and the `nft` command only to look at its rules. The packages recommend `nftables` (Debian: `Recommends`, Arch: an optional dependency) for that.
 - Recommended: a `dns` setting in `/etc/docker/daemon.json`, so Portcullis can see containers' DNS lookups. See [DNS visibility](/policy/dns/#dns-visibility).
 
 Docker can use iptables or nftables for its own rules; Portcullis works next to either.
