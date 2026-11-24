@@ -106,7 +106,7 @@ Test the command by hand with an event on stdin, and check `journalctl -u portcu
 
 ## `apply_failed` events
 
-A rule update failed. The previous rules stay in place, and Portcullis retries after 5 seconds, then less and less often, down to every 5 minutes, until it succeeds. The event's `error` says what the kernel or libnftables refused. Run with `log-level = "trace"` to log every firewall script that gets applied.
+A rule update failed. The previous rules stay in place, and Portcullis retries after 5 seconds, then less and less often, down to every 5 minutes, until it succeeds. The event's `error` says what the kernel refused, as the nft command it was, with the kernel's reason where it gives one. Run with `log-level = "trace"` to log every update, as the nft script that does the same.
 
 ## `events_lost` warnings
 
@@ -121,7 +121,7 @@ sudo nft list table inet portcullis
 sudo nft list table bridge portcullis
 ```
 
-They are generated and replaced in one step on every update; don't edit them. With `log-level = "trace"`, every script Portcullis applies is logged to stderr.
+They are generated and replaced in one step on every update; don't edit them. With `log-level = "trace"`, every update is logged to stderr, as the nft script that does the same.
 
 ## Conflicts with other software
 

@@ -71,13 +71,11 @@ users:
 package_update: true
 packages:
   - build-essential
-  - clang
   - curl
   - dnsmasq-base
   - dnsutils
   - inotify-tools
   - iptables
-  - libnftables-dev
   - nftables
   - pkg-config
   - rsync

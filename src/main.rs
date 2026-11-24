@@ -70,7 +70,9 @@ const DNS_QUEUE: u16 = 4242;
 /// NFQUEUE number packets of not yet known containers are held in.
 const SOURCE_QUEUE: u16 = 4243;
 /// File in the state directory the rules of every update are saved to.
-const SAVED_RULES: &str = "rules.nft";
+const SAVED_RULES: &str = "rules.batch";
+/// Where earlier versions saved their rules, as an nft script.
+const LEGACY_SAVED_RULES: &str = "rules.nft";
 /// File in the state directory who each container address belongs to is saved to.
 const SAVED_OWNERS: &str = "owners";
 /// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held in.
@@ -174,10 +176,11 @@ fn run_audit(mut args: Arguments) -> Result<(), MainError> {
 /// again.
 fn run_cleanup(args: Arguments) -> Result<(), MainError> {
     let state_dir = config::cleanup_state_dir(args)?;
-    let firewall = NftablesFirewall::with_libnftables(Options::default())?
-        .saving_to(state_dir.join(SAVED_RULES));
+    let firewall =
+        NftablesFirewall::with_netlink(Options::default())?.saving_to(state_dir.join(SAVED_RULES));
     firewall.cleanup()?;
     firewall.forget_saved()?;
+    let _ = std::fs::remove_file(state_dir.join(LEGACY_SAVED_RULES));
     let owners = state_dir.join(SAVED_OWNERS);
     match std::fs::remove_file(&owners) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -850,7 +853,7 @@ fn run(config: &Config) -> Result<(), MainError> {
     .map_err(MainError::EventsSocket)?;
 
     let firewall = Arc::new(
-        NftablesFirewall::with_libnftables(Options {
+        NftablesFirewall::with_netlink(Options {
             deny: config.deny_action,
             log_group: NFLOG_GROUP,
             log_allowed: config.log_allowed,
@@ -873,6 +876,9 @@ fn run(config: &Config) -> Result<(), MainError> {
         Ok(Restored::Nothing) => info!("no rules of a last run to restore"),
         Err(error) => warn!(%error, "can't restore the rules of the last run"),
     }
+    // What earlier versions saved, which this one doesn't read: the next update saves the
+    // rules anew.
+    let _ = std::fs::remove_file(config.state_dir.join(LEGACY_SAVED_RULES));
 
     let directory = Arc::new(Directory::default());
     let hosts: SharedHosts = Arc::new(Mutex::new(HostAddresses::new(

@@ -8,7 +8,7 @@ sidebar:
 Portcullis is a daemon that runs on the Docker host. It watches the Docker API for containers and networks, turns their labels into firewall rules, and updates the rules whenever something changes.
 
 ```text
- Docker API ──events──▶ ┌────────────┐ ──nft script──▶ libnftables ──▶ kernel rules
+ Docker API ──events──▶ ┌────────────┐ ──netlink batch──▶ kernel rules
  Docker's files ──────▶ │ portcullis │ ◀──NFLOG────── decisions to report
  rtnetlink ───────────▶ │   daemon   │ ◀─NFQUEUE───── held packets: new containers, DNS
                         └────────────┘ ──events──▶ stdout, socket, alert command
@@ -23,7 +23,7 @@ The rules are nftables rules, kept in two tables of its own:
 
 A Linux bridge passes traffic between containers directly, without the IP-level hooks Docker's own rules use, so only the bridge table can see it. The bridge table is also where Portcullis checks that each frame really comes from the container it claims to come from. Both work next to Docker's rules whether Docker itself uses iptables or nftables.
 
-Each update changes the rules in one atomic step, so there is never a moment with half-applied rules. Each container has chains of its own, and an update only writes those of containers whose rules changed, and only adds the set elements that are new; a set that loses elements is emptied and filled again in the same step. A container starting leaves the chains of containers whose rules don't mention it as they are. Packets that pass while the kernel puts new rules in place are never misjudged: an established connection isn't denied, nor reported as sent from an unknown source, and nothing gets past a check meanwhile. Starting Portcullis updates the rules a previous run left in place the same way, instead of creating them again. A change that leaves every rule as it is, such as Docker's report of a container Portcullis [found before it](/internals/discovery/), costs no update at all.
+Each update changes the rules in one atomic step, so there is never a moment with half-applied rules: Portcullis sends it to the kernel as one batch of nftables netlink messages, which the kernel applies all or nothing, as it does a script `nft` runs. The rules are encoded as `nft` encodes them, so `nft list ruleset` shows them as if `nft` had added them. Each container has chains of its own, and an update only writes those of containers whose rules changed, and only adds and deletes the set elements that changed. The base chains every packet passes are only written again when their rules change, when networks come and go. An update costs what changed, not the size of the rules in place. A container starting leaves the chains of containers whose rules don't mention it as they are. Packets that pass while the kernel puts new rules in place are never misjudged: an established connection isn't denied, nor reported as sent from an unknown source, and nothing gets past a check meanwhile. Starting Portcullis updates the rules a previous run left in place the same way, instead of creating them again. A change that leaves every rule as it is, such as Docker's report of a container Portcullis [found before it](/internals/discovery/), costs no update at all.
 
 Portcullis only removes access. Traffic that a policy allows still goes through Docker's own rules afterwards, so things Docker blocks (internal networks, isolation between networks) stay blocked.
 
@@ -47,7 +47,7 @@ Portcullis looks at the DNS answers containers receive. The firewall holds each 
 
 Portcullis also looks the hostnames of `host:` rules up itself, through the host's resolver, a few times per hold, and adds what it gets to the rules of every container that uses the name, without a rule update.
 
-Addresses from DNS answers and Portcullis's own lookups go into the hostname sets through netlink directly, not through libnftables: before it adds or deletes set elements, libnftables reads the elements of every set of ranges in the kernel, in every table. On a host with another firewall that keeps large block or country lists, that took tens of megabytes and a good part of a second for each DNS answer, while the answer was held. For the same reason, rule updates never delete set elements one by one. That keeps an address allowed while DNS still returns it, also for applications that resolved it once and kept it.
+Addresses from DNS answers and Portcullis's own lookups go into the hostname sets in a netlink batch of their own, without a rule update. Neither these nor rule updates read anything of the kernel's rules first, so large sets in other tables, such as another firewall's block or country lists, cost them nothing. That keeps an address allowed while DNS still returns it, also for applications that resolved it once and kept it.
 
 For containers with [`portcullis.domains`](/policy/domains/) labels, queries are held too, until Portcullis has checked the names they ask for. Those are denied, not let through, when Portcullis can't check them.
 

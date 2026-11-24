@@ -1,134 +1,43 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::{CStr, CString};
-use std::fmt::{self, Write as _};
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
-use std::ptr::NonNull;
-use std::sync::{Mutex, PoisonError};
+use std::rc::Rc;
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use ipnet::IpNet;
 use tracing::{debug, info, trace, warn};
 
 use super::FirewallError;
-use super::elements::{ElementSocket, TimeoutSet};
+use super::elements::{TimeoutSet, encode_timeouts};
+use super::netlink::{self, Encoder, NftSocket};
 use super::plan::{
     DNS_PORT, Destination, HostSet, HostSetId, ICC_BROADCAST_V4, PRIVATE_V4, PRIVATE_V6, Plan,
     Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
+};
+use super::ruleset::{
+    Batch, Chain, Command, CtState, Element, Expr, Key, KeyType, Object, Part, SetDecl, SetFlags,
+    Stateful, TABLE_NAME, Table, Value, Verdict,
 };
 use crate::dns::{HostResolver, MAX_ADDRESSES_PER_HOST};
 use crate::model::{
     ConnectionLimit, ContainerName, MacAddress, PortState, Protocol, RuntimeState, Service,
 };
 
-/// Name of both managed tables.
-const TABLE_NAME: &str = "portcullis";
-/// Priority of all base chains: before Docker's filter chains.
-const HOOK_PRIORITY: i32 = -1;
-
-/// The managed tables: `inet` sees traffic routed out of a container's network (forward
-/// hook) and traffic to the host itself (input hook), `bridge` sees traffic between containers on the same network, which a bridge
-/// switches without passing the IP hooks unless `br_netfilter` is loaded (prerouting hook:
-/// the bridge family only supports `reject` there).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Table {
-    Inet,
-    Bridge,
-}
-
-impl fmt::Display for Table {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Inet => write!(f, "inet {TABLE_NAME}"),
-            Self::Bridge => write!(f, "bridge {TABLE_NAME}"),
-        }
-    }
-}
-
-/// A chain, displayed as `<family> <table> <chain>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Chain {
-    /// The base chain of a table.
-    Base(Table),
-    /// Base chain of the inet table for traffic addressed to the host itself.
-    Input,
-    /// Base chain of the bridge table for frames a bridge delivers to the host itself.
-    BridgeInput,
-    /// Base chain of the bridge table for frames a bridge passes from one container to
-    /// another.
-    BridgeForward,
-    /// Reports and denies connections over a container's limit: open connections, or new
-    /// connections per second (`rate`), in monitor mode or not.
-    Limited { rate: bool, monitor: bool },
-    /// Denies (or in monitor mode, reports) ARP that isn't a plain request or reply, see
-    /// `render_arp_check`.
-    ArpCheck { monitor: bool },
-    /// Egress rules of the source in the n-th slot (see `Slots`), in the inet table.
-    Egress(usize),
-    /// ICC rules of the source in the n-th slot, in the bridge table.
-    Icc(usize),
-}
-
-impl Table {
-    const fn hook(self) -> &'static str {
-        match self {
-            Self::Inet => "forward",
-            Self::Bridge => "prerouting",
-        }
-    }
-}
-
-impl Chain {
-    const fn table(self) -> Table {
-        match self {
-            Self::Base(table) => table,
-            Self::Input | Self::Egress(_) => Table::Inet,
-            Self::BridgeInput
-            | Self::BridgeForward
-            | Self::Limited { .. }
-            | Self::ArpCheck { .. }
-            | Self::Icc(_) => Table::Bridge,
-        }
-    }
-}
-
-impl fmt::Display for Chain {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.table(), ChainName(*self))
-    }
-}
-
-/// The chain name alone, as used in jump targets.
-struct ChainName(Chain);
-
-impl fmt::Display for ChainName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Chain::Base(table) => f.write_str(table.hook()),
-            Chain::Input | Chain::BridgeInput => f.write_str("input"),
-            Chain::BridgeForward => f.write_str("forward"),
-            Chain::Limited { rate, monitor } => write!(
-                f,
-                "limit_{}{}",
-                if rate { "rate" } else { "open" },
-                if monitor { "_monitor" } else { "" }
-            ),
-            Chain::ArpCheck { monitor } => {
-                write!(f, "arp_check{}", if monitor { "_monitor" } else { "" })
-            }
-            Chain::Egress(index) => write!(f, "egress{index}"),
-            Chain::Icc(index) => write!(f, "icc{index}"),
-        }
-    }
-}
-
 pub trait NftRunner {
-    /// Run an nft script as a single atomic transaction.
-    fn run_script(&self, script: String) -> Result<(), FirewallError>;
-    /// Run a listing command (`list ...`), and return what it printed, without set elements.
-    fn list(&self, command: &str) -> Result<String, FirewallError>;
+    /// Put the commands of `batch` in place, as a single atomic transaction.
+    fn run(&self, batch: &Batch) -> Result<(), FirewallError>;
+    /// Put a batch saved as encoded (see [`NftablesFirewall::save`]) in place, as a single
+    /// atomic transaction.
+    fn run_encoded(&self, batch: &mut [u8]) -> Result<(), FirewallError>;
+    /// The chains and sets of the managed tables, or `None` unless both exist.
+    fn installed(&self) -> Result<Option<Found>, FirewallError>;
     /// Set how much longer each address stays in the hostname sets of the inet table that
     /// hold its family, in one transaction (see [`render_timeouts`]).
     fn set_timeouts(
@@ -136,6 +45,13 @@ pub trait NftRunner {
         sets: &[TimeoutSet<'_>],
         addresses: &[(IpAddr, Duration)],
     ) -> Result<(), FirewallError>;
+}
+
+/// The chains (and whether each is a base chain) and sets of the managed tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    pub chains: Vec<(Object, bool)>,
+    pub sets: Vec<Object>,
 }
 
 /// What happens to traffic a policy doesn't allow.
@@ -148,12 +64,12 @@ pub enum DenyAction {
     Drop,
 }
 
-impl fmt::Display for DenyAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Reject => "reject with icmpx admin-prohibited",
-            Self::Drop => "drop",
-        })
+impl DenyAction {
+    const fn expr(self) -> Expr {
+        match self {
+            Self::Reject => Expr::Reject { tcp_reset: false },
+            Self::Drop => Expr::Verdict(Verdict::Drop),
+        }
     }
 }
 
@@ -238,7 +154,7 @@ const LOG_SNAPLEN: u16 = 128;
 /// Bytes copied of denied DNS queries, so their name can be reported.
 const LOG_SNAPLEN_DNS: u16 = 512;
 
-pub struct NftablesFirewall<R = LibNftablesRunner> {
+pub struct NftablesFirewall<R = NetlinkRunner> {
     runner: R,
     options: Options,
     /// What the last successful update installed; `None` before the first one and after a
@@ -248,12 +164,12 @@ pub struct NftablesFirewall<R = LibNftablesRunner> {
     saved: Option<PathBuf>,
 }
 
-/// Chains and sets an update created besides the fixed base chains and log sets, as
-/// `<family> <table> <name>`. The next update deletes the ones it doesn't need anymore.
+/// Chains and sets an update created besides the fixed base chains and log sets. The next
+/// update deletes the ones it doesn't need anymore.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Installed {
-    chains: BTreeSet<String>,
-    sets: BTreeSet<String>,
+    chains: BTreeSet<Object>,
+    sets: BTreeSet<Object>,
     /// The container of each managed address.
     sources: BTreeMap<IpAddr, ContainerName>,
     /// The slot of each managed address, which numbers its chains.
@@ -291,39 +207,31 @@ struct Renewal {
 }
 
 impl Installed {
-    /// Add the chains and sets of a terse listing of `table`, except the base chains and
-    /// the sets every update creates anyway.
-    fn add_listed(&mut self, table: Table, listing: &str) {
-        let fixed: BTreeSet<&str> = NamedSet::ALL
-            .iter()
-            .filter(|set| set.table() == table)
-            .map(|set| set.name())
-            .chain([
-                QUARANTINED_SET,
-                LOGGED_SET_V4,
-                LOGGED_SET_V6,
-                LOGGED_SET_FRAMES,
-                LOGGED_SET_ARP,
-            ])
-            .collect();
-        let mut lines = listing.lines().map(str::trim).peekable();
-        while let Some(line) = lines.next() {
-            let Some((kind, rest)) = line.split_once(' ') else {
-                continue;
-            };
-            let Some(name) = rest.strip_suffix(" {") else {
-                continue;
-            };
-            match kind {
-                // A base chain says so on its first line.
-                "chain" if !lines.peek().is_some_and(|next| next.starts_with("type ")) => {
-                    self.chains.insert(format!("{table} {name}"));
-                }
-                "set" | "map" if !fixed.contains(name) => {
-                    self.sets.insert(format!("{table} {name}"));
-                }
-                _ => {}
-            }
+    /// What an update needs to know of `found`: the chains and sets it may delete, all
+    /// but the base chains and the sets every update creates anyway.
+    fn of(found: Found) -> Self {
+        let fixed = |set: &Object| {
+            NamedSet::ALL
+                .iter()
+                .any(|named| named.table() == set.table && named.name() == set.name)
+                || [
+                    QUARANTINED_SET,
+                    LOGGED_SET_V4,
+                    LOGGED_SET_V6,
+                    LOGGED_SET_FRAMES,
+                    LOGGED_SET_ARP,
+                ]
+                .contains(&set.name.as_str())
+        };
+        Self {
+            chains: found
+                .chains
+                .into_iter()
+                .filter_map(|(chain, base)| (!base).then_some(chain))
+                .collect(),
+            sets: found.sets.into_iter().filter(|set| !fixed(set)).collect(),
+            found: true,
+            ..Self::default()
         }
     }
 }
@@ -333,10 +241,15 @@ struct Written {
     /// What each source's chain was written from. A chain written from the same isn't
     /// written again.
     rules: HashMap<Chain, ChainInputs>,
-    /// The elements of each named set, one per line, so that only elements that changed
-    /// are added and deleted. `None` when the sets may hold others: found in place at the
-    /// start, or after an update failed.
-    elements: Option<HashMap<NamedSet, String>>,
+    /// The rules of the chains written from the plan as a whole: base chains, limits and
+    /// ARP checks. A chain with the same rules isn't written again.
+    fixed: HashMap<Chain, Vec<Vec<Expr>>>,
+    /// The tables, chains and sets declared, which needn't be again.
+    declared: HashSet<Declaration>,
+    /// The elements of each set besides those of hostnames and reports, so that only
+    /// elements that changed are added and deleted. `None` when the sets may hold others:
+    /// found in place at the start, or after an update failed.
+    elements: Option<HashMap<ElementSet, Vec<Element>>>,
     /// The addresses each hostname set was filled with, by set.
     host_addresses: HashMap<String, String>,
 }
@@ -393,13 +306,22 @@ where
         let Some(path) = &self.saved else {
             return Ok(Restored::Nothing);
         };
-        let script = match fs::read_to_string(path) {
-            Ok(script) => script,
+        let mut saved = match fs::read(path) {
+            Ok(saved) => saved,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Restored::Nothing),
             Err(error) => return Err(FirewallError::Saved(error)),
         };
-        self.runner.run_script(script)?;
-        // What the script installed is known by name only from the kernel.
+        let current = saved.starts_with(SAVED_HEADER);
+        let Some(batch) = saved.get_mut(SAVED_HEADER.len()..).filter(|_| current) else {
+            warn!(
+                path = %path.display(),
+                "the saved rules aren't in a format this version reads; the first update \
+                 puts the rules in place"
+            );
+            return Ok(Restored::Nothing);
+        };
+        self.runner.run_encoded(batch)?;
+        // What the batch installed is known by name only from the kernel.
         *self
             .installed
             .lock()
@@ -409,28 +331,7 @@ where
 
     /// The chains and sets of both tables, when both exist.
     fn find_installed(&self) -> Result<Option<Installed>, FirewallError> {
-        let tables = self.runner.list("list tables")?;
-        let exists = |family: &str| {
-            tables.lines().any(|line| {
-                line.trim()
-                    .strip_prefix("table ")
-                    .and_then(|line| line.strip_prefix(family))
-                    .and_then(|line| line.strip_prefix(' '))
-                    == Some(TABLE_NAME)
-            })
-        };
-        if !(exists("inet") && exists("bridge")) {
-            return Ok(None);
-        }
-        let mut installed = Installed {
-            found: true,
-            ..Installed::default()
-        };
-        for table in [Table::Inet, Table::Bridge] {
-            let listing = self.runner.list(&format!("list table {table}"))?;
-            installed.add_listed(table, &listing);
-        }
-        Ok(Some(installed))
+        Ok(self.runner.installed()?.map(Installed::of))
     }
 
     /// Forget the saved rules, so the next start doesn't restore them.
@@ -443,29 +344,29 @@ where
         }
     }
 
-    /// Write the rules of `plan`, from scratch, where the next start finds them. Written
-    /// to a temporary file first and renamed, so a crash never leaves half a script.
-    /// Save the rules of `plan`, just applied, for `restore` at the next start. Not part of
-    /// `apply`: writing them can take a while, and what the new rules report should be
-    /// attributed (`Directory::update`) as soon as they are in place.
+    /// Save the rules of `plan`, just applied, for `restore` at the next start, as the
+    /// netlink batch that installs them from scratch. Written to a temporary file first and
+    /// renamed, so a crash never leaves half a batch. Not part of `apply`: writing them can
+    /// take a while, and what the new rules report should be attributed
+    /// (`Directory::update`) as soon as they are in place.
     pub fn save(&self, plan: &Plan) -> Result<(), FirewallError> {
         let Some(path) = &self.saved else {
             return Ok(());
         };
-        let mut script = String::with_capacity(plan.rule_count() * 96);
-        render_apply_script(plan, self.options, None, &mut script)?;
         let temporary = path.with_extension("tmp");
         let write = || -> io::Result<()> {
             if let Some(directory) = path.parent() {
                 fs::create_dir_all(directory)?;
             }
-            let mut file = fs::OpenOptions::new()
+            let file = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
                 .open(&temporary)?;
-            file.write_all(script.as_bytes())?;
+            let file = write_saved(plan, self.options, io::BufWriter::new(file))?
+                .into_inner()
+                .map_err(io::IntoInnerError::into_error)?;
             file.sync_all()?;
             fs::rename(&temporary, path)
         };
@@ -538,21 +439,21 @@ where
             "applying nftables changes"
         );
 
-        let mut script = String::with_capacity(plan.rule_count() * 96);
+        let mut batch = Batch::default();
         // Takes the rules of the installed chains out of `installed`: should the update fail,
         // the next one writes every chain again.
         let now_installed =
-            render_apply_script(&plan, self.options, installed.as_mut(), &mut script)?;
+            render_apply_script(&plan, self.options, installed.as_mut(), &mut batch);
         before(&plan);
-        let mut now_installed = match self.runner.run_script(script) {
+        let mut now_installed = match self.runner.run(&batch) {
             Ok(()) => now_installed,
             // Tables another version left may not fit these rules (a set of another type):
             // start from empty ones.
             Err(error) if installed.as_ref().is_some_and(|installed| installed.found) => {
                 warn!(%error, "can't update the rules found in place; replacing them");
-                let mut script = String::with_capacity(plan.rule_count() * 96);
-                let now_installed = render_apply_script(&plan, self.options, None, &mut script)?;
-                self.runner.run_script(script)?;
+                let mut batch = Batch::default();
+                let now_installed = render_apply_script(&plan, self.options, None, &mut batch);
+                self.runner.run(&batch)?;
                 now_installed
             }
             Err(error) => return Err(error),
@@ -574,6 +475,17 @@ where
             plan,
             changed: true,
         })
+    }
+
+    /// The slot of each source, which numbers its chains.
+    #[cfg(test)]
+    pub fn slots(&self) -> BTreeMap<IpAddr, usize> {
+        self.installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|installed| installed.slots.0.clone())
+            .unwrap_or_default()
     }
 
     /// Set how much longer each of `addresses` stays allowed in a hostname set of the
@@ -607,9 +519,9 @@ where
     }
 
     pub fn cleanup(&self) -> Result<(), FirewallError> {
-        let mut script = String::new();
-        render_table_reset(&mut script)?;
-        self.runner.run_script(script)?;
+        let mut batch = Batch::default();
+        render_table_reset(&mut batch);
+        self.runner.run(&batch)?;
         *self
             .installed
             .lock()
@@ -619,21 +531,101 @@ where
     }
 }
 
-impl NftablesFirewall<LibNftablesRunner> {
-    pub fn with_libnftables(options: Options) -> Result<Self, FirewallError> {
-        let runner = LibNftablesRunner::new()?;
+impl NftablesFirewall<NetlinkRunner> {
+    pub fn with_netlink(options: Options) -> Result<Self, FirewallError> {
+        let runner = NetlinkRunner::new()?;
         Ok(Self::new(runner, options))
     }
 }
 
-/// Remove the managed tables. The `add` makes the `delete` succeed whether or not a table
-/// exists, so neither cleanup nor apply depend on prior state or on matching error strings.
-fn render_table_reset(out: &mut String) -> fmt::Result {
-    for table in [Table::Inet, Table::Bridge] {
-        writeln!(out, "add table {table}")?;
-        writeln!(out, "delete table {table}")?;
+/// What a saved batch starts with: its format, which a later version may change.
+const SAVED_HEADER: &[u8] = b"portcullis nf_tables batch 1
+";
+
+/// A saved batch being written.
+struct Saving<W> {
+    out: W,
+    /// One command, encoded.
+    buffer: Vec<u8>,
+    set_id: u32,
+    error: Option<io::Error>,
+}
+
+/// Write the saved form of the rules of `plan` to `out`: the header, then the batch that
+/// puts them in place from scratch. Each command is written as it is rendered, so that
+/// neither the commands nor the batch are ever all in memory.
+fn write_saved<W: io::Write + 'static>(plan: &Plan, options: Options, out: W) -> io::Result<W> {
+    let mut saving = Saving {
+        out,
+        buffer: Vec::with_capacity(1 << 16),
+        set_id: 0,
+        error: None,
+    };
+    saving.out.write_all(SAVED_HEADER)?;
+    netlink::batch_marker(&mut saving.buffer, false);
+    saving.out.write_all(&saving.buffer)?;
+    let saving = Rc::new(RefCell::new(saving));
+    let sink = Rc::clone(&saving);
+    let mut batch = Batch::streaming(Box::new(move |command| {
+        let mut saving = sink.borrow_mut();
+        let saving = &mut *saving;
+        if saving.error.is_some() {
+            return;
+        }
+        saving.buffer.clear();
+        let mut encoder = Encoder::resume(&mut saving.buffer, saving.set_id);
+        encoder.command(0, &command);
+        saving.set_id = encoder.set_id();
+        if let Err(error) = saving.out.write_all(&saving.buffer) {
+            saving.error = Some(error);
+        }
+    }));
+    render_update(plan, options, None, Slots::default(), &mut batch);
+    drop(batch);
+    let Saving {
+        mut out,
+        mut buffer,
+        error,
+        ..
+    } = Rc::try_unwrap(saving)
+        .map_err(|_| io::Error::other("the saved batch is still being written"))?
+        .into_inner();
+    if let Some(error) = error {
+        return Err(error);
     }
-    Ok(())
+    buffer.clear();
+    netlink::batch_marker(&mut buffer, true);
+    out.write_all(&buffer)?;
+    Ok(out)
+}
+
+/// The commands that put the rules of `plan` in place from scratch.
+#[cfg(test)]
+pub(super) fn fresh_batch(plan: &Plan, options: Options) -> Batch {
+    let mut batch = Batch::default();
+    render_apply_script(plan, options, None, &mut batch);
+    batch
+}
+
+/// [`fresh_batch`], with sources' chains numbered by `slots`, as an update that kept them
+/// numbers them.
+#[cfg(test)]
+pub(super) fn fresh_batch_with_slots(
+    plan: &Plan,
+    options: Options,
+    slots: &BTreeMap<IpAddr, usize>,
+) -> Batch {
+    let mut batch = Batch::default();
+    render_update(plan, options, None, Slots(slots.clone()), &mut batch);
+    batch
+}
+
+/// Remove the managed tables, whether or not they exist, so neither cleanup nor apply
+/// depend on prior state or on matching error strings.
+fn render_table_reset(out: &mut Batch) {
+    for table in Table::ALL {
+        out.push(Command::ResetTable(table));
+    }
 }
 
 /// What a rule does with matching traffic, and how it reports it.
@@ -746,17 +738,15 @@ impl Outcome {
         };
         self.reason.filter(|_| log).map(|reason| (verdict, reason))
     }
-}
 
-/// The verdict alone.
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// The verdict alone.
+    const fn verdict(&self) -> Expr {
         if self.allow || self.monitor {
-            f.write_str("accept")
+            Expr::Verdict(Verdict::Accept)
         } else if self.drop {
-            f.write_str("drop")
+            Expr::Verdict(Verdict::Drop)
         } else {
-            write!(f, "{}", self.options.deny)
+            self.options.deny.expr()
         }
     }
 }
@@ -769,16 +759,26 @@ const LOGGED_SET_V6: &str = "logged6";
 const LOGGED_SET_FRAMES: &str = "frames";
 /// Recently reported ARP: (bridge port, announced MAC, announced address).
 const LOGGED_SET_ARP: &str = "announced";
-const LOGGED_TIMEOUT: &str = "60s";
+const LOGGED_TIMEOUT: Duration = Duration::from_secs(60);
 const LOGGED_SIZE: u32 = 65_536;
 
 /// Create the sets of reported flows; with `flush`, forget the flows reported so far.
-fn render_logged_sets(out: &mut String, table: Table, flush: bool) -> fmt::Result {
-    const FLOW_V4: &str = "ipv4_addr . ipv4_addr . inet_proto . inet_service";
-    const FLOW_V6: &str = "ipv6_addr . ipv6_addr . inet_proto . inet_service";
-    const FRAME: &str = "ifname . ether_addr . ether_type";
-    const ARP: &str = "ifname . ether_addr . ipv4_addr";
-    let sets: &[(&str, &str)] = match table {
+fn render_logged_sets(out: &mut Batch, declared: &mut Declarations, table: Table, flush: bool) {
+    const FLOW_V4: &[KeyType] = &[
+        KeyType::Ipv4,
+        KeyType::Ipv4,
+        KeyType::InetProto,
+        KeyType::InetService,
+    ];
+    const FLOW_V6: &[KeyType] = &[
+        KeyType::Ipv6,
+        KeyType::Ipv6,
+        KeyType::InetProto,
+        KeyType::InetService,
+    ];
+    const FRAME: &[KeyType] = &[KeyType::Ifname, KeyType::Ether, KeyType::EtherType];
+    const ARP: &[KeyType] = &[KeyType::Ifname, KeyType::Ether, KeyType::Ipv4];
+    let sets: &[(&'static str, &'static [KeyType])] = match table {
         Table::Inet => &[(LOGGED_SET_V4, FLOW_V4), (LOGGED_SET_V6, FLOW_V6)],
         Table::Bridge => &[
             (LOGGED_SET_V4, FLOW_V4),
@@ -786,88 +786,141 @@ fn render_logged_sets(out: &mut String, table: Table, flush: bool) -> fmt::Resul
             (LOGGED_SET_ARP, ARP),
         ],
     };
-    for (name, key) in sets {
-        writeln!(
-            out,
-            "add set {table} {name} {{ type {key}; flags dynamic,timeout; timeout {LOGGED_TIMEOUT}; size {LOGGED_SIZE}; }}"
-        )?;
+    for &(name, key) in sets {
+        let decl = SetDecl {
+            flags: SetFlags {
+                dynamic: true,
+                timeout: true,
+            },
+            timeout: Some(LOGGED_TIMEOUT),
+            size: Some(LOGGED_SIZE),
+            ..SetDecl::set(table, name, key)
+        };
+        declared.declare(out, Declaration::Set(decl.clone()));
         if flush {
-            writeln!(out, "flush set {table} {name}")?;
+            out.push(Command::FlushSet(decl));
         }
     }
-    Ok(())
 }
 
-/// Render a decision: `head` (`add rule <chain> <match>`) followed by the outcome. A
+/// Render a decision: `head` (matches of a rule of `chain`) followed by the outcome. A
 /// reported outcome gets rules before it that log the packet, but only the first of its
 /// flow within the de-duplication timeout; the verdict rule applies to every packet.
-fn decide(out: &mut String, head: fmt::Arguments<'_>, outcome: Outcome) -> fmt::Result {
+fn decide(out: &mut Batch, chain: Chain, head: Vec<Expr>, outcome: Outcome) {
+    const IPV4: &[Key] = &[Key::IpSaddr, Key::IpDaddr, Key::L4proto, Key::ThDport];
+    const IPV6: &[Key] = &[Key::Ip6Saddr, Key::Ip6Daddr, Key::L4proto, Key::ThDport];
+    const ORIGINAL_V4: &[Key] = &[
+        Key::IpSaddr,
+        Key::CtDaddr { ipv6: false },
+        Key::L4proto,
+        Key::CtProtoDst,
+    ];
+    const ORIGINAL_V6: &[Key] = &[
+        Key::Ip6Saddr,
+        Key::CtDaddr { ipv6: true },
+        Key::L4proto,
+        Key::CtProtoDst,
+    ];
+    const FRAME: &[Key] = &[Key::Iifname, Key::EtherSaddr, Key::EtherType];
+    const ARP: &[Key] = &[Key::Iifname, Key::ArpSaddrEther, Key::ArpSaddrIp];
     if let Some((verdict, reason)) = outcome.log_prefix() {
         let (set, key) = match outcome.key {
-            LogKey::Ipv4 => (
-                LOGGED_SET_V4,
-                "ip saddr . ip daddr . meta l4proto . th dport",
-            ),
-            LogKey::Ipv6 => (
-                LOGGED_SET_V6,
-                "ip6 saddr . ip6 daddr . meta l4proto . th dport",
-            ),
-            LogKey::OriginalV4 => (
-                LOGGED_SET_V4,
-                "ip saddr . ct original ip daddr . meta l4proto . ct original proto-dst",
-            ),
-            LogKey::OriginalV6 => (
-                LOGGED_SET_V6,
-                "ip6 saddr . ct original ip6 daddr . meta l4proto . ct original proto-dst",
-            ),
-            LogKey::Frame => (LOGGED_SET_FRAMES, "iifname . ether saddr . ether type"),
-            LogKey::Arp => (LOGGED_SET_ARP, "iifname . arp saddr ether . arp saddr ip"),
+            LogKey::Ipv4 => (LOGGED_SET_V4, IPV4),
+            LogKey::Ipv6 => (LOGGED_SET_V6, IPV6),
+            LogKey::OriginalV4 => (LOGGED_SET_V4, ORIGINAL_V4),
+            LogKey::OriginalV6 => (LOGGED_SET_V6, ORIGINAL_V6),
+            LogKey::Frame => (LOGGED_SET_FRAMES, FRAME),
+            LogKey::Arp => (LOGGED_SET_ARP, ARP),
         };
-        let log = format_args!(
-            "log prefix \"{LOG_PREFIX}:{verdict}:{reason}\" group {} snaplen {}",
-            outcome.options.log_group, outcome.snaplen
-        );
-        writeln!(out, "{head} {key} != @{set} add @{set} {{ {key} }} {log}")?;
+        let log = Expr::Log {
+            prefix: Cow::Owned(format!("{LOG_PREFIX}:{verdict}:{reason}")),
+            group: outcome.options.log_group,
+            snaplen: outcome.snaplen,
+        };
+        let not_logged = Expr::Lookup {
+            key,
+            set: Cow::Borrowed(set),
+            negate: true,
+        };
+        let mut first = head.clone();
+        first.extend([
+            not_logged.clone(),
+            Expr::AddToSet {
+                key,
+                set: Cow::Borrowed(set),
+                stateful: None,
+            },
+            log.clone(),
+        ]);
+        out.rule(chain, first);
         // Adding to a full set fails, and so would the log statement after it: anyone able
         // to fill the set with flows of their own would make every denial after it go
         // unreported. A flow the rule above didn't add is still logged, at a limited rate
         // per rule, so one source can't drown out the others either.
-        writeln!(
-            out,
-            "{head} {key} != @{set} limit rate {LOG_FULL_RATE} {log}"
-        )?;
+        let mut second = head.clone();
+        second.extend([
+            not_logged,
+            Expr::Limit {
+                rate: LOG_FULL_RATE,
+                burst: None,
+                over: false,
+            },
+            log,
+        ]);
+        out.rule(chain, second);
     }
-    writeln!(out, "{head} {outcome}")
+    let mut verdict = head;
+    verdict.push(outcome.verdict());
+    out.rule(chain, verdict);
 }
 
-/// How often a rule reports flows once its de-duplication set is full.
-const LOG_FULL_RATE: &str = "10/second";
+/// How often (per second) a rule reports flows once its de-duplication set is full.
+const LOG_FULL_RATE: u32 = 10;
 
-/// Render the script of a rule update.
+const ACCEPT: Expr = Expr::Verdict(Verdict::Accept);
+
+/// Render the commands of a rule update.
 ///
 /// Each table has a base chain that dispatches each managed source address through a
 /// verdict map to its own chain: the bridge table after checking where a frame came from,
 /// the inet table after letting established traffic through. A packet costs one hash
 /// lookup plus the rules of its own source, regardless of how many containers are managed.
 ///
-/// The tables, base chains and log sets are created once and kept: an update flushes and
-/// refills chains and sets, and deletes those of the previous update it doesn't need, in
-/// one atomic transaction. Deleting a base chain would unregister its hook, and the kernel
-/// drops every packet held in a queue from that hook: DNS answers being inspected, and
-/// packets of new containers waiting for their rules. Only the first update, without
-/// `previous`, starts from empty tables, removing whatever a previous run left behind.
+/// The tables, base chains and log sets are created once and kept: an update writes only
+/// what changed, in one atomic transaction. It empties and refills the chains whose rules
+/// changed (of sources whose rules changed, and base chains only when the networks or
+/// options change), deletes and adds the set elements that changed, and deletes the chains
+/// and sets of the previous update it doesn't need. Deleting a base chain would unregister
+/// its hook, and the kernel drops every packet held in a queue from that hook: DNS answers
+/// being inspected, and packets of new containers waiting for their rules. Only the first
+/// update, without `previous`, starts from empty tables, removing whatever a previous run
+/// left behind. After an update failed, the next one writes everything again.
 fn render_apply_script(
     plan: &Plan,
     options: Options,
     previous: Option<&mut Installed>,
-    out: &mut String,
-) -> Result<Installed, fmt::Error> {
-    let empty = Installed::default();
+    out: &mut Batch,
+) -> Installed {
+    render_update(plan, options, previous, Slots::default(), out)
+}
+
+/// [`render_apply_script`], with the slots sources keep from scratch (without `previous`).
+fn render_update(
+    plan: &Plan,
+    options: Options,
+    previous: Option<&mut Installed>,
+    slots: Slots,
+    out: &mut Batch,
+) -> Installed {
+    let empty = Installed {
+        slots,
+        ..Installed::default()
+    };
     let (previous, mut written) = if let Some(previous) = previous {
         let written = std::mem::take(&mut previous.written);
         (&*previous, written)
     } else {
-        render_table_reset(out)?;
+        render_table_reset(out);
         (&empty, Written::default())
     };
     let mut elements = Elements::default();
@@ -883,27 +936,11 @@ fn render_apply_script(
         .sources
         .iter()
         .any(|(address, container)| sources.get(address) != Some(container));
-    for table in [Table::Inet, Table::Bridge] {
-        writeln!(out, "add table {table}")?;
-        render_base_chain(out, Chain::Base(table), table.hook())?;
-        let input = match table {
-            Table::Inet => Chain::Input,
-            Table::Bridge => Chain::BridgeInput,
-        };
-        render_base_chain(out, input, "input")?;
-        writeln!(out, "flush chain {input}")?;
-        if table == Table::Bridge {
-            render_base_chain(out, Chain::BridgeForward, "forward")?;
-            writeln!(out, "flush chain {}", Chain::BridgeForward)?;
-            render_quarantined_set(out, plan)?;
-        }
-        render_logged_sets(out, table, reassigned)?;
-        writeln!(out, "flush chain {}", Chain::Base(table))?;
-        // Changed at the end, see `Elements::render`.
-        for set in NamedSet::ALL.iter().filter(|set| set.table() == table) {
-            set.render_declaration(out)?;
-        }
-    }
+    let mut declared = Declarations {
+        previous: std::mem::take(&mut written.declared),
+        now: HashSet::new(),
+    };
+    render_declarations(out, &mut declared, reassigned);
 
     let mut installed = render_objects(
         out,
@@ -912,7 +949,9 @@ fn render_apply_script(
         previous,
         &slots,
         &mut written.host_addresses,
-    )?;
+        &mut declared,
+        &mut elements,
+    );
     installed.sources = sources;
 
     render_source_chains(
@@ -922,39 +961,85 @@ fn render_apply_script(
         &slots,
         &mut written.rules,
         &mut installed,
-    )?;
+    );
 
+    let mut fixed = Batch::default();
+    render_fixed_chains(&mut fixed, plan, options, &slots, &mut elements);
+    installed.written.fixed = write_changed_chains(out, plan, fixed, &written.fixed);
+    elements.fill(
+        ElementSet::Quarantined,
+        plan.sources
+            .iter()
+            .filter(|source| source.quarantined && !source.monitor)
+            .filter_map(|source| source.port.known())
+            .map(|port| port.name.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|port| Element::of(&[Part::Ifname(port)])),
+    );
+    elements.render(out, written.elements.as_ref());
+    installed.written.elements = Some(elements.0);
+    installed.written.declared = declared.now;
+    // Nothing references them anymore: their map elements are gone, and the chains whose
+    // rules used the sets were written again.
+    for chain in previous.chains.difference(&installed.chains) {
+        out.push(Command::DeleteChain(chain.clone()));
+    }
+    for set in previous.sets.difference(&installed.sets) {
+        out.push(Command::DeleteSet(set.clone()));
+    }
+    installed.slots = slots;
+    installed
+}
+
+/// The rules of the chains written from the plan as a whole: base chains, limits and ARP
+/// checks.
+fn render_fixed_chains(
+    out: &mut Batch,
+    plan: &Plan,
+    options: Options,
+    slots: &Slots,
+    elements: &mut Elements,
+) {
     // Routed traffic.
     let base = Chain::Base(Table::Inet);
     let bridges = |mode: Option<bool>| {
         plan.bridges
             .iter()
             .filter(move |bridge| mode.is_none_or(|monitor| bridge.monitor == monitor))
-            .map(|bridge| Quoted(&bridge.name))
+            .map(|bridge| Element::of(&[Part::Ifname(&bridge.name)]))
     };
-    elements.fill(NamedSet::InetBridges, bridges(None))?;
-    elements.fill(NamedSet::InetEnforcedBridges, bridges(Some(false)))?;
-    elements.fill(NamedSet::BridgeBridges, bridges(None))?;
-    elements.fill(NamedSet::MonitoredBridges, bridges(Some(true)))?;
-    elements.fill(NamedSet::EnforcedBridges, bridges(Some(false)))?;
+    elements.fill(NamedSet::InetBridges, bridges(None));
+    elements.fill(NamedSet::InetEnforcedBridges, bridges(Some(false)));
+    elements.fill(NamedSet::BridgeBridges, bridges(None));
+    elements.fill(NamedSet::MonitoredBridges, bridges(Some(true)));
+    elements.fill(NamedSet::EnforcedBridges, bridges(Some(false)));
     if let Some(queue) = options.dns_queue
         && !plan.bridges.is_empty()
     {
         // Hold DNS answers to managed containers until the addresses they contain are
         // allowed. `bypass` lets them through when Portcullis isn't listening.
-        for protocol in ["tcp", "udp"] {
-            writeln!(
-                out,
-                "add rule {base} oifname @{} meta l4proto {protocol} th sport {DNS_PORT} ct direction reply queue num {queue} bypass",
-                NamedSet::InetBridges.name()
-            )?;
+        for protocol in [Protocol::Tcp, Protocol::Udp] {
+            out.rule(
+                base,
+                vec![
+                    Expr::lookup(&[Key::Oifname], NamedSet::InetBridges.name()),
+                    Expr::cmp(Key::L4proto, Value::Protocol(protocol, false)),
+                    Expr::cmp(Key::ThSport, Value::Range(DNS_PORT, DNS_PORT)),
+                    Expr::cmp(Key::CtDirection, Value::Reply),
+                    Expr::Queue {
+                        num: queue,
+                        bypass: true,
+                    },
+                ],
+            );
         }
     }
     // Traffic to the host itself (services on the host, and other containers' published
     // ports through Docker's userland proxy) leaves the container's network as much as
     // routed traffic does, and follows the same rules.
     for base in [base, Chain::Input] {
-        render_egress_dispatch(out, plan, options, base, &slots, &mut elements)?;
+        render_egress_dispatch(out, plan, options, base, slots, elements);
     }
 
     // Everything entering a managed network's bridge from a container: source checks and
@@ -962,74 +1047,171 @@ fn render_apply_script(
     // once its source checks out, in the ICC chains: a container could otherwise send with
     // another container's address into that container's connections.
     if !plan.bridges.is_empty() {
-        render_bridge_dispatch(out, plan, options, &slots, &mut elements)?;
-        render_link_local(out, plan, options)?;
-        render_bridged_destinations(out, plan, options)?;
+        render_bridge_dispatch(out, plan, options, slots, elements);
+        render_link_local(out, plan, options);
+        render_bridged_destinations(out, plan, options);
     }
-    elements.render(out, written.elements.as_ref())?;
-    installed.written.elements = Some(elements.0);
-    // Nothing references them anymore: their map elements are gone, and the chains whose
-    // rules used the sets were written again.
-    for chain in previous.chains.difference(&installed.chains) {
-        writeln!(out, "flush chain {chain}")?;
-        writeln!(out, "delete chain {chain}")?;
+}
+
+/// The chains written from the plan as a whole, as an update with `plan` has them.
+fn fixed_chains(plan: &Plan) -> impl Iterator<Item = Chain> {
+    let bridged = !plan.bridges.is_empty();
+    [
+        Chain::Base(Table::Inet),
+        Chain::Input,
+        Chain::Base(Table::Bridge),
+        Chain::BridgeInput,
+        Chain::BridgeForward,
+    ]
+    .into_iter()
+    .chain(
+        [false, true]
+            .into_iter()
+            .flat_map(|rate| [false, true].map(|monitor| Chain::Limited { rate, monitor }))
+            .chain([false, true].map(|monitor| Chain::ArpCheck { monitor }))
+            .filter(move |_| bridged),
+    )
+}
+
+/// Write the chains of `fixed` (rules of the chains written from the plan as a whole) whose
+/// rules aren't those `previous` wrote: emptied and filled again. Returns the rules of
+/// each.
+///
+/// A base chain is never deleted, see [`render_apply_script`]; nor is it written again
+/// when its rules stay the same, which they do while the networks and options do.
+fn write_changed_chains(
+    out: &mut Batch,
+    plan: &Plan,
+    fixed: Batch,
+    previous: &HashMap<Chain, Vec<Vec<Expr>>>,
+) -> HashMap<Chain, Vec<Vec<Expr>>> {
+    let mut rules: HashMap<Chain, Vec<Vec<Expr>>> = fixed_chains(plan)
+        .map(|chain| (chain, Vec::new()))
+        .collect();
+    for command in fixed.commands {
+        if let Command::AddRule(chain, exprs) = command {
+            rules.entry(chain).or_default().push(exprs);
+        }
     }
-    for set in previous.sets.difference(&installed.sets) {
-        writeln!(out, "delete set {set}")?;
+    for chain in fixed_chains(plan) {
+        let Some(new) = rules.get(&chain) else {
+            continue;
+        };
+        if previous.get(&chain) == Some(new) {
+            continue;
+        }
+        out.push(Command::FlushChain(chain));
+        for exprs in new {
+            out.rule(chain, exprs.clone());
+        }
     }
-    installed.slots = slots;
-    Ok(installed)
+    rules
+}
+
+/// A table, chain or set an update declares: created if it isn't there.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Declaration {
+    Table(Table),
+    Chain(Chain),
+    Set(SetDecl),
+}
+
+/// The declarations of an update: those it needs (`now`), of which it writes those the last
+/// update didn't declare (`previous`).
+struct Declarations {
+    previous: HashSet<Declaration>,
+    now: HashSet<Declaration>,
+}
+
+impl Declarations {
+    fn declare(&mut self, out: &mut Batch, declaration: Declaration) {
+        if !self.previous.contains(&declaration) {
+            out.push(match &declaration {
+                Declaration::Table(table) => Command::AddTable(*table),
+                Declaration::Chain(chain) => Command::AddChain(*chain),
+                Declaration::Set(decl) => Command::AddSet(decl.clone()),
+            });
+        }
+        self.now.insert(declaration);
+    }
+}
+
+/// Create the tables, base chains and fixed sets.
+fn render_declarations(out: &mut Batch, declared: &mut Declarations, reassigned: bool) {
+    for table in Table::ALL {
+        declared.declare(out, Declaration::Table(table));
+        declared.declare(out, Declaration::Chain(Chain::Base(table)));
+        let input = match table {
+            Table::Inet => Chain::Input,
+            Table::Bridge => Chain::BridgeInput,
+        };
+        declared.declare(out, Declaration::Chain(input));
+        if table == Table::Bridge {
+            declared.declare(out, Declaration::Chain(Chain::BridgeForward));
+            declared.declare(out, Declaration::Set(ElementSet::Quarantined.declaration()));
+        }
+        render_logged_sets(out, declared, table, reassigned);
+        for set in NamedSet::ALL.iter().filter(|set| set.table() == table) {
+            declared.declare(out, Declaration::Set(set.declaration()));
+        }
+    }
 }
 
 /// The chains of each source, before the maps that lead to them are filled. Only those
 /// whose rules changed are written: whether they did is told from what the rules are
 /// written from ([`ChainInputs`]), without writing them.
 fn render_source_chains(
-    out: &mut String,
+    out: &mut Batch,
     plan: &Plan,
     options: Options,
     slots: &Slots,
     previous: &mut HashMap<Chain, ChainInputs>,
     installed: &mut Installed,
-) -> fmt::Result {
+) {
     for source in &plan.sources {
         let chain = Chain::Egress(slots.of(source));
         let rules = plan.egress_rules(source);
         let written = Written::chain(plan, source, chain, rules, previous, installed);
         if !written {
-            begin_chain(out, chain)?;
-            render_related(out, chain, source.address)?;
+            begin_chain(out, chain);
+            render_related(out, chain, source.address);
             for rule in rules {
-                render_rule(plan, source, chain, rule, options, out)?;
+                render_rule(plan, source, chain, rule, options, out);
             }
             decide(
                 out,
-                format_args!("add rule {chain}"),
+                chain,
+                Vec::new(),
                 Outcome::deny(options, source.monitor, "egress")
                     .for_address(source.address)
                     .original(),
-            )?;
+            );
         }
         if source.address.is_ipv4() && icc_chain_needed(plan, source, options) {
             let chain = Chain::Icc(slots.of(source));
             let rules = plan.icc_rules(source);
             if !Written::chain(plan, source, chain, rules, previous, installed) {
-                begin_chain(out, chain)?;
-                writeln!(out, "add rule {chain} ct state established accept")?;
-                render_related(out, chain, source.address)?;
+                begin_chain(out, chain);
+                out.rule(
+                    chain,
+                    vec![
+                        Expr::cmp(Key::CtState, Value::CtState(CtState::Established)),
+                        ACCEPT,
+                    ],
+                );
+                render_related(out, chain, source.address);
                 for rule in rules {
-                    render_rule(plan, source, chain, rule, options, out)?;
+                    render_rule(plan, source, chain, rule, options, out);
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// Create `chain` if it isn't there, and empty it.
-fn begin_chain(out: &mut String, chain: Chain) -> fmt::Result {
-    writeln!(out, "add chain {chain}")?;
-    writeln!(out, "flush chain {chain}")
+fn begin_chain(out: &mut Batch, chain: Chain) {
+    out.push(Command::AddChain(chain));
+    out.push(Command::FlushChain(chain));
 }
 
 /// What the rules of a source's chain are written from, besides the chain itself and the
@@ -1104,65 +1286,98 @@ impl Written {
     }
 }
 
-/// The elements of the named sets in an update, one per line, by set.
+/// A set whose elements updates change one by one: those of [`NamedSet`], quarantined
+/// ports, and ports under a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ElementSet {
+    Named(NamedSet),
+    Quarantined,
+    Ports(Limit),
+}
+
+impl From<NamedSet> for ElementSet {
+    fn from(set: NamedSet) -> Self {
+        Self::Named(set)
+    }
+}
+
+impl ElementSet {
+    fn declaration(self) -> SetDecl {
+        match self {
+            Self::Named(set) => set.declaration(),
+            Self::Quarantined => SetDecl::set(Table::Bridge, QUARANTINED_SET, &[KeyType::Ifname]),
+            Self::Ports(limit) => limit.ports(),
+        }
+    }
+}
+
+/// The elements of the sets of an update, by set.
 #[derive(Default)]
-struct Elements(HashMap<NamedSet, String>);
+struct Elements(HashMap<ElementSet, Vec<Element>>);
 
 impl Elements {
-    /// Set the elements of `set`.
-    fn fill<T: fmt::Display>(
-        &mut self,
-        set: NamedSet,
-        elements: impl Iterator<Item = T>,
-    ) -> fmt::Result {
-        let text = self.0.entry(set).or_default();
-        for element in elements {
-            writeln!(text, "{element}")?;
-        }
-        Ok(())
+    /// Add elements to `set`.
+    fn fill(&mut self, set: impl Into<ElementSet>, elements: impl Iterator<Item = Element>) {
+        self.0.entry(set.into()).or_default().extend(elements);
     }
 
     /// Change the sets from the elements an update wrote before (`previous`, none when they
-    /// aren't known) to these: add what's new; a set that lost elements, or a verdict map
-    /// with an element whose verdict changed, is emptied and filled again instead (see
-    /// [`render_added`] for why nothing is deleted one by one).
-    fn render(
-        &self,
-        out: &mut String,
-        previous: Option<&HashMap<NamedSet, String>>,
-    ) -> fmt::Result {
-        let mut old_lines = Vec::new();
-        let mut new_lines = Vec::new();
-        for set in NamedSet::ALL {
-            let new = self.0.get(&set).map_or("", String::as_str);
-            let old = previous.map(|previous| previous.get(&set).map_or("", String::as_str));
+    /// aren't known, and the sets are emptied and filled again) to these: delete what's gone
+    /// and add what's new, in the same transaction, so that lookups of the others never
+    /// miss. A map element whose verdict changed is deleted and added again.
+    fn render(&self, out: &mut Batch, previous: Option<&HashMap<ElementSet, Vec<Element>>>) {
+        let mut sets: Vec<ElementSet> = NamedSet::ALL
+            .into_iter()
+            .map(ElementSet::Named)
+            .chain([ElementSet::Quarantined])
+            .collect();
+        let mut ports: Vec<ElementSet> = self
+            .0
+            .keys()
+            .filter(|set| matches!(set, ElementSet::Ports(_)))
+            .copied()
+            .collect();
+        ports.sort_unstable();
+        sets.extend(ports);
+        let mut old_sorted = Vec::new();
+        let mut new_sorted = Vec::new();
+        for set in sets {
+            let new = self.0.get(&set).map_or(&[][..], Vec::as_slice);
+            let old = previous.map(|previous| previous.get(&set).map_or(&[][..], Vec::as_slice));
             if old == Some(new) {
                 continue;
             }
-            old_lines.clear();
-            old_lines.extend(old.unwrap_or_default().lines());
-            old_lines.sort_unstable();
-            new_lines.clear();
-            new_lines.extend(new.lines());
-            new_lines.sort_unstable();
-            let refill = old.is_none()
-                || old_lines
-                    .iter()
-                    .any(|line| new_lines.binary_search(line).is_err());
-            if refill {
-                writeln!(out, "flush {} {} {}", set.kind(), set.table(), set.name())?;
-                render_added(out, set.declaration(), new.lines())?;
-            } else {
-                render_added(
-                    out,
-                    set.declaration(),
-                    new_lines
-                        .iter()
-                        .filter(|line| old_lines.binary_search(line).is_err()),
-                )?;
+            let decl = set.declaration();
+            let Some(old) = old else {
+                out.push(Command::FlushSet(decl.clone()));
+                render_added(out, decl, new.to_vec());
+                continue;
+            };
+            old_sorted.clear();
+            old_sorted.extend_from_slice(old);
+            old_sorted.sort_unstable();
+            old_sorted.dedup();
+            new_sorted.clear();
+            new_sorted.extend_from_slice(new);
+            new_sorted.sort_unstable();
+            new_sorted.dedup();
+            // An element is there once, however many sources have it.
+            let mut deleted: Vec<Element> = old_sorted
+                .iter()
+                .filter(|element| new_sorted.binary_search(element).is_err())
+                .copied()
+                .collect();
+            deleted.dedup_by(|a, b| a.key() == b.key());
+            if !deleted.is_empty() {
+                out.push(Command::DeleteElements(decl.clone(), deleted));
             }
+            let added = new_sorted
+                .iter()
+                .filter(|element| old_sorted.binary_search(element).is_err())
+                .copied()
+                .collect();
+            render_added(out, decl, added);
         }
-        Ok(())
     }
 }
 
@@ -1202,35 +1417,39 @@ impl Slots {
 
 /// Send traffic from containers through their egress chains, from `base`.
 fn render_egress_dispatch(
-    out: &mut String,
+    out: &mut Batch,
     plan: &Plan,
     options: Options,
     base: Chain,
     slots: &Slots,
     elements: &mut Elements,
-) -> fmt::Result {
-    render_link_local_ip(out, plan, options, base)?;
-    render_dns_names(out, plan, options, base, elements)?;
+) {
+    render_link_local_ip(out, plan, options, base);
+    render_dns_names(out, plan, options, base, elements);
     // The bridge table checked where established traffic comes from. Related traffic (ICMP
     // errors about a connection) is checked in the source's chain, see `render_related`.
-    writeln!(out, "add rule {base} ct state established accept")?;
-    for (family, is_family, map) in [
+    out.rule(
+        base,
+        vec![
+            Expr::cmp(Key::CtState, Value::CtState(CtState::Established)),
+            ACCEPT,
+        ],
+    );
+    for (key, is_family, map) in [
         (
-            "ip",
+            &[Key::IpSaddr][..],
             IpAddr::is_ipv4 as fn(&IpAddr) -> bool,
             NamedSet::Egress4,
         ),
-        ("ip6", IpAddr::is_ipv6, NamedSet::Egress6),
+        (&[Key::Ip6Saddr][..], IpAddr::is_ipv6, NamedSet::Egress6),
     ] {
         let mut entries = plan
             .sources
             .iter()
             .filter(|source| is_family(&source.address))
             .map(|source| {
-                Dispatch(
-                    source.address,
-                    Verdict::Goto(Chain::Egress(slots.of(source))),
-                )
+                Element::of(&[Part::Address(source.address)])
+                    .with_verdict(Verdict::Goto(Chain::Egress(slots.of(source))))
             })
             .peekable();
         if entries.peek().is_none() {
@@ -1238,29 +1457,33 @@ fn render_egress_dispatch(
         }
         // Filled once, from the forward chain; the input chain uses the same map.
         if base == Chain::Base(Table::Inet) {
-            elements.fill(map, entries)?;
+            elements.fill(map, entries);
         }
         // Only from a managed bridge: a container's address arriving from anywhere else
         // isn't the container, and its traffic mustn't count against the container (or
         // get it quarantined).
-        writeln!(
-            out,
-            "add rule {base} iifname @{} {family} saddr vmap @{}",
-            NamedSet::InetBridges.name(),
-            map.name()
-        )?;
+        out.rule(
+            base,
+            vec![
+                Expr::lookup(&[Key::Iifname], NamedSet::InetBridges.name()),
+                Expr::Vmap {
+                    key,
+                    map: map.name().into(),
+                },
+            ],
+        );
     }
     // Unknown or spoofed sources of enforced networks; the bridge table already reported
     // them.
     if plan.bridges.iter().any(|bridge| !bridge.monitor) {
-        writeln!(
-            out,
-            "add rule {base} iifname @{} {}",
-            NamedSet::InetEnforcedBridges.name(),
-            options.deny
-        )?;
+        out.rule(
+            base,
+            vec![
+                Expr::lookup(&[Key::Iifname], NamedSet::InetEnforcedBridges.name()),
+                options.deny.expr(),
+            ],
+        );
     }
-    Ok(())
 }
 
 /// Accept related traffic (ICMP errors about a connection) from `address` only when it is
@@ -1268,15 +1491,23 @@ fn render_egress_dispatch(
 /// packet quoted inside it, whoever sends it: anyone could otherwise send ICMP errors, with
 /// data of their choice, to wherever any container has a connection. Other related traffic
 /// continues through the chain's rules.
-fn render_related(out: &mut String, chain: Chain, address: IpAddr) -> fmt::Result {
-    let f = family(address);
-    for direction in ["original", "reply"] {
-        writeln!(
-            out,
-            "add rule {chain} ct state related ct {direction} {f} saddr {address} accept"
-        )?;
+fn render_related(out: &mut Batch, chain: Chain, address: IpAddr) {
+    for reply in [false, true] {
+        out.rule(
+            chain,
+            vec![
+                Expr::cmp(Key::CtState, Value::CtState(CtState::Related)),
+                Expr::cmp(
+                    Key::CtSaddr {
+                        reply,
+                        ipv6: address.is_ipv6(),
+                    },
+                    Value::Address(address),
+                ),
+                ACCEPT,
+            ],
+        );
     }
-    Ok(())
 }
 
 /// DNS queries of containers whose names are limited are held until Portcullis has read the
@@ -1285,65 +1516,88 @@ fn render_related(out: &mut String, chain: Chain, address: IpAddr) -> fmt::Resul
 /// as any other, a denied one is rejected, so the lookup fails at once. The queue has no
 /// bypass: while Portcullis isn't reading it, such lookups fail.
 fn render_dns_names(
-    out: &mut String,
+    out: &mut Batch,
     plan: &Plan,
     options: Options,
     base: Chain,
     elements: &mut Elements,
-) -> fmt::Result {
+) {
     let Some(queue) = options.dns_query_queue else {
-        return Ok(());
+        return;
     };
     let mut limited = plan
         .sources
         .iter()
         .filter(|source| source.address.is_ipv4() && source.domains.is_some())
-        .map(|source| source.address)
+        .map(|source| Element::of(&[Part::Address(source.address)]))
         .peekable();
     if limited.peek().is_some() {
         if base == Chain::Base(Table::Inet) {
-            elements.fill(NamedSet::NameLimited, limited)?;
+            elements.fill(NamedSet::NameLimited, limited);
         }
-        for protocol in ["tcp", "udp"] {
-            writeln!(
-                out,
-                "add rule {base} ip saddr @{} meta l4proto {protocol} th dport {DNS_PORT} ct direction original meta mark != {DNS_ALLOWED_MARK:#x} meta mark != {DNS_DENIED_MARK:#x} queue num {queue}",
-                NamedSet::NameLimited.name()
-            )?;
+        for protocol in [Protocol::Tcp, Protocol::Udp] {
+            out.rule(
+                base,
+                vec![
+                    Expr::lookup(&[Key::IpSaddr], NamedSet::NameLimited.name()),
+                    Expr::cmp(Key::L4proto, Value::Protocol(protocol, false)),
+                    Expr::cmp(Key::ThDport, Value::Range(DNS_PORT, DNS_PORT)),
+                    Expr::cmp(Key::CtDirection, Value::Original),
+                    Expr::not(Key::Mark, Value::Mark(DNS_ALLOWED_MARK)),
+                    Expr::not(Key::Mark, Value::Mark(DNS_DENIED_MARK)),
+                    Expr::Queue {
+                        num: queue,
+                        bypass: false,
+                    },
+                ],
+            );
         }
     }
-    writeln!(
-        out,
-        "add rule {base} meta mark {DNS_DENIED_MARK:#x} meta l4proto tcp reject with tcp reset"
-    )?;
-    writeln!(
-        out,
-        "add rule {base} meta mark {DNS_DENIED_MARK:#x} reject with icmpx admin-prohibited"
-    )?;
-    writeln!(
-        out,
-        "add rule {base} meta mark {DNS_ALLOWED_MARK:#x} meta mark set 0x0"
-    )
+    out.rule(
+        base,
+        vec![
+            Expr::cmp(Key::Mark, Value::Mark(DNS_DENIED_MARK)),
+            Expr::cmp(Key::L4proto, Value::Protocol(Protocol::Tcp, false)),
+            Expr::Reject { tcp_reset: true },
+        ],
+    );
+    out.rule(
+        base,
+        vec![
+            Expr::cmp(Key::Mark, Value::Mark(DNS_DENIED_MARK)),
+            Expr::Reject { tcp_reset: false },
+        ],
+    );
+    out.rule(
+        base,
+        vec![
+            Expr::cmp(Key::Mark, Value::Mark(DNS_ALLOWED_MARK)),
+            Expr::SetMark(0),
+        ],
+    );
 }
 
 /// Create or flush the chains and sets of `plan`, and remove those of `previous` it doesn't
 /// need. Returns what is installed afterwards.
+#[allow(clippy::too_many_arguments)]
 fn render_objects(
-    out: &mut String,
+    out: &mut Batch,
     plan: &Plan,
     options: Options,
     previous: &Installed,
     slots: &Slots,
     previous_host_addresses: &mut HashMap<String, String>,
-) -> Result<Installed, fmt::Error> {
+    declared: &mut Declarations,
+    elements: &mut Elements,
+) -> Installed {
     let mut installed = Installed::default();
     // Written by `render_chain`, if their rules changed. Containers are only managed by
     // their IPv4 address on the bridge; see the IPv6 limitation.
     for source in &plan.sources {
         let slot = slots.of(source);
-        installed.chains.insert(Chain::Egress(slot).to_string());
+        installed.chains.insert(Chain::Egress(slot).object());
         if source.address.is_ipv4() && icc_chain_needed(plan, source, options) {
-            installed.chains.insert(Chain::Icc(slot).to_string());
+            installed.chains.insert(Chain::Icc(slot).object());
         }
     }
     let limited = (!plan.bridges.is_empty())
@@ -1357,34 +1611,31 @@ fn render_objects(
         .flatten()
         .map(|monitor| Chain::ArpCheck { monitor });
     for chain in limited.chain(arp_checks) {
-        writeln!(out, "add chain {chain}")?;
-        writeln!(out, "flush chain {chain}")?;
-        installed.chains.insert(chain.to_string());
+        declared.declare(out, Declaration::Chain(chain));
+        installed.chains.insert(chain.object());
     }
-    for limit in limits(plan, options).into_keys() {
-        let name = format!("{} {}", Table::Bridge, limit.set_name());
-        let flags = if limit.rate {
-            "dynamic,timeout; timeout 60s"
-        } else {
-            "dynamic"
-        };
-        writeln!(
-            out,
-            "add set {name} {{ type ifname; flags {flags}; size 65536; }}"
-        )?;
-        installed.sets.insert(name);
+    let limits = limits(plan, options);
+    for limit in limits.keys() {
+        let decl = limit.set();
+        installed.sets.insert(Object {
+            table: decl.table,
+            name: decl.name.to_string(),
+        });
+        declared.declare(out, Declaration::Set(decl));
     }
-    for (limit, ports) in limits(plan, options) {
-        // Kept in `installed`.
-        let name = format!("{} {}", Table::Bridge, limit.ports_name());
-        writeln!(out, "add set {name} {{ type ifname; }}")?;
-        writeln!(out, "flush set {name}")?;
-        render_added(
-            out,
-            format_args!("add set {name} {{ type ifname"),
-            ports.into_iter().map(Quoted),
-        )?;
-        installed.sets.insert(name);
+    for (limit, ports) in limits {
+        let decl = limit.ports();
+        installed.sets.insert(Object {
+            table: decl.table,
+            name: decl.name.to_string(),
+        });
+        declared.declare(out, Declaration::Set(decl));
+        elements.fill(
+            ElementSet::Ports(limit),
+            ports
+                .into_iter()
+                .map(|port| Element::of(&[Part::Ifname(port)])),
+        );
     }
     let mut listed = String::new();
     for set in &plan.host_sets {
@@ -1395,13 +1646,13 @@ fn render_objects(
             listed: &mut listed,
         };
         if set.used_v4 {
-            host_set.render(out, set, SET_PREFIX_V4, "ipv4_addr", || set.v4())?;
+            host_set.render(out, set, SET_PREFIX_V4, || set.v4());
         }
         if set.used_v6 {
-            host_set.render(out, set, SET_PREFIX_V6, "ipv6_addr", || set.v6())?;
+            host_set.render(out, set, SET_PREFIX_V6, || set.v6());
         }
     }
-    Ok(installed)
+    installed
 }
 
 /// Whether `source` needs its own ICC chain: anything beyond "allow everything" without
@@ -1412,13 +1663,6 @@ fn icc_chain_needed(plan: &Plan, source: &Source, options: Options) -> bool {
             .icc_rules(source)
             .iter()
             .any(|rule| !matches!(rule, Rule::AcceptHost(_) | Rule::AcceptNet(_)))
-}
-
-fn render_base_chain(out: &mut String, chain: Chain, hook: &str) -> fmt::Result {
-    writeln!(
-        out,
-        "add chain {chain} {{ type filter hook {hook} priority {HOOK_PRIORITY}; policy accept; }}"
-    )
 }
 
 /// Bridge base chain: only frames entering a managed network's bridge are checked. A frame
@@ -1435,21 +1679,27 @@ fn render_base_chain(out: &mut String, chain: Chain, hook: &str) -> fmt::Result 
 /// kernel could unwrap a VLAN tag (even VLAN ID 0) past every check here, and Portcullis
 /// doesn't manage IPv6.
 fn render_bridge_dispatch(
-    out: &mut String,
+    out: &mut Batch,
     plan: &Plan,
     options: Options,
     slots: &Slots,
     elements: &mut Elements,
-) -> fmt::Result {
+) {
     let base = Chain::Base(Table::Bridge);
-    writeln!(
-        out,
-        "add rule {base} meta ibrname != @{} accept",
-        NamedSet::BridgeBridges.name()
-    )?;
-    render_limits(out, plan, options)?;
-    render_arp_check(out, plan, options)?;
-    render_known_sources(out, plan, options, base, slots, elements)?;
+    out.rule(
+        base,
+        vec![
+            Expr::Lookup {
+                key: &[Key::Ibrname],
+                set: NamedSet::BridgeBridges.name().into(),
+                negate: true,
+            },
+            ACCEPT,
+        ],
+    );
+    render_limits(out, plan, options);
+    render_arp_check(out, plan, options);
+    render_known_sources(out, plan, options, base, slots, elements);
     for monitor in [true, false] {
         if !plan.bridges.iter().any(|bridge| bridge.monitor == monitor) {
             continue;
@@ -1459,9 +1709,8 @@ fn render_bridge_dispatch(
         } else {
             options.source_queue
         };
-        render_unknown_sources(out, plan, options, monitor, queue, elements)?;
+        render_unknown_sources(out, plan, options, monitor, queue, elements);
     }
-    Ok(())
 }
 
 /// ARP of a container is accepted by who it says it is (see `render_known_sources`); what
@@ -1470,18 +1719,42 @@ fn render_bridge_dispatch(
 /// data after the ARP body, would reach containers ARP goes to whatever their ICC rules
 /// say. Denied as a frame enforced networks don't carry. Checked in a chain of its own,
 /// which other frames skip with one rule.
-fn render_arp_check(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
-    const MALFORMED: [&str; 8] = [
-        "arp htype != 1",
-        "arp ptype != ip",
-        "arp hlen != 6",
-        "arp plen != 4",
-        "arp operation != 1-2",
-        "meta length != 28 meta length != 46",
-        // The padding, 18 bytes after the body, in two parts: a comparison takes at most 16.
-        "meta length 46 @nh,224,128 != 0",
-        "meta length 46 @nh,352,16 != 0",
-    ];
+fn render_arp_check(out: &mut Batch, plan: &Plan, options: Options) {
+    let malformed = || {
+        [
+            vec![Expr::not(Key::ArpHtype, Value::Number(1))],
+            vec![Expr::not(Key::ArpPtype, Value::EtherIp)],
+            vec![Expr::not(Key::ArpHlen, Value::Number(6))],
+            vec![Expr::not(Key::ArpPlen, Value::Number(4))],
+            vec![Expr::not(Key::ArpOperation, Value::Range(1, 2))],
+            vec![
+                Expr::not(Key::Length, Value::Number(28)),
+                Expr::not(Key::Length, Value::Number(46)),
+            ],
+            // The padding, 18 bytes after the body, in two parts: a comparison takes at
+            // most 16.
+            vec![
+                Expr::cmp(Key::Length, Value::Number(46)),
+                Expr::not(
+                    Key::Raw {
+                        offset: 224,
+                        bits: 128,
+                    },
+                    Value::Number(0),
+                ),
+            ],
+            vec![
+                Expr::cmp(Key::Length, Value::Number(46)),
+                Expr::not(
+                    Key::Raw {
+                        offset: 352,
+                        bits: 16,
+                    },
+                    Value::Number(0),
+                ),
+            ],
+        ]
+    };
     let base = Chain::Base(Table::Bridge);
     for (monitor, bridges) in [
         (false, NamedSet::EnforcedBridges),
@@ -1491,40 +1764,42 @@ fn render_arp_check(out: &mut String, plan: &Plan, options: Options) -> fmt::Res
             continue;
         }
         let chain = Chain::ArpCheck { monitor };
-        writeln!(
-            out,
-            "add rule {base} meta ibrname @{} ether type arp jump {}",
-            bridges.name(),
-            ChainName(chain)
-        )?;
-        for malformed in MALFORMED {
+        out.rule(
+            base,
+            vec![
+                Expr::lookup(&[Key::Ibrname], bridges.name()),
+                Expr::cmp(Key::EtherType, Value::EtherArp),
+                Expr::Verdict(Verdict::Jump(chain)),
+            ],
+        );
+        for malformed in malformed() {
             decide(
                 out,
-                format_args!("add rule {chain} {malformed}"),
+                chain,
+                malformed,
                 Outcome::deny(options, monitor, "frame").for_frame(),
-            )?;
+            );
         }
     }
-    Ok(())
 }
 
 /// Frames entering `bridges` (all enforced, or all in monitor mode) that no rule above
 /// accepted: their source isn't a managed container's own address, MAC and port.
 fn render_unknown_sources(
-    out: &mut String,
+    out: &mut Batch,
     plan: &Plan,
     options: Options,
     monitor: bool,
     queue: Option<u16>,
     elements: &mut Elements,
-) -> fmt::Result {
+) {
     let base = Chain::Base(Table::Bridge);
     let (bridges, ports) = if monitor {
         (NamedSet::MonitoredBridges, NamedSet::MonitoredPorts)
     } else {
         (NamedSet::EnforcedBridges, NamedSet::EnforcedPorts)
     };
-    let bridges = bridges.name();
+    let on_bridges = || Expr::lookup(&[Key::Ibrname], bridges.name());
     if queue.is_some() {
         // Held before, and the source stayed unknown: Portcullis didn't know the sender in
         // time, whatever port it came from by now, so it isn't taken for spoofing.
@@ -1532,9 +1807,12 @@ fn render_unknown_sources(
             out,
             options,
             monitor,
-            format_args!("meta ibrname @{bridges} meta mark {HOLD_EXPIRED_MARK:#x}"),
+            &[
+                on_bridges(),
+                Expr::cmp(Key::Mark, Value::Mark(HOLD_EXPIRED_MARK)),
+            ],
             "source:held",
-        )?;
+        );
     }
     // From a managed container's port, but not with its own address and MAC: denied at once.
     let networks: BTreeSet<&str> = plan
@@ -1548,17 +1826,17 @@ fn render_unknown_sources(
         .iter()
         .filter(|source| networks.contains(source.network.as_str()))
         .filter_map(|source| source.port.known())
-        .map(|port| Quoted(&port.name))
+        .map(|port| Element::of(&[Part::Ifname(&port.name)]))
         .peekable();
     if known.peek().is_some() {
-        elements.fill(ports, known)?;
+        elements.fill(ports, known);
         render_denied_frames(
             out,
             options,
             monitor,
-            format_args!("meta ibrname @{bridges} iifname @{}", ports.name()),
+            &[on_bridges(), Expr::lookup(&[Key::Iifname], ports.name())],
             "source",
-        )?;
+        );
     }
     if let Some(queue) = queue {
         // A port no managed container has (yet): most likely a container that just started,
@@ -1566,67 +1844,68 @@ fn render_unknown_sources(
         // for. Hold the packet until Portcullis knows the container; if the source stays
         // unknown, it is denied (or in monitor mode reported) above once the hold expires.
         // In monitor mode the queue fails open.
-        for ether_type in ["ip", "arp"] {
-            writeln!(
-                out,
-                "add rule {base} meta ibrname @{bridges} ether type {ether_type} queue num {queue}{}",
-                if monitor { " bypass" } else { "" }
-            )?;
+        for ether_type in [Value::EtherIp, Value::EtherArp] {
+            out.rule(
+                base,
+                vec![
+                    on_bridges(),
+                    Expr::cmp(Key::EtherType, ether_type),
+                    Expr::Queue {
+                        num: queue,
+                        bypass: monitor,
+                    },
+                ],
+            );
         }
     }
-    render_denied_frames(
-        out,
-        options,
-        monitor,
-        format_args!("meta ibrname @{bridges}"),
-        "source",
-    )
+    render_denied_frames(out, options, monitor, &[on_bridges()], "source");
 }
 
-/// The set of quarantined containers' bridge ports, refilled on every update.
+/// The set of quarantined containers' bridge ports.
 const QUARANTINED_SET: &str = "quarantined";
 
-fn render_quarantined_set(out: &mut String, plan: &Plan) -> fmt::Result {
-    let name = fmt::from_fn(|f| write!(f, "{} {QUARANTINED_SET}", Table::Bridge));
-    writeln!(out, "add set {name} {{ type ifname; }}")?;
-    writeln!(out, "flush set {name}")?;
-    render_added(
-        out,
-        format_args!("add set {name} {{ type ifname"),
-        plan.sources
-            .iter()
-            .filter(|source| source.quarantined && !source.monitor)
-            .filter_map(|source| source.port.known())
-            .map(|port| port.name.as_str())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(Quoted),
-    )
-}
-
 /// A limit shared by some containers: open connections or new connections per second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Limit {
     rate: bool,
     value: u32,
     monitor: bool,
 }
 
+/// Room in the sets that count connections, by port.
+const LIMIT_SET_SIZE: u32 = 65_536;
+/// How long a port's count of new connections lasts.
+const RATE_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl Limit {
+    /// The name of the set counting each port's connections, or new connections, under this
+    /// limit.
+    fn set_name(self) -> String {
+        let kind = if self.rate { "new" } else { "conns" };
+        format!("{kind}{}", self.value)
+    }
+
     /// The set counting each port's connections, or new connections, under this limit.
-    fn set_name(self) -> impl fmt::Display {
-        fmt::from_fn(move |f| {
-            let kind = if self.rate { "new" } else { "conns" };
-            write!(f, "{kind}{}", self.value)
-        })
+    fn set(self) -> SetDecl {
+        SetDecl {
+            name: self.set_name().into(),
+            flags: SetFlags {
+                dynamic: true,
+                timeout: self.rate,
+            },
+            timeout: self.rate.then_some(RATE_TIMEOUT),
+            size: Some(LIMIT_SET_SIZE),
+            ..SetDecl::set(Table::Bridge, "", &[KeyType::Ifname])
+        }
     }
 
     /// The set of the ports under this limit.
-    fn ports_name(self) -> impl fmt::Display {
-        fmt::from_fn(move |f| {
-            let monitor = if self.monitor { "_monitor" } else { "" };
-            write!(f, "ports_{}{monitor}", self.set_name())
-        })
+    fn ports(self) -> SetDecl {
+        let monitor = if self.monitor { "_monitor" } else { "" };
+        SetDecl {
+            name: format!("ports_{}{monitor}", self.set_name()).into(),
+            ..SetDecl::set(Table::Bridge, "", &[KeyType::Ifname])
+        }
     }
 }
 
@@ -1663,36 +1942,39 @@ fn limits(plan: &Plan, options: Options) -> BTreeMap<Limit, BTreeSet<&str>> {
 /// tracking table, which every container shares, and new connections of all of them would
 /// fail. Both are matched by bridge port, which a container can't borrow, before its
 /// address is checked.
-fn render_limits(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+fn render_limits(out: &mut Batch, plan: &Plan, options: Options) {
     let base = Chain::Base(Table::Bridge);
-    writeln!(out, "add rule {base} iifname @{QUARANTINED_SET} drop")?;
-    writeln!(
-        out,
-        "add rule {} iifname @{QUARANTINED_SET} drop",
-        Chain::BridgeInput
-    )?;
+    for chain in [base, Chain::BridgeInput] {
+        out.rule(
+            chain,
+            vec![
+                Expr::lookup(&[Key::Iifname], QUARANTINED_SET),
+                Expr::Verdict(Verdict::Drop),
+            ],
+        );
+    }
     for limit in limits(plan, options).into_keys() {
-        let check = fmt::from_fn(|f| {
-            if limit.rate {
-                write!(
-                    f,
-                    "limit rate over {0}/second burst {0} packets",
-                    limit.value
-                )
-            } else {
-                write!(f, "ct count over {}", limit.value)
-            }
-        });
-        writeln!(
-            out,
-            "add rule {base} iifname @{} ct state new add @{} {{ iifname {check} }} goto {}",
-            limit.ports_name(),
-            limit.set_name(),
-            ChainName(Chain::Limited {
-                rate: limit.rate,
-                monitor: limit.monitor
-            })
-        )?;
+        let stateful = if limit.rate {
+            Stateful::RateOver(limit.value)
+        } else {
+            Stateful::CtCountOver(limit.value)
+        };
+        out.rule(
+            base,
+            vec![
+                Expr::lookup(&[Key::Iifname], limit.ports().name),
+                Expr::cmp(Key::CtState, Value::CtState(CtState::New)),
+                Expr::AddToSet {
+                    key: &[Key::Iifname],
+                    set: limit.set_name().into(),
+                    stateful: Some(stateful),
+                },
+                Expr::Verdict(Verdict::Goto(Chain::Limited {
+                    rate: limit.rate,
+                    monitor: limit.monitor,
+                })),
+            ],
+        );
     }
     for rate in [false, true] {
         for monitor in [false, true] {
@@ -1700,12 +1982,12 @@ fn render_limits(out: &mut String, plan: &Plan, options: Options) -> fmt::Result
             let reason = if rate { "limit:rate" } else { "limit:open" };
             decide(
                 out,
-                format_args!("add rule {chain}"),
+                chain,
+                Vec::new(),
                 Outcome::deny(options, monitor, reason).dropped(),
-            )?;
+            );
         }
     }
-    Ok(())
 }
 
 /// Frames to the link-local group addresses (01:80:c2:00:00:00 to 0f, used by protocols
@@ -1715,7 +1997,7 @@ fn render_limits(out: &mut String, plan: &Plan, options: Options) -> fmt::Result
 /// likes. No container has a reason to send them; they are denied where the bridge hands
 /// them over. LLDP (and STP, where enabled) skips even that hook, see
 /// `render_link_local_ip`.
-fn render_link_local(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+fn render_link_local(out: &mut Batch, plan: &Plan, options: Options) {
     for (monitor, bridges) in [
         (false, NamedSet::EnforcedBridges),
         (true, NamedSet::MonitoredBridges),
@@ -1725,15 +2007,14 @@ fn render_link_local(out: &mut String, plan: &Plan, options: Options) -> fmt::Re
         }
         decide(
             out,
-            format_args!(
-                "add rule {} meta ibrname @{} {LINK_LOCAL_GROUP}",
-                Chain::BridgeInput,
-                bridges.name()
-            ),
+            Chain::BridgeInput,
+            vec![
+                Expr::lookup(&[Key::Ibrname], bridges.name()),
+                link_local_group(),
+            ],
             Outcome::deny(options, monitor, "frame").for_frame(),
-        )?;
+        );
     }
-    Ok(())
 }
 
 /// A bridge passes a frame to whichever port has its destination MAC, whatever its IP
@@ -1742,85 +2023,91 @@ fn render_link_local(out: &mut String, plan: &Plan, options: Options) -> fmt::Re
 /// container would accept it. IPv4 passed from one container to another must therefore be
 /// addressed to the network itself, or be broadcast or multicast (which the ICC rules
 /// check). The bridge's forward hook can only drop.
-fn render_bridged_destinations(out: &mut String, plan: &Plan, options: Options) -> fmt::Result {
+fn render_bridged_destinations(out: &mut Batch, plan: &Plan, options: Options) {
     let chain = Chain::BridgeForward;
     for bridge in plan
         .bridges
         .iter()
         .filter(|bridge| bridge.subnet.addr().is_ipv4())
     {
-        let name = Quoted(&bridge.name);
+        let name = || Expr::cmp(Key::Ibrname, Value::Ifname(bridge.name.clone().into()));
         for destination in std::iter::once(&bridge.subnet).chain(&ICC_BROADCAST_V4) {
-            writeln!(
-                out,
-                "add rule {chain} meta ibrname {name} ip daddr {destination} accept"
-            )?;
+            out.rule(
+                chain,
+                vec![
+                    name(),
+                    Expr::cmp(Key::IpDaddr, Value::Network(*destination)),
+                    ACCEPT,
+                ],
+            );
         }
         decide(
             out,
-            format_args!("add rule {chain} meta ibrname {name} ether type ip"),
+            chain,
+            vec![name(), Expr::cmp(Key::EtherType, Value::EtherIp)],
             Outcome::deny(options, bridge.monitor, "icc").dropped(),
-        )?;
+        );
     }
-    Ok(())
 }
 
 /// The link-local group addresses: 01:80:c2:00:00:00 to 01:80:c2:00:00:0f.
-const LINK_LOCAL_GROUP: &str = "ether daddr & ff:ff:ff:ff:ff:f0 == 01:80:c2:00:00:00";
+fn link_local_group() -> Expr {
+    Expr::Masked {
+        key: Key::EtherDaddr,
+        mask: Value::Mac(MacAddress::from([0xff, 0xff, 0xff, 0xff, 0xff, 0xf0])),
+        value: Value::Mac(MacAddress::from([0x01, 0x80, 0xc2, 0, 0, 0])),
+    }
+}
 
 /// IP in frames to link-local group addresses that the bridge passed to the host without any
 /// bridge hook (LLDP, and STP where enabled). Nothing legitimate sends IP that way, from
 /// anywhere, so it is denied on every interface. Reported as denied while any network is
 /// enforced, as would-be-denied while all are monitored.
-fn render_link_local_ip(
-    out: &mut String,
-    plan: &Plan,
-    options: Options,
-    base: Chain,
-) -> fmt::Result {
+fn render_link_local_ip(out: &mut Batch, plan: &Plan, options: Options, base: Chain) {
     if plan.bridges.is_empty() {
-        return Ok(());
+        return;
     }
     let monitor = plan.bridges.iter().all(|bridge| bridge.monitor);
-    for (family, key) in [("ipv4", LogKey::Ipv4), ("ipv6", LogKey::Ipv6)] {
+    for (ipv6, key) in [(false, LogKey::Ipv4), (true, LogKey::Ipv6)] {
         let mut outcome = Outcome::deny(options, monitor, "frame").dropped();
         outcome.key = key;
         decide(
             out,
-            format_args!("add rule {base} meta nfproto {family} {LINK_LOCAL_GROUP}"),
+            base,
+            vec![
+                Expr::cmp(Key::Nfproto, Value::NfProto(ipv6)),
+                link_local_group(),
+            ],
             outcome,
-        )?;
+        );
     }
-    Ok(())
 }
 
 /// Deny (or in monitor mode, report) frames of the bridge base chain matching `selector`:
 /// IPv4 and ARP as using a source that isn't the sender's (reported with `reason`), anything
 /// else as a frame enforced networks don't carry.
 fn render_denied_frames(
-    out: &mut String,
+    out: &mut Batch,
     options: Options,
     monitor: bool,
-    selector: fmt::Arguments<'_>,
+    selector: &[Expr],
     reason: &'static str,
-) -> fmt::Result {
+) {
     let base = Chain::Base(Table::Bridge);
     let source = Outcome::deny(options, monitor, reason).dropped();
+    let with = |ether_type| {
+        let mut head = selector.to_vec();
+        head.push(Expr::cmp(Key::EtherType, ether_type));
+        head
+    };
+    decide(out, base, with(Value::EtherIp), source);
+    decide(out, base, with(Value::EtherArp), source.for_arp());
     decide(
         out,
-        format_args!("add rule {base} {selector} ether type ip"),
-        source,
-    )?;
-    decide(
-        out,
-        format_args!("add rule {base} {selector} ether type arp"),
-        source.for_arp(),
-    )?;
-    decide(
-        out,
-        format_args!("add rule {base} {selector}"),
+        base,
+        selector.to_vec(),
         Outcome::deny(options, monitor, "frame").for_frame(),
-    )
+    );
 }
 
 /// How a managed container's frames are recognised: by port, MAC and address where its port
@@ -1850,13 +2137,13 @@ impl<'a> SourceKey<'a> {
 /// Send frames from managed containers' own port, MAC and address to their ICC rules, and
 /// accept their ARP.
 fn render_known_sources(
-    out: &mut String,
+    out: &mut Batch,
     plan: &Plan,
     options: Options,
     base: Chain,
     slots: &Slots,
     elements: &mut Elements,
-) -> fmt::Result {
+) {
     let verdict = |source: &Source| {
         if icc_chain_needed(plan, source, options) {
             Verdict::Goto(Chain::Icc(slots.of(source)))
@@ -1876,41 +2163,54 @@ fn render_known_sources(
         out,
         elements,
         base,
-        "iifname . ip saddr . ether saddr",
+        &[Key::Iifname, Key::IpSaddr, Key::EtherSaddr],
         NamedSet::SourcesByPort,
         keys().filter_map(|(source, key)| match key {
-            SourceKey::Port(port, mac, address) => Some(Dispatch(
-                fmt::from_fn(move |f| write!(f, "{} . {address} . {mac}", Quoted(port))),
-                verdict(source),
-            )),
+            SourceKey::Port(port, mac, address) => Some(
+                Element::of(&[Part::Ifname(port), Part::Address(address), Part::Mac(mac)])
+                    .with_verdict(verdict(source)),
+            ),
             _ => None,
         }),
-    )?;
+    );
     render_dispatch(
         out,
         elements,
         base,
-        "ip saddr . ether saddr",
+        &[Key::IpSaddr, Key::EtherSaddr],
         NamedSet::SourcesByMac,
         keys().filter_map(|(source, key)| match key {
-            SourceKey::Mac(mac, address) => Some(Dispatch(
-                fmt::from_fn(move |f| write!(f, "{address} . {mac}")),
-                verdict(source),
-            )),
+            SourceKey::Mac(mac, address) => Some(
+                Element::of(&[Part::Address(address), Part::Mac(mac)])
+                    .with_verdict(verdict(source)),
+            ),
             _ => None,
         }),
-    )?;
+    );
     render_dispatch(
         out,
         elements,
         base,
-        "ip saddr",
+        &[Key::IpSaddr],
         NamedSet::SourcesByAddress,
         keys().filter_map(|(source, key)| match key {
-            SourceKey::Address(address) => Some(Dispatch(address, verdict(source))),
+            SourceKey::Address(address) => {
+                Some(Element::of(&[Part::Address(address)]).with_verdict(verdict(source)))
+            }
             _ => None,
         }),
-    )?;
+    );
+    render_known_arp(out, plan, base, elements);
+}
+
+/// Accept ARP of managed containers announcing themselves.
+fn render_known_arp(out: &mut Batch, plan: &Plan, base: Chain, elements: &mut Elements) {
+    let keys = || {
+        plan.sources
+            .iter()
+            .filter(|source| source.address.is_ipv4())
+            .filter_map(SourceKey::of)
+    };
     // ARP may only announce the container's own address and MAC, or no address at all
     // (0.0.0.0, a probe for whether an address is in use).
     let unspecified = IpAddr::from([0, 0, 0, 0]);
@@ -1918,68 +2218,84 @@ fn render_known_sources(
         out,
         elements,
         base,
-        "iifname . ether saddr . arp saddr ether . arp saddr ip",
+        &[
+            Key::Iifname,
+            Key::EtherSaddr,
+            Key::ArpSaddrEther,
+            Key::ArpSaddrIp,
+        ],
         NamedSet::ArpByPort,
         keys()
-            .flat_map(|(_, key)| match key {
+            .flat_map(|key| match key {
                 SourceKey::Port(port, mac, address) => [address, unspecified].map(|address| {
-                    Some(fmt::from_fn(move |f| {
-                        write!(f, "{} . {mac} . {mac} . {address}", Quoted(port))
-                    }))
+                    Some(Element::of(&[
+                        Part::Ifname(port),
+                        Part::Mac(mac),
+                        Part::Mac(mac),
+                        Part::Address(address),
+                    ]))
                 }),
                 _ => [None, None],
             })
             .flatten(),
-    )?;
+    );
     render_dispatch(
         out,
         elements,
         base,
-        "ether saddr . arp saddr ether . arp saddr ip",
+        &[Key::EtherSaddr, Key::ArpSaddrEther, Key::ArpSaddrIp],
         NamedSet::ArpByMac,
         keys()
-            .flat_map(|(_, key)| match key {
+            .flat_map(|key| match key {
                 SourceKey::Mac(mac, address) => [address, unspecified].map(|address| {
-                    Some(fmt::from_fn(move |f| {
-                        write!(f, "{mac} . {mac} . {address}")
-                    }))
+                    Some(Element::of(&[
+                        Part::Mac(mac),
+                        Part::Mac(mac),
+                        Part::Address(address),
+                    ]))
                 }),
                 _ => [None, None],
             })
             .flatten(),
-    )?;
+    );
     render_dispatch(
         out,
         elements,
         base,
-        "arp saddr ip",
+        &[Key::ArpSaddrIp],
         NamedSet::ArpByAddress,
-        keys().filter_map(|(_, key)| match key {
-            SourceKey::Address(address) => Some(address),
+        keys().filter_map(|key| match key {
+            SourceKey::Address(address) => Some(Element::of(&[Part::Address(address)])),
             _ => None,
         }),
-    )
+    );
 }
 
 /// Fill `set` with `elements` and match `key` against it in `chain`: through it, for a
 /// verdict map, or accepting what it holds. Nothing is matched without elements.
-fn render_dispatch<T: fmt::Display>(
-    out: &mut String,
+fn render_dispatch(
+    out: &mut Batch,
     elements_of: &mut Elements,
     chain: Chain,
-    key: &str,
+    key: &'static [Key],
     set: NamedSet,
-    elements: impl Iterator<Item = T>,
-) -> fmt::Result {
+    elements: impl Iterator<Item = Element>,
+) {
     let mut elements = elements.peekable();
     if elements.peek().is_none() {
-        return Ok(());
+        return;
     }
-    elements_of.fill(set, elements)?;
+    elements_of.fill(set, elements);
     if set.is_map() {
-        writeln!(out, "add rule {chain} {key} vmap @{}", set.name())
+        out.rule(
+            chain,
+            vec![Expr::Vmap {
+                key,
+                map: set.name().into(),
+            }],
+        );
     } else {
-        writeln!(out, "add rule {chain} {key} @{} accept", set.name())
+        out.rule(chain, vec![Expr::lookup(key, set.name()), ACCEPT]);
     }
 }
 
@@ -1988,9 +2304,9 @@ fn render_dispatch<T: fmt::Display>(
 /// along with its rule, and while the kernel commits the update, lookups in it can miss.
 /// That briefly lets packets through checks, or denies established connections as from an
 /// unknown source. A named set lives on: an update deletes the elements it doesn't hold
-/// anymore and adds the new ones, which lookups of the others don't notice. Sets of ranges (`flags interval`) can miss as well, so rules
-/// match ranges one prefix at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// anymore and adds the new ones, which lookups of the others don't notice. Sets of ranges
+/// (`flags interval`) can miss as well, so rules match ranges one prefix at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum NamedSet {
     /// Bridges of managed networks, for the inet table.
     InetBridges,
@@ -2073,7 +2389,7 @@ impl NamedSet {
     }
 
     /// The type of its elements, or keys.
-    const fn key_type(self) -> &'static str {
+    const fn key_type(self) -> &'static [KeyType] {
         match self {
             Self::InetBridges
             | Self::InetEnforcedBridges
@@ -2081,15 +2397,20 @@ impl NamedSet {
             | Self::MonitoredBridges
             | Self::EnforcedBridges
             | Self::MonitoredPorts
-            | Self::EnforcedPorts => "ifname",
+            | Self::EnforcedPorts => &[KeyType::Ifname],
             Self::Egress4 | Self::NameLimited | Self::SourcesByAddress | Self::ArpByAddress => {
-                "ipv4_addr"
+                &[KeyType::Ipv4]
             }
-            Self::Egress6 => "ipv6_addr",
-            Self::SourcesByPort => "ifname . ipv4_addr . ether_addr",
-            Self::SourcesByMac => "ipv4_addr . ether_addr",
-            Self::ArpByPort => "ifname . ether_addr . ether_addr . ipv4_addr",
-            Self::ArpByMac => "ether_addr . ether_addr . ipv4_addr",
+            Self::Egress6 => &[KeyType::Ipv6],
+            Self::SourcesByPort => &[KeyType::Ifname, KeyType::Ipv4, KeyType::Ether],
+            Self::SourcesByMac => &[KeyType::Ipv4, KeyType::Ether],
+            Self::ArpByPort => &[
+                KeyType::Ifname,
+                KeyType::Ether,
+                KeyType::Ether,
+                KeyType::Ipv4,
+            ],
+            Self::ArpByMac => &[KeyType::Ether, KeyType::Ether, KeyType::Ipv4],
         }
     }
 
@@ -2104,74 +2425,18 @@ impl NamedSet {
         )
     }
 
-    const fn kind(self) -> &'static str {
-        if self.is_map() { "map" } else { "set" }
-    }
-
-    /// `add <kind> <table> <name> { type <type>`, without the closing brace.
-    fn declaration(self) -> impl fmt::Display {
-        fmt::from_fn(move |f| {
-            let value = if self.is_map() { " : verdict" } else { "" };
-            write!(
-                f,
-                "add {} {} {} {{ type {}{value}",
-                self.kind(),
-                self.table(),
-                self.name(),
-                self.key_type()
-            )
-        })
-    }
-
-    /// Create the set if needed.
-    fn render_declaration(self, out: &mut String) -> fmt::Result {
-        writeln!(out, "{}; }}", self.declaration())
+    fn declaration(self) -> SetDecl {
+        let mut decl = SetDecl::set(self.table(), self.name(), self.key_type());
+        decl.map = self.is_map();
+        decl
     }
 }
 
-/// Write `{head} { e1, e2, ... }{tail}` and a newline; writes nothing without elements.
-fn render_elements<T: fmt::Display>(
-    out: &mut String,
-    head: fmt::Arguments<'_>,
-    elements: impl Iterator<Item = T>,
-    tail: impl fmt::Display,
-) -> fmt::Result {
-    let mut elements = elements.peekable();
-    if elements.peek().is_none() {
-        return Ok(());
+/// Add elements to a set, if there are any.
+fn render_added(out: &mut Batch, decl: SetDecl, elements: Vec<Element>) {
+    if !elements.is_empty() {
+        out.push(Command::AddElements(decl, elements));
     }
-    write!(out, "{head} {{ ")?;
-    for (index, element) in elements.enumerate() {
-        if index > 0 {
-            out.push_str(", ");
-        }
-        write!(out, "{element}")?;
-    }
-    writeln!(out, " }}{tail}")?;
-    Ok(())
-}
-
-/// Add elements to a set: `{declaration}; elements = { e1, e2, ... }; }` and a newline,
-/// where `declaration` is the set's `add set ... { type ...` as it was created, without the
-/// closing brace. Writes nothing without elements.
-///
-/// Elements are never added with `add element`, nor deleted with `delete element`: before
-/// either, libnftables loads the elements of every set with `flags interval` in the
-/// kernel, in every table, its own or not. Another firewall's large sets of ranges (block
-/// lists, country lists) then cost tens of megabytes and a good part of a second per
-/// update. Declaring the set again with its elements doesn't. A set that loses elements is
-/// flushed and filled again, in the same transaction, so lookups see it before or after.
-fn render_added<T: fmt::Display>(
-    out: &mut String,
-    declaration: impl fmt::Display,
-    elements: impl Iterator<Item = T>,
-) -> fmt::Result {
-    render_elements(
-        out,
-        format_args!("{declaration}; elements ="),
-        elements,
-        "; }",
-    )
 }
 
 /// Writes the hostname sets of an update.
@@ -2199,54 +2464,72 @@ impl HostSetUpdate<'_> {
     /// have left already.
     fn render<I>(
         &mut self,
-        out: &mut String,
+        out: &mut Batch,
         set: &HostSet,
         prefix: &'static str,
-        type_name: &str,
         addresses: impl Fn() -> I,
-    ) -> fmt::Result
-    where
+    ) where
         I: Iterator<Item = (IpAddr, Duration)>,
     {
-        let name = format!("{} {}", Table::Inet, set.id.name(prefix));
+        let name = set.id.name(prefix).to_string();
+        let object = Object {
+            table: Table::Inet,
+            name: name.clone(),
+        };
         self.listed.clear();
         for (address, _) in addresses() {
-            write!(self.listed, "{address} ")?;
+            let _ = write!(self.listed, "{address} ");
         }
         let listed = match self.previous_addresses.remove(&name) {
-            Some(written) if written == *self.listed && self.previous.sets.contains(&name) => {
+            Some(written) if written == *self.listed && self.previous.sets.contains(&object) => {
                 written
             }
             _ => {
                 // Bounded in the kernel too: addresses are added from DNS answers between
                 // updates.
-                let declaration = format_args!(
-                    "add set {name} {{ type {type_name}; flags timeout; size {HOST_SET_SIZE}"
-                );
-                writeln!(out, "{declaration}; }}")?;
-                let timed = || addresses().map(|(address, timeout)| Timed(address, timeout));
-                if self.previous.kept && self.previous.sets.contains(&name) {
+                let decl = SetDecl {
+                    name: Cow::Owned(name.clone()),
+                    flags: SetFlags {
+                        dynamic: false,
+                        timeout: true,
+                    },
+                    size: Some(HOST_SET_SIZE),
+                    ..SetDecl::set(
+                        Table::Inet,
+                        "",
+                        if prefix == SET_PREFIX_V6 {
+                            &[KeyType::Ipv6]
+                        } else {
+                            &[KeyType::Ipv4]
+                        },
+                    )
+                };
+                out.push(Command::AddSet(decl.clone()));
+                let timed = || {
+                    addresses()
+                        .map(|(address, timeout)| {
+                            Element::of(&[Part::Address(address)]).with_timeout(timeout)
+                        })
+                        .collect()
+                };
+                if self.previous.kept && self.previous.sets.contains(&object) {
                     // Adding doesn't renew the addresses the set holds already: that's done
                     // once the update is in place.
-                    render_added(out, declaration, timed())?;
+                    render_added(out, decl, timed());
                     self.installed.renewals.push(Renewal {
-                        set: set.id.name(prefix).to_string(),
+                        set: name.clone(),
                         ipv6: prefix == SET_PREFIX_V6,
                         addresses: addresses().collect(),
                     });
                 } else {
-                    writeln!(out, "flush set {name}")?;
-                    render_added(out, declaration, timed())?;
+                    out.push(Command::FlushSet(decl.clone()));
+                    render_added(out, decl, timed());
                 }
                 self.listed.clone()
             }
         };
-        self.installed
-            .written
-            .host_addresses
-            .insert(name.clone(), listed);
-        self.installed.sets.insert(name);
-        Ok(())
+        self.installed.written.host_addresses.insert(name, listed);
+        self.installed.sets.insert(object);
     }
 }
 
@@ -2262,78 +2545,57 @@ impl HostSetUpdate<'_> {
 /// The firewall sends this as a netlink batch (see [`super::elements`]), not as a script;
 /// tests record it as the script that does the same.
 #[cfg(test)]
-fn render_timeouts<I>(
-    out: &mut String,
-    name: fmt::Arguments<'_>,
-    addresses: impl Fn() -> I,
-) -> fmt::Result
+fn render_timeouts<I>(out: &mut Batch, name: &str, ipv6: bool, addresses: impl Fn() -> I)
 where
     I: Iterator<Item = (IpAddr, Duration)>,
 {
-    let timed = || addresses().map(|(address, timeout)| Timed(address, timeout));
-    render_elements(out, format_args!("add element {name}"), timed(), "")?;
-    render_elements(
-        out,
-        format_args!("delete element {name}"),
-        addresses().map(|(address, _)| address),
+    let decl = SetDecl::set(
+        Table::Inet,
         "",
-    )?;
-    render_elements(
+        if ipv6 {
+            &[KeyType::Ipv6]
+        } else {
+            &[KeyType::Ipv4]
+        },
+    );
+    let decl = SetDecl {
+        name: Cow::Owned(name.to_string()),
+        ..decl
+    };
+    let timed = || {
+        addresses()
+            .map(|(address, timeout)| Element::of(&[Part::Address(address)]).with_timeout(timeout))
+    };
+    let added: Vec<_> = timed().collect();
+    if added.is_empty() {
+        return;
+    }
+    out.push(Command::AddElements(decl.clone(), added.clone()));
+    out.push(Command::DeleteElements(decl.clone(), added));
+    render_added(
         out,
-        format_args!("add element {name}"),
-        timed().filter(|timed| !timed.1.is_zero()),
-        "",
-    )
+        decl,
+        timed()
+            .filter(|element| element.timeout.is_some_and(|timeout| !timeout.is_zero()))
+            .collect(),
+    );
 }
 
 /// Room in a hostname set: the addresses a container may learn for a hostname, and those
 /// Portcullis resolves itself.
-const HOST_SET_SIZE: usize = MAX_ADDRESSES_PER_HOST * 2;
+#[allow(clippy::cast_possible_truncation)]
+const HOST_SET_SIZE: u32 = MAX_ADDRESSES_PER_HOST as u32 * 2;
 
-/// A set element with a timeout, at least one second.
-struct Timed(IpAddr, Duration);
-
-impl fmt::Display for Timed {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let seconds = self.1.as_secs() + u64::from(self.1.subsec_nanos() > 0);
-        write!(f, "{} timeout {}s", self.0, seconds.max(1))
-    }
-}
-
-/// Verdict map entry: `<key> : <verdict>`.
-struct Dispatch<K>(K, Verdict);
-
-impl<K: fmt::Display> fmt::Display for Dispatch<K> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} : ", self.0)?;
-        match self.1 {
-            Verdict::Accept => f.write_str("accept"),
-            Verdict::Goto(chain) => write!(f, "goto {}", ChainName(chain)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Verdict {
-    Accept,
-    Goto(Chain),
-}
-
-/// A string in double quotes, as nft expects interface names.
-struct Quoted<'a>(&'a str);
-
-impl fmt::Display for Quoted<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"{}\"", self.0)
-    }
-}
-
-const fn family(address: IpAddr) -> &'static str {
-    match address {
-        IpAddr::V4(_) => "ip",
-        IpAddr::V6(_) => "ip6",
-    }
-}
+/// IPv4 and IPv6 ranges that aren't public, as prefixes.
+static PRIVATE: LazyLock<[Vec<IpNet>; 2]> = LazyLock::new(|| {
+    let parse = |ranges: &[&str]| {
+        ranges
+            .iter()
+            .filter_map(|range| range.parse().ok())
+            .collect()
+    };
+    [parse(&PRIVATE_V4), parse(&PRIVATE_V6)]
+});
 
 /// How a rule matches destinations. The bridge table sees packets as sent. The inet table
 /// sees them after Docker's DNAT has rewritten published ports of the host to the
@@ -2341,59 +2603,81 @@ const fn family(address: IpAddr) -> &'static str {
 /// connection tracking remembers it: a published port reached through the host is the
 /// host's address and port, not another container on the same network.
 struct Match {
-    family: &'static str,
+    ipv6: bool,
     original: bool,
 }
 
 impl Match {
     const fn new(address: IpAddr, chain: Chain) -> Self {
         Self {
-            family: family(address),
+            ipv6: address.is_ipv6(),
             original: !matches!(chain, Chain::Icc(_)),
         }
     }
 
-    fn daddr(&self) -> impl fmt::Display {
-        let (family, original) = (self.family, self.original);
-        fmt::from_fn(move |f| {
-            if original {
-                write!(f, "ct original {family} daddr")
-            } else {
-                write!(f, "{family} daddr")
-            }
-        })
-    }
-
-    fn dport(&self, protocol: &str, port: u16) -> impl fmt::Display {
-        let original = self.original;
-        fmt::from_fn(move |f| {
-            if original {
-                write!(f, "meta l4proto {protocol} ct original proto-dst {port}")
-            } else {
-                write!(f, "{protocol} dport {port}")
-            }
-        })
-    }
-
-    /// What matches `service`, with a leading space; nothing for any traffic.
-    fn service(&self, service: Service, ipv6: bool) -> impl fmt::Display {
-        let original = self.original;
-        fmt::from_fn(move |f| {
-            let Service::Protocol(protocol, ports) = service else {
-                return Ok(());
-            };
-            let name = match protocol {
-                Protocol::Icmp if ipv6 => "ipv6-icmp",
-                _ => protocol.as_str(),
-            };
-            match ports {
-                Some(ports) if original => {
-                    write!(f, " meta l4proto {name} ct original proto-dst {ports}")
+    /// The destination address, as a one-part key.
+    const fn daddr(&self) -> &'static [Key] {
+        match (self.original, self.ipv6) {
+            (true, ipv6) => {
+                if ipv6 {
+                    &[Key::CtDaddr { ipv6: true }]
+                } else {
+                    &[Key::CtDaddr { ipv6: false }]
                 }
-                Some(ports) => write!(f, " {name} dport {ports}"),
-                None => write!(f, " meta l4proto {name}"),
             }
-        })
+            (false, false) => &[Key::IpDaddr],
+            (false, true) => &[Key::Ip6Daddr],
+        }
+    }
+
+    fn to(&self, value: Value) -> Expr {
+        let [key] = self.daddr() else {
+            unreachable!("a destination is one key")
+        };
+        Expr::cmp(*key, value)
+    }
+
+    fn not_to(&self, value: Value) -> Expr {
+        let [key] = self.daddr() else {
+            unreachable!("a destination is one key")
+        };
+        Expr::not(*key, value)
+    }
+
+    fn dport(&self, protocol: Protocol, port: u16, out: &mut Vec<Expr>) {
+        if self.original {
+            out.push(Expr::cmp(Key::L4proto, Value::Protocol(protocol, false)));
+            out.push(Expr::cmp(Key::CtProtoDst, Value::Range(port, port)));
+        } else {
+            out.push(Expr::cmp(Key::Dport(protocol), Value::Range(port, port)));
+        }
+    }
+
+    /// What matches `service`; nothing for any traffic.
+    fn service(&self, service: Service, out: &mut Vec<Expr>) {
+        let Service::Protocol(protocol, ports) = service else {
+            return;
+        };
+        match ports {
+            Some(ports) if self.original => {
+                out.push(Expr::cmp(
+                    Key::L4proto,
+                    Value::Protocol(protocol, self.ipv6),
+                ));
+                out.push(Expr::cmp(
+                    Key::CtProtoDst,
+                    Value::Range(ports.first, ports.last),
+                ));
+            }
+            Some(ports) => out.push(Expr::cmp(
+                Key::Dport(protocol),
+                Value::Range(ports.first, ports.last),
+            )),
+            None => out.push(Expr::cmp(
+                Key::L4proto,
+                Value::Protocol(protocol, self.ipv6),
+            )),
+        }
     }
 }
 
@@ -2403,10 +2687,9 @@ fn render_rule(
     chain: Chain,
     rule: &Rule,
     options: Options,
-    out: &mut String,
-) -> fmt::Result {
+    out: &mut Batch,
+) {
     let to = Match::new(source.address, chain);
-    let daddr = to.daddr();
     let icc = matches!(chain, Chain::Icc(_));
     let reason = if icc { "icc" } else { "egress" };
     let outcome = |outcome: Outcome| {
@@ -2421,299 +2704,247 @@ fn render_rule(
             destination,
             protocol,
         } => {
-            write!(out, "add rule {chain} ")?;
+            let mut exprs = Vec::with_capacity(4);
             if let Some(destination) = destination {
-                write!(out, "{daddr} {destination} ")?;
+                exprs.push(to.to(Value::Address(destination)));
             }
-            writeln!(out, "{} accept", to.dport(protocol.as_str(), DNS_PORT))
+            to.dport(protocol, DNS_PORT, &mut exprs);
+            exprs.push(ACCEPT);
+            out.rule(chain, exprs);
         }
-        Rule::DenyDns { protocol } => decide(
-            out,
-            format_args!("add rule {chain} {}", to.dport(protocol.as_str(), DNS_PORT)),
-            deny("dns").snaplen(LOG_SNAPLEN_DNS),
-        ),
+        Rule::DenyDns { protocol } => {
+            let mut exprs = Vec::with_capacity(2);
+            to.dport(protocol, DNS_PORT, &mut exprs);
+            decide(out, chain, exprs, deny("dns").snaplen(LOG_SNAPLEN_DNS));
+        }
         // Only what leaves through a bridge: the chain also checks traffic to the host
         // (from the input hook, without an output interface), which can have a destination
         // in the subnet too, its broadcast address.
         Rule::AcceptPeers { subnet, gateway } => {
-            write!(out, "add rule {chain} {daddr} {subnet} ")?;
+            let mut exprs = vec![to.to(Value::Network(subnet))];
             if let Some(gateway) = gateway {
-                write!(out, "{daddr} != {gateway} ")?;
+                exprs.push(to.not_to(Value::Address(gateway)));
             }
-            writeln!(out, "oifname @{} accept", NamedSet::InetBridges.name())?;
+            exprs.push(Expr::lookup(&[Key::Oifname], NamedSet::InetBridges.name()));
+            exprs.push(ACCEPT);
+            out.rule(chain, exprs);
             // Broadcast and multicast are never routed: leaving through a bridge, they are
             // bridged, and the ICC rules decided on them.
             if subnet.addr().is_ipv4() {
                 for destination in &ICC_BROADCAST_V4 {
-                    writeln!(
-                        out,
-                        "add rule {chain} {daddr} {destination} oifname @{} accept",
-                        NamedSet::InetBridges.name()
-                    )?;
+                    out.rule(
+                        chain,
+                        vec![
+                            to.to(Value::Network(*destination)),
+                            Expr::lookup(&[Key::Oifname], NamedSet::InetBridges.name()),
+                            ACCEPT,
+                        ],
+                    );
                 }
             }
-            Ok(())
         }
-        Rule::AcceptNet(destination) => decide(
-            out,
-            format_args!("add rule {chain} {daddr} {destination}"),
-            allow,
-        ),
+        Rule::AcceptNet(destination) => {
+            decide(out, chain, vec![to.to(Value::Network(destination))], allow);
+        }
         Rule::AcceptHost(destination) => {
-            writeln!(out, "add rule {chain} {daddr} {destination} accept")
+            out.rule(chain, vec![to.to(Value::Address(destination)), ACCEPT]);
         }
         Rule::DenyNet(destination) => decide(
             out,
-            format_args!("add rule {chain} {daddr} {destination}"),
+            chain,
+            vec![to.to(Value::Network(destination))],
             deny(reason),
         ),
         Rule::Accept {
             destination,
             service,
         } => {
-            let set = match destination {
-                Destination::HostSet(index) => match plan.host_set(index) {
-                    Some(set) => Some(set),
-                    None => return Ok(()),
-                },
-                _ => None,
-            };
-            let ipv4 = source.address.is_ipv4();
-            let to_destination = fmt::from_fn(|f| match destination {
-                Destination::Net(destination) => write!(f, " {daddr} {destination}"),
-                Destination::Addr(destination) => write!(f, " {daddr} {destination}"),
-                Destination::HostSet(_) => match set {
-                    Some(set) => {
-                        let prefix = if ipv4 { SET_PREFIX_V4 } else { SET_PREFIX_V6 };
-                        write!(f, " {daddr} @{}", set.id.name(prefix))
-                    }
-                    None => Ok(()),
-                },
-                Destination::Any => Ok(()),
+            let mut exprs = Vec::new();
+            match destination {
+                Destination::Net(destination) => exprs.push(to.to(Value::Network(destination))),
+                Destination::Addr(destination) => exprs.push(to.to(Value::Address(destination))),
+                Destination::HostSet(index) => {
+                    let Some(set) = plan.host_set(index) else {
+                        return;
+                    };
+                    let prefix = if to.ipv6 {
+                        SET_PREFIX_V6
+                    } else {
+                        SET_PREFIX_V4
+                    };
+                    exprs.push(Expr::lookup(to.daddr(), set.id.name(prefix).to_string()));
+                }
+                Destination::Any => {}
                 Destination::Public => {
-                    let private: &[&str] = if ipv4 { &PRIVATE_V4 } else { &PRIVATE_V6 };
+                    let [v4, v6] = &*PRIVATE;
+                    let private = if to.ipv6 { v6 } else { v4 };
                     // One prefix at a time, not a set of ranges, see `NamedSet`.
                     for range in private {
-                        write!(f, " {daddr} != {range}")?;
+                        exprs.push(to.not_to(Value::Network(*range)));
                     }
                     // The host's own addresses are local wherever they are: traffic to them
                     // goes to the input hook, or, to a published port, gets DNAT.
-                    f.write_str(" fib daddr type != local ct status & dnat == 0")
+                    exprs.push(Expr::not(Key::FibDaddrType, Value::Local));
+                    exprs.push(Expr::Masked {
+                        key: Key::CtStatus,
+                        mask: Value::Dnat,
+                        value: Value::Number(0),
+                    });
                 }
-            });
-            let service = to.service(service, !ipv4);
-            decide(
-                out,
-                format_args!("add rule {chain}{to_destination}{service}"),
-                allow,
-            )
+            }
+            to.service(service, &mut exprs);
+            decide(out, chain, exprs, allow);
         }
     }
 }
 
-#[allow(unsafe_code, warnings)]
-mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/libnftables_bindings.rs"));
+/// Puts rule updates in place over nfnetlink (see [`super::netlink`]).
+pub struct NetlinkRunner {
+    /// Opened at the first update, and again after one failed: answers of a batch that
+    /// failed half way may still be queued.
+    updates: Mutex<Option<NftSocket>>,
+    /// The encoded batch, reused from one update to the next.
+    buffer: Mutex<Vec<u8>>,
+    /// For renewals of hostname sets, which come from DNS answers held meanwhile: they don't
+    /// wait for an update.
+    elements: Mutex<Option<(NftSocket, Vec<u8>, String)>>,
 }
 
-trait NftApi {
-    type Handle: Copy;
-
-    fn new_context(&self) -> Option<Self::Handle>;
-    fn free_context(&self, handle: Self::Handle);
-    fn buffer_output(&self, handle: Self::Handle) -> i32;
-    fn buffer_error(&self, handle: Self::Handle) -> i32;
-    fn run_script(&self, handle: Self::Handle, script: &CStr) -> i32;
-    fn error_output(&self, handle: Self::Handle) -> Option<String>;
-    /// What the last command listed.
-    fn output(&self, handle: Self::Handle) -> Option<String>;
-    /// List sets without their elements.
-    fn set_terse(&self, handle: Self::Handle);
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RealNftApi;
-
-#[allow(unsafe_code)]
-impl NftApi for RealNftApi {
-    type Handle = NonNull<bindings::nft_ctx>;
-
-    fn new_context(&self) -> Option<Self::Handle> {
-        // SAFETY: `nft_ctx_new` is an FFI constructor that returns either null or a valid
-        // pointer to an allocated context when passed a valid flags value.
-        let pointer = unsafe { bindings::nft_ctx_new(bindings::NFT_CTX_DEFAULT) };
-        NonNull::new(pointer)
-    }
-
-    fn free_context(&self, handle: Self::Handle) {
-        // SAFETY: `handle` comes from `nft_ctx_new` and is freed exactly once in `Drop`.
-        unsafe { bindings::nft_ctx_free(handle.as_ptr()) };
-    }
-
-    fn buffer_output(&self, handle: Self::Handle) -> i32 {
-        // SAFETY: `handle` points to a valid live context.
-        unsafe { bindings::nft_ctx_buffer_output(handle.as_ptr()) }
-    }
-
-    fn buffer_error(&self, handle: Self::Handle) -> i32 {
-        // SAFETY: `handle` points to a valid live context.
-        unsafe { bindings::nft_ctx_buffer_error(handle.as_ptr()) }
-    }
-
-    fn run_script(&self, handle: Self::Handle, script: &CStr) -> i32 {
-        // SAFETY: both pointers are valid for the duration of this call.
-        unsafe { bindings::nft_run_cmd_from_buffer(handle.as_ptr(), script.as_ptr()) }
-    }
-
-    fn error_output(&self, handle: Self::Handle) -> Option<String> {
-        // SAFETY: pointer is owned by libnftables for this context and may be null.
-        let pointer = unsafe { bindings::nft_ctx_get_error_buffer(handle.as_ptr()) };
-        if pointer.is_null() {
-            return None;
-        }
-
-        // SAFETY: non-null C string pointer returned by libnftables.
-        let cstr = unsafe { CStr::from_ptr(pointer) };
-        Some(cstr.to_string_lossy().trim().to_string())
-    }
-
-    fn output(&self, handle: Self::Handle) -> Option<String> {
-        // SAFETY: pointer is owned by libnftables for this context and may be null.
-        let pointer = unsafe { bindings::nft_ctx_get_output_buffer(handle.as_ptr()) };
-        if pointer.is_null() {
-            return None;
-        }
-        // SAFETY: non-null C string pointer returned by libnftables.
-        let cstr = unsafe { CStr::from_ptr(pointer) };
-        Some(cstr.to_string_lossy().into_owned())
-    }
-
-    fn set_terse(&self, handle: Self::Handle) {
-        // SAFETY: `handle` points to a valid live context.
-        unsafe {
-            let flags = bindings::nft_ctx_output_get_flags(handle.as_ptr());
-            bindings::nft_ctx_output_set_flags(
-                handle.as_ptr(),
-                flags | bindings::NFT_CTX_OUTPUT_TERSE,
-            );
-        }
-    }
-}
-
-struct NftContext<A>
-where
-    A: NftApi,
-{
-    api: A,
-    handle: A::Handle,
-}
-
-impl<A> NftContext<A>
-where
-    A: NftApi,
-{
-    fn new(api: A) -> Result<Self, FirewallError> {
-        let Some(handle) = api.new_context() else {
-            return Err(FirewallError::LibContextCreate);
-        };
-
-        let output_rc = api.buffer_output(handle);
-        if output_rc != 0 {
-            api.free_context(handle);
-            return Err(FirewallError::LibBufferConfig {
-                buffer: "output",
-                code: output_rc,
-            });
-        }
-
-        let error_rc = api.buffer_error(handle);
-        if error_rc != 0 {
-            api.free_context(handle);
-            return Err(FirewallError::LibBufferConfig {
-                buffer: "error",
-                code: error_rc,
-            });
-        }
-
-        api.set_terse(handle);
-        Ok(Self { api, handle })
-    }
-
-    /// Run a listing command and return what it printed.
-    fn list(&mut self, command: &str) -> Result<String, FirewallError> {
-        self.run_script(command)?;
-        Ok(self.api.output(self.handle).unwrap_or_default())
-    }
-
-    /// Run `script`. Taking ownership of a `String` lets the NUL terminator be appended
-    /// without copying the script.
-    fn run_script(&mut self, script: impl Into<Vec<u8>>) -> Result<(), FirewallError> {
-        let c_script = CString::new(script).map_err(|_| FirewallError::ScriptContainsNul)?;
-        let result = self.api.run_script(self.handle, &c_script);
-        if result == 0 {
-            return Ok(());
-        }
-
-        let stderr = self
-            .api
-            .error_output(self.handle)
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| "unknown libnftables error".to_string());
-
-        Err(FirewallError::LibCommandFailure {
-            code: result,
-            stderr,
-        })
-    }
-}
-
-impl<A> Drop for NftContext<A>
-where
-    A: NftApi,
-{
-    fn drop(&mut self) {
-        self.api.free_context(self.handle);
-    }
-}
-
-// SAFETY: a libnftables context isn't tied to the thread that created it, and
-// `LibNftablesRunner` only touches it while holding its mutex, so it's never used from two
-// threads at once.
-#[allow(unsafe_code)]
-unsafe impl Send for NftContext<RealNftApi> {}
-
-pub struct LibNftablesRunner {
-    context: Mutex<NftContext<RealNftApi>>,
-    /// Opened at the first renewal.
-    elements: Mutex<Option<ElementSocket>>,
-}
-
-impl LibNftablesRunner {
+impl NetlinkRunner {
     pub fn new() -> Result<Self, FirewallError> {
-        let context = NftContext::new(RealNftApi)?;
         Ok(Self {
-            context: Mutex::new(context),
+            updates: Mutex::new(Some(NftSocket::open().map_err(FirewallError::Netlink)?)),
+            buffer: Mutex::new(Vec::new()),
             elements: Mutex::new(None),
         })
     }
-}
 
-impl NftRunner for LibNftablesRunner {
-    fn run_script(&self, script: String) -> Result<(), FirewallError> {
-        trace!(program = "nft", script, "executing firewall script");
-        let mut guard = self
-            .context
-            .lock()
-            .map_err(|_| FirewallError::LibContextLock)?;
-        guard.run_script(script)
+    /// Send an encoded batch on the update socket; `describe` names the command of a
+    /// message the kernel refused.
+    fn send(
+        &self,
+        batch: &mut [u8],
+        describe: impl Fn(Option<usize>) -> String,
+    ) -> Result<(), FirewallError> {
+        let mut guard = self.updates.lock().unwrap_or_else(PoisonError::into_inner);
+        let socket = match &mut *guard {
+            Some(socket) => socket,
+            empty => empty.insert(NftSocket::open().map_err(FirewallError::Netlink)?),
+        };
+        socket.send_batch(batch).map_err(|refusal| {
+            *guard = None;
+            FirewallError::Refused {
+                command: describe(refusal.message),
+                error: refusal.error,
+                reason: refusal.reason,
+            }
+        })
     }
 
-    fn list(&self, command: &str) -> Result<String, FirewallError> {
-        let mut guard = self
-            .context
-            .lock()
-            .map_err(|_| FirewallError::LibContextLock)?;
-        guard.list(command)
+    /// Dump the objects of `kind` of the managed table of `table`'s family.
+    fn dump(&self, kind: u16, table: Table, each: impl FnMut(&[u8])) -> Result<(), FirewallError> {
+        let mut guard = self.updates.lock().unwrap_or_else(PoisonError::into_inner);
+        let socket = match &mut *guard {
+            Some(socket) => socket,
+            empty => empty.insert(NftSocket::open().map_err(FirewallError::Netlink)?),
+        };
+        let filter = |out: &mut netlink::Writer<'_>| {
+            if kind == netlink::NFT_MSG_GETSET {
+                out.string(netlink::NFTA_SET_TABLE, TABLE_NAME);
+            }
+        };
+        socket
+            .dump(kind, netlink::family(table), filter, each)
+            .map_err(FirewallError::Netlink)
+    }
+}
+
+/// How much of the buffer of encoded batches is kept from one update to the next.
+const KEPT_BUFFER: usize = 1 << 20;
+
+/// The text of a command, short enough for a log line.
+fn short(command: &Command) -> String {
+    const LONGEST: usize = 300;
+    let mut text = command.to_string();
+    if text.len() > LONGEST {
+        let mut end = LONGEST;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("...");
+    }
+    text
+}
+
+impl NftRunner for NetlinkRunner {
+    fn run(&self, batch: &Batch) -> Result<(), FirewallError> {
+        if tracing::enabled!(tracing::Level::TRACE) {
+            trace!(script = %batch, "putting rules in place");
+        }
+        let mut buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        let origins = Encoder::new(&mut buffer).batch(batch);
+        let result = self.send(&mut buffer, |message| {
+            message
+                .and_then(|message| origins.get(message))
+                .and_then(|origin| batch.commands.get(*origin))
+                .map_or_else(|| "the batch".to_string(), short)
+        });
+        // Most updates are small: the room a large one (the first) took isn't kept.
+        if buffer.capacity() > KEPT_BUFFER {
+            *buffer = Vec::new();
+        }
+        result
+    }
+
+    fn run_encoded(&self, batch: &mut [u8]) -> Result<(), FirewallError> {
+        self.send(batch, |message| {
+            message.map_or_else(
+                || "the saved batch".to_string(),
+                |message| format!("message {message} of the saved batch"),
+            )
+        })
+    }
+
+    fn installed(&self) -> Result<Option<Found>, FirewallError> {
+        let mut found = Found::default();
+        for table in Table::ALL {
+            let mut exists = false;
+            self.dump(netlink::NFT_MSG_GETTABLE, table, |attributes| {
+                exists |= netlink::string_attribute(attributes, netlink::NFTA_TABLE_NAME)
+                    == Some(TABLE_NAME);
+            })?;
+            if !exists {
+                return Ok(None);
+            }
+            self.dump(netlink::NFT_MSG_GETCHAIN, table, |attributes| {
+                if netlink::string_attribute(attributes, netlink::NFTA_CHAIN_TABLE)
+                    != Some(TABLE_NAME)
+                {
+                    return;
+                }
+                if let Some(name) = netlink::string_attribute(attributes, netlink::NFTA_CHAIN_NAME)
+                {
+                    let base = netlink::has_attribute(attributes, netlink::NFTA_CHAIN_HOOK);
+                    found.chains.push((
+                        Object {
+                            table,
+                            name: name.to_string(),
+                        },
+                        base,
+                    ));
+                }
+            })?;
+            self.dump(netlink::NFT_MSG_GETSET, table, |attributes| {
+                if let Some(name) = netlink::string_attribute(attributes, netlink::NFTA_SET_NAME) {
+                    found.sets.push(Object {
+                        table,
+                        name: name.to_string(),
+                    });
+                }
+            })?;
+        }
+        Ok(Some(found))
     }
 
     fn set_timeouts(
@@ -2722,213 +2953,21 @@ impl NftRunner for LibNftablesRunner {
         addresses: &[(IpAddr, Duration)],
     ) -> Result<(), FirewallError> {
         let mut guard = self.elements.lock().unwrap_or_else(PoisonError::into_inner);
-        let socket = match &mut *guard {
-            Some(socket) => socket,
-            empty => empty.insert(ElementSocket::open().map_err(FirewallError::Netlink)?),
+        let (socket, buffer, name) = match &mut *guard {
+            Some(open) => open,
+            empty => empty.insert((
+                NftSocket::open().map_err(FirewallError::Netlink)?,
+                Vec::new(),
+                String::new(),
+            )),
         };
-        let result = socket.set_timeouts(TABLE_NAME, sets, addresses);
+        encode_timeouts(buffer, name, TABLE_NAME, sets, addresses);
+        let result = socket.send_batch(buffer);
         if result.is_err() {
             // Answers of a batch that failed half way may still be queued.
             *guard = None;
         }
-        result.map_err(FirewallError::Netlink)
-    }
-}
-
-#[cfg(test)]
-mod libnftables_tests {
-    use std::ffi::CStr;
-    use std::sync::{Arc, Mutex};
-
-    use super::*;
-
-    #[derive(Clone, Debug)]
-    struct MockState {
-        next_context: Option<usize>,
-        output_rc: i32,
-        error_rc: i32,
-        run_rc: i32,
-        error_message: String,
-        freed: usize,
-        scripts: Vec<String>,
-    }
-
-    #[derive(Clone)]
-    struct MockApi {
-        state: Arc<Mutex<MockState>>,
-    }
-
-    impl MockApi {
-        fn new(state: MockState) -> Self {
-            Self {
-                state: Arc::new(Mutex::new(state)),
-            }
-        }
-
-        fn state(&self) -> MockState {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.clone()
-        }
-    }
-
-    impl NftApi for MockApi {
-        type Handle = usize;
-
-        fn new_context(&self) -> Option<Self::Handle> {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.next_context
-        }
-
-        fn free_context(&self, _handle: Self::Handle) {
-            let mut guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.freed += 1;
-        }
-
-        fn buffer_output(&self, _handle: Self::Handle) -> i32 {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.output_rc
-        }
-
-        fn buffer_error(&self, _handle: Self::Handle) -> i32 {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.error_rc
-        }
-
-        fn run_script(&self, _handle: Self::Handle, script: &CStr) -> i32 {
-            let mut guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            guard.scripts.push(script.to_string_lossy().to_string());
-            guard.run_rc
-        }
-
-        fn error_output(&self, _handle: Self::Handle) -> Option<String> {
-            let guard = match self.state.lock() {
-                Ok(value) => value,
-                Err(error) => panic!("failed to lock mock state: {error}"),
-            };
-            Some(guard.error_message.clone())
-        }
-
-        fn output(&self, _handle: Self::Handle) -> Option<String> {
-            None
-        }
-
-        fn set_terse(&self, _handle: Self::Handle) {}
-    }
-
-    fn base_state() -> MockState {
-        MockState {
-            next_context: Some(1),
-            output_rc: 0,
-            error_rc: 0,
-            run_rc: 0,
-            error_message: String::new(),
-            freed: 0,
-            scripts: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn wrapper_runs_script_successfully() {
-        let api = MockApi::new(base_state());
-        let mut context = match NftContext::new(api.clone()) {
-            Ok(value) => value,
-            Err(error) => panic!("expected context creation to succeed: {error}"),
-        };
-
-        let result = context.run_script("add table inet portcullis");
-        assert!(result.is_ok());
-
-        let state = api.state();
-        assert_eq!(state.scripts.len(), 1);
-    }
-
-    #[test]
-    fn wrapper_reports_script_failure() {
-        let mut state = base_state();
-        state.run_rc = -1;
-        state.error_message = "syntax error".to_string();
-        let api = MockApi::new(state);
-        let mut context = match NftContext::new(api) {
-            Ok(value) => value,
-            Err(error) => panic!("expected context creation to succeed: {error}"),
-        };
-
-        let result = context.run_script("invalid");
-        assert!(matches!(
-            result,
-            Err(FirewallError::LibCommandFailure { code: -1, .. })
-        ));
-    }
-
-    #[test]
-    fn wrapper_rejects_nul_byte_scripts() {
-        let api = MockApi::new(base_state());
-        let mut context = match NftContext::new(api) {
-            Ok(value) => value,
-            Err(error) => panic!("expected context creation to succeed: {error}"),
-        };
-
-        let result = context.run_script("bad\0script");
-        assert!(matches!(result, Err(FirewallError::ScriptContainsNul)));
-    }
-
-    #[test]
-    fn wrapper_frees_context_on_drop() {
-        let api = MockApi::new(base_state());
-        {
-            let context = match NftContext::new(api.clone()) {
-                Ok(value) => value,
-                Err(error) => panic!("expected context creation to succeed: {error}"),
-            };
-            let _ = context;
-        }
-
-        let state = api.state();
-        assert_eq!(state.freed, 1);
-    }
-
-    #[test]
-    fn wrapper_fails_when_context_creation_fails() {
-        let mut state = base_state();
-        state.next_context = None;
-        let api = MockApi::new(state);
-
-        let result = NftContext::new(api);
-        assert!(matches!(result, Err(FirewallError::LibContextCreate)));
-    }
-
-    #[test]
-    fn wrapper_fails_when_output_buffering_fails() {
-        let mut state = base_state();
-        state.output_rc = -1;
-        let api = MockApi::new(state);
-
-        let result = NftContext::new(api);
-        assert!(matches!(
-            result,
-            Err(FirewallError::LibBufferConfig {
-                buffer: "output",
-                code: -1
-            })
-        ));
+        result.map_err(|refusal| FirewallError::Netlink(refusal.error))
     }
 }
 
@@ -2955,10 +2994,9 @@ mod tests {
             &test_support::host_resolvers(),
             monitor_all,
         );
-        let mut script = String::new();
-        render_apply_script(&plan, options, Some(&mut Installed::default()), &mut script)
-            .expect("script should render");
-        script
+        let mut batch = Batch::default();
+        render_apply_script(&plan, options, Some(&mut Installed::default()), &mut batch);
+        batch.to_string()
     }
 
     fn render(state: &RuntimeState) -> String {
@@ -3073,10 +3111,8 @@ mod tests {
 add table inet portcullis
 add chain inet portcullis forward { type filter hook forward priority -1; policy accept; }
 add chain inet portcullis input { type filter hook input priority -1; policy accept; }
-flush chain inet portcullis input
 add set inet portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set inet portcullis logged6 { type ipv6_addr . ipv6_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
-flush chain inet portcullis forward
 add set inet portcullis bridges { type ifname; }
 add set inet portcullis enforced_bridges { type ifname; }
 add map inet portcullis egress4 { type ipv4_addr : verdict; }
@@ -3085,15 +3121,11 @@ add set inet portcullis name_limited { type ipv4_addr; }
 add table bridge portcullis
 add chain bridge portcullis prerouting { type filter hook prerouting priority -1; policy accept; }
 add chain bridge portcullis input { type filter hook input priority -1; policy accept; }
-flush chain bridge portcullis input
 add chain bridge portcullis forward { type filter hook forward priority -1; policy accept; }
-flush chain bridge portcullis forward
 add set bridge portcullis quarantined { type ifname; }
-flush set bridge portcullis quarantined
 add set bridge portcullis logged4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis frames { type ifname . ether_addr . ether_type; flags dynamic,timeout; timeout 60s; size 65536; }
 add set bridge portcullis announced { type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout 60s; size 65536; }
-flush chain bridge portcullis prerouting
 add set bridge portcullis bridges { type ifname; }
 add set bridge portcullis monitored_bridges { type ifname; }
 add set bridge portcullis enforced_bridges { type ifname; }
@@ -3106,7 +3138,11 @@ add set bridge portcullis arp_by_port { type ifname . ether_addr . ether_addr . 
 add set bridge portcullis arp_by_mac { type ether_addr . ether_addr . ipv4_addr; }
 add set bridge portcullis arp_by_address { type ipv4_addr; }
 add chain bridge portcullis limit_open
-flush chain bridge portcullis limit_open
+add chain bridge portcullis limit_open_monitor
+add chain bridge portcullis limit_rate
+add chain bridge portcullis limit_rate_monitor
+add chain bridge portcullis arp_check
+add chain bridge portcullis arp_check_monitor
 ";
         assert!(
             script.starts_with(expected_head),
@@ -3293,19 +3329,18 @@ flush chain bridge portcullis limit_open
         }
 
         // What the previous update created and this one doesn't need is removed; the rest
-        // is flushed and refilled.
-        let removed: Vec<_> = chains(first).difference(&chains(second)).copied().collect();
+        // stays, rewritten where its rules changed.
+        let removed: Vec<&str> = second
+            .lines()
+            .filter_map(|line| line.strip_prefix("delete chain "))
+            .collect();
         assert_ne!(removed, [] as [&str; 0]);
         for chain in removed {
+            assert!(chains(first).contains(chain), "{chain}:\n{first}");
+            assert!(!chains(second).contains(chain), "{chain}:\n{second}");
             assert!(
                 second.contains(&format!("flush chain {chain}\ndelete chain {chain}\n")),
                 "{chain} not removed:\n{second}"
-            );
-        }
-        for chain in chains(second) {
-            assert!(
-                !second.contains(&format!("delete chain {chain}\n")),
-                "{second}"
             );
         }
         assert!(!second.contains("delete set"), "{second}");
@@ -3322,8 +3357,11 @@ flush chain bridge portcullis limit_open
 
     /// A removed container's elements go, the map emptied and filled again without them,
     /// then its chains (slot `a`); the other container's (slot `b`) stay.
-    fn assert_removed(removed: &str, a: usize, b: usize) {
-        let deleted = "flush map inet portcullis egress4\n";
+    /// The container at 172.18.0.2, with chains of slot `a`, was removed, and the one at
+    /// 172.18.0.3 kept.
+    fn assert_removed(removed: &str, a: usize) {
+        // Its map element is deleted before its chain, which it leads to.
+        let deleted = "delete element inet portcullis egress4 { 172.18.0.2 }\n";
         let chain = format!(
             "flush chain inet portcullis egress{a}\ndelete chain inet portcullis egress{a}\n"
         );
@@ -3331,19 +3369,9 @@ flush chain bridge portcullis limit_open
             panic!("{removed}");
         };
         assert!(deleted < chain, "{removed}");
-        let refilled = removed
-            .lines()
-            .find(|line| {
-                line.starts_with(
-                    "add map inet portcullis egress4 { type ipv4_addr : verdict; elements = ",
-                )
-            })
-            .expect("refilled map");
-        assert!(
-            refilled.contains(&format!("172.18.0.3 : goto egress{b}")),
-            "{removed}"
-        );
-        assert!(!refilled.contains("172.18.0.2"), "{removed}");
+        // The others stay as they are.
+        assert!(!removed.contains("flush map"), "{removed}");
+        assert!(!removed.contains("172.18.0.3 :"), "{removed}");
     }
 
     #[test]
@@ -3414,8 +3442,7 @@ flush chain bridge portcullis limit_open
             assert!(!added.contains(&format!("goto {chain}")), "{added}");
         }
         assert!(!added.contains("flush map"), "{added}");
-        assert_removed(removed, a, b);
-        assert!(!removed.contains("delete element"), "{removed}");
+        assert_removed(removed, a);
         assert!(
             !removed.contains(&format!("flush chain inet portcullis egress{b}")),
             "{removed}"
@@ -3450,6 +3477,90 @@ flush chain bridge portcullis limit_open
             ),
             "{reused}"
         );
+    }
+
+    #[test]
+    fn deletes_an_element_two_sources_had_once() {
+        let port = Element::of(&[Part::Ifname("veth1")]);
+        let set = ElementSet::Named(NamedSet::EnforcedPorts);
+        let previous = HashMap::from([(set, vec![port, port])]);
+        let mut batch = Batch::default();
+        Elements::default().render(&mut batch, Some(&previous));
+        assert_eq!(
+            batch.to_string(),
+            "delete element bridge portcullis enforced_ports { \"veth1\" }\n"
+        );
+        let mut batch = Batch::default();
+        let mut elements = Elements::default();
+        elements.fill(set, [port, port].into_iter());
+        elements.render(&mut batch, Some(&HashMap::new()));
+        assert_eq!(
+            batch.to_string(),
+            "add set bridge portcullis enforced_ports { type ifname; elements = { \"veth1\" }; }\n"
+        );
+    }
+
+    #[test]
+    fn writes_base_chains_and_sets_only_when_they_change() {
+        use crate::model::IccMode;
+
+        let firewall = NftablesFirewall::new(RecordingRunner::default(), OPTIONS);
+        let mut resolver = MockResolver::default();
+        let mut state = RuntimeState::default();
+        test_support::add_network(&mut state, "net", "172.18.0.0/16", "172.18.0.1");
+        let add = |state: &mut RuntimeState, name: &str, address: &str, icc: IccMode| {
+            test_support::add_container(
+                state,
+                name,
+                name,
+                &[("net", address, &[])],
+                test_support::policy(icc, Vec::new()),
+            );
+        };
+        add(&mut state, "a", "172.18.0.2", IccMode::Allow);
+        let mut apply = |state: &RuntimeState| {
+            firewall
+                .apply(state, &mut resolver, &[], false)
+                .expect("apply");
+        };
+        apply(&state);
+        add(&mut state, "b", "172.18.0.3", IccMode::Allow);
+        apply(&state);
+        // Its traffic to other containers now goes through ICC rules of its own.
+        add(&mut state, "a", "172.18.0.2", IccMode::Deny);
+        apply(&state);
+        let scripts = firewall.runner.scripts.lock().expect("lock");
+        let [_, added, changed] = scripts.as_slice() else {
+            panic!("expected three scripts");
+        };
+        for script in [added, changed] {
+            // The tables, base chains and sets are there already, and the base chains'
+            // rules stay the same while the networks do.
+            for line in script.lines() {
+                assert!(!line.starts_with("add table"), "{script}");
+                assert!(!line.ends_with("verdict; }"), "{script}");
+                assert!(!line.contains("portcullis logged4 {"), "{script}");
+                assert!(!line.contains("portcullis forward"), "{script}");
+                assert!(!line.contains("portcullis prerouting"), "{script}");
+                assert!(!line.contains("portcullis input"), "{script}");
+            }
+        }
+        // A new container: its chain, and its elements, added to those there.
+        assert_lines(
+            added,
+            &["add map bridge portcullis sources_by_mac { type ipv4_addr . ether_addr : verdict; elements = { 172.18.0.3 . 02:42:ac:12:00:03 : accept }; }".into()],
+        );
+        assert!(!added.contains("delete element"), "{added}");
+        // A verdict that changed: the element is deleted and added again, in one step.
+        assert!(
+            changed.contains(
+                "delete element bridge portcullis sources_by_mac { 172.18.0.2 . 02:42:ac:12:00:02 }\n\
+                 add map bridge portcullis sources_by_mac { type ipv4_addr . ether_addr : verdict; elements = { 172.18.0.2 . 02:42:ac:12:00:02 : goto icc"
+            ),
+            "{changed}"
+        );
+        assert!(!changed.contains("172.18.0.3 . "), "{changed}");
+        assert!(!changed.contains("flush map"), "{changed}");
     }
 
     #[test]
@@ -3657,7 +3768,7 @@ flush chain bridge portcullis limit_open
         firewall
             .apply(&state, &mut resolver, &[], false)
             .expect("apply");
-        *firewall.runner.failing.lock().expect("lock") = Some("add table".to_string());
+        *firewall.runner.failing.lock().expect("lock") = Some("add rule".to_string());
         firewall
             .apply(&test_support::hostname_state(), &mut resolver, &[], false)
             .expect_err("failed apply");
@@ -3670,9 +3781,15 @@ flush chain bridge portcullis limit_open
         assert_eq!(firewall.runner.scripts.lock().expect("lock").len(), 2);
         let scripts = firewall.runner.scripts.lock().expect("lock");
         let last = scripts.last().expect("script");
-        // The sets too: what they hold isn't known.
+        // The sets too: what they hold isn't known. So are the tables, base chains and
+        // sets declared.
         assert!(
             has_line(last, "flush map inet portcullis egress4"),
+            "{last}"
+        );
+        assert!(has_line(last, "add table inet portcullis"), "{last}");
+        assert!(
+            has_line(last, "flush chain inet portcullis forward"),
             "{last}"
         );
         assert!(
@@ -3952,7 +4069,7 @@ flush chain bridge portcullis limit_open
                     || line.starts_with("add rule bridge portcullis limit_")
                     || line.starts_with("add rule bridge portcullis arp_check ")
                     || line.contains("@quarantined")
-                    || line.contains(LINK_LOCAL_GROUP),
+                    || line.contains(&link_local_group().to_string()),
                 "{line}"
             );
         }
@@ -4189,22 +4306,26 @@ flush chain bridge portcullis limit_open
             first: 1,
             last: 200,
         };
+        let service = |to: &Match, service| {
+            let mut exprs = Vec::new();
+            to.service(service, &mut exprs);
+            exprs.iter().fold(String::new(), |mut text, expr| {
+                let _ = write!(text, " {expr}");
+                text
+            })
+        };
         assert_eq!(
-            to.service(Service::Protocol(Protocol::Tcp, Some(ports)), false)
-                .to_string(),
+            service(&to, Service::Protocol(Protocol::Tcp, Some(ports))),
             " tcp dport 1-200"
         );
         assert_eq!(
-            to.service(Service::Protocol(Protocol::Sctp, None), false)
-                .to_string(),
+            service(&to, Service::Protocol(Protocol::Sctp, None)),
             " meta l4proto sctp"
         );
-        assert_eq!(to.service(Service::Any, false).to_string(), "");
+        assert_eq!(service(&to, Service::Any), "");
         let routed = Match::new(test_support::ip("fd00::2"), Chain::Egress(0));
         assert_eq!(
-            routed
-                .service(Service::Protocol(Protocol::Icmp, None), true)
-                .to_string(),
+            service(&routed, Service::Protocol(Protocol::Icmp, None)),
             " meta l4proto ipv6-icmp"
         );
     }
@@ -4223,68 +4344,58 @@ flush chain bridge portcullis limit_open
     #[derive(Default)]
     struct RecordingRunner {
         scripts: Mutex<Vec<String>>,
-        /// What listing commands print.
-        listings: Mutex<BTreeMap<String, String>>,
-        /// Scripts fail while they contain this.
+        /// Saved batches put in place.
+        encoded: Mutex<Vec<Vec<u8>>>,
+        /// What the tables hold, if they exist.
+        found: Mutex<Option<Found>>,
+        /// Batches fail while they contain this.
         failing: Mutex<Option<String>>,
-        /// Listings the next script makes appear, as if it created the tables.
-        creates: Mutex<Option<BTreeMap<String, String>>>,
+        /// What the next batch makes appear, as if it created the tables.
+        creates: Mutex<Option<Found>>,
     }
 
     impl RecordingRunner {
         /// Pretend both tables exist, as a previous run left them.
-        fn with_tables(inet: &str, bridge: &str) -> Self {
+        fn with_tables(found: Found) -> Self {
             let runner = Self::default();
-            runner
-                .listings
-                .lock()
-                .expect("lock")
-                .extend(Self::tables(inet, bridge));
+            *runner.found.lock().expect("lock") = Some(found);
             runner
         }
 
-        fn tables(inet: &str, bridge: &str) -> BTreeMap<String, String> {
-            BTreeMap::from([
-                (
-                    "list tables".to_string(),
-                    "table inet portcullis\ntable ip nat\ntable bridge portcullis\n".to_string(),
-                ),
-                ("list table inet portcullis".to_string(), inet.to_string()),
-                (
-                    "list table bridge portcullis".to_string(),
-                    bridge.to_string(),
-                ),
-            ])
+        fn created(&self) {
+            if let Some(created) = self.creates.lock().expect("lock").take() {
+                *self.found.lock().expect("lock") = Some(created);
+            }
         }
     }
 
     impl NftRunner for RecordingRunner {
-        fn run_script(&self, script: String) -> Result<(), FirewallError> {
+        fn run(&self, batch: &Batch) -> Result<(), FirewallError> {
+            let script = batch.to_string();
             let failing = self.failing.lock().expect("lock");
             if failing
                 .as_ref()
                 .is_some_and(|text| script.contains(text.as_str()))
             {
-                return Err(FirewallError::LibCommandFailure {
-                    code: 1,
-                    stderr: "Device or resource busy".to_string(),
+                return Err(FirewallError::Refused {
+                    command: script,
+                    error: io::Error::from_raw_os_error(16),
+                    reason: None,
                 });
             }
             self.scripts.lock().expect("lock").push(script);
-            if let Some(created) = self.creates.lock().expect("lock").take() {
-                self.listings.lock().expect("lock").extend(created);
-            }
+            self.created();
             Ok(())
         }
 
-        fn list(&self, command: &str) -> Result<String, FirewallError> {
-            Ok(self
-                .listings
-                .lock()
-                .expect("lock")
-                .get(command)
-                .cloned()
-                .unwrap_or_default())
+        fn run_encoded(&self, batch: &mut [u8]) -> Result<(), FirewallError> {
+            self.encoded.lock().expect("lock").push(batch.to_vec());
+            self.created();
+            Ok(())
+        }
+
+        fn installed(&self) -> Result<Option<Found>, FirewallError> {
+            Ok(self.found.lock().expect("lock").clone())
         }
 
         /// Recorded as the script that does the same.
@@ -4293,80 +4404,54 @@ flush chain bridge portcullis limit_open
             sets: &[TimeoutSet<'_>],
             addresses: &[(IpAddr, Duration)],
         ) -> Result<(), FirewallError> {
-            let mut script = String::new();
+            let mut batch = Batch::default();
             for set in sets {
-                render_timeouts(
-                    &mut script,
-                    format_args!("{} {}", Table::Inet, set.name),
-                    || {
-                        addresses
-                            .iter()
-                            .copied()
-                            .filter(|(address, _)| address.is_ipv6() == set.ipv6)
-                    },
-                )?;
+                render_timeouts(&mut batch, &set.name.to_string(), set.ipv6, || {
+                    addresses
+                        .iter()
+                        .copied()
+                        .filter(|(address, _)| address.is_ipv6() == set.ipv6)
+                });
             }
-            if !script.is_empty() {
-                self.run_script(script)?;
+            if !batch.is_empty() {
+                self.run(&batch)?;
             }
             Ok(())
         }
     }
 
-    const INET_LISTING: &str = "table inet portcullis {
-	set logged4 {
-		type ipv4_addr . ipv4_addr . inet_proto . inet_service
-		size 65536
-		flags dynamic,timeout
-		timeout 1m
-	}
-	map egress4 {
-		type ipv4_addr : verdict
-	}
-	set pc_h4_00000000000000aa {
-		type ipv4_addr
-		size 8192
-		flags timeout
-	}
-	chain forward {
-		type filter hook forward priority -1; policy accept;
-		ct state established accept
-	}
-	chain egress0 {
-		ct state related ct original ip saddr 172.18.0.2 accept
-	}
-	chain egress7 {
-	}
-}
-";
+    fn object(table: Table, name: &str) -> Object {
+        Object {
+            table,
+            name: name.to_string(),
+        }
+    }
 
-    const BRIDGE_LISTING: &str = "table bridge portcullis {
-	set quarantined {
-		type ifname
-	}
-	set conns16384 {
-		type ifname
-		size 65536
-		flags dynamic
-	}
-	chain prerouting {
-		type filter hook prerouting priority -1; policy accept;
-	}
-	chain icc3 {
-		ct state established accept
-	}
-	chain limit_open {
-		drop
-	}
-}
-";
+    /// The tables a previous run left: base chains, chains of sources, sets every update
+    /// creates, and sets of hostnames and limits.
+    fn previous_run() -> Found {
+        Found {
+            chains: vec![
+                (object(Table::Inet, "forward"), true),
+                (object(Table::Inet, "egress0"), false),
+                (object(Table::Inet, "egress7"), false),
+                (object(Table::Bridge, "prerouting"), true),
+                (object(Table::Bridge, "icc3"), false),
+                (object(Table::Bridge, "limit_open"), false),
+            ],
+            sets: vec![
+                object(Table::Inet, "logged4"),
+                object(Table::Inet, "egress4"),
+                object(Table::Inet, "pc_h4_00000000000000aa"),
+                object(Table::Bridge, "quarantined"),
+                object(Table::Bridge, "conns16384"),
+            ],
+        }
+    }
 
     #[test]
     fn keeps_the_rules_a_previous_run_left_in_place() {
-        let firewall = NftablesFirewall::new(
-            RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING),
-            OPTIONS,
-        );
+        let firewall = NftablesFirewall::new(RecordingRunner::with_tables(previous_run()), OPTIONS);
         assert_eq!(firewall.restore().expect("restore"), Restored::Kept);
         firewall
             .apply(
@@ -4411,7 +4496,7 @@ flush chain bridge portcullis limit_open
 
     #[test]
     fn replaces_rules_found_in_place_that_updates_cant_change() {
-        let runner = RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING);
+        let runner = RecordingRunner::with_tables(previous_run());
         *runner.failing.lock().expect("lock") = Some("delete chain inet portcullis egress7".into());
         let firewall = NftablesFirewall::new(runner, OPTIONS);
         firewall.restore().expect("restore");
@@ -4434,30 +4519,22 @@ flush chain bridge portcullis limit_open
 
     #[test]
     fn lists_installed_chains_and_sets() {
-        let mut installed = Installed::default();
-        installed.add_listed(Table::Inet, INET_LISTING);
-        installed.add_listed(Table::Bridge, BRIDGE_LISTING);
+        let installed = Installed::of(previous_run());
         assert_eq!(
             installed.chains,
-            BTreeSet::from(
-                [
-                    "inet portcullis egress0",
-                    "inet portcullis egress7",
-                    "bridge portcullis icc3",
-                    "bridge portcullis limit_open",
-                ]
-                .map(String::from)
-            )
+            BTreeSet::from([
+                object(Table::Inet, "egress0"),
+                object(Table::Inet, "egress7"),
+                object(Table::Bridge, "icc3"),
+                object(Table::Bridge, "limit_open"),
+            ])
         );
         assert_eq!(
             installed.sets,
-            BTreeSet::from(
-                [
-                    "inet portcullis pc_h4_00000000000000aa",
-                    "bridge portcullis conns16384"
-                ]
-                .map(String::from)
-            )
+            BTreeSet::from([
+                object(Table::Inet, "pc_h4_00000000000000aa"),
+                object(Table::Bridge, "conns16384"),
+            ])
         );
     }
 
@@ -4506,9 +4583,9 @@ flush chain bridge portcullis limit_open
         assert_eq!(
             scripts.as_slice(),
             [format!(
-                "add element inet portcullis {name} {{ 198.51.100.3 timeout 2s, 198.51.100.4 timeout 1s }}\n\
+                "add set inet portcullis {name} {{ type ipv4_addr; elements = {{ 198.51.100.3 timeout 2s, 198.51.100.4 timeout 1s }}; }}\n\
                  delete element inet portcullis {name} {{ 198.51.100.3, 198.51.100.4 }}\n\
-                 add element inet portcullis {name} {{ 198.51.100.3 timeout 2s }}\n"
+                 add set inet portcullis {name} {{ type ipv4_addr; elements = {{ 198.51.100.3 timeout 2s }}; }}\n"
             )]
         );
     }
@@ -4518,13 +4595,22 @@ flush chain bridge portcullis limit_open
         let state = test_support::hostname_state();
         let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
         let name = plan.host_set(0).expect("host set").id.name(SET_PREFIX_V4);
-        let inet = format!(
-            "table inet portcullis {{\n\tset {name} {{\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}}\n}}\n"
-        );
+        let tables = || Found {
+            chains: vec![
+                (object(Table::Bridge, "prerouting"), true),
+                (object(Table::Bridge, "icc3"), false),
+                (object(Table::Bridge, "limit_open"), false),
+            ],
+            sets: vec![
+                object(Table::Inet, &name.to_string()),
+                object(Table::Bridge, "quarantined"),
+                object(Table::Bridge, "conns16384"),
+            ],
+        };
         let renewed = format!(
-            "add element inet portcullis {name} {{ 1.1.1.1 timeout 3600s }}\n\
+            "add set inet portcullis {name} {{ type ipv4_addr; elements = {{ 1.1.1.1 timeout 3600s }}; }}\n\
              delete element inet portcullis {name} {{ 1.1.1.1 }}\n\
-             add element inet portcullis {name} {{ 1.1.1.1 timeout 3600s }}\n"
+             add set inet portcullis {name} {{ type ipv4_addr; elements = {{ 1.1.1.1 timeout 3600s }}; }}\n"
         );
         let added = format!(
             "add set inet portcullis {name} {{ type ipv4_addr; flags timeout; size 8192; elements = {{ 1.1.1.1 timeout 3600s }}; }}\n"
@@ -4533,8 +4619,7 @@ flush chain bridge portcullis limit_open
 
         // Left in place by a run that stopped: what the set has stays, the update renews
         // what Portcullis knows.
-        let firewall =
-            NftablesFirewall::new(RecordingRunner::with_tables(&inet, BRIDGE_LISTING), OPTIONS);
+        let firewall = NftablesFirewall::new(RecordingRunner::with_tables(tables()), OPTIONS);
         assert_eq!(firewall.restore().expect("restore"), Restored::Kept);
         // Then a network without containers: an update that changes nothing of the set.
         let mut more = state.clone();
@@ -4561,28 +4646,32 @@ flush chain bridge portcullis limit_open
 
         // Put back from the saved rules after a reboot: those addresses may be days old.
         let path = std::env::temp_dir().join(format!(
-            "portcullis-saved-hosts-{}/rules.nft",
+            "portcullis-saved-hosts-{}/rules.batch",
             std::process::id()
         ));
         fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, "# saved\n").expect("save");
+        let mut empty = SAVED_HEADER.to_vec();
+        netlink::batch_marker(&mut empty, false);
+        netlink::batch_marker(&mut empty, true);
+        fs::write(&path, empty).expect("save");
         let restored =
             NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
-        *restored.runner.creates.lock().expect("lock") =
-            Some(RecordingRunner::tables(&inet, BRIDGE_LISTING));
+        *restored.runner.creates.lock().expect("lock") = Some(tables());
         assert_eq!(restored.restore().expect("restore"), Restored::Saved);
         restored
             .apply(&state, &mut MockResolver::default(), &[], false)
             .expect("apply");
         let scripts = restored.runner.scripts.lock().expect("lock");
-        assert!(scripts[1].contains(&flushed), "{}", scripts[1]);
+        assert!(scripts[0].contains(&flushed), "{}", scripts[0]);
         let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn saves_rules_to_restore_them_at_the_next_start() {
-        let path =
-            std::env::temp_dir().join(format!("portcullis-saved-{}/rules.nft", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "portcullis-saved-{}/rules.batch",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         let firewall =
             NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
@@ -4592,45 +4681,61 @@ flush chain bridge portcullis limit_open
             "nothing saved yet"
         );
         let mut resolver = MockResolver::default();
+        let mut last = None;
         for state in [test_support::icc_state(), test_support::hostname_state()] {
             let plan = firewall
                 .apply(&state, &mut resolver, &[], false)
                 .expect("apply");
             firewall.save(&plan).expect("save");
+            last = Some(plan);
         }
-        // The saved script installs the last update's rules from scratch, unlike the
-        // update itself.
-        let saved = fs::read_to_string(&path).expect("saved");
-        assert!(saved.starts_with("add table inet portcullis\ndelete table inet portcullis\n"));
+        // The saved batch installs the last update's rules from scratch, unlike the update
+        // itself.
+        let fresh = fresh_batch(&last.expect("plan"), OPTIONS);
+        let script = fresh.to_string();
+        assert!(script.starts_with("add table inet portcullis\ndelete table inet portcullis\n"));
         // ...with nothing of the update before it.
-        assert!(saved.contains("ct original ip daddr @pc_h4_"));
-        assert!(!saved.contains("delete chain"), "{saved}");
+        assert!(script.contains("ct original ip daddr @pc_h4_"));
+        assert!(!script.contains("delete chain"), "{script}");
+        let saved = fs::read(&path).expect("saved");
+        let mut encoded = SAVED_HEADER.to_vec();
+        let mut whole = Vec::new();
+        Encoder::new(&mut whole).batch(&fresh);
+        encoded.extend_from_slice(&whole);
+        assert_eq!(saved, encoded);
 
-        // Without tables in place (after a reboot), restoring runs it, and the next update
-        // changes what it installed in place.
-        *firewall.runner.creates.lock().expect("lock") =
-            Some(RecordingRunner::tables(INET_LISTING, BRIDGE_LISTING));
+        // Without tables in place (after a reboot), restoring puts it in place, and the next
+        // update changes what it installed in place.
+        *firewall.runner.creates.lock().expect("lock") = Some(previous_run());
         assert_eq!(firewall.restore().expect("restore"), Restored::Saved);
+        assert_eq!(
+            firewall.runner.encoded.lock().expect("lock").as_slice(),
+            [saved[SAVED_HEADER.len()..].to_vec()]
+        );
         firewall
             .apply(&test_support::icc_state(), &mut resolver, &[], false)
             .expect("apply");
         let scripts = firewall.runner.scripts.lock().expect("lock");
-        assert_eq!(scripts.get(2), Some(&saved));
         assert!(
             scripts
-                .get(3)
+                .get(2)
                 .is_some_and(|script| !script.contains("delete table"))
         );
         drop(scripts);
 
+        // Rules an earlier version saved as an nft script aren't run.
+        fs::write(&path, "add table inet portcullis\n").expect("save");
+        let earlier =
+            NftablesFirewall::new(RecordingRunner::default(), OPTIONS).saving_to(path.clone());
+        assert_eq!(earlier.restore().expect("restore"), Restored::Nothing);
+        assert!(earlier.runner.encoded.lock().expect("lock").is_empty());
+
         // With tables in place, they are kept, and the saved script isn't run.
-        let kept = NftablesFirewall::new(
-            RecordingRunner::with_tables(INET_LISTING, BRIDGE_LISTING),
-            OPTIONS,
-        )
-        .saving_to(path.clone());
+        let kept = NftablesFirewall::new(RecordingRunner::with_tables(previous_run()), OPTIONS)
+            .saving_to(path.clone());
         assert_eq!(kept.restore().expect("restore"), Restored::Kept);
         assert!(kept.runner.scripts.lock().expect("lock").is_empty());
+        assert!(kept.runner.encoded.lock().expect("lock").is_empty());
 
         firewall.forget_saved().expect("forget");
         assert!(!path.exists());
