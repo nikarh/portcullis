@@ -16,7 +16,7 @@ portcullis.egress.<name>=<destination>,<service>[,<service>...]
 ```yaml title="docker-compose.yml"
 labels:
   - portcullis.egress.stripe=host:api.stripe.com,tcp:443
-  - portcullis.egress.ntp=ip:162.159.200.1,udp:123
+  - portcullis.egress.ntp=host:pool.ntp.org,udp:123
   - portcullis.egress.internal=ip:10.20.0.0/16,tcp:80,443
   - portcullis.egress.peers=ip:public,tcp:*,udp:1024-65535
   - portcullis.egress.stun=ip:public,udp:3478-3479
@@ -30,8 +30,10 @@ labels:
 | `ip:<cidr>` | a range, such as `ip:10.0.0.0/8` |
 | `ip:public` | any public address (see below) |
 | `ip:*` | any address, the Docker host's and the LAN's included |
-| `host:<name>` | the addresses the name resolves to, such as `host:api.stripe.com`; see [Hostname rules](/policy/hostnames/) |
-| `host:<pattern>` | the addresses of names matching a [pattern](/policy/patterns/), such as `host:*.example.org` |
+| `host:<name>` | the addresses the name resolves to, such as `host:api.stripe.com`; a connection that names the server it wants (TLS, HTTP, QUIC) must name this one. See [Hostname rules](/policy/hostnames/) |
+| `host:<pattern>` | the same for names matching a [pattern](/policy/patterns/), such as `host:*.example.org` |
+
+After the services of a `host:` rule, `strict` denies connections that don't name a server, such as TLS without a server name or SSH (`host:api.stripe.com,tcp:443,strict`); see [Strict name checks](/policy/hostnames/#strict-name-checks).
 
 IPv6 addresses aren't accepted; see [Limitations](/limits/limitations/).
 

@@ -173,6 +173,7 @@ fn connection_event(
         domain: None,
         domain_source: None,
         query: None,
+        name: None,
         detail: None,
         mid_stream: false,
         forged: false,

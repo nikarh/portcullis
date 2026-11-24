@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::dns;
 use crate::firewall::{self, DenyAction, LogAllowed};
 use crate::logging::{LogFormat, LogLevel};
+pub use crate::model::Strictness;
 use crate::policy_file;
 use crate::tools;
 
@@ -33,6 +34,11 @@ pub struct Config {
     pub monitor_networks: Vec<String>,
     pub log_allowed: LogAllowed,
     pub hostname_hold: Duration,
+    /// Whether `host:` rules allow connections that don't name a server by address
+    /// (`lenient`), or only those that name one of their names (`strict`).
+    pub name_checks: Strictness,
+    /// Bits of connection marks name checks may use.
+    pub ct_mark_mask: u32,
     pub alert_exec: Option<String>,
     pub alert_interval: Duration,
     pub log_level: LogLevel,
@@ -80,6 +86,8 @@ impl Default for Config {
             monitor_networks: Vec::new(),
             log_allowed: LogAllowed::Monitor,
             hostname_hold: dns::DEFAULT_HOLD,
+            name_checks: Strictness::Lenient,
+            ct_mark_mask: firewall::DEFAULT_CT_MARK_MASK,
             alert_exec: None,
             alert_interval: Duration::from_secs(600),
             log_level: LogLevel::Info,
@@ -131,6 +139,8 @@ struct Settings {
     monitor_networks: Option<Vec<String>>,
     log_allowed: Option<String>,
     hostname_hold: Option<Limit>,
+    name_checks: Option<String>,
+    ct_mark_mask: Option<String>,
     alert_exec: Option<String>,
     alert_interval: Option<u64>,
     log_level: Option<String>,
@@ -265,6 +275,8 @@ fn flags(args: &mut Arguments) -> Result<Settings, ConfigError> {
             .filter(|names| !names.is_empty()),
         log_allowed: args.opt_value_from_str("--log-allowed")?,
         hostname_hold: args.opt_value_from_str("--hostname-hold")?,
+        name_checks: args.opt_value_from_str("--name-checks")?,
+        ct_mark_mask: args.opt_value_from_str("--ct-mark-mask")?,
         alert_exec: args.opt_value_from_str("--alert-exec")?,
         alert_interval: args.opt_value_from_str("--alert-interval")?,
         log_level: args.opt_value_from_str("--log-level")?,
@@ -296,6 +308,35 @@ impl Config {
         if let Some(directory) = settings.policy_dir.take() {
             self.policy_dir = directory;
         }
+    }
+
+    /// `name-checks` and `ct-mark-mask`.
+    fn apply_name_checks(
+        &mut self,
+        name_checks: Option<String>,
+        ct_mark_mask: Option<String>,
+        invalid: &impl Fn(&str, String, &'static str) -> ConfigError,
+    ) -> Result<(), ConfigError> {
+        if let Some(value) = name_checks {
+            self.name_checks = Strictness::parse(&value)
+                .ok_or_else(|| invalid("name-checks", value.clone(), "lenient or strict"))?;
+        }
+        if let Some(value) = ct_mark_mask {
+            let parsed = value
+                .strip_prefix("0x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .ok_or_else(|| {
+                    invalid(
+                        "ct-mark-mask",
+                        value.clone(),
+                        "a hexadecimal mask such as 0x00f00000",
+                    )
+                })?;
+            firewall::CtMarkBits::from_mask(parsed)
+                .map_err(|reason| invalid("ct-mark-mask", value.clone(), reason))?;
+            self.ct_mark_mask = parsed;
+        }
+        Ok(())
     }
 
     fn apply(&mut self, mut settings: Settings, origin: &Origin<'_>) -> Result<(), ConfigError> {
@@ -332,6 +373,7 @@ impl Config {
             self.hostname_hold = dns::parse_hold(&value)
                 .map_err(|expected| invalid("hostname-hold", value, expected))?;
         }
+        self.apply_name_checks(settings.name_checks, settings.ct_mark_mask, &invalid)?;
         if let Some(command) = settings.alert_exec {
             self.alert_exec = Some(command);
         }
@@ -425,6 +467,8 @@ mod tests {
             monitor_networks: vec!["backend".to_string(), "frontend".to_string()],
             log_allowed: LogAllowed::Always,
             hostname_hold: Duration::from_secs(60),
+            name_checks: Strictness::Strict,
+            ct_mark_mask: 0x0000_f000,
             alert_exec: Some("notify-send".to_string()),
             alert_interval: Duration::from_secs(30),
             log_level: LogLevel::Debug,
@@ -483,6 +527,10 @@ mod tests {
             "always",
             "--hostname-hold",
             "60",
+            "--name-checks",
+            "strict",
+            "--ct-mark-mask",
+            "0x0000f000",
             "--alert-exec",
             "notify-send",
             "--alert-interval",
@@ -519,6 +567,8 @@ mod tests {
             monitor-networks = ["backend", "frontend"]
             log-allowed = "always"
             hostname-hold = 60
+            name-checks = "strict"
+            ct-mark-mask = "0x0000f000"
             alert-exec = "notify-send"
             alert-interval = 30
             log-level = "debug"
@@ -576,6 +626,12 @@ mod tests {
             ("--connection-limit", "0"),
             ("--connection-limit", "many"),
             ("--monitor-network", ""),
+            ("--name-checks", "loose"),
+            ("--ct-mark-mask", "f00000"),
+            ("--ct-mark-mask", "0x00700000"),
+            ("--ct-mark-mask", "0x00f0f000"),
+            ("--ct-mark-mask", "0x0000000f"),
+            ("--ct-mark-mask", "0x7fffffff"),
         ] {
             assert!(from_flags(&[flag, value]).is_err(), "{flag} {value}");
         }

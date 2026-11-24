@@ -74,6 +74,15 @@ pub enum Chain {
     ArpCheck { monitor: bool },
     /// Egress rules of the source in the n-th slot, in the inet table.
     Egress(usize),
+    /// Base chain of the inet table for traffic the host sends: replies of its services to
+    /// containers, for connections whose names are checked.
+    Output,
+    /// Packets of connections whose names are checked, or were denied.
+    NameCheck,
+    /// The client's packets with data of a watched connection (plain HTTP).
+    NameWatch,
+    /// Hands packets on to Portcullis's queue for their mode.
+    NameQueue,
     /// ICC rules of the source in the n-th slot, in the bridge table.
     Icc(usize),
 }
@@ -82,7 +91,12 @@ impl Chain {
     pub const fn table(self) -> Table {
         match self {
             Self::Base(table) => table,
-            Self::Input | Self::Egress(_) => Table::Inet,
+            Self::Input
+            | Self::Egress(_)
+            | Self::Output
+            | Self::NameCheck
+            | Self::NameWatch
+            | Self::NameQueue => Table::Inet,
             Self::BridgeInput
             | Self::BridgeForward
             | Self::Limited { .. }
@@ -96,6 +110,7 @@ impl Chain {
         match self {
             Self::Base(table) => Some(table.hook()),
             Self::Input | Self::BridgeInput => Some("input"),
+            Self::Output => Some("output"),
             Self::BridgeForward => Some("forward"),
             _ => None,
         }
@@ -125,6 +140,10 @@ impl fmt::Display for ChainName {
         match self.0 {
             Chain::Base(table) => f.write_str(table.hook()),
             Chain::Input | Chain::BridgeInput => f.write_str("input"),
+            Chain::Output => f.write_str("output"),
+            Chain::NameCheck => f.write_str("name_check"),
+            Chain::NameWatch => f.write_str("name_watch"),
+            Chain::NameQueue => f.write_str("name_queue"),
             Chain::BridgeForward => f.write_str("forward"),
             Chain::Limited { rate, monitor } => write!(
                 f,
@@ -492,6 +511,7 @@ pub enum Key {
     CtState,
     CtStatus,
     CtDirection,
+    CtMark,
     /// The source address of a connection in its original direction, or its reply.
     CtSaddr {
         reply: bool,
@@ -539,6 +559,7 @@ impl fmt::Display for Key {
             Self::CtState => f.write_str("ct state"),
             Self::CtStatus => f.write_str("ct status"),
             Self::CtDirection => f.write_str("ct direction"),
+            Self::CtMark => f.write_str("ct mark"),
             Self::CtSaddr { reply, ipv6 } => write!(
                 f,
                 "ct {} {} saddr",
@@ -639,10 +660,11 @@ pub enum Expr {
         equal: bool,
         value: Value,
     },
-    /// `<key> & <mask> == <value>`.
+    /// `<key> & <mask> == <value>`, or with `equal` false, `!=`.
     Masked {
         key: Key,
         mask: Value,
+        equal: bool,
         value: Value,
     },
     /// The key, or concatenation of keys, is in the set (or with `negate`, isn't).
@@ -684,6 +706,11 @@ pub enum Expr {
         bypass: bool,
     },
     SetMark(u32),
+    /// `ct mark set ct mark & <keep> | <set>`: change some bits of the connection's mark.
+    SetCtMark {
+        keep: u32,
+        set: u32,
+    },
 }
 
 impl Expr {
@@ -740,7 +767,16 @@ impl fmt::Display for Expr {
                 equal: false,
                 value,
             } => write!(f, "{key} != {value}"),
-            Self::Masked { key, mask, value } => write!(f, "{key} & {mask} == {value}"),
+            Self::Masked {
+                key,
+                mask,
+                equal,
+                value,
+            } => write!(
+                f,
+                "{key} & {mask} {} {value}",
+                if *equal { "==" } else { "!=" }
+            ),
             Self::Lookup { key, set, negate } => write!(
                 f,
                 "{} {}@{set}",
@@ -782,6 +818,9 @@ impl fmt::Display for Expr {
                 write!(f, "queue num {num}{}", if *bypass { " bypass" } else { "" })
             }
             Self::SetMark(mark) => write!(f, "meta mark set {mark:#x}"),
+            Self::SetCtMark { keep, set } => {
+                write!(f, "ct mark set ct mark & {keep:#010x} | {set:#010x}")
+            }
         }
     }
 }

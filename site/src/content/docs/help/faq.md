@@ -35,11 +35,11 @@ Portcullis puts the last saved rules back before Docker starts, then waits for D
 
 ## What does it cost?
 
-Rules are evaluated in the kernel. Containers with `portcullis.domains` labels wait for a round trip through Portcullis on every lookup, a small delay next to the lookup itself; containers without them aren't affected. There are no published benchmarks.
+Rules are evaluated in the kernel. Containers with `portcullis.domains` labels wait for a round trip through Portcullis on every lookup, a small delay next to the lookup itself; containers without them aren't affected. Connections through `host:` rules go through Portcullis for their first few packets, until their name is checked, and then pass in the kernel; plain HTTP connections stay watched. See [Name checks](/internals/how-it-works/#name-checks) for measurements. There are no published benchmarks.
 
 ## Can it filter by URL, or by TLS SNI?
 
-No. Rules match addresses and ports. A `host:` rule allows the addresses a name resolves to, which may serve other sites too. For hostname- or URL-precise filtering, send traffic through a filtering proxy and let Portcullis make the proxy the only way out: see [Egress through a filtering proxy](/examples/egress-proxy/).
+By TLS SNI (QUIC's too) and HTTP `Host`, yes: a connection through a `host:` rule that names a server must name the rule's, so other sites on the same CDN address are denied; connections that name nothing are allowed by address, unless names are checked strictly (see [Names connections ask for](/policy/hostnames/#names-connections-ask-for)). By URL, no: that, and what a client asks for inside TLS, takes a proxy that decrypts. Send traffic through a filtering proxy and let Portcullis make the proxy the only way out: see [Egress through a filtering proxy](/examples/egress-proxy/).
 
 ## Does it control incoming connections?
 

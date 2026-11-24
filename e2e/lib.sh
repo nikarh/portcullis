@@ -92,6 +92,14 @@ craft() {
   in_svc "${service}" craft "$@" 2>&1
 }
 
+# name_probe <service> tls|http <address> <port> <name> [...]: a client that names the
+# server it wants; see images/tester/name-probe.py.
+name_probe() {
+  local service="$1"
+  shift
+  in_svc "${service}" name-probe "$@" 2>&1
+}
+
 # ping_probe <service> <address>
 ping_probe() {
   in_svc "$1" ping -c 1 -W 3 "$2" 2>&1
@@ -111,6 +119,7 @@ answered() {
     dns) grep -Eq '^[0-9a-f.:]+$' <<<"$2" ;;
     resolve | fast_dns) grep -A1 '^Name:' <<<"$2" | grep -q '^Address' ;;
     craft) grep -q '^answered' <<<"$2" ;;
+    name_probe) grep -Eq '^([0-9.]+|answered)$' <<<"$2" ;;
     ping_probe) grep -q ' 0% packet loss' <<<"$2" ;;
     *) return 1 ;;
   esac
@@ -122,6 +131,8 @@ rejected() {
     # Docker's DNS server answers SERVFAIL when its upstream rejects the query.
     resolve) grep -Eq 'SERVFAIL|unreachable' <<<"$2" ;;
     craft) grep -q '^rejected' <<<"$2" ;;
+    # A connection denied once it is open gets a reset.
+    name_probe) grep -Eq '^(reset|unreachable)$' <<<"$2" ;;
     *) grep -Eqi 'unreachable|no route to host' <<<"$2" ;;
   esac
 }

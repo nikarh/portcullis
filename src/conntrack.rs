@@ -30,6 +30,9 @@ const CTA_TUPLE_REPLY: u16 = 2;
 const CTA_ZONE: u16 = 18;
 const CTA_TUPLE_IP: u16 = 1;
 const CTA_TUPLE_PROTO: u16 = 2;
+const CTA_MARK: u16 = 8;
+const CTA_PROTO_NUM: u16 = 1;
+const CTA_PROTO_SRC_PORT: u16 = 2;
 const CTA_PROTO_DST_PORT: u16 = 3;
 const CTA_IP_V4_SRC: u16 = 1;
 const CTA_IP_V4_DST: u16 = 2;
@@ -112,6 +115,67 @@ pub fn forget(addresses: &HashSet<IpAddr>) -> io::Result<usize> {
     Ok(deleted)
 }
 
+/// Asks connection tracking whether connections are still tracked.
+pub struct Lookup {
+    socket: RouteSocket,
+}
+
+impl Lookup {
+    pub fn open() -> io::Result<Self> {
+        Ok(Self {
+            socket: RouteSocket::open_protocol(NETLINK_NETFILTER)?,
+        })
+    }
+
+    /// Whether the connection whose original direction is `tuple` is tracked (in the
+    /// default zone).
+    pub fn exists(&mut self, tuple: &Tuple) -> io::Result<bool> {
+        let family = if tuple.source.0.is_ipv4() {
+            AF_INET
+        } else {
+            AF_INET6
+        };
+        let mut request = nfgenmsg(family);
+        request.extend(attribute(
+            CTA_TUPLE_ORIG | NLA_F_NESTED,
+            &encode_tuple(tuple),
+        ));
+        match self.socket.exchange(
+            (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET,
+            NLM_F_ACK,
+            &request,
+            |_, _| true,
+        ) {
+            Ok(()) => Ok(true),
+            Err(error) if error.raw_os_error() == Some(ENOENT) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// The attributes of a tuple.
+fn encode_tuple(tuple: &Tuple) -> Vec<u8> {
+    let mut ip = Vec::new();
+    for (address, (v4, v6)) in [
+        (tuple.source.0, (CTA_IP_V4_SRC, CTA_IP_V6_SRC)),
+        (tuple.destination.0, (CTA_IP_V4_DST, CTA_IP_V6_DST)),
+    ] {
+        match address {
+            IpAddr::V4(address) => ip.extend(attribute(v4, &address.octets())),
+            IpAddr::V6(address) => ip.extend(attribute(v6, &address.octets())),
+        }
+    }
+    let mut proto = attribute(CTA_PROTO_NUM, &[tuple.protocol]);
+    proto.extend(attribute(CTA_PROTO_SRC_PORT, &tuple.source.1.to_be_bytes()));
+    proto.extend(attribute(
+        CTA_PROTO_DST_PORT,
+        &tuple.destination.1.to_be_bytes(),
+    ));
+    let mut out = attribute(CTA_TUPLE_IP | NLA_F_NESTED, &ip);
+    out.extend(attribute(CTA_TUPLE_PROTO | NLA_F_NESTED, &proto));
+    out
+}
+
 /// `struct nfgenmsg`: family, version 0, resource ID 0.
 fn nfgenmsg(family: u8) -> Vec<u8> {
     vec![family, 0, 0, 0]
@@ -153,6 +217,50 @@ pub fn original_destination(connection: &[u8]) -> Option<(IpAddr, Option<u16>)> 
         .and_then(|(_, port)| <[u8; 2]>::try_from(port).ok())
         .map(u16::from_be_bytes);
     Some((destination, port))
+}
+
+/// A connection as one direction of it goes: protocol, and source and destination address
+/// and port (zero for protocols without ports).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Tuple {
+    pub protocol: u8,
+    pub source: (IpAddr, u16),
+    pub destination: (IpAddr, u16),
+}
+
+/// The original direction and the mark of a connection, from its attributes (as NFQUEUE
+/// attaches them to queued packets).
+pub fn tracked(connection: &[u8]) -> Option<(Tuple, u32)> {
+    let mut original = None;
+    let mut mark = 0;
+    for (kind, value) in attributes(connection) {
+        match kind {
+            CTA_TUPLE_ORIG => original = tuple(value),
+            CTA_MARK => mark = u32::from_be_bytes(value.try_into().ok()?),
+            _ => {}
+        }
+    }
+    Some((original?, mark))
+}
+
+fn tuple(value: &[u8]) -> Option<Tuple> {
+    let (source, destination) = addresses(value)?;
+    let (_, proto) = attributes(value).find(|(kind, _)| *kind == CTA_TUPLE_PROTO)?;
+    let mut protocol = None;
+    let mut ports = (0, 0);
+    for (kind, value) in attributes(proto) {
+        match kind {
+            CTA_PROTO_NUM => protocol = value.first().copied(),
+            CTA_PROTO_SRC_PORT => ports.0 = u16::from_be_bytes(value.try_into().ok()?),
+            CTA_PROTO_DST_PORT => ports.1 = u16::from_be_bytes(value.try_into().ok()?),
+            _ => {}
+        }
+    }
+    Some(Tuple {
+        protocol: protocol?,
+        source: (source, ports.0),
+        destination: (destination, ports.1),
+    })
 }
 
 /// Source and destination of a tuple attribute.
@@ -227,6 +335,43 @@ mod tests {
             original_destination(&connection),
             Some(("198.51.100.1".parse().expect("ip"), Some(18080)))
         );
+    }
+
+    #[test]
+    fn reads_the_connection_of_queued_packets() {
+        let mut ip = attribute(CTA_IP_V4_SRC, &[172, 18, 0, 3]);
+        ip.extend(attribute(CTA_IP_V4_DST, &[198, 51, 100, 1]));
+        let mut proto = attribute(CTA_PROTO_NUM, &[6]);
+        proto.extend(attribute(CTA_PROTO_SRC_PORT, &40312_u16.to_be_bytes()));
+        proto.extend(attribute(CTA_PROTO_DST_PORT, &443_u16.to_be_bytes()));
+        let mut original = attribute(CTA_TUPLE_IP | NLA_F_NESTED, &ip);
+        original.extend(attribute(CTA_TUPLE_PROTO | NLA_F_NESTED, &proto));
+        let mut connection = attribute(CTA_TUPLE_ORIG | NLA_F_NESTED, &original);
+        connection.extend(attribute(CTA_MARK, &0x0020_0001_u32.to_be_bytes()));
+        let ip = |value: &str| value.parse::<IpAddr>().expect("ip");
+        assert_eq!(
+            tracked(&connection),
+            Some((
+                Tuple {
+                    protocol: 6,
+                    source: (ip("172.18.0.3"), 40312),
+                    destination: (ip("198.51.100.1"), 443),
+                },
+                0x0020_0001
+            ))
+        );
+        assert_eq!(tracked(&attribute(CTA_MARK, &[0, 0, 0, 1])), None);
+    }
+
+    #[test]
+    fn encodes_tuples_as_the_kernel_reports_them() {
+        let ip = |value: &str| value.parse::<IpAddr>().expect("ip");
+        let original = Tuple {
+            protocol: 6,
+            source: (ip("172.18.0.3"), 40312),
+            destination: (ip("198.51.100.1"), 443),
+        };
+        assert_eq!(super::tuple(&encode_tuple(&original)), Some(original));
     }
 
     #[test]

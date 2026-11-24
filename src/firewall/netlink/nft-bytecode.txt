@@ -6226,3 +6226,349 @@ add rule bridge portcullis icc3 ip daddr 172.18.0.0/16 accept
 [ cmp eq reg 1 0x000012ac ]
 [ immediate reg 0 accept ]
 
+add rule inet portcullis egress0 ct original ip daddr @pc_h4_4fce35e60191b43e meta l4proto tcp ct original proto-dst 443 ct mark set ct mark & 0xffffffff | 0x00200000 queue num 8
+[ ct load dst_ip => reg 1 , dir original ]
+[ lookup reg 1 set pc_h4_4fce35e60191b43e ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load proto_dst => reg 1 , dir original ]
+[ cmp eq reg 1 0x0000bb01 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xffdfffff ) ^ 0x00200000 ]
+[ ct set mark with reg 1 ]
+[ queue num 8 ]
+
+add rule inet portcullis forward meta mark 0x70630004 ct mark set ct mark & 0xff0fffff | 0x00000000 accept
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630004 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00000000 ]
+[ ct set mark with reg 1 ]
+[ immediate reg 0 accept ]
+
+add rule inet portcullis forward meta mark 0x70630005 ct mark set ct mark & 0xff1fffff | 0x00400000 accept
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630005 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff1fffff ) ^ 0x00400000 ]
+[ ct set mark with reg 1 ]
+[ immediate reg 0 accept ]
+
+add rule inet portcullis forward meta mark 0x70630006 meta l4proto tcp ct mark set ct mark & 0xff0fffff | 0x00800000 reject with tcp reset
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630006 ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00800000 ]
+[ ct set mark with reg 1 ]
+[ reject type 1 code 0 ]
+
+add rule inet portcullis forward meta mark 0x70630006 ct mark set ct mark & 0xff0fffff | 0x00800000 reject with icmpx admin-prohibited
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630006 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00800000 ]
+[ ct set mark with reg 1 ]
+[ reject type 2 code 3 ]
+
+add rule inet portcullis forward ct mark & 0xf00000 != 0x0 jump name_check
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x00f00000 ) ^ 0x00000000 ]
+[ cmp neq reg 1 0x00000000 ]
+[ immediate reg 0 jump -> name_check ]
+
+add rule inet portcullis input meta mark 0x70630004 ct mark set ct mark & 0xff0fffff | 0x00000000 accept
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630004 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00000000 ]
+[ ct set mark with reg 1 ]
+[ immediate reg 0 accept ]
+
+add rule inet portcullis input meta mark 0x70630005 ct mark set ct mark & 0xff1fffff | 0x00400000 accept
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630005 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff1fffff ) ^ 0x00400000 ]
+[ ct set mark with reg 1 ]
+[ immediate reg 0 accept ]
+
+add rule inet portcullis input meta mark 0x70630006 meta l4proto tcp ct mark set ct mark & 0xff0fffff | 0x00800000 reject with tcp reset
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630006 ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00800000 ]
+[ ct set mark with reg 1 ]
+[ reject type 1 code 0 ]
+
+add rule inet portcullis input meta mark 0x70630006 ct mark set ct mark & 0xff0fffff | 0x00800000 reject with icmpx admin-prohibited
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630006 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00800000 ]
+[ ct set mark with reg 1 ]
+[ reject type 2 code 3 ]
+
+add rule inet portcullis input ct mark & 0xf00000 != 0x0 jump name_check
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x00f00000 ) ^ 0x00000000 ]
+[ cmp neq reg 1 0x00000000 ]
+[ immediate reg 0 jump -> name_check ]
+
+add rule inet portcullis output meta mark 0x70630004 ct mark set ct mark & 0xff0fffff | 0x00000000 accept
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630004 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00000000 ]
+[ ct set mark with reg 1 ]
+[ immediate reg 0 accept ]
+
+add rule inet portcullis output meta mark 0x70630005 ct mark set ct mark & 0xff1fffff | 0x00400000 accept
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630005 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff1fffff ) ^ 0x00400000 ]
+[ ct set mark with reg 1 ]
+[ immediate reg 0 accept ]
+
+add rule inet portcullis output meta mark 0x70630006 meta l4proto tcp ct mark set ct mark & 0xff0fffff | 0x00800000 reject with tcp reset
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630006 ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00800000 ]
+[ ct set mark with reg 1 ]
+[ reject type 1 code 0 ]
+
+add rule inet portcullis output meta mark 0x70630006 ct mark set ct mark & 0xff0fffff | 0x00800000 reject with icmpx admin-prohibited
+[ meta load mark => reg 1 ]
+[ cmp eq reg 1 0x70630006 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xff0fffff ) ^ 0x00800000 ]
+[ ct set mark with reg 1 ]
+[ reject type 2 code 3 ]
+
+add rule inet portcullis output ct mark & 0x600000 != 0x0 jump name_check
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x00600000 ) ^ 0x00000000 ]
+[ cmp neq reg 1 0x00000000 ]
+[ immediate reg 0 jump -> name_check ]
+
+add rule inet portcullis name_check ct mark & 0x800000 == 0x800000 drop
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x00800000 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00800000 ]
+[ immediate reg 0 drop ]
+
+add rule inet portcullis name_check ct mark & 0x200000 == 0x200000 goto name_queue
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x00200000 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00200000 ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_check ct mark & 0x400000 == 0x400000 ct direction original goto name_watch
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x00400000 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00400000 ]
+[ ct load direction => reg 1 ]
+[ cmp eq reg 1 0x00000000 ]
+[ immediate reg 0 goto -> name_watch ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 80 @nh,16,16 41-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000050 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00002900 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 96 @nh,16,16 45-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000060 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00002d00 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 112 @nh,16,16 49-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000070 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00003100 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 128 @nh,16,16 53-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000080 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00003500 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 144 @nh,16,16 57-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000090 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00003900 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 160 @nh,16,16 61-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x000000a0 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00003d00 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 176 @nh,16,16 65-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x000000b0 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00004100 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 192 @nh,16,16 69-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x000000c0 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00004500 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 208 @nh,16,16 73-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x000000d0 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00004900 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 224 @nh,16,16 77-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x000000e0 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00004d00 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 @nh,256,8 & 240 == 240 @nh,16,16 81-65535 goto name_queue
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ payload load 1b @ network header + 32 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x000000f0 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x000000f0 ]
+[ payload load 2b @ network header + 2 => reg 1 ]
+[ range eq reg 1 0x00005100 0x0000ffff ]
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_watch @nh,0,8 & 15 == 5 accept
+[ payload load 1b @ network header + 0 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x0000000f ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00000005 ]
+[ immediate reg 0 accept ]
+
+add rule inet portcullis name_watch goto name_queue
+[ immediate reg 0 goto -> name_queue ]
+
+add rule inet portcullis name_queue ct mark & 0x100000 == 0x100000 queue num 9 bypass
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x00100000 ) ^ 0x00000000 ]
+[ cmp eq reg 1 0x00100000 ]
+[ queue num 9 bypass ]
+
+add rule inet portcullis name_queue queue num 8
+[ queue num 8 ]
+
+add rule inet portcullis egress0 ct original ip daddr @pc_h4_4fce35e60191b43e meta l4proto tcp ct original proto-dst 443 ct mark set ct mark & 0xffffffff | 0x00300000 queue num 9 bypass
+[ ct load dst_ip => reg 1 , dir original ]
+[ lookup reg 1 set pc_h4_4fce35e60191b43e ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load proto_dst => reg 1 , dir original ]
+[ cmp eq reg 1 0x0000bb01 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xffcfffff ) ^ 0x00300000 ]
+[ ct set mark with reg 1 ]
+[ queue num 9 bypass ]
+
+add rule inet portcullis egress0 ct original ip daddr @pc_h4_a9555a911dfbc0a7 meta l4proto tcp ct mark set ct mark & 0xffffffff | 0x00300000 queue num 9 bypass
+[ ct load dst_ip => reg 1 , dir original ]
+[ lookup reg 1 set pc_h4_a9555a911dfbc0a7 ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xffcfffff ) ^ 0x00300000 ]
+[ ct set mark with reg 1 ]
+[ queue num 9 bypass ]
+
+add rule inet portcullis egress0 ct original ip6 daddr @pc_h6_d8e03f5bc45f937a meta l4proto tcp ct original proto-dst 443 ct mark set ct mark & 0xffffffff | 0x00200000 queue num 8
+[ ct load dst_ip6 => reg 1 , dir original ]
+[ lookup reg 1 set pc_h6_d8e03f5bc45f937a ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load proto_dst => reg 1 , dir original ]
+[ cmp eq reg 1 0x0000bb01 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xffdfffff ) ^ 0x00200000 ]
+[ ct set mark with reg 1 ]
+[ queue num 8 ]
+
+add rule inet portcullis egress0 ct original ip6 daddr @pc_h6_d8e03f5bc45f937a meta l4proto tcp ct original proto-dst 443 ct mark set ct mark & 0xffffffff | 0x00300000 queue num 9 bypass
+[ ct load dst_ip6 => reg 1 , dir original ]
+[ lookup reg 1 set pc_h6_d8e03f5bc45f937a ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load proto_dst => reg 1 , dir original ]
+[ cmp eq reg 1 0x0000bb01 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xffcfffff ) ^ 0x00300000 ]
+[ ct set mark with reg 1 ]
+[ queue num 9 bypass ]
+
+add rule inet portcullis egress0 ct original ip daddr @pc_h4_a9555a911dfbc0a7 meta l4proto tcp ct mark set ct mark & 0xffffffff | 0x00200000 queue num 8
+[ ct load dst_ip => reg 1 , dir original ]
+[ lookup reg 1 set pc_h4_a9555a911dfbc0a7 ]
+[ meta load l4proto => reg 1 ]
+[ cmp eq reg 1 0x00000006 ]
+[ ct load mark => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0xffdfffff ) ^ 0x00200000 ]
+[ ct set mark with reg 1 ]
+[ queue num 8 ]

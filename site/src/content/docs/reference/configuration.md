@@ -30,6 +30,7 @@ connection-limit = "none"
 | `--monitor-network <name>` | none | Watch this network in monitor mode without a `portcullis.enable` label; `*` watches every bridge network. Repeat the flag for more networks. In the file, `monitor-networks = ["backend", "frontend"]`. A network's label, if it has one, wins. See [Enforcing a network](/policy/networks/#watching-networks-without-a-label). |
 | `--deny-action <reject\|drop>` | `reject` | `reject` answers denied traffic with an ICMP "administratively prohibited" error, so applications fail immediately with "Host is unreachable". `drop` discards it silently, and applications wait for their own timeout. Traffic denied for its source or kind (reasons `source` and `frame`) is always dropped: a rejection would go to an address the sender only claims. |
 | `--hostname-hold <duration>` | `3600` | How long an address of a `host:` rule stays allowed after DNS last returned it: seconds, or a number with `s`, `m`, `h` or `d`, from 10s to 7d. Containers can set their own with `portcullis.hostname-hold`. See [Hostname rules](/policy/hostnames/#how-long-an-address-stays-allowed). |
+| `--name-checks <lenient\|strict>` | `lenient` | What `host:` rules do with connections that don't name a server (TLS without a server name, other protocols, UDP other than QUIC): `lenient` allows them by address, `strict` denies them. Containers can set their own with `portcullis.name-checks`, and rules with `strict`. See [Strict name checks](/policy/hostnames/#strict-name-checks). |
 | `--quarantine <isolate\|report\|off>` | `isolate` | What happens to a container that misbehaves, see [Quarantine](/policy/limits/#quarantine). |
 | `--quarantine-denials <n>` | `1000` | Denied connections per minute past which a container is quarantined. |
 | `--policy-dir <path>` | `/etc/portcullis/policies` | Where the files `portcullis.policy-file` labels name are, see [Policy files](/policy/files/#where-files-are). |
@@ -54,6 +55,7 @@ connection-limit = "none"
 | `--docker-root <path>` | `/var/lib/docker` | Docker's data directory (`docker info -f '{{.DockerRootDir}}'`), where Portcullis reads the settings of containers that just started, see [Finding new containers](/internals/discovery/). |
 | `--state-dir <path>` | `/var/lib/portcullis` | Where the rules are saved, to be put back first thing at the next start, see [Boot order](/guides/service/#boot-order); and who each container address belongs to, see [Files](/reference/host-resources/#files). |
 | `--on-exit <keep\|remove>` | `keep` | What happens to the firewall rules when Portcullis stops, see [While Portcullis isn't running](/guides/service/#while-portcullis-isnt-running). |
+| `--ct-mark-mask <mask>` | `0x00f00000` | The bits of connection marks name checks use: at least 4 contiguous bits, of which the lowest 4 are used, none of `0x70630007`. In the file, a string (`"0x0000f000"`). Change it when other software on the host uses the same bits; see [Connection marks](/reference/host-resources/#connection-marks). |
 
 ## Command line only
 
@@ -71,6 +73,7 @@ monitor-networks = []
 deny-action = "reject"
 log-allowed = "monitor"
 hostname-hold = "1h"
+name-checks = "lenient"
 events-socket = "/run/portcullis.sock"
 alert-exec = "logger -t portcullis-alert"
 alert-interval = 600
@@ -84,4 +87,5 @@ docker-socket = "/var/run/docker.sock"
 docker-root = "/var/lib/docker"
 state-dir = "/var/lib/portcullis"
 on-exit = "keep"
+ct-mark-mask = "0x00f00000"
 ```

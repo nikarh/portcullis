@@ -8,9 +8,9 @@ sidebar:
 
 Portcullis filters what containers on bridge networks send, by IPv4 address, protocol and port, from labels. Some needs fall outside that. This page lists them with what to do instead. The underlying limits are listed in [Limitations](/limits/limitations/).
 
-## Filtering by hostname, SNI or URL
+## Filtering by URL, or inside TLS
 
-A `host:` rule allows the addresses a name resolves to. Behind a CDN or shared hosting, those addresses serve other sites too, and a pattern under a domain where anyone can create names (`*.cloudfront.net`, `*.github.io`) allows anyone's server. Portcullis doesn't look at TLS SNI or HTTP.
+A `host:` rule checks the TLS server name or HTTP `Host` a connection asks for (see [Names connections ask for](/policy/hostnames/#names-connections-ask-for)), but not URLs, nor what a client asks for inside TLS ([domain fronting](/limits/limitations/#names)). A pattern under a domain where anyone can create names (`*.cloudfront.net`, `*.github.io`) allows anyone's server.
 
 Use a filtering proxy (Squid, Envoy, smokescreen) that decides by `CONNECT` target, SNI or URL, and let Portcullis make it the only way out: the application may only reach the proxy, the proxy may reach `ip:public` on 80 and 443.
 

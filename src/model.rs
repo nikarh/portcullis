@@ -242,6 +242,18 @@ pub enum Service {
 }
 
 impl Service {
+    /// Whether this allows the IP protocol `protocol`, to `port` for protocols with ports.
+    #[must_use]
+    pub fn allows(self, protocol: u8, port: u16) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Protocol(allowed, ports) => {
+                allowed.number() == protocol
+                    && ports.is_none_or(|ports| (ports.first..=ports.last).contains(&port))
+            }
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub const fn tcp(port: u16) -> Self {
@@ -269,7 +281,24 @@ pub enum EgressTarget {
     /// Any public address (`ip:public`): not a private, shared, loopback, link-local,
     /// multicast or otherwise reserved one, nor one of the Docker host's.
     PublicAddress,
+    /// The addresses of names matching the pattern (`host:`). A connection that names a
+    /// server (TLS server name, HTTP Host) has to name such a name; one that doesn't is
+    /// allowed by address, unless names are checked strictly.
     Hostname(NamePattern),
+    /// The same, with names checked strictly (`host:...,strict`): a connection that doesn't
+    /// name a server is denied.
+    StrictHostname(NamePattern),
+}
+
+impl EgressTarget {
+    /// The name pattern of a `host:` target.
+    #[must_use]
+    pub const fn hostname(&self) -> Option<&NamePattern> {
+        match self {
+            Self::Hostname(pattern) | Self::StrictHostname(pattern) => Some(pattern),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +361,30 @@ pub struct ContainerPolicy {
     /// How long an address of its `host:` rules stays allowed after it was last seen
     /// (`portcullis.hostname-hold`); `--hostname-hold` if not set.
     pub hostname_hold: Option<Duration>,
+    /// How its `host:` rules treat connections that don't name a server
+    /// (`portcullis.name-checks`); `--name-checks` if not set.
+    pub name_checks: Option<Strictness>,
+}
+
+/// What `host:` rules do with connections that don't name a server (TLS without a server
+/// name, protocols other than TLS and HTTP, UDP other than QUIC).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Strictness {
+    /// Allow them by address.
+    #[default]
+    Lenient,
+    /// Deny them.
+    Strict,
+}
+
+impl Strictness {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "lenient" => Some(Self::Lenient),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
 }
 
 /// `portcullis.limit.connections`.
@@ -371,6 +424,7 @@ impl Default for ContainerPolicy {
             quarantine: true,
             domains: None,
             hostname_hold: None,
+            name_checks: None,
         }
     }
 }

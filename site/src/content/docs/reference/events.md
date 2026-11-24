@@ -25,7 +25,17 @@ A decision about a packet: <span class="v-allowed">allowed</span>, <span class="
  "container":"billing","network":"backend","protocol":"tcp",
  "source":"172.18.0.2","source_port":40312,"destination":"104.18.3.4","destination_port":443,
  "destination_container":null,"domain":"api.stripe.com","domain_source":"dns",
- "query":null,"detail":null}
+ "query":null,"name":null,"detail":null}
+```
+
+A connection through a `host:` rule that asked for another site on the same address:
+
+```json
+{"time":"2026-11-02T10:15:31.402Z","event":"connection","verdict":"denied","reason":"egress",
+ "container":"billing","network":"backend","protocol":"tcp",
+ "source":"172.18.0.2","source_port":40316,"destination":"104.18.3.4","destination_port":443,
+ "destination_container":null,"domain":null,"domain_source":null,"query":null,
+ "name":"paste.example.net","detail":"not one of the container's host: names for this port"}
 ```
 
 | Field | Type | Meaning |
@@ -41,7 +51,8 @@ A decision about a packet: <span class="v-allowed">allowed</span>, <span class="
 | `domain` | string or null | The destination's name, if known |
 | `domain_source` | string or null | `dns` when the container looked the name up and Portcullis saw the answer, `rule` when the address belongs to one of the container's `host:` rules |
 | `query` | string or null | For denied DNS queries, the name asked for |
-| `detail` | string or null | For `source`, what's wrong, such as which container's address was used. Some details mark packets that aren't crafted, and don't get the container quarantined: see [Source or frame events](/help/troubleshooting/#source-or-frame-events). For `egress` to a network's gateway, `the Docker host, the gateway of <network>`. |
+| `name` | string or null | For connections through `host:` rules, the name the connection asked for: the TLS or QUIC server name, or the HTTP `Host`. See [Names connections ask for](/policy/hostnames/#names-connections-ask-for). |
+| `detail` | string or null | For `source`, what's wrong, such as which container's address was used. Some details mark packets that aren't crafted, and don't get the container quarantined: see [Source or frame events](/help/troubleshooting/#source-or-frame-events). For `egress` to a network's gateway, `the Docker host, the gateway of <network>`. For connections through `host:` rules, why the name check denied it, such as `not one of the container's host: names for this port`, or, with strict name checks, what the connection sent instead of a name (`not TLS or HTTP: no name to check; names are checked strictly`). |
 | `mid_stream` | `true`, or absent | A TCP packet that doesn't start a connection: a reply, or the rest of a connection the firewall doesn't track, because it lost track of it or the packet doesn't fit the connection. Rules decide new connections; what they say about such a packet doesn't mean a label is missing. |
 
 Reasons:
@@ -56,6 +67,8 @@ Reasons:
 | `limit` | [Connection limits](/policy/limits/#connection-limits) |
 
 A flow (container, destination, protocol and port) is reported at most once a minute. Replies and the rest of a connection are never reported.
+
+Connections through `host:` rules are reported once their name is checked, not when they open: allowed ones (where allowed connections are reported) and denied ones with the name they asked for. The same decision about the same flow and name is reported at most once a minute.
 
 ## `dns`
 

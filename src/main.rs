@@ -18,11 +18,14 @@ mod labels;
 mod logging;
 mod model;
 mod monitor;
+mod name_check;
+mod names;
 mod nfnetlink;
 mod owners;
 mod pattern;
 mod policy_file;
 mod quarantine;
+mod quic;
 mod rtnetlink;
 mod source_hold;
 mod systemd;
@@ -53,7 +56,9 @@ use crate::docker::{
 use crate::events::{
     ContainerAction, ContainerChange, Event, EventBus, Mode, Sinks, Warning, WarningKind,
 };
-use crate::firewall::{FirewallError, NftablesFirewall, Options, Plan, Restored, Update};
+use crate::firewall::{
+    CtMarkBits, FirewallError, NameChecks, NftablesFirewall, Options, Plan, Restored, Update,
+};
 use crate::logging::LoggingError;
 use crate::model::{ContainerId, RuntimeState, RuntimeStateAction};
 use crate::monitor::{DockerMonitor, Fetched, MonitorError};
@@ -79,6 +84,10 @@ const SAVED_OWNERS: &str = "owners";
 const DNS_QUERY_QUEUE: u16 = 4244;
 /// NFQUEUE number the same packets are held in on networks in monitor mode.
 const MONITOR_SOURCE_QUEUE: u16 = 4245;
+/// NFQUEUE numbers of connections through `host:` rules, whose names are checked, on
+/// enforced networks and on networks in monitor mode.
+const NAME_QUEUE: u16 = 4246;
+const MONITOR_NAME_QUEUE: u16 = 4247;
 /// How long such packets are held before they are denied. Containers are found within
 /// milliseconds without Docker (see `discovery`); this only runs out for sources that
 /// aren't a container's.
@@ -114,6 +123,8 @@ enum MainError {
     DnsInspection(std::io::Error),
     #[error("failed to listen for packets of new containers (NFQUEUE): {0}")]
     SourceHold(std::io::Error),
+    #[error("failed to listen for connections whose names are checked (NFQUEUE): {0}")]
+    NameCheck(std::io::Error),
     #[error("{0}")]
     Tool(std::io::Error),
     #[error("{0}; stopping, for the service manager to start Portcullis again")]
@@ -235,6 +246,12 @@ OPTIONS:
                                in monitor mode)
   --hostname-hold <duration>   How long an address of a host: rule stays allowed after DNS
                                last returned it: seconds, or with s, m, h or d (default: 1h)
+  --name-checks <lenient|strict>
+                               What host: rules do with connections that don't name a
+                               server (TLS without a server name, other protocols, UDP):
+                               allow them by address, or deny them (default: lenient)
+  --ct-mark-mask <mask>        Bits of connection marks name checks use, at least 4
+                               contiguous ones (default: 0x00f00000)
   --events-socket <path>       Serve events as JSON lines on this Unix socket (mode 0600;
                                off by default)
   --alert-exec <command>       Run this command with sh -c for every denial and warning,
@@ -852,6 +869,12 @@ fn run(config: &Config) -> Result<(), MainError> {
     })
     .map_err(MainError::EventsSocket)?;
 
+    let name_checks = NameChecks {
+        enforce: NAME_QUEUE,
+        monitor: MONITOR_NAME_QUEUE,
+        // Checked when the config was read.
+        marks: CtMarkBits::from_mask(config.ct_mark_mask).unwrap_or_default(),
+    };
     let firewall = Arc::new(
         NftablesFirewall::with_netlink(Options {
             deny: config.deny_action,
@@ -862,6 +885,7 @@ fn run(config: &Config) -> Result<(), MainError> {
             monitor_source_queue: Some(MONITOR_SOURCE_QUEUE),
             connection_limit: config.connection_limit,
             dns_query_queue: Some(DNS_QUERY_QUEUE),
+            name_checks: Some(name_checks),
         })?
         .saving_to(config.state_dir.join(SAVED_RULES)),
     );
@@ -915,6 +939,23 @@ fn run(config: &Config) -> Result<(), MainError> {
         failed_tx.clone(),
     )
     .map_err(MainError::DnsInspection)?;
+
+    name_check::spawn(
+        name_check::Settings {
+            checks: name_checks,
+            strictness: config.name_checks,
+            log_allowed: config.log_allowed,
+            // Only for the end-to-end tests, which can't wait minutes.
+            idle_check: std::env::var("PORTCULLIS_NAME_IDLE_CHECK")
+                .ok()
+                .and_then(|seconds| seconds.parse().ok())
+                .map_or(name_check::IDLE_CHECK, Duration::from_secs),
+        },
+        &directory,
+        &bus,
+        &failed_tx,
+    )
+    .map_err(MainError::NameCheck)?;
 
     let (discover_tx, discover_rx) = unbounded::<u32>();
     watch_ports(discover_tx.clone());

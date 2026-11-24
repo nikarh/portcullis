@@ -12,6 +12,8 @@ SCENARIOS=(
   default-deny
   egress
   hostname
+  names
+  names-mask
   icc
   dns-labels
   published-port

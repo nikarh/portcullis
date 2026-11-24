@@ -10,7 +10,7 @@ use crate::dns;
 use crate::events::WarningKind;
 use crate::model::{
     ConnectionLimit, ContainerPolicy, DnsTarget, EgressRule, EgressTarget, IccAllowRule, IccMode,
-    IccTarget, PortRange, Protocol, Service,
+    IccTarget, PortRange, Protocol, Service, Strictness,
 };
 use crate::pattern::{NameKind, NamePattern};
 
@@ -23,6 +23,7 @@ const CONNECTION_LIMIT_LABEL: &str = "portcullis.limit.connections";
 const NEW_CONNECTIONS_LABEL: &str = "portcullis.limit.new-connections";
 const QUARANTINE_LABEL: &str = "portcullis.quarantine";
 const HOSTNAME_HOLD_LABEL: &str = "portcullis.hostname-hold";
+const NAME_CHECKS_LABEL: &str = "portcullis.name-checks";
 /// Configuration warnings acknowledged for a container or network, comma-separated.
 pub const ACK_LABEL: &str = "portcullis.ack";
 /// A file in the policy directory with more of a container's policy labels, see
@@ -40,6 +41,7 @@ pub fn is_policy_label(key: &str) -> bool {
             NEW_CONNECTIONS_LABEL,
             QUARANTINE_LABEL,
             HOSTNAME_HOLD_LABEL,
+            NAME_CHECKS_LABEL,
             ACK_LABEL,
         ]
         .contains(&key)
@@ -144,6 +146,7 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
     let mut quarantine = true;
     let mut domains: Option<Vec<NamePattern>> = None;
     let mut hostname_hold = None;
+    let mut name_checks = None;
 
     for (key, value) in labels {
         let result = if key.starts_with(EGRESS_PREFIX) {
@@ -170,6 +173,17 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
                 .map_err(|expected| {
                     LabelParseError::InvalidValue(HOSTNAME_HOLD_LABEL, value.clone(), expected)
                 })
+        } else if key == NAME_CHECKS_LABEL {
+            // An invalid value checks strictly: ignoring a label never opens anything up.
+            let parsed = Strictness::parse(value);
+            name_checks = Some(parsed.unwrap_or(Strictness::Strict));
+            parsed.map(|_| ()).ok_or_else(|| {
+                LabelParseError::InvalidValue(
+                    NAME_CHECKS_LABEL,
+                    value.clone(),
+                    "expected lenient or strict",
+                )
+            })
         } else if key == QUARANTINE_LABEL {
             match value.as_str() {
                 "on" => Ok(()),
@@ -208,6 +222,7 @@ pub fn parse_policy(labels: &IndexMap<String, String>) -> (ContainerPolicy, Vec<
         quarantine,
         domains,
         hostname_hold,
+        name_checks,
     };
     (policy, errors)
 }
@@ -289,7 +304,23 @@ fn parse_egress_value(key: &str, value: &str) -> Result<EgressRule, LabelParseEr
         ));
     };
 
-    let target = parse_target(key, target_part)?;
+    let mut target = parse_target(key, target_part)?;
+    // `strict` after a host: rule's services.
+    let (strict, service_parts) = match service_parts.split_last() {
+        Some((&"strict", rest)) => (true, rest),
+        _ => (false, service_parts),
+    };
+    if strict {
+        target = match target {
+            EgressTarget::Hostname(pattern) => EgressTarget::StrictHostname(pattern),
+            _ => {
+                return Err(LabelParseError::InvalidEgress(
+                    key.to_string(),
+                    "strict is only for host: rules".to_string(),
+                ));
+            }
+        };
+    }
     let services = parse_services(key, service_parts)?;
 
     Ok(EgressRule { target, services })
@@ -571,6 +602,23 @@ mod tests {
     use crate::events::WarningKind;
     use crate::model::{DnsTarget, EgressTarget, IccMode, PortRange, Protocol, Service};
     use crate::pattern::NamePattern;
+
+    #[test]
+    fn parses_name_checks() {
+        for (value, expected) in [
+            ("strict", Strictness::Strict),
+            ("lenient", Strictness::Lenient),
+        ] {
+            let (policy, errors) = parse_policy(&labels(&[("portcullis.name-checks", value)]));
+            assert_eq!(policy.name_checks, Some(expected));
+            assert_eq!(errors, []);
+        }
+        // An invalid value checks strictly.
+        let (policy, errors) = parse_policy(&labels(&[("portcullis.name-checks", "off")]));
+        assert_eq!(policy.name_checks, Some(Strictness::Strict));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(parse_policy(&labels(&[])).0.name_checks, None);
+    }
 
     #[test]
     fn parses_the_hostname_hold() {
@@ -887,6 +935,23 @@ mod tests {
             target("host:**.example.net"),
             Ok(EgressTarget::Hostname(NamePattern::host("**.example.net")))
         );
+        assert_eq!(
+            parse_strict(&labels(&[(
+                "portcullis.egress.x",
+                "host:api.example.com,tcp:443,strict"
+            )]))
+            .map(|policy| policy.egress[0].clone()),
+            Ok(EgressRule {
+                target: EgressTarget::StrictHostname(NamePattern::host("api.example.com")),
+                services: vec![Service::tcp(443)],
+            })
+        );
+        for value in ["ip:10.0.0.1,tcp:443,strict", "host:api.example.com,strict"] {
+            assert!(
+                parse_strict(&labels(&[("portcullis.egress.x", value)])).is_err(),
+                "{value}"
+            );
+        }
         for invalid in [
             "host:*",
             "host:**",

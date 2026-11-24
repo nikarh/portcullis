@@ -137,6 +137,56 @@ struct Findings {
     mid_stream: (BTreeSet<String>, usize),
     /// Traffic of protocols labels can't name.
     unsupported: BTreeSet<String>,
+    /// Connections through `host:` rules the name check denied, by why, with examples.
+    names: BTreeMap<Cow<'static, str>, BTreeSet<String>>,
+}
+
+impl Findings {
+    /// A connection through a `host:` rule the name check denied, for `detail`, which
+    /// asked for `name`.
+    fn add_name_denial(
+        &mut self,
+        detail: Option<Cow<'static, str>>,
+        name: Option<String>,
+        service: (Cow<'static, str>, Option<u16>),
+        destination: Option<IpAddr>,
+        port: Option<u16>,
+    ) {
+        let example = format!("{} {}", service.0, endpoint(destination, port, None));
+        let examples = self.names.entry(detail.unwrap_or_default()).or_default();
+        if examples.len() < EXAMPLES {
+            examples.insert(match &name {
+                Some(name) => format!("{example} asking for {name}"),
+                None => example,
+            });
+        }
+        // Another site on an address the container may reach: a label for it, if that is
+        // what the container should reach.
+        if let Some(name) = name {
+            self.egress
+                .entry(format!("host:{name}"))
+                .or_default()
+                .insert(service);
+        }
+    }
+}
+
+/// Connections the name check denied, by why.
+fn write_names(out: &mut String, names: &BTreeMap<Cow<'static, str>, BTreeSet<String>>) {
+    for (detail, examples) in names {
+        let _ = writeln!(
+            out,
+            "  through host: rules, denied by the check of the name it asks for: {detail}, such as:"
+        );
+        for example in examples {
+            let _ = writeln!(out, "    {example}");
+        }
+    }
+    if !names.is_empty() {
+        out.push_str(
+            "    (connections that name no server are only denied where names are checked strictly)\n",
+        );
+    }
 }
 
 #[derive(Debug, Default)]
@@ -182,6 +232,7 @@ impl Report {
             destination_port,
             destination_container,
             domain,
+            name,
             detail,
             mid_stream,
             ..
@@ -223,7 +274,14 @@ impl Report {
             // Protocols without ports, and frames (ARP, IPv6).
             _ => (protocol, None),
         };
+        // Denied by the name check of a host: rule: what it asked for, and why.
+        let named = detail
+            .as_ref()
+            .is_some_and(|text| !text.starts_with(DOCKER_HOST));
         match reason {
+            Reason::Egress if named => {
+                findings.add_name_denial(detail, name, service, destination, destination_port);
+            }
             Reason::Egress => {
                 let target = match (domain, destination) {
                     (Some(mut domain), _) => {
@@ -334,6 +392,7 @@ impl Report {
             for unsupported in &findings.unsupported {
                 let _ = writeln!(out, "  {unsupported}, which labels can't allow");
             }
+            write_names(&mut out, &findings.names);
             let (examples, count) = &findings.mid_stream;
             if *count > 0 {
                 let _ = writeln!(
@@ -892,6 +951,39 @@ api (2 denied or would-be-denied connections)
   portcullis.icc.allow.224-2-2-3=multicast:224.2.2.3,udp:54327
     (with portcullis.icc.mode=allow-listed)
   broadcast to every container on the network, which labels can't allow
+"
+        );
+    }
+
+    #[test]
+    fn reports_connections_the_name_check_denied() {
+        let named = |name: &str, detail: &str| {
+            let name = if name.is_empty() {
+                "null".to_string()
+            } else {
+                format!("\"{name}\"")
+            };
+            format!(
+                r#"{{"time":"T","event":"connection","verdict":"would_deny","reason":"egress","container":"api","network":"n","protocol":"tcp","source":"172.18.0.2","source_port":1,"destination":"104.18.3.4","destination_port":443,"destination_container":null,"domain":"api.example.com","domain_source":"dns","query":null,"name":{name},"detail":"{detail}"}}"#
+            )
+        };
+        let report = lines(&[
+            &named(
+                "paste.example.net",
+                "not one of the container's host: names for this port",
+            ),
+            &named("", "not TLS or HTTP: no name to check"),
+        ]);
+        assert_eq!(
+            report.render(),
+            "\
+api (2 denied or would-be-denied connections)
+  portcullis.egress.paste-example-net=host:paste.example.net,tcp:443
+  through host: rules, denied by the check of the name it asks for: not TLS or HTTP: no name to check, such as:
+    tcp 104.18.3.4:443
+  through host: rules, denied by the check of the name it asks for: not one of the container's host: names for this port, such as:
+    tcp 104.18.3.4:443 asking for paste.example.net
+    (connections that name no server are only denied where names are checked strictly)
 "
         );
     }

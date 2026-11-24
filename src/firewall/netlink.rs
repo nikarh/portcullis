@@ -52,7 +52,6 @@ const NFT_MSG_NEWSET: u16 = 9;
 pub const NFT_MSG_GETSET: u16 = 10;
 const NFT_MSG_DELSET: u16 = 11;
 pub const NFT_MSG_NEWSETELEM: u16 = 12;
-#[cfg(test)]
 pub const NFT_MSG_GETSETELEM: u16 = 13;
 pub const NFT_MSG_DELSETELEM: u16 = 14;
 
@@ -256,6 +255,7 @@ fn hook_number(hook: &str) -> u32 {
     match hook {
         "prerouting" => 0,
         "input" => 1,
+        "output" => 3,
         _ => 2,
     }
 }
@@ -620,6 +620,7 @@ fn source(key: Key) -> (Source, usize) {
         Key::CtState => (ct(0, None), 4),
         Key::CtDirection => (ct(1, None), 1),
         Key::CtStatus => (ct(2, None), 4),
+        Key::CtMark => (ct(3, None), 4),
         Key::CtProtoDst => (ct(12, Some(0)), 2),
         Key::CtSaddr { reply, ipv6 } => (
             ct(if ipv6 { 21 } else { 19 }, Some(u8::from(reply))),
@@ -695,7 +696,7 @@ impl Data {
 const fn host_order(key: Key) -> bool {
     matches!(
         key,
-        Key::Length | Key::Mark | Key::CtState | Key::CtStatus | Key::FibDaddrType
+        Key::Length | Key::Mark | Key::CtState | Key::CtStatus | Key::CtMark | Key::FibDaddrType
     ) && cfg!(target_endian = "little")
 }
 
@@ -769,13 +770,18 @@ impl<'w, 'a> Rule<'w, 'a> {
     }
 
     fn bitwise(&mut self, mask: &[u8]) {
+        let zeros = [0; 16];
+        self.bitwise_xor(mask, zeros.get(..mask.len()).unwrap_or(&zeros));
+    }
+
+    /// `reg 1 = (reg 1 & mask) ^ xor`.
+    fn bitwise_xor(&mut self, mask: &[u8], xor: &[u8]) {
         let expr = self.open("bitwise");
         self.out.u32(1, NFT_REG_1);
         self.out.u32(2, NFT_REG_1);
         self.out.u32(3, u32::try_from(mask.len()).unwrap_or(0));
         self.out.data(4, mask);
-        let zeros = [0; 16];
-        self.out.data(5, zeros.get(..mask.len()).unwrap_or(&zeros));
+        self.out.data(5, xor);
         self.close(expr);
     }
 
@@ -872,11 +878,30 @@ impl<'w, 'a> Rule<'w, 'a> {
     fn expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Cmp { key, equal, value } => self.compare(*key, *equal, value),
-            Expr::Masked { key, mask, value } => {
+            Expr::Masked {
+                key,
+                mask,
+                equal,
+                value,
+            } => {
                 self.dependencies(&[*key]);
                 self.load(*key, NFT_REG_1, None);
                 self.bitwise(value_data(*key, mask).as_slice());
-                self.cmp(CMP_EQ, value_data(*key, value).as_slice());
+                let op = if *equal { CMP_EQ } else { CMP_NEQ };
+                self.cmp(op, value_data(*key, value).as_slice());
+            }
+            Expr::SetCtMark { keep, set } => {
+                // As nft has it: bits that are set are kept out of the mask.
+                self.load(Key::CtMark, NFT_REG_1, None);
+                let host = host_order(Key::CtMark);
+                self.bitwise_xor(
+                    Data::number(u64::from(keep & !set), 4, host).as_slice(),
+                    Data::number(u64::from(*set), 4, host).as_slice(),
+                );
+                let expr = self.open("ct");
+                self.out.u32(2, 3);
+                self.out.u32(4, NFT_REG_1);
+                self.close(expr);
             }
             Expr::Lookup { key, set, negate } => {
                 self.load_concat(key);

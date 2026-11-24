@@ -60,5 +60,5 @@ Containers without it get a `dns_not_observable` warning when they start. See [D
 
 ## What this doesn't cover
 
-- A `host:` rule allows the hostname's addresses. Any other service on the same addresses is reachable too, which is common behind CDNs. For hostname-precise filtering, see [Egress through a filtering proxy](/examples/egress-proxy/).
+- A `host:` rule allows connections to the hostname's addresses that ask for the hostname (see [Names connections ask for](/policy/hostnames/#names-connections-ask-for)). What the client asks for inside TLS, such as URLs, isn't checked; for that, see [Egress through a filtering proxy](/examples/egress-proxy/).
 - Inbound connections. Replies to connections made to the container are always allowed; egress labels only limit what it opens.

@@ -1,11 +1,11 @@
 ---
 title: Hostname rules
-description: "How host: rules turn names into addresses, how long addresses stay allowed, and what that allows besides the name."
+description: "How host: rules turn names into addresses, how long addresses stay allowed, and how the names connections ask for are checked."
 sidebar:
   order: 5
 ---
 
-An IP firewall can't match hostnames, so a `host:` rule allows the addresses the hostname resolves to. Portcullis learns them in two ways.
+A `host:` rule allows connections to the addresses its hostname resolves to. A connection that names the server it wants (TLS, HTTP, QUIC) must also name the rule's hostname; see [Names connections ask for](#names-connections-ask-for). Portcullis learns the addresses in two ways.
 
 ## From the container's DNS answers
 
@@ -67,11 +67,87 @@ A longer hold is for applications that keep using an address DNS stopped returni
 
 A [pattern](/policy/patterns/) such as `host:*.example.org` can't be looked up, so it only allows addresses from DNS answers to the container for names it matches. Portcullis has to see the container's lookups. Of an answer, only the addresses of the name asked for, and of the CNAMEs it resolved through, count.
 
-## What a hostname rule allows
+## Names connections ask for
 
-A hostname rule allows the hostname's addresses, not the hostname. Any other service on the same addresses is reachable too, which is common with CDNs and shared hosting: `host:api.example.com` behind a large CDN allows every other site that CDN serves from the same addresses. Portcullis doesn't look at TLS SNI or HTTP Host headers.
+Many sites share an address: a CDN, shared hosting, or a reverse proxy serves them all from the same addresses and tells them apart by the name the client asks for. Allowing the addresses of `api.example.com` alone would allow every other site there. So Portcullis reads the name a connection through a `host:` rule asks for, and allows it only when the name is one of the container's `host:` names for that port, and that name's addresses include the destination. Other names on the same address are denied, with the name they asked for on the [event](/reference/events/#connection) (`name`).
 
-When that matters, send the container's traffic through a proxy that filters by name; see [Filtering by hostname with a proxy](/examples/egress-proxy/).
+```yaml
+labels:
+  - portcullis.egress.stripe=host:api.stripe.com,tcp:443
+```
+
+With that label, a connection to an address of `api.stripe.com` that asks for `api.stripe.com` is allowed. One to the same address that asks for any other site behind the same CDN is denied.
+
+What is checked by name, and what by address:
+
+| The client sends | Checked |
+| --- | --- |
+| A TLS ClientHello with a server name (SNI), on any port; after a Postgres request for TLS too | By name: the server name |
+| An HTTP/1 request | By name: the `Host` of every request on the connection, the first and those that follow on a keep-alive connection; the URI too, for a request with a full URI |
+| An HTTP `Upgrade` (WebSocket) or `CONNECT` request | By name, that request: after it, the connection is a tunnel that names nothing more |
+| QUIC (HTTP/3): Initial packets with a ClientHello | By name: the server name, read from the first Initial packets of the flow, however many the ClientHello spans |
+| TLS without a server name (a client connecting to an address, not a name) | By address |
+| Anything else: SSH, SMTP, plain Postgres, a server that speaks first, HTTP/2 without TLS, UDP other than QUIC | By address |
+| ICMP and other protocols without ports | By address |
+
+By address means as any `ip:` rule: allowed when the destination is one of the name's addresses. That leaves protocols that name nothing working, and keeps the check from guessing at them.
+
+Some things are denied because what they name can't be told:
+
+- A ClientHello, request head or QUIC ClientHello that doesn't arrive whole within 3 seconds, or is over 64 KiB (16 KiB for a request head). Its first bytes could be the start of a name for another site.
+- TLS and HTTP that servers could read differently: two server names, a repeated TLS extension, more than one `Host`, a body with both `Content-Length` and `Transfer-Encoding`, folded header lines, lines that end with a bare line feed. The [Limitations](/limits/limitations/#names) list the rest.
+- A ClientHello with Encrypted Client Hello (ECH): the name it shows is the provider's (such as `cloudflare-ech.com`), not the site's, and is checked like any other. Browsers use ECH for sites that publish it in DNS; most other clients don't.
+
+### Strict name checks
+
+Connections that don't name a server are allowed by address, which also allows every service on those addresses that is reached that way: SSH to a shared address, or TLS without a server name to a CDN's default site. Where that matters, check names strictly: only TLS and QUIC with a matching server name, and HTTP with a matching `Host`, get through; everything else to the rule's addresses is denied.
+
+For one rule, add `strict` after its services:
+
+```yaml
+labels:
+  - portcullis.egress.stripe=host:api.stripe.com,tcp:443,strict
+```
+
+For every `host:` rule of a container, with a label:
+
+```yaml
+labels:
+  - portcullis.name-checks=strict
+```
+
+For every container, in the config (`--name-checks`):
+
+```toml title="/etc/portcullis/config.toml"
+name-checks = "strict"
+```
+
+A rule's `strict` wins over the others, and a container's label over the config; `portcullis.name-checks=lenient` turns it off for a container. An invalid label value counts as `strict`. The default is `lenient`.
+
+### How it works
+
+Portcullis gets the first packets of each such connection. The TCP handshake goes through, and the client's first bytes are held until the ClientHello or request head is whole (it often takes more than one packet), then let through or denied. A denied TCP connection gets a reset. Once a TLS server has the whole ClientHello, the rest of the connection passes in the kernel like any other; so does a connection allowed by address, after its first data, and a QUIC flow, after its ClientHello. A plain HTTP connection names a server in every request, so the packets its client sends with data keep going through Portcullis for as long as connection tracking keeps the connection, however long it idles between requests. See [Name checks](/internals/how-it-works/#name-checks).
+
+### In monitor mode
+
+On networks in monitor mode, nothing is held or denied: Portcullis reads copies of the packets and reports connections it would deny as `would_deny`, with the name. [`portcullis audit`](/reference/cli/) lists them.
+
+### What the check doesn't see
+
+The name is checked where the client sends it in the clear. What follows is up to the client and the server:
+
+- Inside TLS, an HTTP request can ask for another site on the same server than its server name said ("domain fronting"). Most large CDNs refuse that now; some servers don't. Seeing it takes decrypting the traffic.
+- HTTP/2 clients reuse a connection for other sites whose names the server's certificate covers ("connection coalescing"), without a new ClientHello.
+- A QUIC flow's later packets aren't read: a client could start a second QUIC connection on the same UDP flow, with another name.
+- A site that is allowed can still be used for anything it offers, such as an account of someone else's on the same service.
+
+For control over those, put a filtering proxy in front of the container; see [Filtering by hostname with a proxy](/examples/egress-proxy/).
+
+### Compared with other tools
+
+- Cilium's `toFQDNs` rules allow the addresses DNS answers gave, as `host:` rules do, without looking at what connections ask for: every site on those addresses is allowed. Checking names takes its L7 policies on top, `serverNames` for TLS and HTTP rules, which send the traffic through an Envoy proxy and only apply where a rule asks for them. A rule with `serverNames` denies TLS without a server name.
+- Istio's sidecar routes HTTP and TLS by `Host` and server name to the services it knows of, and treats other TCP as opaque, by address and port.
+- Portcullis checks the names of TLS, HTTP and QUIC on every `host:` rule, in the kernel's path with a queue for the first packets rather than a proxy, and allows what names nothing by address unless names are checked strictly.
 
 ## Which DNS answers count
 

@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::dns::normalize;
-use crate::firewall::{Destination, HostSet, Plan, Rule};
-use crate::model::{MacAddress, PortState};
+use crate::firewall::{Destination, HostSet, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6};
+use crate::model::{MacAddress, PortState, Service, Strictness};
 use crate::pattern::NamePattern;
 
 /// Observations kept before expired ones are pruned, at most once per [`PRUNE_EVERY`].
@@ -39,6 +39,20 @@ pub struct SourceInfo {
     pub ipv6_network: bool,
     /// The domain names the container may look up, if limited.
     pub domains: Option<Vec<NamePattern>>,
+    /// The container's `host:` rules, whose connections have to ask for their names.
+    pub names: Arc<[NameRule]>,
+}
+
+/// A `host:` rule: connections for `service` to the addresses of the hostname set `set`
+/// (of the inet table) must ask for a name `pattern` matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameRule {
+    pub set: String,
+    pub pattern: NamePattern,
+    pub service: Service,
+    /// Strict for the rule, or the container's `portcullis.name-checks`; `--name-checks`
+    /// when `None`.
+    pub strictness: Option<Strictness>,
 }
 
 #[derive(Debug, Default)]
@@ -120,11 +134,9 @@ impl Directory {
                 .iter()
                 .filter_map(|rule| match rule {
                     Rule::Accept {
-                        destination: Destination::HostSet(index),
+                        destination: Destination::Host { set, .. },
                         ..
-                    } => plan
-                        .host_set(*index)
-                        .map(|set| (set.host.clone(), set.hold)),
+                    } => plan.host_set(*set).map(|set| (set.host.clone(), set.hold)),
                     _ => None,
                 })
                 .collect();
@@ -336,8 +348,36 @@ fn source_infos(plan: &Plan) -> Vec<(IpAddr, SourceInfo)> {
                     quarantine: source.quarantine,
                     ipv6_network: ipv6_networks.contains(source.network.as_str()),
                     domains: source.domains.clone(),
+                    names: name_rules(plan, source),
                 },
             )
+        })
+        .collect()
+}
+
+fn name_rules(plan: &Plan, source: &crate::firewall::Source) -> Arc<[NameRule]> {
+    let prefix = if source.address.is_ipv4() {
+        SET_PREFIX_V4
+    } else {
+        SET_PREFIX_V6
+    };
+    plan.egress_rules(source)
+        .iter()
+        .filter_map(|rule| match rule {
+            Rule::Accept {
+                destination: Destination::Host { set: index, strict },
+                service,
+            } => plan.host_set(*index).map(|set| NameRule {
+                set: set.id.name(prefix).to_string(),
+                pattern: set.pattern.clone(),
+                service: *service,
+                strictness: if *strict {
+                    Some(Strictness::Strict)
+                } else {
+                    source.name_checks
+                },
+            }),
+            _ => None,
         })
         .collect()
 }
@@ -356,6 +396,57 @@ fn interface_name(index: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takes_name_checks_from_the_rule_or_the_container() {
+        use crate::firewall::test_support::{self, MockResolver};
+        use crate::model::{EgressRule, EgressTarget, IccMode};
+        let rules = |name_checks| {
+            let mut state = crate::model::RuntimeState::default();
+            test_support::add_network(&mut state, "net0", "172.18.0.0/16", "172.18.0.1");
+            let mut policy = test_support::policy(
+                IccMode::Deny,
+                vec![
+                    EgressRule {
+                        target: EgressTarget::Hostname(NamePattern::host(test_support::HOST)),
+                        services: vec![Service::tcp(443)],
+                    },
+                    EgressRule {
+                        target: EgressTarget::StrictHostname(NamePattern::host(test_support::HOST)),
+                        services: vec![Service::tcp(8443)],
+                    },
+                ],
+            );
+            policy.name_checks = name_checks;
+            test_support::add_container(
+                &mut state,
+                "w",
+                "web",
+                &[("net0", "172.18.0.2", &[])],
+                policy,
+            );
+            let plan = Plan::build(&state, &mut MockResolver::default(), &[], false);
+            let directory = Directory::default();
+            directory.update(&plan);
+            let source = directory
+                .source(test_support::ip("172.18.0.2"))
+                .expect("source");
+            source
+                .names
+                .iter()
+                .map(|rule| rule.strictness)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rules(None), [None, Some(Strictness::Strict)]);
+        assert_eq!(
+            rules(Some(Strictness::Lenient)),
+            [Some(Strictness::Lenient), Some(Strictness::Strict)]
+        );
+        assert_eq!(
+            rules(Some(Strictness::Strict)),
+            [Some(Strictness::Strict), Some(Strictness::Strict)]
+        );
+    }
     use crate::firewall::test_support::{self, MockResolver, ip};
 
     fn directory() -> Directory {
