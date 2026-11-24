@@ -98,6 +98,7 @@
 <li>Containers that start on an enforced network in the meantime can’t send anything: they have no rules yet, so their packets are held for Portcullis and then dropped by the kernel. They get their rules as soon as Portcullis is back.</li>
 <li>DNS answers are let through without inspection, and nothing is reported.</li>
 <li>Containers with <a href="/main/policy/domains/"><code dir="auto">portcullis.domains</code></a> labels can’t look anything up: their queries are held for a Portcullis that isn’t there.</li>
+<li>New connections through <a href="/main/policy/hostnames/#names-connections-ask-for"><code dir="auto">host:</code> rules</a> can’t get past their handshake: Portcullis checks their names. Connections whose check ended keep going; those it was still checking, plain HTTP connections included (every request of theirs is checked), are denied when it is back.</li>
 <li>On networks in monitor mode, the first packets of new containers are let through.</li>
 </ul>
 <p>When Portcullis starts again, it puts its saved rules back, and its first update replaces them in one step.</p>

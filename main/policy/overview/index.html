@@ -77,7 +77,7 @@
 <tr>
 <td><a href="/main/policy/egress/"><code dir="auto">portcullis.egress.&lt;name&gt;</code></a></td>
 <td>container</td>
-<td><code dir="auto">&lt;destination&gt;,&lt;service&gt;[,&lt;service&gt;...]</code></td>
+<td><code dir="auto">&lt;destination&gt;,&lt;service&gt;[,&lt;service&gt;...]</code>, then <code dir="auto">strict</code> for a <code dir="auto">host:</code> rule</td>
 <td>nothing allowed</td>
 </tr>
 <tr>
@@ -127,6 +127,12 @@
 <td>container</td>
 <td>a duration: <code dir="auto">600</code>, <code dir="auto">30m</code>, <code dir="auto">2h</code>, <code dir="auto">1d</code></td>
 <td><code dir="auto">hostname-hold</code> setting (1h)</td>
+</tr>
+<tr>
+<td><a href="/main/policy/hostnames/#strict-name-checks"><code dir="auto">portcullis.name-checks</code></a></td>
+<td>container</td>
+<td><code dir="auto">lenient</code>, <code dir="auto">strict</code></td>
+<td><code dir="auto">name-checks</code> setting (<code dir="auto">lenient</code>)</td>
 </tr>
 <tr>
 <td><a href="/main/policy/checks/#acknowledging-a-warning"><code dir="auto">portcullis.ack</code></a></td>
@@ -190,7 +196,7 @@
 <li>Limits. A container over its <a href="/main/policy/limits/#connection-limits">connection limits</a> is denied (reason <code dir="auto">limit</code>).</li>
 <li>DNS. Traffic to port 53 leaving the network is decided by the <a href="/main/policy/dns/">DNS labels</a> alone (reason <code dir="auto">dns</code>). For containers with <a href="/main/policy/domains/"><code dir="auto">portcullis.domains</code></a> labels, the query’s names are checked too.</li>
 <li>Containers on the same network. Decided by the <a href="/main/policy/icc/">ICC mode</a> alone (reason <code dir="auto">icc</code>).</li>
-<li>Everything else, the Docker host included. Decided by the <a href="/main/policy/egress/">egress labels</a> (reason <code dir="auto">egress</code>).</li>
+<li>Everything else, the Docker host included. Decided by the <a href="/main/policy/egress/">egress labels</a> (reason <code dir="auto">egress</code>). A connection a <code dir="auto">host:</code> rule allows is then checked for the <a href="/main/policy/hostnames/#names-connections-ask-for">name it asks for</a>.</li>
 </ol>
 <p>The first rule that applies decides. An egress label never allows DNS or traffic to containers on the same network, not even <code dir="auto">ip:*,*</code>.</p>
 <p>What a policy allows still goes through Docker’s own rules afterwards. Replies, and the rest of an allowed connection, always pass.</p>
