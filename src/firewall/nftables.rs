@@ -94,6 +94,78 @@ pub struct Options {
     /// NFQUEUE number DNS queries of containers with `portcullis.domains` labels are held
     /// in until Portcullis has checked the name. See `dns_filter`.
     pub dns_query_queue: Option<u16>,
+    /// Checks of the names connections through `host:` rules ask for (see `name_check`).
+    /// Without them, `host:` rules allow by address alone.
+    pub name_checks: Option<NameChecks>,
+}
+
+/// The queues of connections whose names are checked, and the bits of connection marks
+/// that say how far each got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameChecks {
+    /// For enforced networks: drops what nothing reads.
+    pub enforce: u16,
+    /// For networks in monitor mode: lets through what nothing reads.
+    pub monitor: u16,
+    pub marks: CtMarkBits,
+}
+
+/// The bits of connection marks name checks use, the lowest four of a mask:
+/// - `check`: every packet of the connection, both ways, goes to Portcullis;
+/// - `watch`: the client's packets with data go to Portcullis (plain HTTP);
+/// - `denied`: the connection was denied; its packets are dropped;
+/// - `monitor`: the connection is a monitored container's, whose queue lets packets
+///   through when nothing reads it.
+///
+/// Other bits of the mark are left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtMarkBits {
+    pub monitor: u32,
+    pub check: u32,
+    pub watch: u32,
+    pub denied: u32,
+}
+
+/// The connection mark bits used by default.
+pub const DEFAULT_CT_MARK_MASK: u32 = 0x00f0_0000;
+
+impl CtMarkBits {
+    /// The bits of `mask`: contiguous, at least four, and none of the packet marks'.
+    pub fn from_mask(mask: u32) -> Result<Self, &'static str> {
+        if mask.count_ones() < 4 {
+            return Err("needs at least 4 bits");
+        }
+        let shifted = mask >> mask.trailing_zeros();
+        if shifted & (shifted + 1) != 0 {
+            return Err("the bits must be contiguous");
+        }
+        if mask & PACKET_MARK_BITS != 0 {
+            return Err("overlaps the packet marks Portcullis uses (0x70630007)");
+        }
+        let lowest = mask.isolate_lowest_one();
+        Ok(Self {
+            monitor: lowest,
+            check: lowest << 1,
+            watch: lowest << 2,
+            denied: lowest << 3,
+        })
+    }
+
+    /// All four bits.
+    pub const fn all(self) -> u32 {
+        self.monitor | self.check | self.watch | self.denied
+    }
+}
+
+impl Default for CtMarkBits {
+    fn default() -> Self {
+        Self {
+            monitor: 0x0010_0000,
+            check: 0x0020_0000,
+            watch: 0x0040_0000,
+            denied: 0x0080_0000,
+        }
+    }
 }
 
 impl Default for Options {
@@ -107,6 +179,7 @@ impl Default for Options {
             monitor_source_queue: None,
             connection_limit: Some(DEFAULT_CONNECTION_LIMIT),
             dns_query_queue: None,
+            name_checks: None,
         }
     }
 }
@@ -123,6 +196,16 @@ pub const DNS_DENIED_MARK: u32 = 0x7063_0002;
 /// Packet mark of held packets whose source stayed unknown: they are denied when they come
 /// back.
 pub const HOLD_EXPIRED_MARK: u32 = 0x7063_0001;
+
+/// Packet marks of the verdicts on connections whose names are checked: the connection is
+/// allowed; it is allowed but its client's data stays watched (plain HTTP, whose every
+/// request names a server); it isn't allowed.
+pub const NAME_ALLOWED_MARK: u32 = 0x7063_0004;
+pub const NAME_WATCH_MARK: u32 = 0x7063_0005;
+pub const NAME_DENIED_MARK: u32 = 0x7063_0006;
+/// The bits of the packet marks Portcullis sets, which connection mark bits must stay
+/// clear of: a host that copies connection marks into packet marks could make one.
+const PACKET_MARK_BITS: u32 = 0x7063_0007;
 
 /// Which allowed connections are reported.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -941,6 +1024,9 @@ fn render_update(
         now: HashSet::new(),
     };
     render_declarations(out, &mut declared, reassigned);
+    if options.name_checks.is_some() {
+        declared.declare(out, Declaration::Chain(Chain::Output));
+    }
 
     let mut installed = render_objects(
         out,
@@ -965,7 +1051,7 @@ fn render_update(
 
     let mut fixed = Batch::default();
     render_fixed_chains(&mut fixed, plan, options, &slots, &mut elements);
-    installed.written.fixed = write_changed_chains(out, plan, fixed, &written.fixed);
+    installed.written.fixed = write_changed_chains(out, plan, options, fixed, &written.fixed);
     elements.fill(
         ElementSet::Quarantined,
         plan.sources
@@ -981,8 +1067,15 @@ fn render_update(
     installed.written.elements = Some(elements.0);
     installed.written.declared = declared.now;
     // Nothing references them anymore: their map elements are gone, and the chains whose
-    // rules used the sets were written again.
-    for chain in previous.chains.difference(&installed.chains) {
+    // rules used the sets were written again. The chains of name checks refer to each
+    // other: they are all emptied before any is deleted.
+    let removed: Vec<&Object> = previous.chains.difference(&installed.chains).collect();
+    for chain in [Chain::NameCheck, Chain::NameWatch, Chain::NameQueue] {
+        if removed.contains(&&chain.object()) {
+            out.push(Command::FlushChain(chain));
+        }
+    }
+    for chain in removed {
         out.push(Command::DeleteChain(chain.clone()));
     }
     for set in previous.sets.difference(&installed.sets) {
@@ -1014,6 +1107,7 @@ fn render_fixed_chains(
     elements.fill(NamedSet::BridgeBridges, bridges(None));
     elements.fill(NamedSet::MonitoredBridges, bridges(Some(true)));
     elements.fill(NamedSet::EnforcedBridges, bridges(Some(false)));
+    render_name_check(out, plan, options);
     if let Some(queue) = options.dns_queue
         && !plan.bridges.is_empty()
     {
@@ -1054,8 +1148,9 @@ fn render_fixed_chains(
 }
 
 /// The chains written from the plan as a whole, as an update with `plan` has them.
-fn fixed_chains(plan: &Plan) -> impl Iterator<Item = Chain> {
+fn fixed_chains(plan: &Plan, options: Options) -> impl Iterator<Item = Chain> {
     let bridged = !plan.bridges.is_empty();
+    let names = options.name_checks.is_some();
     [
         Chain::Base(Table::Inet),
         Chain::Input,
@@ -1064,11 +1159,17 @@ fn fixed_chains(plan: &Plan) -> impl Iterator<Item = Chain> {
         Chain::BridgeForward,
     ]
     .into_iter()
+    .chain(names.then_some(Chain::Output))
     .chain(
         [false, true]
             .into_iter()
             .flat_map(|rate| [false, true].map(|monitor| Chain::Limited { rate, monitor }))
             .chain([false, true].map(|monitor| Chain::ArpCheck { monitor }))
+            .chain(
+                [Chain::NameCheck, Chain::NameWatch, Chain::NameQueue]
+                    .into_iter()
+                    .filter(move |_| names),
+            )
             .filter(move |_| bridged),
     )
 }
@@ -1082,10 +1183,11 @@ fn fixed_chains(plan: &Plan) -> impl Iterator<Item = Chain> {
 fn write_changed_chains(
     out: &mut Batch,
     plan: &Plan,
+    options: Options,
     fixed: Batch,
     previous: &HashMap<Chain, Vec<Vec<Expr>>>,
 ) -> HashMap<Chain, Vec<Vec<Expr>>> {
-    let mut rules: HashMap<Chain, Vec<Vec<Expr>>> = fixed_chains(plan)
+    let mut rules: HashMap<Chain, Vec<Vec<Expr>>> = fixed_chains(plan, options)
         .map(|chain| (chain, Vec::new()))
         .collect();
     for command in fixed.commands {
@@ -1093,7 +1195,7 @@ fn write_changed_chains(
             rules.entry(chain).or_default().push(exprs);
         }
     }
-    for chain in fixed_chains(plan) {
+    for chain in fixed_chains(plan, options) {
         let Some(new) = rules.get(&chain) else {
             continue;
         };
@@ -1252,14 +1354,14 @@ impl ChainInputs {
 fn rule_input(plan: &Plan, rule: Rule) -> (Rule, Option<HostSetId>) {
     match rule {
         Rule::Accept {
-            destination: Destination::HostSet(index),
+            destination: Destination::Host { set, strict },
             service,
         } => (
             Rule::Accept {
-                destination: Destination::HostSet(0),
+                destination: Destination::Host { set: 0, strict },
                 service,
             },
-            plan.host_set(index).map(|set| set.id),
+            plan.host_set(set).map(|set| set.id),
         ),
         rule => (rule, None),
     }
@@ -1610,7 +1712,11 @@ fn render_objects(
         .into_iter()
         .flatten()
         .map(|monitor| Chain::ArpCheck { monitor });
-    for chain in limited.chain(arp_checks) {
+    let name_checks = (options.name_checks.is_some() && !plan.bridges.is_empty())
+        .then_some([Chain::NameCheck, Chain::NameWatch, Chain::NameQueue])
+        .into_iter()
+        .flatten();
+    for chain in limited.chain(arp_checks).chain(name_checks) {
         declared.declare(out, Declaration::Chain(chain));
         installed.chains.insert(chain.object());
     }
@@ -2055,6 +2161,7 @@ fn link_local_group() -> Expr {
     Expr::Masked {
         key: Key::EtherDaddr,
         mask: Value::Mac(MacAddress::from([0xff, 0xff, 0xff, 0xff, 0xff, 0xf0])),
+        equal: true,
         value: Value::Mac(MacAddress::from([0x01, 0x80, 0xc2, 0, 0, 0])),
     }
 }
@@ -2597,6 +2704,231 @@ static PRIVATE: LazyLock<[Vec<IpNet>; 2]> = LazyLock::new(|| {
     [parse(&PRIVATE_V4), parse(&PRIVATE_V6)]
 });
 
+/// The rules of a `host:` rule (after `head`, which matches its addresses) for TCP and
+/// UDP: those connections are marked and go to Portcullis, which checks the name they ask
+/// for. Returns whether that covers all of `service`: other protocols have no name, and
+/// are allowed by address alone.
+fn render_name_rule(
+    out: &mut Batch,
+    chain: Chain,
+    source: &Source,
+    checks: NameChecks,
+    service: Service,
+    head: &[Expr],
+) -> bool {
+    let to = Match::new(source.address, chain);
+    let (bits, queue) = if source.monitor {
+        (
+            checks.marks.check | checks.marks.monitor,
+            Expr::Queue {
+                num: checks.monitor,
+                bypass: true,
+            },
+        )
+    } else {
+        (
+            checks.marks.check,
+            Expr::Queue {
+                num: checks.enforce,
+                bypass: false,
+            },
+        )
+    };
+    let mut rule = |service: Service| {
+        let mut exprs = head.to_vec();
+        to.service(service, &mut exprs);
+        exprs.push(Expr::SetCtMark {
+            keep: u32::MAX,
+            set: bits,
+        });
+        exprs.push(queue.clone());
+        out.rule(chain, exprs);
+    };
+    match service {
+        Service::Any => {
+            for protocol in [Protocol::Tcp, Protocol::Udp] {
+                rule(Service::Protocol(protocol, None));
+            }
+            false
+        }
+        Service::Protocol(Protocol::Tcp | Protocol::Udp, _) => {
+            rule(service);
+            true
+        }
+        Service::Protocol(..) => false,
+    }
+}
+
+/// The rules of connections whose names are checked (see `name_check`), in the inet table.
+///
+/// A `host:` rule marks the connection it allows (`check`) and hands its first packet to
+/// Portcullis. Every later packet of a marked connection, both ways, goes to Portcullis too,
+/// from the top of each base chain, before established traffic passes: one test of the
+/// connection's mark for every other packet. Portcullis sends a packet back through the
+/// hook with a packet mark that says how the check ended, and the rules here set the
+/// connection's mark from it: cleared, the connection passes as any other; watched, only
+/// its client's packets that carry data still go to Portcullis; denied, its packets are
+/// dropped.
+fn render_name_check(out: &mut Batch, plan: &Plan, options: Options) {
+    let Some(checks) = options.name_checks else {
+        return;
+    };
+    if plan.bridges.is_empty() {
+        return;
+    }
+    let bits = checks.marks;
+    let mark = |mark| Expr::cmp(Key::Mark, Value::Mark(mark));
+    let masked = |mask: u32, equal: bool, value: u32| Expr::Masked {
+        key: Key::CtMark,
+        mask: Value::Mark(mask),
+        equal,
+        value: Value::Mark(value),
+    };
+    let denied = Expr::SetCtMark {
+        keep: !bits.all(),
+        set: bits.denied,
+    };
+    for base in [Chain::Base(Table::Inet), Chain::Input, Chain::Output] {
+        out.rule(
+            base,
+            vec![
+                mark(NAME_ALLOWED_MARK),
+                Expr::SetCtMark {
+                    keep: !bits.all(),
+                    set: 0,
+                },
+                ACCEPT,
+            ],
+        );
+        out.rule(
+            base,
+            vec![
+                mark(NAME_WATCH_MARK),
+                Expr::SetCtMark {
+                    keep: !(bits.check | bits.watch | bits.denied),
+                    set: bits.watch,
+                },
+                ACCEPT,
+            ],
+        );
+        // A connection is denied once it is open: TCP gets a reset, so the client doesn't
+        // wait for a timeout.
+        if options.deny == DenyAction::Reject {
+            out.rule(
+                base,
+                vec![
+                    mark(NAME_DENIED_MARK),
+                    Expr::cmp(Key::L4proto, Value::Protocol(Protocol::Tcp, false)),
+                    denied.clone(),
+                    Expr::Reject { tcp_reset: true },
+                ],
+            );
+        }
+        out.rule(
+            base,
+            vec![mark(NAME_DENIED_MARK), denied.clone(), options.deny.expr()],
+        );
+        // The resets above go out with the connection's mark: the output hook only takes
+        // connections still being checked.
+        let tested = if base == Chain::Output {
+            bits.check | bits.watch
+        } else {
+            bits.all()
+        };
+        out.rule(
+            base,
+            vec![
+                masked(tested, false, 0),
+                Expr::Verdict(Verdict::Jump(Chain::NameCheck)),
+            ],
+        );
+    }
+    render_name_chains(out, checks);
+}
+
+/// The chains name checks jump to from the base chains.
+fn render_name_chains(out: &mut Batch, checks: NameChecks) {
+    let bits = checks.marks;
+    let masked = |mask: u32, value: u32| Expr::Masked {
+        key: Key::CtMark,
+        mask: Value::Mark(mask),
+        equal: true,
+        value: Value::Mark(value),
+    };
+    let check = Chain::NameCheck;
+    let queue = Expr::Verdict(Verdict::Goto(Chain::NameQueue));
+    out.rule(
+        check,
+        vec![
+            masked(bits.denied, bits.denied),
+            Expr::Verdict(Verdict::Drop),
+        ],
+    );
+    out.rule(check, vec![masked(bits.check, bits.check), queue.clone()]);
+    out.rule(
+        check,
+        vec![
+            masked(bits.watch, bits.watch),
+            Expr::cmp(Key::CtDirection, Value::Original),
+            Expr::Verdict(Verdict::Goto(Chain::NameWatch)),
+        ],
+    );
+    // Watched: only the client's packets with data. Without IP options (a header of 20
+    // bytes), a TCP packet carries data when it is longer than its headers.
+    let watch = Chain::NameWatch;
+    let header_length = |value: u32| Expr::Masked {
+        key: Key::Raw { offset: 0, bits: 8 },
+        mask: Value::Number(0x0f),
+        equal: true,
+        value: Value::Number(value),
+    };
+    for offset in 5..=15_u16 {
+        out.rule(
+            watch,
+            vec![
+                header_length(5),
+                Expr::Masked {
+                    key: Key::Raw {
+                        offset: 256,
+                        bits: 8,
+                    },
+                    mask: Value::Number(0xf0),
+                    equal: true,
+                    value: Value::Number(u32::from(offset) << 4),
+                },
+                Expr::cmp(
+                    Key::Raw {
+                        offset: 16,
+                        bits: 16,
+                    },
+                    Value::Range(20 + offset * 4 + 1, u16::MAX),
+                ),
+                queue.clone(),
+            ],
+        );
+    }
+    out.rule(watch, vec![header_length(5), ACCEPT]);
+    out.rule(watch, vec![queue]);
+    let chain = Chain::NameQueue;
+    out.rule(
+        chain,
+        vec![
+            masked(bits.monitor, bits.monitor),
+            Expr::Queue {
+                num: checks.monitor,
+                bypass: true,
+            },
+        ],
+    );
+    out.rule(
+        chain,
+        vec![Expr::Queue {
+            num: checks.enforce,
+            bypass: false,
+        }],
+    );
+}
+
 /// How a rule matches destinations. The bridge table sees packets as sent. The inet table
 /// sees them after Docker's DNAT has rewritten published ports of the host to the
 /// container behind them, so it matches the destination the container asked for, as
@@ -2681,6 +3013,7 @@ impl Match {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_rule(
     plan: &Plan,
     source: &Source,
@@ -2763,7 +3096,7 @@ fn render_rule(
             match destination {
                 Destination::Net(destination) => exprs.push(to.to(Value::Network(destination))),
                 Destination::Addr(destination) => exprs.push(to.to(Value::Address(destination))),
-                Destination::HostSet(index) => {
+                Destination::Host { set: index, .. } => {
                     let Some(set) = plan.host_set(index) else {
                         return;
                     };
@@ -2788,9 +3121,16 @@ fn render_rule(
                     exprs.push(Expr::Masked {
                         key: Key::CtStatus,
                         mask: Value::Dnat,
+                        equal: true,
                         value: Value::Number(0),
                     });
                 }
+            }
+            if let (Destination::Host { .. }, Some(checks), false) =
+                (destination, options.name_checks, icc)
+                && render_name_rule(out, chain, source, checks, service, &exprs)
+            {
+                return;
             }
             to.service(service, &mut exprs);
             decide(out, chain, exprs, allow);
@@ -2974,6 +3314,7 @@ impl NftRunner for NetlinkRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::firewall::plan::HostSetId;
     use crate::firewall::test_support::{self, MockResolver};
 
     const OPTIONS: Options = Options {
@@ -2985,6 +3326,7 @@ mod tests {
         monitor_source_queue: None,
         connection_limit: None,
         dns_query_queue: None,
+        name_checks: None,
     };
 
     fn render_with(state: &RuntimeState, options: Options, monitor_all: bool) -> String {
@@ -3001,6 +3343,99 @@ mod tests {
 
     fn render(state: &RuntimeState) -> String {
         render_with(state, OPTIONS, false)
+    }
+
+    const NAMES: Options = Options {
+        deny: DenyAction::Reject,
+        name_checks: Some(NameChecks {
+            enforce: 8,
+            monitor: 9,
+            marks: CtMarkBits {
+                monitor: 0x0010_0000,
+                check: 0x0020_0000,
+                watch: 0x0040_0000,
+                denied: 0x0080_0000,
+            },
+        }),
+        ..OPTIONS
+    };
+
+    #[test]
+    fn hands_connections_through_host_rules_to_the_name_check() {
+        let state = test_support::hostname_state();
+        let script = render_with(&state, NAMES, false);
+        let set = HostSetId::for_host("web", test_support::HOST).name(SET_PREFIX_V4);
+        // Marked, and to the queue that drops what nothing reads.
+        assert!(script.contains(&format!(
+            "add rule inet portcullis egress0 ct original ip daddr @{set} meta l4proto tcp ct original proto-dst 443 ct mark set ct mark & 0xffffffff | 0x00200000 queue num 8\n"
+        )), "{script}");
+        // First in every base chain of the inet table: the verdicts, then the test of the
+        // connection's mark; the output hook only takes connections being checked.
+        for (base, tested) in [
+            ("forward", "0xf00000"),
+            ("input", "0xf00000"),
+            ("output", "0x600000"),
+        ] {
+            let head = format!("add rule inet portcullis {base} ");
+            let rules: Vec<&str> = script
+                .lines()
+                .filter_map(|line| line.strip_prefix(&head))
+                .take(5)
+                .collect();
+            assert_eq!(
+                rules,
+                [
+                    "meta mark 0x70630004 ct mark set ct mark & 0xff0fffff | 0x00000000 accept".to_string(),
+                    "meta mark 0x70630005 ct mark set ct mark & 0xff1fffff | 0x00400000 accept".to_string(),
+                    "meta mark 0x70630006 meta l4proto tcp ct mark set ct mark & 0xff0fffff | 0x00800000 reject with tcp reset".to_string(),
+                    "meta mark 0x70630006 ct mark set ct mark & 0xff0fffff | 0x00800000 reject with icmpx admin-prohibited".to_string(),
+                    format!("ct mark & {tested} != 0x0 jump name_check"),
+                ],
+                "{base}"
+            );
+        }
+        // Monitored: to the queue that lets packets through.
+        let monitored = render_with(&state, NAMES, true);
+        assert!(
+            monitored
+                .contains("ct mark set ct mark & 0xffffffff | 0x00300000 queue num 9 bypass\n")
+        );
+        // Without name checks, host: rules allow by address.
+        assert!(!render(&state).contains("queue num 8"));
+    }
+
+    #[test]
+    fn empties_the_chains_of_name_checks_before_deleting_them() {
+        let state = test_support::hostname_state();
+        let plan = |state: &RuntimeState| {
+            Plan::build(
+                state,
+                &mut MockResolver::default(),
+                &test_support::host_resolvers(),
+                false,
+            )
+        };
+        let mut installed = render_apply_script(&plan(&state), NAMES, None, &mut Batch::default());
+        let mut batch = Batch::default();
+        render_apply_script(
+            &plan(&RuntimeState::default()),
+            NAMES,
+            Some(&mut installed),
+            &mut batch,
+        );
+        let script = batch.to_string();
+        let position = |line: &str| {
+            script
+                .find(line)
+                .unwrap_or_else(|| panic!("{line} in {script}"))
+        };
+        for chain in ["name_check", "name_watch", "name_queue"] {
+            assert!(
+                position(&format!("flush chain inet portcullis {chain}\n"))
+                    < position("delete chain inet portcullis name_check"),
+                "{chain}"
+            );
+        }
     }
 
     /// The de-duplicated log statement of a reported IPv4 decision, of the bridge table.

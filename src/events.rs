@@ -36,7 +36,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 /// An alert command running longer than this is killed.
 const ALERT_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Allowed,
@@ -94,6 +94,10 @@ pub struct Connection {
     pub domain_source: Option<DomainSource>,
     /// The name a denied DNS query asked for.
     pub query: Option<String>,
+    /// For connections through `host:` rules, the name the connection asked for: the TLS
+    /// server name, or the HTTP Host.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Extra explanation, e.g. why a source is considered spoofed. Mostly fixed texts,
     /// which aren't copied.
     pub detail: Option<Cow<'static, str>>,
@@ -242,6 +246,7 @@ impl Event {
                 let destination = connection
                     .destination_container
                     .clone()
+                    .or_else(|| connection.name.clone())
                     .or_else(|| connection.domain.clone())
                     .or_else(|| connection.query.clone())
                     .or_else(|| connection.destination.map(|address| address.to_string()))
@@ -479,6 +484,9 @@ fn write_connection(line: &mut String, connection: &Connection) -> std::fmt::Res
     }
     if let Some(query) = &connection.query {
         write!(line, " query {query}")?;
+    }
+    if let Some(name) = &connection.name {
+        write!(line, " name {name}")?;
     }
     if let Some(detail) = &connection.detail {
         write!(line, " ({detail})")?;
@@ -781,6 +789,7 @@ mod tests {
             domain: Some("api.stripe.com".to_string()),
             domain_source: Some(DomainSource::Dns),
             query: None,
+            name: None,
             detail: None,
             mid_stream: false,
             forged: false,
@@ -805,6 +814,28 @@ mod tests {
             line,
             "T DENIED egress web 172.18.0.2 -> api.stripe.com (104.18.3.4) tcp/443"
         );
+    }
+
+    #[test]
+    fn formats_the_name_a_connection_asked_for() {
+        let Event::Connection(mut connection) = denied(443) else {
+            unreachable!()
+        };
+        connection.name = Some("files.example.net".into());
+        connection.detail = Some("not a name of the container's host: rules".into());
+        assert_eq!(
+            text("T", &Event::Connection(connection.clone())),
+            "T DENIED egress web 172.18.0.2 -> api.stripe.com (104.18.3.4) tcp/443 name files.example.net (not a name of the container's host: rules)"
+        );
+        let json = serde_json::to_value(Record {
+            time: "T",
+            event: &Event::Connection(connection),
+        })
+        .expect("json");
+        assert_eq!(json["name"], "files.example.net");
+        // Events of earlier versions don't have it.
+        let old: Connection = serde_json::from_str(r#"{"verdict":"denied","reason":"egress","container":null,"network":null,"protocol":"tcp","source":null,"source_port":null,"destination":null,"destination_port":null,"destination_container":null,"domain":null,"domain_source":null,"query":null,"detail":null}"#).expect("old event");
+        assert_eq!(old.name, None);
     }
 
     #[test]

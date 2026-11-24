@@ -49,9 +49,52 @@ Portcullis doesn't touch Docker's rules or anyone else's, and works next to Dock
 | NFQUEUE | 4243 | packets of containers not known yet, on enforced networks |
 | NFQUEUE | 4244 | DNS queries of containers with `portcullis.domains` labels |
 | NFQUEUE | 4245 | packets of containers not known yet, on networks in monitor mode |
-| Packet marks | `0x70630001` to `0x70630003` | internal bookkeeping |
+| NFQUEUE | 4246 | connections through `host:` rules whose names are checked, on enforced networks |
+| NFQUEUE | 4247 | the same, on networks in monitor mode |
+| Packet marks | `0x70630001` to `0x70630006` | internal bookkeeping |
+| Connection marks | bits `0x00f00000` (`ct-mark-mask`) | the state of name checks; other bits are left alone |
 
-Other software on the host must not use the same numbers. They can't be changed.
+Other software on the host must not use the same numbers. Only the connection mark bits can be changed.
+
+## Connection marks
+
+Connection tracking keeps a 32-bit mark for each connection, which rules can read and set (`ct mark`). Portcullis keeps the state of each [name check](/internals/how-it-works/#name-checks) in four bits of it, by default `0x00f00000`:
+
+| Bit (default) | Set while |
+| --- | --- |
+| `0x00100000` | the connection is a monitored container's: its packets go to the queue that lets them through when Portcullis isn't reading it |
+| `0x00200000` | the connection's name is being checked: all its packets, both ways, go to Portcullis |
+| `0x00400000` | the connection is plain HTTP: the packets its client sends with data go to Portcullis |
+| `0x00800000` | the connection was denied: its packets are dropped |
+
+It needs the connection's mark because the check spans several packets: the kernel has to know, for every packet of the connection, whether to hand it to Portcullis, let it through, or drop it, and the connection mark is what connection tracking keeps per connection. Most connections never have any of these bits set: those that don't go through a `host:` rule, and those whose check is over. Every packet costs one test of the mark.
+
+Portcullis only changes these four bits, and leaves the rest of the mark as it is. Other software that sets the same bits breaks name checks; software that sets the whole mark (`ct mark set 1337`, rather than a masked change) clears them, and a connection being checked then passes unchecked; one whose bits Portcullis set may be dropped or held by the other software's rules. Software known to use connection marks:
+
+- Istio's sidecar uses the mark `1337`: packet marks, and connection marks in its TPROXY mode.
+- Cilium reserves bits of packet marks for its own datapath.
+- kube-proxy and some Kubernetes network plugins, WireGuard and other VPN setups (`wg-quick` with policy routing), and firewalld zones and some routers' QoS rules use marks too, mostly packet marks, which connection tracking can copy into connection marks (`connmark`).
+
+To check, list the rules of every table and look for marks:
+
+```bash
+sudo nft list ruleset | grep -i mark
+sudo iptables-save | grep -i mark
+```
+
+and look at the marks connections have, which shows bits someone set:
+
+```bash
+sudo conntrack -L -o extended | grep -o 'mark=[0-9]*' | sort | uniq -c
+```
+
+(`conntrack` prints marks in decimal; `printf '%#010x\n' 1337` shows one in hex.) If anything uses bits of `0x00f00000`, give Portcullis other ones, at least four that are contiguous and free (the lowest four of the mask are used), in the config:
+
+```toml title="/etc/portcullis/config.toml"
+ct-mark-mask = "0x0000f000"
+```
+
+and restart Portcullis. Connections whose names were being checked during the restart are denied.
 
 ## Kernel
 

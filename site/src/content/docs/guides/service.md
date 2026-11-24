@@ -66,6 +66,7 @@ By default (`on-exit = "keep"`), the firewall rules stay in place when Portculli
 - Containers that start on an enforced network in the meantime can't send anything: they have no rules yet, so their packets are held for Portcullis and then dropped by the kernel. They get their rules as soon as Portcullis is back.
 - DNS answers are let through without inspection, and nothing is reported.
 - Containers with [`portcullis.domains`](/policy/domains/) labels can't look anything up: their queries are held for a Portcullis that isn't there.
+- New connections through [`host:` rules](/policy/hostnames/#names-connections-ask-for) can't get past their handshake: Portcullis checks their names. Connections whose check ended keep going; those it was still checking, plain HTTP connections included (every request of theirs is checked), are denied when it is back.
 - On networks in monitor mode, the first packets of new containers are let through.
 
 When Portcullis starts again, it puts its saved rules back, and its first update replaces them in one step.

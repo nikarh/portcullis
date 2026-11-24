@@ -345,6 +345,7 @@ mod tests {
             quarantine: true,
             ipv6_network: false,
             domains: None,
+            names: std::sync::Arc::from([]),
         };
         assert!(sent_by(&held(Some(7)), &info(PortState::Known(7))));
         assert!(!sent_by(&held(Some(8)), &info(PortState::Known(7))));

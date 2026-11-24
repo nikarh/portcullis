@@ -154,6 +154,7 @@ mod tests {
             domain: None,
             domain_source: None,
             query: None,
+            name: None,
             detail: Some("uses the address of other".into()),
             mid_stream: false,
             forged: reason == Reason::Source,

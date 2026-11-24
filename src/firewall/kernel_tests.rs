@@ -32,8 +32,8 @@ use super::netlink::{
     NFTA_TABLE_NAME, NftSocket,
 };
 use super::nftables::{
-    DenyAction, Found, LogAllowed, NetlinkRunner, NftRunner, NftablesFirewall, Options,
-    fresh_batch_with_slots,
+    CtMarkBits, DenyAction, Found, LogAllowed, NameChecks, NetlinkRunner, NftRunner,
+    NftablesFirewall, Options, fresh_batch_with_slots,
 };
 use super::ruleset::{Batch, TABLE_NAME};
 use super::{FirewallError, Plan};
@@ -446,6 +446,10 @@ fn policy(random: &mut Random, names: &[String]) -> ContainerPolicy {
             services: vec![Service::Protocol(Protocol::Tcp, None)],
         },
         EgressRule {
+            target: EgressTarget::StrictHostname(NamePattern::host("api.example.com")),
+            services: vec![tcp(8443, 8443), Service::Protocol(Protocol::Icmp, None)],
+        },
+        EgressRule {
             target: EgressTarget::IpCidr(net("8.8.8.0/24")),
             services: vec![tcp(853, 853)],
         },
@@ -765,6 +769,11 @@ fn option_sets() -> Vec<Options> {
             monitor_source_queue: Some(5),
             connection_limit: Some(1000),
             dns_query_queue: Some(6),
+            name_checks: Some(NameChecks {
+                enforce: 8,
+                monitor: 9,
+                marks: CtMarkBits::default(),
+            }),
         },
         Options {
             deny: DenyAction::Drop,
@@ -775,6 +784,11 @@ fn option_sets() -> Vec<Options> {
             monitor_source_queue: Some(5),
             connection_limit: None,
             dns_query_queue: None,
+            name_checks: Some(NameChecks {
+                enforce: 8,
+                monitor: 9,
+                marks: CtMarkBits::from_mask(0x0000_f000).expect("mask"),
+            }),
         },
         Options {
             deny: DenyAction::Drop,

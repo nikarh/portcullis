@@ -62,7 +62,7 @@ It joins consecutive ports into ranges, folds three or more hostnames under one 
 
 A suggestion to reach the Docker host (a network's gateway, see [The Docker host](/policy/egress/#the-docker-host)) comes with a note: it lets the container reach services on the host. Traffic that Docker's userland proxy (`docker-proxy`) forwards to a container from a published port comes from the gateway, so a container may have learned the address from that, rather than needing it.
 
-Packets of connections the firewall didn't track (`mid_stream`), traffic labels can't allow, and traffic sent with someone else's address are listed apart. `source` denials that weren't crafted (see [Source or frame events](/help/troubleshooting/#source-or-frame-events)) are listed as needing no label.
+Connections through `host:` rules that the [name check](/policy/hostnames/#names-connections-ask-for) denied are listed by why, with the name they asked for; one that asked for another site gets a `host:` suggestion for it. Packets of connections the firewall didn't track (`mid_stream`), traffic labels can't allow, and traffic sent with someone else's address are listed apart. `source` denials that weren't crafted (see [Source or frame events](/help/troubleshooting/#source-or-frame-events)) are listed as needing no label.
 
 `--since` leaves out events from before a time: a UTC time as events have it, or the start of one (`2026-11-06`, `2026-11-06T10:30`), or how long ago (`30m`, `12h`, `7d`). Use it to leave out what containers did before they were recreated with the labels they have now. See [Rolling out a policy](/guides/rollout/#3-turn-events-into-labels).
 

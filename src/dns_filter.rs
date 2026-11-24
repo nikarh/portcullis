@@ -204,6 +204,7 @@ fn denied(
         domain: None,
         domain_source: None,
         query,
+        name: None,
         detail: Some(detail.into()),
         mid_stream: false,
         forged: false,

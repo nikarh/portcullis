@@ -3,7 +3,9 @@ use std::fmt::Write as _;
 
 use super::*;
 use crate::firewall::Plan;
-use crate::firewall::nftables::{DenyAction, LogAllowed, Options, fresh_batch};
+use crate::firewall::nftables::{
+    CtMarkBits, DenyAction, LogAllowed, NameChecks, Options, fresh_batch,
+};
 use crate::firewall::ruleset::{Chain, Part, SetFlags};
 use crate::firewall::test_support::{self, MockResolver};
 use crate::model::BridgePort;
@@ -113,6 +115,7 @@ fn describe_expr(expr: &[u8]) -> String {
                 0 => "state",
                 1 => "direction",
                 2 => "status",
+                3 => "mark",
                 12 => "proto_dst",
                 19 => "src_ip",
                 20 => "dst_ip",
@@ -125,7 +128,11 @@ fn describe_expr(expr: &[u8]) -> String {
                 Some([1]) => " , dir reply",
                 _ => "",
             };
-            format!("ct load {key} => reg {}{direction}", u32_(1).expect("dreg"))
+            match (u32_(1), u32_(4)) {
+                (Some(dreg), _) => format!("ct load {key} => reg {dreg}{direction}"),
+                (None, Some(sreg)) => format!("ct set {key} with reg {sreg}"),
+                _ => panic!("ct without register"),
+            }
         }
         "fib" => format!("fib daddr type => reg {}", u32_(1).expect("dreg")),
         "lookup" => {
@@ -253,6 +260,11 @@ fn fixtures() -> Vec<(Plan, Options)> {
         monitor_source_queue: Some(5),
         connection_limit: Some(1000),
         dns_query_queue: Some(6),
+        name_checks: Some(NameChecks {
+            enforce: 8,
+            monitor: 9,
+            marks: CtMarkBits::default(),
+        }),
     };
     let states = [
         test_support::hostname_state(),

@@ -10,13 +10,18 @@ pub mod test_support;
 
 use thiserror::Error;
 
+pub use elements::SetLookup;
 pub use nftables::{
-    DEFAULT_CONNECTION_LIMIT, DNS_ALLOWED_MARK, DNS_DENIED_MARK, DenyAction, HOLD_EXPIRED_MARK,
-    LOG_PREFIX, LogAllowed, NftablesFirewall, Options, Restored, Update,
+    CtMarkBits, DEFAULT_CONNECTION_LIMIT, DEFAULT_CT_MARK_MASK, DNS_ALLOWED_MARK, DNS_DENIED_MARK,
+    DenyAction, HOLD_EXPIRED_MARK, LOG_PREFIX, LogAllowed, NAME_ALLOWED_MARK, NAME_DENIED_MARK,
+    NAME_WATCH_MARK, NameChecks, NftablesFirewall, Options, Restored, Update,
 };
 #[cfg(test)]
 pub use plan::HostSetId;
-pub use plan::{Destination, HostSet, PRIVATE_V4, PRIVATE_V6, Plan, Rule};
+pub use plan::{
+    Destination, HostSet, PRIVATE_V4, PRIVATE_V6, Plan, Rule, SET_PREFIX_V4, SET_PREFIX_V6, Source,
+};
+pub use ruleset::TABLE_NAME;
 
 #[derive(Debug, Error)]
 pub enum FirewallError {

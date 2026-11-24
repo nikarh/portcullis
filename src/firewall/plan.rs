@@ -30,6 +30,7 @@ use crate::dns::{HostResolver, normalize};
 use crate::model::{
     BridgePort, ConnectionLimit, Container, ContainerName, DnsTarget, EgressTarget, IccAllowRule,
     IccMode, IccTarget, MacAddress, NetworkAttachment, PortState, Protocol, RuntimeState, Service,
+    Strictness,
 };
 use crate::pattern::NamePattern;
 
@@ -50,8 +51,13 @@ pub const ICC_BROADCAST_V4: [IpNet; 2] = [
 pub enum Destination {
     Net(IpNet),
     Addr(IpAddr),
-    /// Index into [`Plan::host_sets`].
-    HostSet(usize),
+    /// The addresses of a hostname set, an index into [`Plan::host_sets`] (`host:`). TCP
+    /// and UDP to them go to Portcullis first, which checks the names they ask for (see
+    /// `name_check`); `strict` denies those that don't name a server.
+    Host {
+        set: usize,
+        strict: bool,
+    },
     /// Any address.
     Any,
     /// Any public address, see [`PRIVATE_V4`]; none of the host's.
@@ -152,6 +158,8 @@ pub struct Source {
     /// The domain names the container may look up, if limited: its `portcullis.domains`
     /// patterns and those of its `host:` rules.
     pub domains: Option<Vec<NamePattern>>,
+    /// `portcullis.name-checks`, if set.
+    pub name_checks: Option<Strictness>,
     /// Range into [`Plan::rules`] of rules for traffic leaving the network.
     egress: Range<usize>,
     /// Range into [`Plan::rules`] of rules for traffic to containers on the same network.
@@ -453,33 +461,7 @@ where
         }
         self.plan_dns(source, &policy.dns_targets, container);
 
-        for rule in &policy.egress {
-            let destination = match &rule.target {
-                EgressTarget::IpCidr(net) if same_family(source, net.addr()) => {
-                    Destination::Net(*net)
-                }
-                EgressTarget::IpCidr(_) => continue,
-                EgressTarget::AnyAddress => Destination::Any,
-                EgressTarget::PublicAddress => Destination::Public,
-                EgressTarget::Hostname(host) => {
-                    let index = self.host_set(&container.name, host, policy.hostname_hold);
-                    if let Some(set) = self.plan.host_sets.get_mut(index) {
-                        if source.is_ipv4() {
-                            set.used_v4 = true;
-                        } else {
-                            set.used_v6 = true;
-                        }
-                    }
-                    Destination::HostSet(index)
-                }
-            };
-            self.plan
-                .rules
-                .extend(rule.services.iter().map(|service| Rule::Accept {
-                    destination,
-                    service: *service,
-                }));
-        }
+        self.plan_egress(container, source);
 
         let egress = egress_start..self.plan.rules.len();
 
@@ -518,17 +500,63 @@ where
             quarantined: self.state.is_quarantined(&container.id),
             domains: policy.domains.as_ref().map(|domains| {
                 let mut domains = domains.clone();
-                domains.extend(policy.egress.iter().filter_map(|rule| match &rule.target {
-                    EgressTarget::Hostname(host) => Some(host.clone()),
-                    _ => None,
-                }));
+                domains.extend(
+                    policy
+                        .egress
+                        .iter()
+                        .filter_map(|rule| rule.target.hostname().cloned()),
+                );
                 domains.sort_unstable();
                 domains.dedup();
                 domains
             }),
+            name_checks: policy.name_checks,
             egress,
             icc,
         });
+    }
+
+    /// Egress rules of `container`'s labels. Rules that check names come last: a
+    /// connection another rule allows by its address alone doesn't need a name.
+    fn plan_egress(&mut self, container: &'s Container, source: IpAddr) {
+        let policy = &container.policy;
+        let mut named = Vec::new();
+        for rule in &policy.egress {
+            let destination = match &rule.target {
+                EgressTarget::IpCidr(net) if same_family(source, net.addr()) => {
+                    Destination::Net(*net)
+                }
+                EgressTarget::IpCidr(_) => continue,
+                EgressTarget::AnyAddress => Destination::Any,
+                EgressTarget::PublicAddress => Destination::Public,
+                EgressTarget::Hostname(host) | EgressTarget::StrictHostname(host) => {
+                    let index = self.host_set(&container.name, host, policy.hostname_hold);
+                    if let Some(set) = self.plan.host_sets.get_mut(index) {
+                        if source.is_ipv4() {
+                            set.used_v4 = true;
+                        } else {
+                            set.used_v6 = true;
+                        }
+                    }
+                    let destination = Destination::Host {
+                        set: index,
+                        strict: matches!(rule.target, EgressTarget::StrictHostname(_)),
+                    };
+                    named.extend(rule.services.iter().map(|service| Rule::Accept {
+                        destination,
+                        service: *service,
+                    }));
+                    continue;
+                }
+            };
+            self.plan
+                .rules
+                .extend(rule.services.iter().map(|service| Rule::Accept {
+                    destination,
+                    service: *service,
+                }));
+        }
+        self.plan.rules.append(&mut named);
     }
 
     /// DNS rules. They only cover DNS leaving the container's network; Docker's DNS server
@@ -760,6 +788,7 @@ const fn same_family(a: IpAddr, b: IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::firewall::test_support::{self, MockResolver, ip, net};
+    use crate::model::EgressRule;
     use crate::pattern::NamePattern;
 
     fn build(state: &RuntimeState) -> (Plan, MockResolver) {
@@ -864,13 +893,17 @@ mod tests {
                 Rule::DenyDns {
                     protocol: Protocol::Tcp
                 },
-                Rule::Accept {
-                    destination: Destination::HostSet(0),
-                    service: Service::tcp(443),
-                },
+                // Rules that check names come after those that don't.
                 Rule::Accept {
                     destination: Destination::Net(net("8.8.8.0/24")),
                     service: Service::tcp(853),
+                },
+                Rule::Accept {
+                    destination: Destination::Host {
+                        set: 0,
+                        strict: false
+                    },
+                    service: Service::tcp(443),
                 },
             ]
         );
@@ -987,6 +1020,53 @@ mod tests {
     }
 
     #[test]
+    fn plans_strict_host_rules_on_the_same_set() {
+        let mut state = test_support::hostname_state();
+        let mut container = state.containers().get("abc").cloned().expect("container");
+        state.apply_action(crate::model::RuntimeStateAction::RemoveContainer {
+            container_id: "abc".to_string().into(),
+        });
+        container.policy.egress = vec![
+            EgressRule {
+                target: EgressTarget::Hostname(NamePattern::host(test_support::HOST)),
+                services: vec![Service::tcp(443)],
+            },
+            EgressRule {
+                target: EgressTarget::StrictHostname(NamePattern::host(test_support::HOST)),
+                services: vec![Service::tcp(22)],
+            },
+        ];
+        state.apply_action(crate::model::RuntimeStateAction::CreateContainer {
+            container: Box::new(container),
+        });
+        let (plan, resolver) = build(&state);
+        // Both rules use the one set of the name.
+        assert_eq!(resolver.calls, 1);
+        assert_eq!(plan.host_sets.len(), 1);
+        let rules = rules_of(&plan, "172.18.0.2");
+        let tail = &rules[rules.len() - 2..];
+        assert_eq!(
+            tail,
+            [
+                Rule::Accept {
+                    destination: Destination::Host {
+                        set: 0,
+                        strict: false
+                    },
+                    service: Service::tcp(443),
+                },
+                Rule::Accept {
+                    destination: Destination::Host {
+                        set: 0,
+                        strict: true
+                    },
+                    service: Service::tcp(22),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn creates_a_hostname_set_per_container() {
         // What one container learns from DNS answers must not widen another's rules.
         let (plan, resolver) = build(&test_support::shared_hostname_state());
@@ -998,7 +1078,10 @@ mod tests {
             assert_eq!(set.container, source.container);
             assert_eq!(set.host, test_support::HOST);
             assert!(plan.egress_rules(source).contains(&Rule::Accept {
-                destination: Destination::HostSet(index),
+                destination: Destination::Host {
+                    set: index,
+                    strict: false
+                },
                 service: Service::tcp(443),
             }));
         }
@@ -1112,7 +1195,10 @@ mod tests {
                 service: Service::Protocol(Protocol::Icmp, None),
             },
             Rule::Accept {
-                destination: Destination::HostSet(0),
+                destination: Destination::Host {
+                    set: 0,
+                    strict: false,
+                },
                 service: Service::Protocol(Protocol::Tcp, None),
             },
         ] {
@@ -1194,7 +1280,10 @@ mod tests {
         assert!(set.used_v4);
         let rules = rules_of(&plan, "172.18.0.2");
         assert!(rules.contains(&Rule::Accept {
-            destination: Destination::HostSet(0),
+            destination: Destination::Host {
+                set: 0,
+                strict: false
+            },
             service: Service::tcp(443),
         }));
         assert!(rules.contains(&Rule::Accept {

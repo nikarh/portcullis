@@ -43,7 +43,7 @@ Portcullis assumes a container may be compromised and actively try to get past i
 ## What it isn't
 
 - It isn't an inbound firewall. Labels limit the connections a container opens; who may connect to a container's published ports is up to Docker and your host firewall.
-- It doesn't look inside traffic. A `host:` rule allows the addresses a name resolves to, not the name; there is no TLS SNI or URL filtering. [Limits and workarounds](/limits/escape-hatches/) shows how to add that with a proxy.
+- It doesn't look inside encrypted traffic. A `host:` rule checks the name a connection asks for (TLS and QUIC SNI, HTTP `Host`) at the name's addresses, but not URLs, nor what is asked for inside TLS. [Limits and workarounds](/limits/escape-hatches/) shows how to add that with a proxy.
 - It doesn't do IPv6, and only works on bridge networks. See [Limitations](/limits/limitations/).
 
 ## Where to go next

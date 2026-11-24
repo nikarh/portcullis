@@ -6,7 +6,7 @@ sidebar:
   order: 6
 ---
 
-An IP firewall can't match hostnames. A `host:` rule allows the addresses a name resolves to, and behind a CDN those addresses serve thousands of other sites. A pattern such as `host:*.cloudfront.net` allows anyone's server. When that's too wide, let the application reach only a proxy, and let the proxy decide by hostname (the TLS SNI or the `CONNECT` target) or by URL.
+A `host:` rule allows connections to the addresses a name resolves to that ask for the name (see [Names connections ask for](/policy/hostnames/#names-connections-ask-for)). It doesn't see what a client asks for inside TLS, such as URLs, and a pattern such as `host:*.cloudfront.net` allows anyone's server. When that's too wide, let the application reach only a proxy, and let the proxy decide by hostname (the TLS SNI or the `CONNECT` target) or by URL, decrypting where it has to.
 
 Portcullis then does what it does well: it makes the proxy the only way out.
 

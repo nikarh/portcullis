@@ -67,6 +67,7 @@ const NFQA_CFG_PARAMS: u16 = 2;
 const NFQA_CFG_MASK: u16 = 4;
 const NFQA_CFG_FLAGS: u16 = 5;
 const NFQA_CFG_F_FAIL_OPEN: u32 = 0x0001;
+const NFQA_CFG_F_CONNTRACK: u32 = 0x0002;
 const NFQNL_CFG_CMD_BIND: u8 = 1;
 const NFQNL_COPY_PACKET: u8 = 2;
 const NFQA_PACKET_HDR: u16 = 1;
@@ -75,6 +76,10 @@ const NFQA_MARK: u16 = 3;
 const NFQA_IFINDEX_PHYSINDEV: u16 = 7;
 const NFQA_HWADDR: u16 = 9;
 const NFQA_PAYLOAD: u16 = 10;
+const NFQA_CT: u16 = 11;
+const NFQA_CT_INFO: u16 = 12;
+/// `enum ip_conntrack_info`: values from here on are packets of the reply direction.
+const IP_CT_IS_REPLY: u32 = 3;
 
 const NF_ACCEPT: u32 = 1;
 const NF_REPEAT: u32 = 4;
@@ -149,6 +154,20 @@ pub struct QueuedPacket {
     pub hwaddr: Option<MacAddress>,
     /// The packet, starting at the IP header.
     pub payload: Vec<u8>,
+    /// The packet's tracked connection, for queues bound with it (see
+    /// [`NfqueueSocket::with_connections`]).
+    pub connection: Option<Tracked>,
+}
+
+/// A packet's tracked connection, as the kernel attaches it to queued packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tracked {
+    /// The connection as its opener sent it, before NAT: protocol, source and destination.
+    pub original: crate::conntrack::Tuple,
+    /// The packet goes the reply direction, from the destination back to the opener.
+    pub reply: bool,
+    /// The connection's mark.
+    pub mark: u32,
 }
 
 struct NetfilterSocket {
@@ -333,9 +352,30 @@ impl NfqueueSocket {
         params.push(NFQNL_COPY_PACKET);
         inner.request(config, queue, &attribute(NFQA_CFG_PARAMS, &params))?;
         if overflow == QueueOverflow::Accept {
-            inner.request(config, queue, &fail_open_flags())?;
+            inner.request(config, queue, &flags(NFQA_CFG_F_FAIL_OPEN))?;
         }
         Ok(Self { inner, queue })
+    }
+
+    /// Have the kernel attach each packet's tracked connection.
+    pub fn with_connections(mut self, overflow: QueueOverflow) -> io::Result<Self> {
+        let config = (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG;
+        let mut wanted = NFQA_CFG_F_CONNTRACK;
+        if overflow == QueueOverflow::Accept {
+            wanted |= NFQA_CFG_F_FAIL_OPEN;
+        }
+        self.inner.request(config, self.queue, &flags(wanted))?;
+        Ok(self)
+    }
+
+    /// Make [`Self::receive`] give up after `timeout` without packets, with an error of
+    /// kind `WouldBlock`.
+    pub fn set_receive_timeout(&self, timeout: Duration) -> io::Result<()> {
+        let timeout = nix::sys::time::TimeVal::new(
+            i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+            i64::from(timeout.subsec_micros()),
+        );
+        setsockopt(&self.inner.socket, sockopt::ReceiveTimeout, &timeout).map_err(io::Error::from)
     }
 
     /// Block until packets arrive.
@@ -435,12 +475,16 @@ fn parse_queued(buffer: &[u8]) -> Vec<QueuedPacket> {
             let mut physindev = None;
             let mut hwaddr = None;
             let mut payload = Vec::new();
+            let mut connection = None;
+            let mut reply = None;
             for (kind, value) in attributes(message.body.get(NFGENMSG_LEN..)?) {
                 match kind {
                     NFQA_PACKET_HDR => id = be_u32(value),
                     NFQA_IFINDEX_PHYSINDEV => physindev = be_u32(value),
                     NFQA_HWADDR => hwaddr = hardware_address(value),
                     NFQA_PAYLOAD => payload = value.to_vec(),
+                    NFQA_CT => connection = crate::conntrack::tracked(value),
+                    NFQA_CT_INFO => reply = be_u32(value).map(|info| info >= IP_CT_IS_REPLY),
                     _ => {}
                 }
             }
@@ -449,6 +493,13 @@ fn parse_queued(buffer: &[u8]) -> Vec<QueuedPacket> {
                 physindev,
                 hwaddr,
                 payload,
+                connection: connection
+                    .zip(reply)
+                    .map(|((original, mark), reply)| Tracked {
+                        original,
+                        reply,
+                        mark,
+                    }),
             })
         })
         .collect()
@@ -506,12 +557,10 @@ fn encode(
 }
 
 /// The queue configuration that lets packets through when they can't be queued (Linux 3.6+).
-fn fail_open_flags() -> Vec<u8> {
-    let mut attributes = attribute(NFQA_CFG_MASK, &NFQA_CFG_F_FAIL_OPEN.to_be_bytes());
-    attributes.extend(attribute(
-        NFQA_CFG_FLAGS,
-        &NFQA_CFG_F_FAIL_OPEN.to_be_bytes(),
-    ));
+/// Turn queue flags on.
+fn flags(flags: u32) -> Vec<u8> {
+    let mut attributes = attribute(NFQA_CFG_MASK, &flags.to_be_bytes());
+    attributes.extend(attribute(NFQA_CFG_FLAGS, &flags.to_be_bytes()));
     attributes
 }
 
@@ -574,6 +623,8 @@ pub struct Ipv4Packet<'a> {
     pub ports: Option<(u16, u16)>,
     /// Flags, for TCP.
     pub tcp_flags: Option<u8>,
+    /// Sequence and acknowledgement numbers, for TCP.
+    pub tcp_sequence: Option<(u32, u32)>,
     /// What follows the TCP or UDP header (DNS messages, for example).
     pub data: &'a [u8],
 }
@@ -609,10 +660,16 @@ impl<'a> Ipv4Packet<'a> {
             }
             _ => (None, transport),
         };
-        let tcp_flags = if protocol == PROTOCOL_TCP {
-            transport.get(13).copied()
+        let (tcp_flags, tcp_sequence) = if protocol == PROTOCOL_TCP {
+            let number = |range: std::ops::Range<usize>| {
+                transport
+                    .get(range)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_be_bytes)
+            };
+            (transport.get(13).copied(), number(4..8).zip(number(8..12)))
         } else {
-            None
+            (None, None)
         };
         Some(Self {
             source,
@@ -620,6 +677,7 @@ impl<'a> Ipv4Packet<'a> {
             protocol,
             ports,
             tcp_flags,
+            tcp_sequence,
             data,
         })
     }
@@ -658,14 +716,18 @@ pub mod tests {
     use super::*;
 
     #[test]
-    fn fail_open_sets_only_the_fail_open_flag() {
+    fn sets_only_the_flags_asked_for() {
         let mut expected = Vec::new();
         for kind in [NFQA_CFG_MASK, NFQA_CFG_FLAGS] {
             expected.extend_from_slice(&8_u16.to_ne_bytes());
             expected.extend_from_slice(&kind.to_ne_bytes());
             expected.extend_from_slice(&[0, 0, 0, 1]);
         }
-        assert_eq!(fail_open_flags(), expected);
+        assert_eq!(flags(NFQA_CFG_F_FAIL_OPEN), expected);
+        assert_eq!(
+            flags(NFQA_CFG_F_FAIL_OPEN | NFQA_CFG_F_CONNTRACK)[4..8],
+            [0, 0, 0, 3]
+        );
     }
 
     /// An ARP request from `sender` for `target`.
@@ -846,9 +908,53 @@ pub mod tests {
                 id: 42,
                 physindev: Some(5),
                 hwaddr: Some(MacAddress::new([2, 0x42, 0xac, 0x12, 0, 2])),
-                payload: b"packet".to_vec()
+                payload: b"packet".to_vec(),
+                connection: None,
             }]
         );
+    }
+
+    #[test]
+    fn parses_the_connection_of_queued_packets() {
+        const NESTED: u16 = 0x8000;
+        let mut ip = attribute(1, &[172, 18, 0, 3]);
+        ip.extend(attribute(2, &[198, 51, 100, 3]));
+        let mut proto = attribute(1, &[6]);
+        proto.extend(attribute(2, &40000_u16.to_be_bytes()));
+        proto.extend(attribute(3, &443_u16.to_be_bytes()));
+        let mut tuple = attribute(1 | NESTED, &ip);
+        tuple.extend(attribute(2 | NESTED, &proto));
+        let mut connection = attribute(1 | NESTED, &tuple);
+        connection.extend(attribute(8, &0x0020_0000_u32.to_be_bytes()));
+        let queued = |info: u32| {
+            let mut attributes = attribute(NFQA_PACKET_HDR, &[0, 0, 0, 9, 8, 0, 2]);
+            attributes.extend(attribute(NFQA_CT, &connection));
+            attributes.extend(attribute(NFQA_CT_INFO, &info.to_be_bytes()));
+            let buffer = encode(
+                (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_PACKET,
+                0,
+                0,
+                2,
+                0,
+                &attributes,
+            );
+            parse_queued(&buffer).remove(0).connection
+        };
+        let tracked = queued(0).expect("connection");
+        assert_eq!(tracked.original.protocol, 6);
+        assert_eq!(
+            tracked.original.source,
+            ("172.18.0.3".parse().expect("ip"), 40000)
+        );
+        assert_eq!(
+            tracked.original.destination,
+            ("198.51.100.3".parse().expect("ip"), 443)
+        );
+        assert_eq!(tracked.mark, 0x0020_0000);
+        assert!(!tracked.reply);
+        // IP_CT_NEW is the original direction, IP_CT_ESTABLISHED_REPLY the other.
+        assert!(!queued(2).expect("connection").reply);
+        assert!(queued(3).expect("connection").reply);
     }
 
     #[test]

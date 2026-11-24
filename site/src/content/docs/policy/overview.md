@@ -12,7 +12,7 @@ A policy is a set of Docker labels. Networks get one label that turns Portcullis
 | Label | On | Value | Default |
 | --- | --- | --- | --- |
 | [`portcullis.enable`](/policy/networks/) | network | `true`, `monitor`, `false` | not enforced |
-| [`portcullis.egress.<name>`](/policy/egress/) | container | `<destination>,<service>[,<service>...]` | nothing allowed |
+| [`portcullis.egress.<name>`](/policy/egress/) | container | `<destination>,<service>[,<service>...]`, then `strict` for a `host:` rule | nothing allowed |
 | [`portcullis.icc.mode`](/policy/icc/) | container | `allow`, `deny`, `allow-listed` | `allow` |
 | [`portcullis.icc.allow.<name>`](/policy/icc/#allow-listed) | container | `container:<target>,<service>...` or `multicast:<group>,<service>...` | none |
 | [`portcullis.dns.<name>`](/policy/dns/) | container | `docker`, `host`, `ip:<address>`, `*`, `none` | `docker` |
@@ -21,6 +21,7 @@ A policy is a set of Docker labels. Networks get one label that turns Portcullis
 | [`portcullis.limit.new-connections`](/policy/limits/#connection-limits) | container | `<n>` per second | no limit |
 | [`portcullis.quarantine`](/policy/limits/#quarantine) | container | `on`, `off` | `on` |
 | [`portcullis.hostname-hold`](/policy/hostnames/#how-long-an-address-stays-allowed) | container | a duration: `600`, `30m`, `2h`, `1d` | `hostname-hold` setting (1h) |
+| [`portcullis.name-checks`](/policy/hostnames/#strict-name-checks) | container | `lenient`, `strict` | `name-checks` setting (`lenient`) |
 | [`portcullis.ack`](/policy/checks/#acknowledging-a-warning) | container, network | warning names, comma separated | none |
 | [`portcullis.policy-file`](/policy/files/) | container | the name of a file with more of these labels | none |
 
@@ -47,7 +48,7 @@ For a container on an enforced network, Portcullis decides the first packet of e
 3. Limits. A container over its [connection limits](/policy/limits/#connection-limits) is denied (reason `limit`).
 4. DNS. Traffic to port 53 leaving the network is decided by the [DNS labels](/policy/dns/) alone (reason `dns`). For containers with [`portcullis.domains`](/policy/domains/) labels, the query's names are checked too.
 5. Containers on the same network. Decided by the [ICC mode](/policy/icc/) alone (reason `icc`).
-6. Everything else, the Docker host included. Decided by the [egress labels](/policy/egress/) (reason `egress`).
+6. Everything else, the Docker host included. Decided by the [egress labels](/policy/egress/) (reason `egress`). A connection a `host:` rule allows is then checked for the [name it asks for](/policy/hostnames/#names-connections-ask-for).
 
 The first rule that applies decides. An egress label never allows DNS or traffic to containers on the same network, not even `ip:*,*`.
 
